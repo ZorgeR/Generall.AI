@@ -333,7 +333,15 @@ The application is configured via environment variables in the `.env` file. Key 
 
 ## 📄 License
 
-[Specify your license information here]
+GenerALL.AI is released under a custom license with the following terms:
+
+- ✅ **Personal Use**: You may use this software for personal, non-commercial purposes.
+- ✅ **Modification**: You may modify the software and create derivative works.
+- ✅ **Distribution**: You may distribute copies of the original or modified software.
+- ✅ **Attribution**: You must give appropriate credit to the original authors.
+- ❌ **Commercial Use**: Commercial use requires explicit permission from the copyright holders.
+
+See the [LICENSE](./LICENSE) file for complete details.
 
 ## 👏 Acknowledgments
 
