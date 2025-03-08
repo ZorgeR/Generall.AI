@@ -68,6 +68,7 @@ import agents.main as agents
 anthropic_model = "claude-3-7-sonnet-latest"
 openai_model = "gpt-4o"
 
+user_invite_limit = os.getenv("INVITE_LIMIT")
 telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
 telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID").split(",")
 telegram_admin_id = os.getenv("TELEGRAM_ADMIN_ID")  # Added for admin access
@@ -79,6 +80,10 @@ openai_client = OpenAI(api_key=openai_api_key)
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
 anthropic_client = anthropic.Anthropic(api_key=anthropic_api_key)
 send_reasoning = True
+
+user_invites = {}
+authorized_users = set(telegram_chat_id)
+allow_all_users = os.getenv("TELEGRAM_ALLOWED_ALL_USERS", "false") == "true"
 
 # Initialize voice manager
 voice_manager = VoiceManager()
@@ -2396,12 +2401,6 @@ async def show_reminders_summary(query: CallbackQuery, user_id: str):
             parse_mode="markdown"
         )
 
-# User invite management
-INVITE_LIMIT = 5  # Regular users can create at most 5 invites
-# Store invites as {user_id: {invite_code: {"created_at": timestamp, "used_by": None or user_id}}}
-user_invites = {}
-authorized_users = set(telegram_chat_id)
-
 def ensure_data_directory():
     """Ensure the data directory exists"""
     os.makedirs("data", exist_ok=True)
@@ -2442,6 +2441,8 @@ def save_authorized_users():
 
 def is_user_authorized(user_id):
     """Check if a user is authorized to use the bot"""
+    if allow_all_users:
+        return True
     return user_id in authorized_users
 
 def generate_invite_code(user_id):
@@ -2554,8 +2555,8 @@ async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_admin = user_id == telegram_admin_id
     invite_count = get_user_invite_count(user_id)
     
-    if not is_admin and invite_count >= INVITE_LIMIT:
-        await update.message.reply_text(f"❌ You've reached your invite limit ({INVITE_LIMIT}).")
+    if not is_admin and invite_count >= user_invite_limit:
+        await update.message.reply_text(f"❌ You've reached your invite limit ({user_invite_limit}).")
         return
     
     # Generate invite code
@@ -2569,13 +2570,13 @@ async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     # Use HTML format instead of markdown to avoid parsing issues
-    remaining = "unlimited" if is_admin else str(INVITE_LIMIT - invite_count - 1)
+    remaining = "unlimited" if is_admin else str(user_invite_limit - invite_count - 1)
     
     await update.message.reply_text(
         f"🎟️ <b>New Invite Created</b>\n\n"
         f"Share this link: {invite_link}\n\n"
         f"Or use this command:\n<code>/invite {invite_code}</code>\n\n"
-        f"Invites remaining: {remaining}/{INVITE_LIMIT}",
+        f"Invites remaining: {remaining}/{user_invite_limit}",
         reply_markup=reply_markup,
         parse_mode="HTML"
     )
