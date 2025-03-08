@@ -1,5 +1,7 @@
 # 🤖 GenerALL.AI - Multimodal Telegram AI Assistant
 
+> **Note:** GenerALL.AI refers to a "General Purpose AI", not a military general.
+
 ## 📋 Overview
 
 GenerALL.AI is a sophisticated multimodal Telegram bot assistant powered by advanced AI models like Claude 3.7 Sonnet and GPT-4o. It provides a seamless interface for users to interact with AI capabilities through Telegram, supporting text, voice, images, documents, and more.
