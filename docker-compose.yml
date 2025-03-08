@@ -1,0 +1,17 @@
+version: '3.8'
+
+name: generall-ai-stack
+
+services:
+  bot:
+    build: ./app
+    volumes:
+      - ./data:/app/data:rw,z,bind
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: always
+    privileged: true
+    network_mode: host
+    env_file:
+      - .env

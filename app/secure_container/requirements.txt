@@ -1,0 +1,14 @@
+# Secure container minimal requirements
+requests>=2.31.0
+beautifulsoup4>=4.12.2
+python-dotenv>=1.0.0
+pydantic>=2.5.0
+numpy>=1.24.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+pillow>=10.0.0
+boto3>=1.28.0
+docker>=6.1.3
+pytz>=2024.1
+faiss-cpu>=1.7.4
+regex>=2023.0.0 
