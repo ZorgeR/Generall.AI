@@ -186,6 +186,29 @@ Customize voice parameters including voice model selection, stability, clarity, 
 ### 📄 PDF Processing
 Upload PDFs to extract and analyze content. The bot can understand complex documents, summarize contents, answer questions about the document, and provide insights.
 
+### 📁 Supported Text File Types
+GenerALL.AI supports processing and analysis of various file formats including:
+- **Documents**: PDF, TXT, DOCX, MD
+- **Data Files**: JSON, JSONL, CSV, XLSX, XLS
+- **Code Files**: PY, JS, HTML, CSS, PHP, SQL
+- **Configuration Files**: XML, YAML, YML, TOML, INI, CONF
+- **Shell Scripts**: SH, BAT, PS1
+- **System Files**: LOG
+
+The bot can extract content, analyze structure, and help you understand the information contained within these supported file types.
+
+### 🎬 Supported Media File Types
+GenerALL.AI supports processing and analysis of various media formats including:
+- **Images**: JPG, JPEG, PNG, GIF*, BMP*, WEBP*
+- **Audio**: Telegram Voice Message, mp3*, ogg*
+- **Video**: -/-
+
+The bot can:
+- **Images**: Analyze content, detect objects, read text (OCR), and describe scenes
+- **Audio**: Transcribe speech, analyze audio content, and detect language and answer using voice generation
+- **Video**: -/-
+
+
 ### 💻 Code Execution Capabilities
 - **🐍 Python Development**: Create, edit, and execute Python scripts in a secure environment
 - **🔧 Bash Scripting**: Run Bash scripts and system commands safely

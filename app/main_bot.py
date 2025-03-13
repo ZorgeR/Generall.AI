@@ -295,40 +295,267 @@ def split_text_intelligently(text: str, max_length: int = 4000) -> list[str]:
     
     return chunks
 
-async def describe_pdf(question, pdf_path):
-    pdf_in_base64 = None
-    try:
-        with open(pdf_path, "rb") as pdf_file:
-            pdf_in_base64 = base64.b64encode(pdf_file.read()).decode("utf-8")
-    except FileNotFoundError:
-        return "Error: PDF file not found"
+async def describe_document_openai(question, file_path, file_mime_type):
+    message_files = openai_client.files.create(
+        file=open(file_path, "rb"),
+        purpose="assistants"
+    )
+    message = openai_client.chat.completions.create(
+        model=openai_model,
+        messages=[
+            {"role": "user", "content": question}
+        ],
+        files=[message_files]
+    )
+    return message.choices[0].message.content
 
-    if pdf_in_base64 is None:
-        return "Error: PDF file not found"
+async def describe_document_anthropic(question, file_path, document_type, file_mime_type):
+    document_in_base64 = None
+    try:
+        with open(file_path, "rb") as document_file:
+            document_in_base64 = base64.b64encode(document_file.read()).decode("utf-8")
+    except FileNotFoundError:
+        return "Error: Document file not found"
+
+    if document_in_base64 is None:
+        return "Error: Document file not found"
 
     message = anthropic_client.messages.create(
         model=anthropic_model,
         messages=[
             {
             "role": "user",
-            "content": [{
-                "type": "document",
-                "source": {
-                    "type": "base64",
-                    "media_type": "application/pdf",
-                    "data": pdf_in_base64
-                }
+            "content": [
+                {
+                    "type": document_type,
+                    "source": {
+                        "type": "base64",
+                        "media_type": file_mime_type,
+                        "data": document_in_base64
+                    }
                 },
                 {
                     "type": "text",
                     "text": question
-                }]
+                }
+                ]
             }],
         system="You are a very professional document analyze specialist. Analyze the given document in a detailed way, to answer user's question.",
         max_tokens=4096,
     )
 
     return message.content[0].text
+
+async def describe_txt(question, txt_path):
+    """Analyze text files and answer questions about them"""
+    try:
+        with open(txt_path, "r", encoding="utf-8") as txt_file:
+            txt_content = txt_file.read()
+    except FileNotFoundError:
+        return "Error: TXT file not found"
+    except UnicodeDecodeError:
+        # Try alternative encoding if UTF-8 fails
+        try:
+            with open(txt_path, "r", encoding="latin-1") as txt_file:
+                txt_content = txt_file.read()
+        except Exception as e:
+            return f"Error reading TXT file: {str(e)}"
+
+    # Handle large text files by splitting them if needed
+    if len(txt_content) > 100000:  # Approximately 100KB
+        return await process_large_text(txt_content, question, "text document")
+    
+    message = anthropic_client.messages.create(
+        model=anthropic_model,
+        messages=[
+            {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"Here is the content of a text document:\n\n<document>\n{txt_content}\n</document>\n\n<user_question>\n{question}\n</user_question>"
+                }]
+            }],
+        system="You are a very professional document analyze specialist. Analyze the given text document in a detailed way, to answer user's question.",
+        max_tokens=4096,
+    )
+
+    return message.content[0].text
+
+async def describe_json(question, json_path):
+    """Analyze JSON files and answer questions about them"""
+    try:
+        with open(json_path, "r", encoding="utf-8") as json_file:
+            json_content = json_file.read()
+            # Validate it's proper JSON by parsing it
+            json.loads(json_content)
+    except FileNotFoundError:
+        return "Error: JSON file not found"
+    except json.JSONDecodeError:
+        return "Error: Invalid JSON format"
+    except Exception as e:
+        return f"Error reading JSON file: {str(e)}"
+
+    # Handle large JSON files by splitting them if needed
+    if len(json_content) > 100000:  # Approximately 100KB
+        return await process_large_text(json_content, question, "JSON document")
+    
+    message = anthropic_client.messages.create(
+        model=anthropic_model,
+        messages=[
+            {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"Here is the content of a JSON document:\n\n<json_document>\n{json_content}\n</json_document>\n\n<user_question>\n{question}\n</user_question>"
+                }]
+            }],
+        system="You are a very professional data analyst specializing in JSON. Analyze the given JSON document in a detailed way, to answer user's question. Format your insights clearly.",
+        max_tokens=4096,
+    )
+
+    return message.content[0].text
+
+async def describe_docx(question, docx_path):
+    """Analyze DOCX files and answer questions about them"""
+    try:
+        try:
+            import docx2txt
+        except ImportError:
+            return "Error: docx2txt library not installed. Please install it with 'pip install docx2txt'."
+            
+        docx_content = docx2txt.process(docx_path)
+    except FileNotFoundError:
+        return "Error: DOCX file not found"
+    except Exception as e:
+        return f"Error reading DOCX file: {str(e)}"
+
+    # Handle large DOCX files by splitting them if needed
+    if len(docx_content) > 100000:  # Approximately 100KB
+        return await process_large_text(docx_content, question, "Word document")
+    
+    message = anthropic_client.messages.create(
+        model=anthropic_model,
+        messages=[
+            {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"Here is the content of a Word document:\n\n{docx_content}\n\n{question}"
+                }]
+            }],
+        system="You are a very professional document analyst specializing in Word documents. Analyze the given document in a detailed way, to answer user's question.",
+        max_tokens=4096,
+    )
+
+    return message.content[0].text
+
+async def describe_xlsx(question, xlsx_path):
+    """Analyze Excel (XLSX) files and answer questions about them"""
+    try:
+        try:
+            import pandas as pd
+        except ImportError:
+            return "Error: pandas library not installed. Please install it with 'pip install pandas openpyxl'."
+        
+        # Read all sheets
+        xlsx_content = ""
+        excel_file = pd.ExcelFile(xlsx_path)
+        sheet_names = excel_file.sheet_names
+        
+        for sheet in sheet_names:
+            df = pd.read_excel(xlsx_path, sheet_name=sheet)
+            xlsx_content += f"\n\nSheet: {sheet}\n"
+            xlsx_content += df.to_string(index=True) + "\n"
+            
+    except FileNotFoundError:
+        return "Error: XLSX file not found"
+    except Exception as e:
+        return f"Error reading XLSX file: {str(e)}"
+
+    # Handle large Excel files by splitting them if needed
+    if len(xlsx_content) > 100000:  # Approximately 100KB
+        return await process_large_text(xlsx_content, question, "Excel spreadsheet")
+    
+    message = anthropic_client.messages.create(
+        model=anthropic_model,
+        messages=[
+            {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"Here is the content of an Excel spreadsheet:\n\n{xlsx_content}\n\n{question}"
+                }]
+            }],
+        system="You are a very professional data analyst specializing in Excel spreadsheets. Analyze the given spreadsheet in a detailed way, to answer user's question. Format numeric insights clearly.",
+        max_tokens=4096,
+    )
+
+    return message.content[0].text
+
+async def process_large_text(content, question, content_type):
+    """Process large text content by splitting it into chunks and analyzing each chunk"""
+    # Split the content into chunks of approximately 50KB each
+    chunk_size = 50000
+    chunks = [content[i:i + chunk_size] for i in range(0, len(content), chunk_size)]
+    
+    summaries = []
+    for i, chunk in enumerate(chunks):
+        message = anthropic_client.messages.create(
+            model=anthropic_model,
+            messages=[
+                {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"Here is part {i+1} of {len(chunks)} of a {content_type}:\n\n{chunk}\n\nSummarize this part of the document concisely."
+                    }]
+                }],
+            system="You are a very professional document analyst. Summarize this part of the document concisely.",
+            max_tokens=1000,
+        )
+        summaries.append(message.content[0].text)
+    
+    # Combine the summaries and answer the question
+    combined_summary = "\n\n".join([f"Part {i+1} summary: {summary}" for i, summary in enumerate(summaries)])
+    
+    final_message = anthropic_client.messages.create(
+        model=anthropic_model,
+        messages=[
+            {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"I have analyzed a large {content_type} in parts. Here are the summaries of each part:\n\n{combined_summary}\n\nBased on these summaries, please answer the following question: {question}"
+                }]
+            }],
+        system="You are a very professional document analyst. Based on the provided summaries, answer the user's question thoroughly.",
+        max_tokens=4096,
+    )
+    
+    return final_message.content[0].text
+
+async def describe_document(question, file_path):
+    """Generic function to handle document analysis based on file extension"""
+    file_extension = os.path.splitext(file_path)[1].lower()
+    
+    if file_extension == '.pdf':
+        return await describe_document_anthropic(question, file_path, "document", "application/pdf")
+    elif file_extension in ['.txt', '.csv', '.py', '.sh', '.bat', '.md', '.ps1', '.js', '.css', '.html', '.php', '.sql', '.xml', '.yaml', '.yml', '.toml', '.ini', '.conf', '.log', '.jsonl']:
+        return await describe_txt(question, file_path)
+    elif file_extension == '.json':
+        return await describe_json(question, file_path)
+    elif file_extension == '.docx':
+        return await describe_docx(question, file_path)
+    elif file_extension in ['.xlsx', '.xls']:
+        return await describe_xlsx(question, file_path)
+    else:
+        return f"Error: Unsupported file type {file_extension}"
 
 async def describe_image_anthropic(question, image_path):
     base64_image = encode_image(image_path)
@@ -967,7 +1194,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 print(f"Error cleaning up temporary photo file {temp_photo}: {str(e)}")
 
 async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle incoming document messages (specifically PDFs)"""
+    """Handle incoming document messages (PDF, TXT, JSON, DOCX, XLSX)"""
     user_id = str(update.message.chat_id)
 
     # Check if the user is authorized
@@ -975,23 +1202,29 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("Unauthorized. You need an invite to use this bot.")
         return
     
-    # Check if the document is a PDF
-    if not update.message.document.file_name.lower().endswith('.pdf'):
-        await update.message.reply_text("❌ Only PDF documents are supported.")
+    # Check if the document has a supported file extension
+    file_name = update.message.document.file_name.lower()
+    supported_extensions = ['.pdf', '.txt', '.json', '.docx', '.xlsx', '.xls', '.csv', '.py', '.sh', '.bat', '.md', '.ps1', '.js', '.css', '.html', '.php', '.sql', '.xml', '.yaml', '.yml', '.toml', '.ini', '.conf', '.log', '.jsonl']
+    file_extension = os.path.splitext(file_name)[1].lower()
+    
+    if file_extension not in supported_extensions:
+        supported_formats = ", ".join([ext.replace(".", "").upper() for ext in supported_extensions])
+        await update.message.reply_text(f"❌ Only {supported_formats} documents are supported.")
         return
 
     # Send initial status message
-    status_message = await update.message.reply_text("📄 *Processing PDF document...*", parse_mode="markdown")
+    doc_type = file_extension.replace(".", "").upper()
+    status_message = await update.message.reply_text(f"📄 *Processing {doc_type} document...*", parse_mode="markdown")
     
-    temp_pdf = None
+    temp_file = None
     try:
-        # Download the PDF
+        # Download the document
         document = update.message.document
         document_file = await context.bot.get_file(document.file_id)
         temp_dir = "temp_docs"
         os.makedirs(temp_dir, exist_ok=True)
-        temp_pdf = os.path.join(temp_dir, f"doc_{uuid.uuid4()}.pdf")
-        await document_file.download_to_drive(temp_pdf)
+        temp_file = os.path.join(temp_dir, f"doc_{uuid.uuid4()}{file_extension}")
+        await document_file.download_to_drive(temp_file)
 
         # Get the caption or use default question
         if update.message.caption == None:
@@ -1001,12 +1234,12 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
             caption = update.message.caption
             describe_question = f"Analyze this document and describe its contents in detail. When you are done, answer the following question: {caption}"
 
-        # Get PDF description
-        await status_message.edit_text("🤖 *Analyzing PDF content...*", parse_mode="markdown")
-        pdf_description = await describe_pdf(describe_question, temp_pdf)
+        # Get document description
+        await status_message.edit_text(f"🤖 *Analyzing {doc_type} content...*", parse_mode="markdown")
+        document_description = await describe_document(describe_question, temp_file)
 
-        # Craft the user question combining caption and PDF description
-        user_question = f"{caption}\n\nUser attached a PDF document to this message. Here is the analysis of document contents from Anthropic Agent:\n\n{pdf_description}"
+        # Craft the user question combining caption and document description
+        user_question = f"{caption}\n\nUser attached a {doc_type} document to this message. Here is the analysis of document contents:\n\n{document_description}"
 
         await status_message.edit_text("🤖 *Processing...*", parse_mode="markdown")
         # Process like a regular message
@@ -1035,16 +1268,16 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 
     except Exception as e:
         trace_id = str(uuid.uuid4())
-        await status_message.edit_text(text=f"❌ An error occurred while analyzing the PDF document. Trace ID: {trace_id}")
+        await status_message.edit_text(text=f"❌ An error occurred while analyzing the document. Trace ID: {trace_id}")
         logging.error(f"An error occurred with trace ID {trace_id}: {str(e)}")
 
     finally:
         # Clean up temporary file
-        if temp_pdf and os.path.exists(temp_pdf):
+        if temp_file and os.path.exists(temp_file):
             try:
-                os.remove(temp_pdf)
+                os.remove(temp_file)
             except Exception as e:
-                print(f"Error cleaning up temporary PDF file {temp_pdf}: {str(e)}")
+                print(f"Error cleaning up temporary file {temp_file}: {str(e)}")
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /settings command"""
@@ -2700,7 +2933,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
 
     # Add document message handler
-    app.add_handler(MessageHandler(filters.Document.PDF, handle_document_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document_message))
     
     # Add voice command handler
     app.add_handler(CommandHandler("voice", voice_command))
