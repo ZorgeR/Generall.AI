@@ -258,6 +258,16 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         last_step_category = "initial"
         last_tool_name = ""
         while True:
+            for message in processed_messages:
+                if "content" in message:
+                    try:
+                        if message["content"][0]["type"] == "text":
+                            if message["content"][0]["text"] == "":
+                                print(f"\nEmpty message detected and replaced.")
+                                message["content"][0]["text"] = "Empty message."
+                    except:
+                        pass
+
             if update_status:
                 if last_step_category == "executing-tools":
                     await update_status(step=last_step_category, details=f"Processing tool results {last_tool_name}", iteration=cicles, critique=critique)
@@ -284,6 +294,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             # print(f"\nNew iteration\nProcessed messages: {processed_messages}\nSystem: {system}")
 
             if self.thinking:
+                print(f"\nAgent prepare messages with thinking")
                 response = self.client.messages.create(
                     model=self.model,
                     messages=processed_messages,
@@ -297,6 +308,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                     }
                 )
             else:
+                print(f"\nAgent prepare messages without thinking")
                 response = self.client.messages.create(
                     model=self.model,
                     messages=processed_messages,

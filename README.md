@@ -21,6 +21,9 @@ GenerALL.AI is a sophisticated multimodal Telegram bot assistant powered by adva
 - **🖼️ Image Analysis**: Describe and analyze images using state-of-the-art vision models
 - **📸 Multiple Photo Processing**: Analyze multiple images simultaneously to describe, compare differences, and redraw content
 - **🎨 Image Generation**: Create new images based on text descriptions or modifications of existing images
+  - **🔄 Generate with DALL-E 3**: Create single images with OpenAI's DALL-E 3 model
+  - **✨ Multimodal Generation with Gemini**: Generate stories with matching images using Google's Gemini model
+  - **🖌️ Image-to-Image Transformation**: Edit and transform existing images with powerful AI editing capabilities
 - **📄 Document Processing**: Extract and analyze content from PDFs and other documents with deep understanding of the content
 - **⏰ Reminder System**: Create and manage reminders with natural language processing for both specific times and contextual events
 - **📅 Task Scheduling**: Schedule tasks to execute based on specific times or event triggers like "after a match ends"
@@ -96,21 +99,25 @@ Bot: "I'll perform a security scan of your website. This might take a few minute
       I've attached a detailed report with recommendations for fixing these issues."
 ```
 
-### 🎨 Batch Image Generation
+### 🎨 Advanced Image Generation and Transformation
 
 ```
-User: "Generate 5 different logo concepts for a coffee shop called 'Morning Brew'. Use minimalist design style."
+User: "Create a story about a space explorer discovering an ancient alien civilization. Include images for each key scene."
 
-Bot: "I'll create 5 different logo concepts for 'Morning Brew' coffee shop in a minimalist style."
-     [Generates 5 unique logo designs]
-     [Sends images in a single gallery message]
-     "Here are 5 minimalist logo concepts for 'Morning Brew':
-      1. Simple coffee cup with steam forming the letter M
-      2. Sunrise/coffee cup combined icon with clean typography
-      3. Geometric minimalist representation of coffee beans
-      4. Circular design with negative space forming a cup
-      5. Wordmark with integrated coffee drop icon
-      Let me know if you'd like any modifications or want to explore any concept further."
+Bot: "I'll create a multimodal story about a space explorer discovering an ancient alien civilization."
+     [Generates a complete story with matching images for each key scene]
+     [Sends text and images together in a coherent narrative]
+     "The Stellar Archaeologist - A space explorer's journey to the lost civilization of Proxima Centauri IV..."
+     [Image of a space explorer approaching an alien planet]
+     "As Captain Elara approached the crystalline structures, their surfaces shimmered with an otherworldly light..."
+     [Image of alien crystal structures with mysterious glowing patterns]
+     
+User: "This is great! Can you transform the second image to add more alien symbols and make it look more mysterious?"
+
+Bot: "I'll transform that image to add more alien symbols and enhance the mysterious atmosphere."
+     [Takes the existing image and applies the requested transformations]
+     [Sends the modified image with new alien symbols and enhanced mysterious elements]
+     "Here's the transformed image with additional alien symbols and a more mysterious atmosphere. I've added ancient hieroglyphs that glow with an eerie blue light and enhanced the shadowy elements to create a sense of the unknown."
 ```
 
 ### ⏱️ Complex Event-Based Reminders
@@ -186,6 +193,31 @@ Customize voice parameters including voice model selection, stability, clarity, 
 ### 📄 PDF Processing
 Upload PDFs to extract and analyze content. The bot can understand complex documents, summarize contents, answer questions about the document, and provide insights.
 
+### 🎨 Advanced Image Generation and Transformation
+
+GenerALL.AI offers multiple powerful image generation and transformation capabilities:
+
+#### 📸 DALL-E 3 Image Generation
+Generate high-quality single images with OpenAI's DALL-E 3 model, with customizable parameters:
+- Control image size and quality
+- Detailed prompt capabilities
+- Supports art styles, photography styles, and concept visualization
+
+#### ✨ Multimodal Generation with Gemini
+Create rich stories with matching images using Google's advanced Gemini model:
+- Generate text and images simultaneously within a single cohesive experience
+- Create multiple images that match the narrative flow
+- Support for various artistic styles (3D digital art, photorealistic, cartoon, anime, etc.)
+- Perfect for storytelling, educational content, and creative projects
+
+#### 🖌️ Image-to-Image Transformation
+Transform and edit existing images with AI:
+- Add or remove elements from images
+- Change styles, colors, or artistic approaches
+- Apply creative modifications based on text instructions
+- Useful for design iterations, creative exploration, and visual problem-solving
+- Works with images the user has sent previously
+
 ### 📁 Supported Text File Types
 GenerALL.AI supports processing and analysis of various file formats including:
 - **Documents**: PDF, TXT, DOCX, MD
@@ -235,6 +267,7 @@ The bot can:
 - Anthropic API Key (for Claude 3.7)
 - OpenAI API Key (for GPT-4o and Whisper)
 - ElevenLabs API Key (for voice synthesis)
+- Google API Key (for Gemini image generation/transformation)
 
 ## 📥 Installation
 
@@ -304,6 +337,7 @@ The application is configured via environment variables in the `.env` file. Key 
 
 - `ANTHROPIC_API_KEY`: API key for Anthropic Claude models
 - `OPENAI_API_KEY`: API key for OpenAI GPT models
+- `GOOGLE_API_KEY`: API key for Gemini AI models
 - `OPENAI_API_KEY_WHISPER`: API key for OpenAI Whisper (voice transcription)
 - `TAVILY_API_KEY`: API key for Tavily search integration
 - `PERPLEXITY_API_KEY`: API key for Perplexity search integration

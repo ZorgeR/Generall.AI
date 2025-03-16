@@ -2,7 +2,6 @@ import os
 import logging
 import uuid
 import base64
-import httpx
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, Message, Chat
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
@@ -962,6 +961,7 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         temp_photos = []  # Keep track of temporary files for cleanup
         all_descriptions = []  # Store descriptions for all photos
+        image_paths = []  # Store paths to downloaded images
         
         try:
             # Process each photo
@@ -970,11 +970,19 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
                     photo = photo_group[0]  # Get the photo from the group
                     # Download the photo
                     photo_file = await context.bot.get_file(photo.file_id)
-                    temp_dir = "temp_photos"
+                    temp_dir = f"./data/{user_id}/temp_photos"
                     os.makedirs(temp_dir, exist_ok=True)
                     temp_photo = os.path.join(temp_dir, f"photo_{uuid.uuid4()}.jpg")
                     temp_photos.append(temp_photo)
                     await photo_file.download_to_drive(temp_photo)
+                    
+                    # Save the permanent copy to user's directory
+                    user_images_dir = os.path.join("data", user_id, "images")
+                    os.makedirs(user_images_dir, exist_ok=True)
+                    permanent_image_path = os.path.join(user_images_dir, f"image_{uuid.uuid4()}.jpg")
+                    # Copy the image to the permanent location
+                    shutil.copy(temp_photo, permanent_image_path)
+                    image_paths.append(permanent_image_path)
                     
                     # Get descriptions from both services
                     await status_message.edit_text(f"🤖 *Getting Anthropic description for image {i}...*", parse_mode="markdown")
@@ -985,19 +993,21 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
                     
                     all_descriptions.append({
                         'anthropic': anthropic_description,
-                        'openai': openai_description
+                        'openai': openai_description,
+                        'path': permanent_image_path
                     })
                     
                 except Exception as e:
                     logging.error(f"Error processing photo {i}: {str(e)}")
                     all_descriptions.append({
                         'anthropic': f"Error processing image {i}",
-                        'openai': f"Error processing image {i}"
+                        'openai': f"Error processing image {i}",
+                        'path': "error_path"
                     })
             
             # Craft the user question combining caption and all descriptions
             descriptions_text = "\n\n".join([
-                f"Image {i+1}:\n"
+                f"Image {i+1} (path: {desc['path']}):\n"
                 f"Anthropic description: {desc['anthropic']}\n"
                 f"OpenAI description: {desc['openai']}"
                 for i, desc in enumerate(all_descriptions)
@@ -1113,6 +1123,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     
     temp_photos = []  # Keep track of temporary files for cleanup
     all_descriptions = []  # Store descriptions for all photos
+    image_paths = []  # Store paths to downloaded images
     
     try:
         # Process single photo (rest of the existing code for single photo processing)
@@ -1126,6 +1137,14 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 temp_photos.append(temp_photo)
                 await photo_file.download_to_drive(temp_photo)
                 
+                # Save the permanent copy to user's directory
+                user_images_dir = os.path.join("data", user_id, "images")
+                os.makedirs(user_images_dir, exist_ok=True)
+                permanent_image_path = os.path.join(user_images_dir, f"image_{uuid.uuid4()}.jpg")
+                # Copy the image to the permanent location
+                shutil.copy(temp_photo, permanent_image_path)
+                image_paths.append(permanent_image_path)
+                
                 # Get descriptions from both services
                 await status_message.edit_text(f"🤖 *Getting Anthropic description...*", parse_mode="markdown")
                 anthropic_description = await describe_image_anthropic(question=describe_question, image_path=temp_photo)
@@ -1135,19 +1154,21 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 
                 all_descriptions.append({
                     'anthropic': anthropic_description,
-                    'openai': openai_description
+                    'openai': openai_description,
+                    'path': permanent_image_path
                 })
                 
             except Exception as e:
                 logging.error(f"Error processing photo {i}: {str(e)}")
                 all_descriptions.append({
                     'anthropic': f"Error processing image {i}",
-                    'openai': f"Error processing image {i}"
+                    'openai': f"Error processing image {i}",
+                    'path': "error_path"
                 })
         
         # Craft the user question combining caption and all descriptions
         descriptions_text = "\n\n".join([
-            f"Image {i+1}:\n"
+            f"Image {i+1} (path: {desc['path']}):\n"
             f"Anthropic description: {desc['anthropic']}\n"
             f"OpenAI description: {desc['openai']}"
             for i, desc in enumerate(all_descriptions)
