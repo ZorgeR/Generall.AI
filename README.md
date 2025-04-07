@@ -1,10 +1,10 @@
-# 🤖 GenerALL.AI - Multimodal Telegram AI Assistant
+# 🤖 GALL.AI (prev. GenerALL.AI) - Multimodal Gen AI Agent System
 
 > **Note:** GenerALL.AI refers to a "General Purpose AI", not a military general.
 
 ## 📋 Overview
 
-GenerALL.AI is a sophisticated multimodal Telegram bot assistant powered by advanced AI models like Claude 3.7 Sonnet and GPT-4o. It provides a seamless interface for users to interact with AI capabilities through Telegram, supporting text, voice, images, documents, and more.
+GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bot communication interface powered by advanced AI models like Claude 3.7 Sonnet and GPT-4o. It provides a seamless interface for users to interact with AI capabilities through Telegram, supporting text, voice, images, documents, and more.
 
 ## 🔎 At a Glance
 
@@ -49,6 +49,17 @@ GenerALL.AI is a sophisticated multimodal Telegram bot assistant powered by adva
   - Admins have unlimited invite generation capability
   - Track invite usage and user access via admin commands
   - Automatically notify admins when new users join
+
+## ⚙️ How memory work
+
+![schema](static/schema/genai_tg_schema_v1.png)
+
+- Control all memory aspect
+- Long term memory
+- Short term memory
+- Previous conversation full thinking context
+- RAG automated memory
+- Summarization memory
 
 ## 🚀 Example Scenarios
 
@@ -407,3 +418,35 @@ See the [LICENSE](./LICENSE) file for complete details.
 - Built with [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot)
 - Uses AI models from Anthropic and OpenAI
 - Voice synthesis powered by ElevenLabs 
+
+
+## ❤️ Donation:
+
+##### ₿ BTC:
+![btc](static/donations/btc.png)
+`bc1qyymy3ufvq3c3uq2q4927ll6x4rhvdw8gxlydwc`
+
+##### Ξ ETH:
+![eth](static/donations/eth.png)
+`0x0213A705065B193D14f1A3cd075977e28Da8F9B3`
+
+##### 💵 USDT-TRC20:
+![usdt](static/donations/usdt.png)
+`TG2efcamZ1767TkBfeGUn8QWaRGrLpHUxD`
+
+##### 💵 SOL:
+![sol](static/donations/sol.png)
+`B7faayiFUqM64Dgt4iUtpSfWbo4VANBs8bknSXv3e53E`
+
+##### 💎 TON:
+![ton](static/donations/ton.png)
+`UQDg07heLBcWdYO_sP6_Hc9hCu24E3v05sBJuRqc_DyWKreq`
+
+##### 🐕 DOGE:
+![doge](static/donations/doge.png)
+`D9RbkgazaGhkT4FHkJtHoh4hDxkzAZwQnK`
+
+
+You can make a donation / subscription, or say thanks in Telegram: https://t.me/ZorgeR
+
+Boosty (Donate / Subscription) : https://boosty.to/zorgg
