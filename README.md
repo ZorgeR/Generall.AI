@@ -422,6 +422,9 @@ See the [LICENSE](./LICENSE) file for complete details.
 
 ## ❤️ Donation:
 
+Become a Patron: https://www.patreon.com/zorg
+Donate via Paypal: http://paypal.me/mezorg/15
+
 ##### ₿ BTC:
 ![btc](static/donations/btc.png)
 `bc1qyymy3ufvq3c3uq2q4927ll6x4rhvdw8gxlydwc`
