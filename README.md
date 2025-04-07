@@ -52,7 +52,7 @@ GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bo
 
 ## ⚙️ How memory work
 
-![schema](static/schema/genai_tg_schema_v1.png)
+![schema](static/schema/genai_tg_schema_v2.png)
 
 - Control all memory aspect
 - Long term memory
