@@ -155,7 +155,7 @@ class ImageTools:
             formatted_prompt = f"Generate a story about {prompt} in a {style} style. For each scene, generate an image."
             
             response = genai_client.models.generate_content(
-                model="gemini-2.0-flash-exp",
+                model="gemini-2.5-flash-image-preview",
                 contents=formatted_prompt,
                 config=types.GenerateContentConfig(
                     response_modalities=["Text", "Image"],
@@ -230,7 +230,7 @@ class ImageTools:
             
             # Call Gemini API to transform the image
             response = genai_client.models.generate_content(
-                model="gemini-2.0-flash-exp",
+                model="gemini-2.5-flash-image-preview",
                 contents=(
                     prompt,
                     source_image
