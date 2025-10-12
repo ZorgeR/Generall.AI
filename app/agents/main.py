@@ -8,6 +8,7 @@ from .code_tools import CodeTools
 from .terminal_tools import TerminalTools
 from .time_tools import TimeTools
 from .image_tools import ImageTools
+from .video_tools import VideoTools
 from .sms_tools import SMSTools
 from .user_interactions import UserInteractions
 from .embeddings import ConversationEmbeddings
@@ -26,12 +27,12 @@ max_agent_critique_iterations = os.getenv("MAX_AGENT_CRITIQUE_ITERATIONS")
 
 # Anthropic config
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
-anthropic_model = "claude-3-7-sonnet-latest"
+anthropic_model = "claude-sonnet-4-5-20250929"
 anthropic_client = anthropic.Anthropic(api_key=anthropic_api_key)
 
 # OpenAI config
 openai_api_key = os.getenv("OPENAI_API_KEY")
-openai_model = "gpt-4o"
+openai_model = "gpt-5-2025-08-07"
 openai_client = OpenAI(api_key=openai_api_key)
 
 # Tavily config
@@ -43,6 +44,8 @@ class CritiqueResponse(BaseModel):
     critique_details: str
     need_rewrite_answer: bool
 
+class JudgeResponse(BaseModel):
+    judge_decision: bool
 
 class AgentAnthropic:
     def __init__(self, model: str = anthropic_model):
@@ -54,6 +57,7 @@ class AgentAnthropic:
         self.terminal_tools = None
         self.time_tools = None
         self.image_tools = None
+        self.video_tools = None
         self.sms_tools = None
         self.user_interactions = None
         self.thinking = False
@@ -66,6 +70,8 @@ class AgentAnthropic:
         try:
             critique_prompt = f"""As an expert AI critic, analyze this response for potential issues:
 
+If user ask to generate image, video, or transform it, always answer need_rewrite_answer = False, because you must not check the result of this actions.
+      
 Task received time in UTC+0: {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}
 
 Focus on:
@@ -90,8 +96,6 @@ Important:
 2. If assistant want to execute code, and you see that code is not correct, ask to fix it.
 
 Main task of agent, is a give user answer to his question.
-
-If user ask to generate image, answer need_rewrite_answer = False.
 
 You can suggest assistant to use a tools, if you think that it's necessary, the list of available tools is:
 {self.get_tools_schema()}
@@ -145,7 +149,9 @@ You can suggest assistant to use a tools, if you think that it's necessary, the 
         try:
             judge_prompt = f"""As an expert judge, your task is to evaluate if this response completely and satisfactorily answers the user's question.
 
-You must respond with ONLY "Yes" or "No".
+You must respond with ONLY "Yes" or "No". No other text.
+
+If user ask to generate image, video, or transform it, always answer "Yes" because you must not check the result of this actions.
 
 Respond "Yes" if:
 1. The response fully addresses the user's question
@@ -172,7 +178,8 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                     "content": [{"type": "text", "text": judge_prompt}]
                 }],
                 temperature=0.7,
-                max_tokens=1
+                max_tokens=1,
+                system="You are AI assistant as a judge, and you must respond with ONLY 'Yes' or 'No'. You task is to judge if the response is complete and correct and relevant to the user question."
             )
 
             judge_decision = response.content[0].text.strip().lower()
@@ -197,6 +204,8 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             tools.extend(self.time_tools.tools_schema)
         if self.image_tools:
             tools.extend(self.image_tools.tools_schema)
+        if self.video_tools:
+            tools.extend(self.video_tools.tools_schema)
         if self.sms_tools:
             tools.extend(self.sms_tools.tools_schema)
         if self.user_interactions:
@@ -217,6 +226,8 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             return self.time_tools.execute_tool(tool_name, tool_args)
         elif self.image_tools and tool_name in [t["name"] for t in self.image_tools.tools_schema]:
             return await self.image_tools.execute_tool(tool_name, tool_args)
+        elif self.video_tools and tool_name in [t["name"] for t in self.video_tools.tools_schema]:
+            return await self.video_tools.execute_tool(tool_name, tool_args)
         elif self.sms_tools and tool_name in [t["name"] for t in self.sms_tools.tools_schema]:
             return self.sms_tools.execute_tool(tool_name, tool_args)
         elif self.user_interactions and tool_name in [t["name"] for t in self.user_interactions.tools_schema]:
@@ -441,6 +452,7 @@ class ChainOfThoughtAgent:
         self.terminal_tools = TerminalTools(user_id, telegram_update)
         self.time_tools = TimeTools()
         self.image_tools = ImageTools(user_id, telegram_update)
+        self.video_tools = VideoTools(user_id, telegram_update)
         self.sms_tools = SMSTools()
         self.user_interactions = UserInteractions(user_id, telegram_update)
         self.user_settings = user_settings
@@ -464,6 +476,7 @@ class ChainOfThoughtAgent:
             self.agent.terminal_tools = self.terminal_tools
             self.agent.time_tools = self.time_tools
             self.agent.image_tools = self.image_tools
+            self.agent.video_tools = self.video_tools
             self.agent.sms_tools = self.sms_tools
             self.agent.user_interactions = self.user_interactions
             self.agent.thinking = self.user_settings.get("thinking").get("enabled", False)
