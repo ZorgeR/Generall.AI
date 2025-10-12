@@ -7,7 +7,7 @@ import uuid
 import telegram
 from google import genai
 from google.genai import types
-import PIL.Image
+from google.genai.types import Image
 
 load_dotenv()
 
@@ -212,8 +212,8 @@ class VideoTools:
             if quality == "1080p" and orientation == "portrait":
                 return "Error: 1080p resolution is only supported for horizontal (16:9) videos. Please use 720p for portrait videos or switch to horizontal orientation."
             
-            # Open the image using PIL
-            source_image = PIL.Image.open(image_path_obj)
+            # Load image using the from_file method (handles bytes and mime_type automatically)
+            source_image = Image.from_file(location=str(image_path_obj))
             
             # Notify user that video generation started (it can take some time)
             await self.telegram_update.message.reply_text(
