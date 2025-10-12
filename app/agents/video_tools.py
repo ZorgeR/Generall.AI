@@ -117,7 +117,9 @@ class VideoTools:
         try:
             # Convert orientation to aspect ratio
             aspect_ratio = "16:9" if orientation == "horizontal" else "9:16"
-            
+            # temporary fix for aspect ratio
+            aspect_ratio = "16:9"
+
             # Validate quality and orientation combination
             if quality == "1080p" and orientation == "portrait":
                 return "Error: 1080p resolution is only supported for horizontal (16:9) videos. Please use 720p for portrait videos or switch to horizontal orientation."
@@ -130,15 +132,14 @@ class VideoTools:
             
             # Configure video generation
             config = types.GenerateVideosConfig(
-                aspect_ratio=aspect_ratio,
-                resolution=quality
+                aspect_ratio=aspect_ratio #, resolution=quality
             )
             if negative_prompt:
                 config.negative_prompt = negative_prompt
             
             # Start video generation operation
             operation = genai_client.models.generate_videos(
-                model="veo-3.0-generate-001",
+                model="veo-3.0-generate-preview",
                 prompt=prompt,
                 config=config,
             )
@@ -208,6 +209,8 @@ class VideoTools:
             
             # Convert orientation to aspect ratio
             aspect_ratio = "16:9" if orientation == "horizontal" else "9:16"
+            # temporary fix for aspect ratio
+            aspect_ratio = "16:9"
             
             # Validate quality and orientation combination
             if quality == "1080p" and orientation == "portrait":
@@ -224,15 +227,15 @@ class VideoTools:
             
             # Configure video generation
             config = types.GenerateVideosConfig(
-                aspect_ratio=aspect_ratio,
-                resolution=quality
+                aspect_ratio=aspect_ratio # , resolution=quality
             )
+
             if negative_prompt:
                 config.negative_prompt = negative_prompt
             
             # Start video generation operation with image
             operation = genai_client.models.generate_videos(
-                model="veo-3.0-generate-001",
+                model="veo-3.0-generate-preview",
                 prompt=prompt,
                 image=source_image,
                 config=config,
