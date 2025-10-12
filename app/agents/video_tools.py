@@ -130,8 +130,7 @@ class VideoTools:
             
             # Configure video generation
             config = types.GenerateVideosConfig(
-                aspect_ratio=aspect_ratio,
-                resolution=quality
+                aspect_ratio=aspect_ratio#, resolution=quality
             )
             if negative_prompt:
                 config.negative_prompt = negative_prompt
@@ -224,8 +223,7 @@ class VideoTools:
             
             # Configure video generation
             config = types.GenerateVideosConfig(
-                aspect_ratio=aspect_ratio,
-                resolution=quality
+                aspect_ratio=aspect_ratio #, resolution=quality
             )
             if negative_prompt:
                 config.negative_prompt = negative_prompt

@@ -121,7 +121,6 @@ You can suggest assistant to use a tools, if you think that it's necessary, the 
                 model=openai_model,
                 messages=critique_context,
                 temperature=0.7,
-                max_tokens=4000,
                 response_format=CritiqueResponse
             )
             
@@ -178,7 +177,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                     "content": [{"type": "text", "text": judge_prompt}]
                 }],
                 temperature=0.7,
-                max_tokens=1,
+                max_tokens=100,
                 system="You are AI assistant as a judge, and you must respond with ONLY 'Yes' or 'No'. You task is to judge if the response is complete and correct and relevant to the user question."
             )
 
@@ -495,8 +494,7 @@ Response: {response}"""
         topic_response = openai_client.chat.completions.create(
             model=openai_model,
             messages=[{"role": "user", "content": topic_prompt}],
-            temperature=0.7,
-            max_tokens=50
+            temperature=0.7
         )
         topic = topic_response.choices[0].message.content.strip()
         
@@ -508,8 +506,7 @@ Response: {response}"""
         summary_response = openai_client.chat.completions.create(
             model=openai_model,
             messages=[{"role": "user", "content": summary_prompt}],
-            temperature=0.7,
-            max_tokens=150
+            temperature=0.7
         )
         summary = summary_response.choices[0].message.content.strip()
         
