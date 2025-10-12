@@ -130,14 +130,15 @@ class VideoTools:
             
             # Configure video generation
             config = types.GenerateVideosConfig(
-                aspect_ratio=aspect_ratio#, resolution=quality
+                aspect_ratio=aspect_ratio,
+                resolution=quality
             )
             if negative_prompt:
                 config.negative_prompt = negative_prompt
             
             # Start video generation operation
             operation = genai_client.models.generate_videos(
-                model="veo-3.0-generate-preview",
+                model="veo-3.0-generate-001",
                 prompt=prompt,
                 config=config,
             )
@@ -223,14 +224,15 @@ class VideoTools:
             
             # Configure video generation
             config = types.GenerateVideosConfig(
-                aspect_ratio=aspect_ratio #, resolution=quality
+                aspect_ratio=aspect_ratio,
+                resolution=quality
             )
             if negative_prompt:
                 config.negative_prompt = negative_prompt
             
             # Start video generation operation with image
             operation = genai_client.models.generate_videos(
-                model="veo-3.0-generate-preview",
+                model="veo-3.0-generate-001",
                 prompt=prompt,
                 image=source_image,
                 config=config,
