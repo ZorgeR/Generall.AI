@@ -4,6 +4,15 @@ import sys
 import os
 
 class CodeTools:
+    def __init__(self, user_id: str = "default"):
+        """
+        Initialize CodeTools with user_id.
+        
+        Args:
+            user_id: User ID for tracking code execution
+        """
+        self.user_id = user_id
+    
     @property
     def tools_schema(self) -> List[Dict[str, Any]]:
         """Return the schema for code execution tools"""

@@ -445,7 +445,7 @@ class ChainOfThoughtAgent:
         self.user_id = user_id
         self.file_ops = FileOperations(user_id, telegram_update)
         self.search_tools = SearchTools(user_id)
-        self.code_tools = CodeTools()
+        self.code_tools = CodeTools(user_id)
         self.terminal_tools = TerminalTools(user_id, telegram_update)
         self.time_tools = TimeTools()
         self.image_tools = ImageTools(user_id, telegram_update)
