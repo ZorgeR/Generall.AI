@@ -179,18 +179,15 @@ echo "Package installation completed"
                 # Update the command to run our script
                 command = "/home/runner/workspace/temp_setup.sh"
             
-            # volume prefix
-            # TODO: make this configurable
-            user_dir_short = str(user_dir.absolute())
-            user_dir_fixed = user_dir_short.replace("/app/data", "")
-            prefix = "/Users/zorg/dev/git/generall.ai/generall.ai/data"
-            user_dir_inside_host = f"{prefix}/{user_dir_fixed}"
+            # Get the absolute path of the user directory to mount into the container
+            user_dir_absolute = str(user_dir.absolute())
+            logger.info(f"Mounting host directory {user_dir_absolute} to /home/runner/workspace in container")
 
             container = self.docker_client.containers.run(
                 image=f"{self.image_name}:{self.image_tag}",
                 command=command,
                 volumes={
-                    str(user_dir_inside_host): {
+                    user_dir_absolute: {
                         'bind': '/home/runner/workspace',
                         'mode': 'rw',
                         'propagation': 'shared'
