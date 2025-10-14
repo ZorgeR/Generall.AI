@@ -12,19 +12,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def initialize_secure_containers(base_data_path="./data"):
+def initialize_secure_containers(base_data_path="./data", host_data_path=None):
     """
     Initialize the secure container system.
     This function should be called when the application starts.
     
     Args:
-        base_data_path: Base path for user data directories
+        base_data_path: Base path for user data directories (internal path)
+        host_data_path: Base path on the host machine for Docker volume mounting.
+                       If None, will attempt to read from WORKSPACE_ROOT environment variable
         
     Returns:
         True if initialization was successful, False otherwise
     """
     try:
         logger.info("Initializing secure container system...")
+        
+        # If host_data_path not provided, try to get from environment
+        if host_data_path is None:
+            workspace_root = os.environ.get('WORKSPACE_ROOT')
+            if workspace_root:
+                host_data_path = os.path.join(workspace_root, 'data')
+                logger.info(f"Using WORKSPACE_ROOT from environment: {workspace_root}")
+                logger.info(f"Host data path: {host_data_path}")
+            else:
+                logger.warning("WORKSPACE_ROOT not set, will attempt auto-detection")
         
         # Import the agents module
         import agents
@@ -39,12 +51,12 @@ def initialize_secure_containers(base_data_path="./data"):
             logger.info(f"Docker is available. Version: {docker_version.get('Version', 'unknown')}")
             
             from .container_manager import ContainerManager
-            container_manager = ContainerManager(base_data_path=base_data_path)
+            container_manager = ContainerManager(base_data_path=base_data_path, host_data_path=host_data_path)
             # Store the container manager as a global variable
             globals()['_container_manager'] = container_manager
             
             # Create a tool integrator and patch all tools
-            tool_integrator = ToolIntegrator(base_data_path=base_data_path)
+            tool_integrator = ToolIntegrator(base_data_path=base_data_path, host_data_path=host_data_path)
             if tool_integrator.patch_all_tools(agents):
                 logger.info("Successfully patched all tools to use secure containers")
             else:

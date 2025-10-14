@@ -23,17 +23,28 @@ class ContainerManager:
     Each user gets their own container that is created on demand and destroyed after use.
     """
     
-    def __init__(self, base_data_path="./data"):
+    def __init__(self, base_data_path="./data", host_data_path=None):
         """
         Initialize the container manager.
         
         Args:
-            base_data_path: Base path for user data directories
+            base_data_path: Base path for user data directories (internal path)
+            host_data_path: Base path on the host machine for Docker volume mounting.
+                           If None, will be auto-detected or use base_data_path
         """
         self.base_data_path = Path(base_data_path)
         self.image_name = "secure-container"
         self.image_tag = "latest"
         self.container_prefix = "secure-container-"
+        
+        # Determine the host data path for volume mounting
+        if host_data_path:
+            self.host_data_path = Path(host_data_path)
+        else:
+            # Auto-detect if we're running in a container
+            self.host_data_path = self._detect_host_data_path()
+        
+        logger.info(f"Container manager initialized with base_data_path={self.base_data_path}, host_data_path={self.host_data_path}")
         
         # Initialize Docker client
         try:
@@ -45,6 +56,29 @@ class ContainerManager:
         
         # Ensure the secure container image is built
         self._ensure_image_exists()
+    
+    def _detect_host_data_path(self):
+        """
+        Detect the host data path for Docker volume mounting.
+        If running inside a container with /app/data, translate to host path.
+        Otherwise, use the absolute path of base_data_path.
+        """
+        base_absolute = self.base_data_path.absolute()
+        
+        # Check if we're running inside a container and using /app/data
+        if str(base_absolute).startswith('/app/data'):            
+            # Check if there's a .dockerenv file (indicates we're in a container)
+            if Path('/.dockerenv').exists():
+                # Try to read from an environment variable first
+                workspace_root = os.environ.get('WORKSPACE_ROOT')
+                if workspace_root:
+                    host_path = Path(workspace_root) / 'data'
+                    logger.info(f"Detected host data path from WORKSPACE_ROOT: {host_path}")
+                    return host_path
+                logger.warning("Running in container but WORKSPACE_ROOT not set, using heuristic")
+                return Path('/opt/generall.ai/Generall.AI/data')
+            
+        return base_absolute
     
     def _ensure_image_exists(self):
         """Ensure the secure container image exists, build it if it doesn't"""
@@ -179,15 +213,21 @@ echo "Package installation completed"
                 # Update the command to run our script
                 command = "/home/runner/workspace/temp_setup.sh"
             
-            # Get the absolute path of the user directory to mount into the container
-            user_dir_absolute = str(user_dir.absolute())
-            logger.info(f"Mounting host directory {user_dir_absolute} to /home/runner/workspace in container")
+            # Get the host path for the user directory to mount into the container
+            # user_dir is relative to base_data_path, so we need to construct the host path
+            relative_user_path = user_dir.relative_to(self.base_data_path)
+            host_user_dir = self.host_data_path / relative_user_path
+            host_user_dir_str = str(host_user_dir.absolute())
+            
+            logger.info(f"User directory (internal): {user_dir}")
+            logger.info(f"Host directory (for mounting): {host_user_dir_str}")
+            logger.info(f"Mounting to container: /home/runner/workspace")
 
             container = self.docker_client.containers.run(
                 image=f"{self.image_name}:{self.image_tag}",
                 command=command,
                 volumes={
-                    user_dir_absolute: {
+                    host_user_dir_str: {
                         'bind': '/home/runner/workspace',
                         'mode': 'rw',
                         'propagation': 'shared'

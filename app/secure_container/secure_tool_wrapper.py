@@ -62,14 +62,15 @@ class SecureToolWrapper:
         "run_shell_script" # Run a shell script
     }
     
-    def __init__(self, base_data_path="./data"):
+    def __init__(self, base_data_path="./data", host_data_path=None):
         """
         Initialize the secure tool wrapper.
         
         Args:
-            base_data_path: Base path for user data directories
+            base_data_path: Base path for user data directories (internal path)
+            host_data_path: Base path on the host machine for Docker volume mounting
         """
-        self.container_manager = ContainerManager(base_data_path)
+        self.container_manager = ContainerManager(base_data_path, host_data_path)
         logger.info("Secure tool wrapper initialized")
     
     def needs_secure_execution(self, tool_type: str, method_name: str) -> bool:

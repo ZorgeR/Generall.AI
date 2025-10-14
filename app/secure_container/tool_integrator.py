@@ -19,14 +19,15 @@ class ToolIntegrator:
     This class patches the existing tool methods to run in a secure container.
     """
     
-    def __init__(self, base_data_path="./data"):
+    def __init__(self, base_data_path="./data", host_data_path=None):
         """
         Initialize the tool integrator.
         
         Args:
-            base_data_path: Base path for user data directories
+            base_data_path: Base path for user data directories (internal path)
+            host_data_path: Base path on the host machine for Docker volume mounting
         """
-        self.secure_wrapper = SecureToolWrapper(base_data_path)
+        self.secure_wrapper = SecureToolWrapper(base_data_path, host_data_path)
         logger.info("Tool integrator initialized")
     
     def patch_terminal_tools(self, terminal_tools_class):
