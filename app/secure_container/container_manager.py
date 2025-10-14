@@ -303,6 +303,9 @@ echo "Package installation completed"
             target_file = user_dir / "temp_code.py"
             shutil.copy(temp_file_path, target_file)
             
+            # Set proper permissions for the file (readable and executable by all)
+            os.chmod(target_file, 0o755)
+            
             # Run the code in the container
             command = "python /home/runner/workspace/temp_code.py"
             result = self.run_command(user_id, command, timeout, network_enabled)
