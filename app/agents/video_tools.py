@@ -113,16 +113,18 @@ class VideoTools:
 
     async def _video_generator(self, prompt: str, orientation: str = "horizontal", quality: str = "720p", negative_prompt: str = "", caption: str = "Here is your generated video") -> str:
         """Generate a high-quality video from text using Google's Veo 3.0 model"""
-        print(f"Generating video with Veo 3.0 - Prompt: {prompt}, Orientation: {orientation}, Quality: {quality}, Negative prompt: {negative_prompt}")
+        print(f"Generating video with Veo 3.1 - Prompt: {prompt}, Orientation: {orientation}, Quality: {quality}, Negative prompt: {negative_prompt}")
         try:
             # Convert orientation to aspect ratio
             aspect_ratio = "16:9" if orientation == "horizontal" else "9:16"
             # temporary fix for aspect ratio
-            aspect_ratio = "16:9"
+            # aspect_ratio = "16:9"
 
             # Validate quality and orientation combination
             if quality == "1080p" and orientation == "portrait":
-                return "Error: 1080p resolution is only supported for horizontal (16:9) videos. Please use 720p for portrait videos or switch to horizontal orientation."
+                # return "Error: 1080p resolution is only supported for horizontal (16:9) videos. Please use 720p for portrait videos or switch to horizontal orientation."
+                # force quality to 720p for portrait videos
+                quality = "720p"
             
             # Notify user that video generation started (it can take some time)
             await self.telegram_update.message.reply_text(
@@ -132,14 +134,14 @@ class VideoTools:
             
             # Configure video generation
             config = types.GenerateVideosConfig(
-                aspect_ratio=aspect_ratio #, resolution=quality
+                aspect_ratio=aspect_ratio, resolution=quality
             )
             if negative_prompt:
                 config.negative_prompt = negative_prompt
             
             # Start video generation operation
             operation = genai_client.models.generate_videos(
-                model="veo-3.0-generate-preview",
+                model="veo-3.1-generate-preview",
                 prompt=prompt,
                 config=config,
             )
@@ -200,7 +202,7 @@ class VideoTools:
 
     async def _image_to_video_generator(self, prompt: str, image_path: str, orientation: str = "horizontal", quality: str = "720p", negative_prompt: str = "", caption: str = "Here is your generated video from the image") -> str:
         """Generate a high-quality video from an image using Google's Veo 3.0 model"""
-        print(f"Generating video from image with Veo 3.0 - Prompt: {prompt}, Image: {image_path}, Orientation: {orientation}, Quality: {quality}, Negative prompt: {negative_prompt}")
+        print(f"Generating video from image with Veo 3.1 - Prompt: {prompt}, Image: {image_path}, Orientation: {orientation}, Quality: {quality}, Negative prompt: {negative_prompt}")
         try:
             # Verify the image path exists
             image_path_obj = Path(image_path)
@@ -210,11 +212,13 @@ class VideoTools:
             # Convert orientation to aspect ratio
             aspect_ratio = "16:9" if orientation == "horizontal" else "9:16"
             # temporary fix for aspect ratio
-            aspect_ratio = "16:9"
+            # aspect_ratio = "16:9"
             
             # Validate quality and orientation combination
             if quality == "1080p" and orientation == "portrait":
-                return "Error: 1080p resolution is only supported for horizontal (16:9) videos. Please use 720p for portrait videos or switch to horizontal orientation."
+                # return "Error: 1080p resolution is only supported for horizontal (16:9) videos. Please use 720p for portrait videos or switch to horizontal orientation."
+                # force quality to 720p for portrait videos
+                quality = "720p"
             
             # Load image using the from_file method (handles bytes and mime_type automatically)
             source_image = Image.from_file(location=str(image_path_obj))
@@ -227,7 +231,7 @@ class VideoTools:
             
             # Configure video generation
             config = types.GenerateVideosConfig(
-                aspect_ratio=aspect_ratio # , resolution=quality
+                aspect_ratio=aspect_ratio, resolution=quality
             )
 
             if negative_prompt:
@@ -235,7 +239,7 @@ class VideoTools:
             
             # Start video generation operation with image
             operation = genai_client.models.generate_videos(
-                model="veo-3.0-generate-preview",
+                model="veo-3.1-generate-preview",
                 prompt=prompt,
                 image=source_image,
                 config=config,
