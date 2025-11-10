@@ -3019,10 +3019,7 @@ def main():
     try:
         app.run_polling(
             allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,  # Drop pending updates to start fresh
-            pool_timeout=30,
-            connect_timeout=30,
-            read_timeout=30
+            drop_pending_updates=True  # Drop pending updates to start fresh
         )
     except Exception as e:
         logger.error(f"Bot polling failed: {str(e)}")
