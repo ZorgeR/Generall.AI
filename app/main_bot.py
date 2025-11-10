@@ -716,9 +716,12 @@ async def send_reasoning_file(update: Update, messages, user_id: str):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.chat_id)
+    
+    logger.info(f"Received message from user {user_id}: {update.message.text[:50]}...")
 
     # Check if the user is authorized
     if not is_user_authorized(user_id):
+        logger.warning(f"Unauthorized access attempt from user {user_id}")
         await update.message.reply_text("Unauthorized. You need an invite to use this bot.")
         return
     
@@ -733,26 +736,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if step == "saving":
             iteration = "final"
             critique = "end"
-        await thinking_message.edit_text(
-            f"💭 *Thinking...*\n"
-            f"- - - - \n"
-            f"📝 *Step:* _{step.replace('_', '-')}_\n"
-            f"📋 *Details:* _{details.replace('_', '-')}_\n"
-            f"🔄 *Iterations:* _{iteration}_\n"
-            f"🎯 *Critiques:* _{critique}_",
-            parse_mode="markdown"
-        )
+        try:
+            await thinking_message.edit_text(
+                f"💭 *Thinking...*\n"
+                f"- - - - \n"
+                f"📝 *Step:* _{step.replace('_', '-')}_\n"
+                f"📋 *Details:* _{details.replace('_', '-')}_\n"
+                f"🔄 *Iterations:* _{iteration}_\n"
+                f"🎯 *Critiques:* _{critique}_",
+                parse_mode="markdown"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to update thinking message: {str(e)}")
     
     try:
         # Get response
+        logger.info(f"Processing message for user {user_id}")
         response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context)
+        logger.info(f"Got response for user {user_id}, sending to user")
         await send_response_to_user(update, thinking_message, response)
         await send_reasoning_file(update, messages, user_id)
+        logger.info(f"Successfully processed message for user {user_id}")
     except Exception as e:
         # Edit thinking message with error if something goes wrong
         trace_id = str(uuid.uuid4())
         await thinking_message.edit_text(text=f"❌ An error occurred. Trace ID: {trace_id}")
-        logging.error(f"An error occurred with trace ID {trace_id}: {str(e)}")
+        logger.error(f"An error occurred with trace ID {trace_id}: {str(e)}")
+        import traceback
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
 
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.chat_id)
@@ -2936,8 +2947,22 @@ def main():
     # Load authorized users from file
     load_authorized_users()
     
-    # Create application with job queue enabled
-    app = Application.builder().token(telegram_bot_token).build()
+    # Validate bot token
+    if not telegram_bot_token or telegram_bot_token == "":
+        logger.error("TELEGRAM_BOT_TOKEN is not set in environment variables!")
+        print("ERROR: TELEGRAM_BOT_TOKEN is not set!")
+        exit(1)
+    
+    logger.info(f"Bot token loaded (length: {len(telegram_bot_token)} chars)")
+    
+    try:
+        # Create application with job queue enabled
+        app = Application.builder().token(telegram_bot_token).build()
+        logger.info("Telegram application created successfully")
+    except Exception as e:
+        logger.error(f"Failed to create Telegram application: {str(e)}")
+        print(f"ERROR: Failed to create Telegram application: {str(e)}")
+        exit(1)
     
     # Add command handlers
     app.add_handler(CommandHandler("start", start_command))
@@ -2988,9 +3013,23 @@ def main():
         import atexit
         atexit.register(shutdown_handler, app)
     
-    # Start polling
+    # Start polling with error handling
     print("Bot is running...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Starting bot polling...")
+    try:
+        app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,  # Drop pending updates to start fresh
+            pool_timeout=30,
+            connect_timeout=30,
+            read_timeout=30
+        )
+    except Exception as e:
+        logger.error(f"Bot polling failed: {str(e)}")
+        print(f"ERROR: Bot polling failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        exit(1)
 
 def shutdown_handler(application=None):
     """Clean up containers when the application shuts down"""
