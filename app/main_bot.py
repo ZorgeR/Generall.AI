@@ -2956,9 +2956,17 @@ def main():
     logger.info(f"Bot token loaded (length: {len(telegram_bot_token)} chars)")
     
     try:
-        # Create application with job queue enabled
-        app = Application.builder().token(telegram_bot_token).build()
-        logger.info("Telegram application created successfully")
+        # Create application with job queue enabled and increased timeouts
+        app = (
+            Application.builder()
+            .token(telegram_bot_token)
+            .connect_timeout(30.0)
+            .read_timeout(30.0)
+            .write_timeout(30.0)
+            .pool_timeout(30.0)
+            .build()
+        )
+        logger.info("Telegram application created successfully with 30s timeouts")
     except Exception as e:
         logger.error(f"Failed to create Telegram application: {str(e)}")
         print(f"ERROR: Failed to create Telegram application: {str(e)}")
