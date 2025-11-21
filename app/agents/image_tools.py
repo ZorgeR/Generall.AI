@@ -39,7 +39,7 @@ class ImageTools:
         self.tools_schema = [
             {
                 "name": "image_generator",
-                "description": "Generate high-quality images from text descriptions using Gemini 2.5 Flash Image (state-of-the-art text-to-image generation with unprecedented contextual understanding), save to images directory, and send to user via Telegram",
+                "description": "Generate high-quality images from text descriptions using Gemini image generation, save to images directory, and send to user via Telegram. ALWAYS use Normal mode by default unless user specifically requests Pro mode.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -51,6 +51,24 @@ class ImageTools:
                             "type": "string",
                             "description": "Visual style for the image (e.g., 'photorealistic', 'digital art', 'cartoon', 'anime', 'impressionist', 'minimalist')",
                             "default": "photorealistic"
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "Model to use: 'Normal' (faster, standard quality, gemini-2.5-flash-image) or 'Pro' (higher quality, more control, gemini-3-pro-image-preview). ALWAYS use 'Normal' unless user specifically requests Pro mode.",
+                            "enum": ["Normal", "Pro"],
+                            "default": "Normal"
+                        },
+                        "aspect_ratio": {
+                            "type": "string",
+                            "description": "Aspect ratio for Pro mode only. Options: '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'. Default is '16:9'. Only used when model is 'Pro'.",
+                            "enum": ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"],
+                            "default": "16:9"
+                        },
+                        "resolution": {
+                            "type": "string",
+                            "description": "Resolution for Pro mode only. Options: '1K', '2K', '4K'. Default is '2K'. Only used when model is 'Pro'.",
+                            "enum": ["1K", "2K", "4K"],
+                            "default": "2K"
                         },
                         "caption": {
                             "type": "string",
@@ -111,7 +129,7 @@ class ImageTools:
             },
             {
                 "name": "image_editing",
-                "description": "Edit and transform existing images using Gemini's advanced image editing capabilities. Supports adding, removing, or modifying elements, changing styles, adjusting colors, and mask-free editing.",
+                "description": "Edit and transform existing images using Gemini's advanced image editing capabilities. Supports adding, removing, or modifying elements, changing styles, adjusting colors, and mask-free editing. ALWAYS use Normal mode by default unless user specifically requests Pro mode.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -122,6 +140,24 @@ class ImageTools:
                         "image_path": {
                             "type": "string",
                             "description": "Path to the image file to be edited. This should be a full path to an image file in the user's directory."
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "Model to use: 'Normal' (faster, standard quality, gemini-2.5-flash-image) or 'Pro' (higher quality, more control, gemini-3-pro-image-preview). ALWAYS use 'Normal' unless user specifically requests Pro mode.",
+                            "enum": ["Normal", "Pro"],
+                            "default": "Normal"
+                        },
+                        "aspect_ratio": {
+                            "type": "string",
+                            "description": "Aspect ratio for Pro mode only. Options: '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'. Default is '16:9'. Only used when model is 'Pro'.",
+                            "enum": ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"],
+                            "default": "16:9"
+                        },
+                        "resolution": {
+                            "type": "string",
+                            "description": "Resolution for Pro mode only. Options: '1K', '2K', '4K'. Default is '2K'. Only used when model is 'Pro'.",
+                            "enum": ["1K", "2K", "4K"],
+                            "default": "2K"
                         },
                         "caption": {
                             "type": "string",
@@ -134,7 +170,7 @@ class ImageTools:
             },
             {
                 "name": "image_composition",
-                "description": "Compose a new image using multiple input images with Gemini's advanced multi-image processing. Perfect for style transfer, combining elements from different images, or creating composite scenes.",
+                "description": "Compose a new image using multiple input images with Gemini's advanced multi-image processing. Perfect for style transfer, combining elements from different images, or creating composite scenes. ALWAYS use Normal mode by default unless user specifically requests Pro mode.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -150,6 +186,24 @@ class ImageTools:
                             },
                             "minItems": 2,
                             "maxItems": 3
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "Model to use: 'Normal' (faster, standard quality, gemini-2.5-flash-image) or 'Pro' (higher quality, more control, gemini-3-pro-image-preview). ALWAYS use 'Normal' unless user specifically requests Pro mode.",
+                            "enum": ["Normal", "Pro"],
+                            "default": "Normal"
+                        },
+                        "aspect_ratio": {
+                            "type": "string",
+                            "description": "Aspect ratio for Pro mode only. Options: '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'. Default is '16:9'. Only used when model is 'Pro'.",
+                            "enum": ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"],
+                            "default": "16:9"
+                        },
+                        "resolution": {
+                            "type": "string",
+                            "description": "Resolution for Pro mode only. Options: '1K', '2K', '4K'. Default is '2K'. Only used when model is 'Pro'.",
+                            "enum": ["1K", "2K", "4K"],
+                            "default": "2K"
                         },
                         "caption": {
                             "type": "string",
@@ -210,7 +264,7 @@ class ImageTools:
             formatted_prompt = f"Generate a story about {prompt} in a {style} style. For each scene, generate an image."
             
             response = genai_client.models.generate_content(
-                model="gemini-2.5-flash-image-preview",
+                model="gemini-2.5-flash-image",
                 contents=formatted_prompt,
                 config=types.GenerateContentConfig(
                     response_modalities=["Text", "Image"],
@@ -271,9 +325,9 @@ class ImageTools:
         except Exception as e:
             return f"Error generating multimodal story: {str(e)}"
             
-    async def _image_editing(self, prompt: str, image_path: str, caption: str = "Here is your edited image") -> str:
+    async def _image_editing(self, prompt: str, image_path: str, model: str = "Normal", aspect_ratio: str = "16:9", resolution: str = "2K", caption: str = "Here is your edited image") -> str:
         """Edit an existing image using Google's Gemini model"""
-        print(f"Editing image with prompt: {prompt}, image_path: {image_path}")
+        print(f"Editing image with prompt: {prompt}, image_path: {image_path}, Model: {model}")
         try:
             # Verify the image path exists
             image_path_obj = Path(image_path)
@@ -283,16 +337,31 @@ class ImageTools:
             # Open the image using PIL
             source_image = PIL.Image.open(image_path_obj)
             
+            # Select model based on mode
+            model_name = "gemini-3-pro-image-preview" if model.lower() == "pro" else "gemini-2.5-flash-image"
+            
+            # Build config based on mode
+            if model == "Pro":
+                config = types.GenerateContentConfig(
+                    response_modalities=["Text", "Image"],
+                    image_config=types.ImageConfig(
+                        aspect_ratio=aspect_ratio,
+                        image_size=resolution
+                    )
+                )
+            else:
+                config = types.GenerateContentConfig(
+                    response_modalities=["Text", "Image"]
+                )
+            
             # Call Gemini API to transform the image
             response = genai_client.models.generate_content(
-                model="gemini-2.5-flash-image-preview",
+                model=model_name,
                 contents=(
                     prompt,
                     source_image
                 ),
-                config=types.GenerateContentConfig(
-                    response_modalities=["Text", "Image"]
-                ),
+                config=config,
             )
             
             contents = response.candidates[0].content.parts
@@ -351,9 +420,9 @@ class ImageTools:
         except Exception as e:
             return f"Error editing image: {str(e)}"
     
-    async def _image_generator(self, prompt: str, style: str = "photorealistic", caption: str = "Here is your generated image") -> str:
+    async def _image_generator(self, prompt: str, style: str = "photorealistic", model: str = "Normal", aspect_ratio: str = "16:9", resolution: str = "2K", caption: str = "Here is your generated image") -> str:
         """Generate a high-quality image from text using Google's Gemini model"""
-        print(f"Generating image with Gemini - Prompt: {prompt}, Style: {style}")
+        print(f"Generating image with Gemini - Prompt: {prompt}, Style: {style}, Model: {model}")
         try:
             # Format the prompt to include style information
             if style and style != "photorealistic":
@@ -361,10 +430,27 @@ class ImageTools:
             else:
                 formatted_prompt = prompt
             
-            response = genai_client.models.generate_content(
-                model="gemini-2.5-flash-image-preview",
-                contents=[formatted_prompt],
-            )
+            # Select model based on mode
+            model_name = "gemini-3-pro-image-preview" if model.lower() == "pro" else "gemini-2.5-flash-image"
+            
+            # Build config based on mode
+            if model == "Pro":
+                config = types.GenerateContentConfig(
+                    image_config=types.ImageConfig(
+                        aspect_ratio=aspect_ratio,
+                        image_size=resolution
+                    )
+                )
+                response = genai_client.models.generate_content(
+                    model=model_name,
+                    contents=[formatted_prompt],
+                    config=config
+                )
+            else:
+                response = genai_client.models.generate_content(
+                    model=model_name,
+                    contents=[formatted_prompt],
+                )
             
             # Process the response and extract images
             contents = response.candidates[0].content.parts
@@ -409,9 +495,9 @@ class ImageTools:
         except Exception as e:
             return f"Error generating image: {str(e)}"
     
-    async def _image_composition(self, prompt: str, image_paths: List[str], caption: str = "Here is your composed image") -> str:
+    async def _image_composition(self, prompt: str, image_paths: List[str], model: str = "Normal", aspect_ratio: str = "16:9", resolution: str = "2K", caption: str = "Here is your composed image") -> str:
         """Compose a new image from multiple input images using Google's Gemini model"""
-        print(f"Composing image with prompt: {prompt}, image_paths: {image_paths}")
+        print(f"Composing image with prompt: {prompt}, image_paths: {image_paths}, Model: {model}")
         try:
             # Verify all image paths exist
             images = []
@@ -432,13 +518,28 @@ class ImageTools:
                 contents.append(image)
             contents.append(prompt)
             
+            # Select model based on mode
+            model_name = "gemini-3-pro-image-preview" if model.lower() == "pro" else "gemini-2.5-flash-image"
+            
+            # Build config based on mode
+            if model == "Pro":
+                config = types.GenerateContentConfig(
+                    response_modalities=["Text", "Image"],
+                    image_config=types.ImageConfig(
+                        aspect_ratio=aspect_ratio,
+                        image_size=resolution
+                    )
+                )
+            else:
+                config = types.GenerateContentConfig(
+                    response_modalities=["Text", "Image"]
+                )
+            
             # Call Gemini API for image composition
             response = genai_client.models.generate_content(
-                model="gemini-2.5-flash-image-preview",
+                model=model_name,
                 contents=contents,
-                config=types.GenerateContentConfig(
-                    response_modalities=["Text", "Image"]
-                ),
+                config=config,
             )
             
             response_parts = response.candidates[0].content.parts
