@@ -68,7 +68,7 @@ import agents.main as agents
 anthropic_model = "claude-sonnet-4-5-20250929"
 openai_model = "gpt-5-2025-08-07"
 
-user_invite_limit = os.getenv("INVITE_LIMIT")
+user_invite_limit = int(os.getenv("INVITE_LIMIT", "3"))
 telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
 telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID").split(",")
 telegram_admin_id = os.getenv("TELEGRAM_ADMIN_ID")  # Added for admin access
