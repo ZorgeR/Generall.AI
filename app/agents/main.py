@@ -12,6 +12,7 @@ from .video_tools import VideoTools
 from .sms_tools import SMSTools
 from .user_interactions import UserInteractions
 from .embeddings import ConversationEmbeddings
+from stats import stats_tracker
 from tavily import TavilyClient
 from typing import Dict, Any, Literal
 import json
@@ -48,8 +49,9 @@ class JudgeResponse(BaseModel):
     judge_decision: bool
 
 class AgentAnthropic:
-    def __init__(self, model: str = anthropic_model):
+    def __init__(self, model: str = anthropic_model, user_id: str = None):
         self.model = model
+        self.user_id = user_id
         self.client = anthropic.Anthropic(api_key=anthropic_api_key)
         self.file_ops = None
         self.search_tools = None
@@ -211,6 +213,10 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
 
     async def execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
         """Execute a tool by routing to the appropriate tool provider"""
+        # Track tool usage
+        if self.user_id:
+            stats_tracker.track_tool_used(self.user_id, tool_name)
+        
         if self.file_ops and tool_name in [t["name"] for t in self.file_ops.tools_schema]:
             return await self.file_ops.execute_tool(tool_name, tool_args)
         elif self.search_tools and tool_name in [t["name"] for t in self.search_tools.tools_schema]:
@@ -466,7 +472,7 @@ class ChainOfThoughtAgent:
         self.short_term_memory_path.mkdir(parents=True, exist_ok=True)
         
         if model_type == "anthropic":
-            self.agent = AgentAnthropic(model)
+            self.agent = AgentAnthropic(model, user_id=user_id)
             self.agent.file_ops = self.file_ops
             self.agent.search_tools = self.search_tools
             self.agent.code_tools = self.code_tools

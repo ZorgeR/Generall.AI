@@ -20,6 +20,7 @@ from typing import Any
 from pathlib import Path
 # Import the secure container system
 from secure_container.main import initialize_secure_containers, cleanup_containers
+from stats import stats_tracker
 import shutil
 
 # Check if running in Docker
@@ -662,8 +663,12 @@ async def sendvoice_to_user(audio_stream):
 
     return temp_audio_path
 
-async def send_response_to_user(update: Update, thinking_message, response: str):
+async def send_response_to_user(update: Update, thinking_message, response: str, user_id: str = None):
     """Helper function to send bot's response to the user, handling long messages and markdown formatting"""
+    # Track message sent
+    if user_id:
+        stats_tracker.track_message_sent(user_id)
+    
     try:
         # Try sending with markdown
         if len(response) > 4000:
@@ -725,6 +730,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Unauthorized. You need an invite to use this bot.")
         return
     
+    # Track message received
+    stats_tracker.track_message_received(user_id, "text")
+    
     # Get user's message
     user_message = update.message.text
     
@@ -754,7 +762,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Processing message for user {user_id}")
         response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context)
         logger.info(f"Got response for user {user_id}, sending to user")
-        await send_response_to_user(update, thinking_message, response)
+        await send_response_to_user(update, thinking_message, response, user_id)
         await send_reasoning_file(update, messages, user_id)
         logger.info(f"Successfully processed message for user {user_id}")
     except Exception as e:
@@ -772,6 +780,9 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if not is_user_authorized(user_id):
         await update.message.reply_text("Unauthorized. You need an invite to use this bot.")
         return
+    
+    # Track message received
+    stats_tracker.track_message_received(user_id, "voice")
     
     voice_message = update.message.voice
     
@@ -845,7 +856,7 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     print(f"Error generating audio: {str(e)}")
                 
                 # Send text response
-                await send_response_to_user(update, thinking_message, response)
+                await send_response_to_user(update, thinking_message, response, user_id)
                 await send_reasoning_file(update, messages, user_id)
                 
                 return transcription
@@ -956,6 +967,9 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
             await media_group_waiting_message[user_id].edit_text("🖼️ *Processing media group...*", parse_mode="markdown")
         
         photos = media_group_photos[user_id]
+        
+        # Track media group processed
+        stats_tracker.track_media_group_processed(user_id, len(photos))
 
         print(f"User {user_id} has {len(photos)} photos in media group")
 
@@ -998,9 +1012,11 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
                     # Get descriptions from both services
                     await status_message.edit_text(f"🤖 *Getting Anthropic description for image {i}...*", parse_mode="markdown")
                     anthropic_description = await describe_image_anthropic(question=describe_question, image_path=temp_photo)
+                    stats_tracker.track_describe_used(user_id, "image_anthropic")
                     
                     await status_message.edit_text(f"🤖 *Getting OpenAI description for image {i}...*", parse_mode="markdown")
                     openai_description = await describe_image_openai(question=describe_question, image_path=temp_photo)
+                    stats_tracker.track_describe_used(user_id, "image_openai")
                     
                     all_descriptions.append({
                         'anthropic': anthropic_description,
@@ -1047,7 +1063,7 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             # Get response using the same logic as handle_message
             response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context)
-            await send_response_to_user(update, thinking_message, response)
+            await send_response_to_user(update, thinking_message, response, user_id)
             await send_reasoning_file(update, messages, user_id)
             await status_message.edit_text("🤖 *Done!*", parse_mode="markdown")
             
@@ -1078,6 +1094,9 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if not is_user_authorized(user_id):
         await update.message.reply_text("Unauthorized. You need an invite to use this bot.")
         return
+    
+    # Track message received
+    stats_tracker.track_message_received(user_id, "photo")
     
     if update.message.media_group_id:
         # Cancel any existing delayed task for this user
@@ -1159,9 +1178,11 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 # Get descriptions from both services
                 await status_message.edit_text(f"🤖 *Getting Anthropic description...*", parse_mode="markdown")
                 anthropic_description = await describe_image_anthropic(question=describe_question, image_path=temp_photo)
+                stats_tracker.track_describe_used(user_id, "image_anthropic")
                 
                 await status_message.edit_text(f"🤖 *Getting OpenAI description...*", parse_mode="markdown")
                 openai_description = await describe_image_openai(question=describe_question, image_path=temp_photo)
+                stats_tracker.track_describe_used(user_id, "image_openai")
                 
                 all_descriptions.append({
                     'anthropic': anthropic_description,
@@ -1208,7 +1229,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         
         # Get response using the same logic as handle_message
         response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context)
-        await send_response_to_user(update, thinking_message, response)
+        await send_response_to_user(update, thinking_message, response, user_id)
         await send_reasoning_file(update, messages, user_id)
         await status_message.edit_text("🤖 *Done!*", parse_mode="markdown")
     except Exception as e:
@@ -1233,6 +1254,9 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     if not is_user_authorized(user_id):
         await update.message.reply_text("Unauthorized. You need an invite to use this bot.")
         return
+    
+    # Track message received
+    stats_tracker.track_message_received(user_id, "document")
     
     # Check if the document has a supported file extension
     file_name = update.message.document.file_name.lower()
@@ -1269,6 +1293,20 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         # Get document description
         await status_message.edit_text(f"🤖 *Analyzing {doc_type} content...*", parse_mode="markdown")
         document_description = await describe_document(describe_question, temp_file)
+        
+        # Track describe used based on file type
+        describe_type_map = {
+            '.pdf': 'pdf',
+            '.txt': 'txt', '.csv': 'txt', '.py': 'txt', '.sh': 'txt', '.bat': 'txt',
+            '.md': 'txt', '.ps1': 'txt', '.js': 'txt', '.css': 'txt', '.html': 'txt',
+            '.php': 'txt', '.sql': 'txt', '.xml': 'txt', '.yaml': 'txt', '.yml': 'txt',
+            '.toml': 'txt', '.ini': 'txt', '.conf': 'txt', '.log': 'txt', '.jsonl': 'txt',
+            '.json': 'json',
+            '.docx': 'docx',
+            '.xlsx': 'xlsx', '.xls': 'xlsx'
+        }
+        describe_type = describe_type_map.get(file_extension, 'txt')
+        stats_tracker.track_describe_used(user_id, describe_type)
 
         # Craft the user question combining caption and document description
         user_question = f"{caption}\n\nUser attached a {doc_type} document to this message. Here is the analysis of document contents:\n\n{document_description}"
@@ -1294,7 +1332,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 
         # Get response using the same logic as handle_message
         response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context)
-        await send_response_to_user(update, thinking_message, response)
+        await send_response_to_user(update, thinking_message, response, user_id)
         await send_reasoning_file(update, messages, user_id)
         await status_message.edit_text("🤖 *Done!*", parse_mode="markdown")
 
@@ -2666,6 +2704,265 @@ async def show_reminders_summary(query: CallbackQuery, user_id: str):
             parse_mode="markdown"
         )
 
+# ============== STATS FUNCTIONALITY ==============
+
+async def get_telegram_user_display_name(bot, user_id: str) -> str:
+    """Fetch user's display name from Telegram API"""
+    try:
+        chat = await bot.get_chat(chat_id=int(user_id))
+        if chat.username:
+            return f"@{chat.username}"
+        elif chat.first_name:
+            name = chat.first_name
+            if chat.last_name:
+                name += f" {chat.last_name}"
+            return name
+    except Exception:
+        pass
+    return user_id  # Fallback to user_id if fetch fails
+
+
+def format_stats_text(stats: dict, title: str = "Usage Statistics") -> str:
+    """Format stats dictionary into a readable text format"""
+    text = f"📊 *{title}*\n\n"
+    
+    # Messages Received
+    msg_recv = stats.get("messages_received", {})
+    msg_total = msg_recv.get("total", 0)
+    text += f"├─ Messages Received: *{msg_total:,}* total\n"
+    for msg_type in ["text", "voice", "photo", "document"]:
+        count = msg_recv.get(msg_type, 0)
+        if count > 0:
+            text += f"│  ├─ {msg_type}: {count:,}\n"
+    
+    # Messages Sent
+    msg_sent = stats.get("messages_sent", 0)
+    text += f"├─ Messages Sent: *{msg_sent:,}*\n"
+    
+    # Tools Used
+    tools_total = stats.get("tools_total", 0)
+    tools_used = stats.get("tools_used", {})
+    text += f"├─ Tools Used: *{tools_total:,}* total\n"
+    # Sort tools by count and show top ones
+    sorted_tools = sorted(tools_used.items(), key=lambda x: x[1], reverse=True)[:10]
+    for tool_name, count in sorted_tools:
+        text += f"│  ├─ {tool_name}: {count:,}\n"
+    
+    # Describe Used
+    describe_total = stats.get("describe_total", 0)
+    describe_used = stats.get("describe_used", {})
+    text += f"├─ Describe Used: *{describe_total:,}* total\n"
+    sorted_describe = sorted(describe_used.items(), key=lambda x: x[1], reverse=True)
+    for desc_type, count in sorted_describe:
+        text += f"│  ├─ {desc_type}: {count:,}\n"
+    
+    # Media Groups
+    media_groups = stats.get("media_groups_processed", 0)
+    text += f"└─ Media Groups: *{media_groups:,}*\n"
+    
+    return text
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the /stats command - admin only"""
+    user_id = str(update.message.chat_id)
+    
+    # Only admin can view stats
+    if user_id != telegram_admin_id:
+        await update.message.reply_text("Unauthorized. Only admin can use this command.")
+        return
+    
+    # Get aggregated stats
+    stats_30d = stats_tracker.get_aggregated_stats(days=30)
+    stats_all = stats_tracker.get_aggregated_stats(days=None)
+    
+    # Format the message
+    text = "📊 *Usage Statistics (All Users)*\n\n"
+    text += f"Total Users: *{stats_all.get('total_users', 0):,}*\n\n"
+    
+    text += "📅 *Last 30 Days:*\n"
+    text += format_stats_text(stats_30d, "").replace("📊 **\n\n", "")
+    
+    text += "\n📈 *All Time:*\n"
+    text += format_stats_text(stats_all, "").replace("📊 **\n\n", "")
+    
+    # Create keyboard with View Users button
+    keyboard = [
+        [InlineKeyboardButton("👥 View Users", callback_data="stats_users_page_1")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="markdown")
+    except Exception as e:
+        logging.error(f"Error sending stats: {str(e)}")
+        # Fallback without markdown
+        await update.message.reply_text(
+            text.replace('*', ''),
+            reply_markup=reply_markup
+        )
+
+
+async def stats_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle stats menu button presses"""
+    query = update.callback_query
+    user_id = str(query.message.chat_id)
+    
+    # Only admin can use stats buttons
+    if user_id != telegram_admin_id:
+        await query.answer("Unauthorized. Only admin can use this.")
+        return
+    
+    await query.answer()
+    
+    data = query.data
+    
+    if data.startswith("stats_users_page_"):
+        # Show users list at specified page
+        page = int(data.replace("stats_users_page_", ""))
+        await show_users_stats_page(query, context, page)
+    
+    elif data.startswith("stats_user_"):
+        # Show individual user stats
+        target_user_id = data.replace("stats_user_", "")
+        await show_user_stats(query, context, target_user_id)
+    
+    elif data == "stats_back_main":
+        # Return to main aggregated stats view
+        await show_main_stats(query, context)
+
+
+async def show_main_stats(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE):
+    """Show main aggregated stats view"""
+    # Get aggregated stats
+    stats_30d = stats_tracker.get_aggregated_stats(days=30)
+    stats_all = stats_tracker.get_aggregated_stats(days=None)
+    
+    # Format the message
+    text = "📊 *Usage Statistics (All Users)*\n\n"
+    text += f"Total Users: *{stats_all.get('total_users', 0):,}*\n\n"
+    
+    text += "📅 *Last 30 Days:*\n"
+    text += format_stats_text(stats_30d, "").replace("📊 **\n\n", "")
+    
+    text += "\n📈 *All Time:*\n"
+    text += format_stats_text(stats_all, "").replace("📊 **\n\n", "")
+    
+    # Create keyboard with View Users button
+    keyboard = [
+        [InlineKeyboardButton("👥 View Users", callback_data="stats_users_page_1")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="markdown")
+    except Exception as e:
+        logging.error(f"Error showing main stats: {str(e)}")
+        await query.edit_message_text(
+            text.replace('*', ''),
+            reply_markup=reply_markup
+        )
+
+
+async def show_users_stats_page(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, page: int):
+    """Show paginated list of users sorted by 30-day activity"""
+    # Get users ranked by activity
+    ranked_users = stats_tracker.get_users_ranked_by_activity(days=30)
+    
+    if not ranked_users:
+        keyboard = [[InlineKeyboardButton("⬅️ Back to Stats", callback_data="stats_back_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "No user activity recorded yet.",
+            reply_markup=reply_markup
+        )
+        return
+    
+    # Pagination
+    items_per_page = 10
+    total_pages = (len(ranked_users) + items_per_page - 1) // items_per_page
+    page = max(1, min(page, total_pages))  # Clamp page number
+    
+    start_idx = (page - 1) * items_per_page
+    end_idx = start_idx + items_per_page
+    current_users = ranked_users[start_idx:end_idx]
+    
+    # Build the text with user names
+    text = "👥 *Top Users (by 30-day activity)*\n\n"
+    
+    user_buttons = []
+    for rank, (uid, activity) in enumerate(current_users, start=start_idx + 1):
+        display_name = await get_telegram_user_display_name(context.bot, uid)
+        text += f"{rank}. {display_name} - {activity:,} actions\n"
+        
+        # Truncate display name for button if needed
+        button_name = display_name[:15] + "..." if len(display_name) > 18 else display_name
+        user_buttons.append(InlineKeyboardButton(button_name, callback_data=f"stats_user_{uid}"))
+    
+    text += f"\nPage {page}/{total_pages}"
+    
+    # Create keyboard with user buttons (3 per row)
+    keyboard = []
+    for i in range(0, len(user_buttons), 3):
+        keyboard.append(user_buttons[i:i+3])
+    
+    # Add navigation buttons
+    nav_row = []
+    if page > 1:
+        nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"stats_users_page_{page-1}"))
+    nav_row.append(InlineKeyboardButton("📊 Back to Stats", callback_data="stats_back_main"))
+    if page < total_pages:
+        nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"stats_users_page_{page+1}"))
+    keyboard.append(nav_row)
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="markdown")
+    except Exception as e:
+        logging.error(f"Error showing users stats page: {str(e)}")
+        await query.edit_message_text(
+            text.replace('*', ''),
+            reply_markup=reply_markup
+        )
+
+
+async def show_user_stats(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, target_user_id: str):
+    """Show stats for a specific user"""
+    # Get user's display name
+    display_name = await get_telegram_user_display_name(context.bot, target_user_id)
+    
+    # Get user stats
+    stats_30d = stats_tracker.get_user_stats(target_user_id, days=30)
+    stats_all = stats_tracker.get_user_stats(target_user_id, days=None)
+    
+    # Format the message
+    text = f"📊 *User Stats: {display_name}*\n"
+    text += f"ID: `{target_user_id}`\n\n"
+    
+    text += "📅 *Last 30 Days:*\n"
+    text += format_stats_text(stats_30d, "").replace("📊 **\n\n", "")
+    
+    text += "\n📈 *All Time:*\n"
+    text += format_stats_text(stats_all, "").replace("📊 **\n\n", "")
+    
+    # Create keyboard with back button
+    keyboard = [
+        [InlineKeyboardButton("⬅️ Back to Users", callback_data="stats_users_page_1")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="markdown")
+    except Exception as e:
+        logging.error(f"Error showing user stats: {str(e)}")
+        await query.edit_message_text(
+            text.replace('*', '').replace('`', ''),
+            reply_markup=reply_markup
+        )
+
+# ============== END STATS FUNCTIONALITY ==============
+
 def ensure_data_directory():
     """Ensure the data directory exists"""
     os.makedirs("data", exist_ok=True)
@@ -2998,11 +3295,15 @@ def main():
     # Add reminders command handler
     app.add_handler(CommandHandler("reminders", reminders_command))
     
+    # Add stats command handler (admin only)
+    app.add_handler(CommandHandler("stats", stats_command))
+    
     # Add callback query handlers
     app.add_handler(CallbackQueryHandler(voice_button, pattern="^voice_"))
     app.add_handler(CallbackQueryHandler(settings_button, pattern="^settings_"))
     app.add_handler(CallbackQueryHandler(reminder_button, pattern="^reminder_"))
     app.add_handler(CallbackQueryHandler(reminder_button, pattern="^reminders_"))
+    app.add_handler(CallbackQueryHandler(stats_button, pattern="^stats_"))
     
     # Set up job queue for reminders
     if app.job_queue:
