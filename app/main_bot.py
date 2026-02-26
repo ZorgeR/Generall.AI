@@ -943,8 +943,8 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
     async with get_user_lock(user_id):
         stats_tracker.track_message_received(user_id, "video")
         
-        # Get video file from either video or video_note
-        video = update.message.video or update.message.video_note
+        # Get video file from video, video_note, or document (sent without compression)
+        video = update.message.video or update.message.video_note or update.message.document
         if not video:
             await update.message.reply_text("❌ Could not process video message.")
             return
@@ -1419,13 +1419,20 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text(f"⚠️ You've reached your action limit ({used}/{limit} for 30 days). Contact admin.")
         return
     
+    # Check if the document has a supported file extension
+    file_name = update.message.document.file_name.lower()
+    file_extension = os.path.splitext(file_name)[1].lower()
+    
+    # Redirect video files sent as documents to the video handler
+    video_extensions = ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v', '.3gp']
+    if file_extension in video_extensions:
+        await handle_video_message(update, context)
+        return
+    
     # Track message received
     stats_tracker.track_message_received(user_id, "document")
     
-    # Check if the document has a supported file extension
-    file_name = update.message.document.file_name.lower()
     supported_extensions = ['.pdf', '.txt', '.json', '.docx', '.xlsx', '.xls', '.csv', '.py', '.sh', '.bat', '.md', '.ps1', '.js', '.css', '.html', '.php', '.sql', '.xml', '.yaml', '.yml', '.toml', '.ini', '.conf', '.log', '.jsonl']
-    file_extension = os.path.splitext(file_name)[1].lower()
     
     if file_extension not in supported_extensions:
         supported_formats = ", ".join([ext.replace(".", "").upper() for ext in supported_extensions])
