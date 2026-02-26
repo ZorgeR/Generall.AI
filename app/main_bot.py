@@ -2784,9 +2784,23 @@ async def get_telegram_user_display_name(bot, user_id: str) -> str:
     return user_id  # Fallback to user_id if fetch fails
 
 
-def format_stats_text(stats: dict, title: str = "Usage Statistics") -> str:
+def escape_md(text: str) -> str:
+    """Escape special characters for Telegram Markdown v1"""
+    for char in ['_', '*', '[', ']', '(', ')', '~', '`']:
+        text = text.replace(char, f'\\{char}')
+    return text
+
+
+def strip_md(text: str) -> str:
+    """Strip all markdown formatting for plain text fallback"""
+    return text.replace('*', '').replace('`', '').replace('\\', '')
+
+
+def format_stats_text(stats: dict, title: str = "") -> str:
     """Format stats dictionary into a readable text format"""
-    text = f"📊 *{title}*\n\n"
+    text = ""
+    if title:
+        text += f"📊 *{escape_md(title)}*\n\n"
     
     # Messages Received
     msg_recv = stats.get("messages_received", {})
@@ -2808,7 +2822,7 @@ def format_stats_text(stats: dict, title: str = "Usage Statistics") -> str:
     # Sort tools by count and show top ones
     sorted_tools = sorted(tools_used.items(), key=lambda x: x[1], reverse=True)[:10]
     for tool_name, count in sorted_tools:
-        text += f"│  ├─ {tool_name}: {count:,}\n"
+        text += f"│  ├─ {escape_md(tool_name)}: {count:,}\n"
     
     # Describe Used
     describe_total = stats.get("describe_total", 0)
@@ -2816,7 +2830,7 @@ def format_stats_text(stats: dict, title: str = "Usage Statistics") -> str:
     text += f"├─ Describe Used: *{describe_total:,}* total\n"
     sorted_describe = sorted(describe_used.items(), key=lambda x: x[1], reverse=True)
     for desc_type, count in sorted_describe:
-        text += f"│  ├─ {desc_type}: {count:,}\n"
+        text += f"│  ├─ {escape_md(desc_type)}: {count:,}\n"
     
     # Media Groups
     media_groups = stats.get("media_groups_processed", 0)
@@ -2843,10 +2857,10 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += f"Total Users: *{stats_all.get('total_users', 0):,}*\n\n"
     
     text += "📅 *Last 30 Days:*\n"
-    text += format_stats_text(stats_30d, "").replace("📊 **\n\n", "")
+    text += format_stats_text(stats_30d)
     
     text += "\n📈 *All Time:*\n"
-    text += format_stats_text(stats_all, "").replace("📊 **\n\n", "")
+    text += format_stats_text(stats_all)
     
     # Create keyboard with View Users button
     keyboard = [
@@ -2857,12 +2871,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="markdown")
     except Exception as e:
-        logging.error(f"Error sending stats: {str(e)}")
-        # Fallback without markdown
-        await update.message.reply_text(
-            text.replace('*', ''),
-            reply_markup=reply_markup
-        )
+        logging.error(f"Error sending stats with markdown: {str(e)}")
+        await update.message.reply_text(strip_md(text), reply_markup=reply_markup)
 
 
 async def stats_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2924,10 +2934,10 @@ async def show_main_stats(query: CallbackQuery, context: ContextTypes.DEFAULT_TY
     text += f"Total Users: *{stats_all.get('total_users', 0):,}*\n\n"
     
     text += "📅 *Last 30 Days:*\n"
-    text += format_stats_text(stats_30d, "").replace("📊 **\n\n", "")
+    text += format_stats_text(stats_30d)
     
     text += "\n📈 *All Time:*\n"
-    text += format_stats_text(stats_all, "").replace("📊 **\n\n", "")
+    text += format_stats_text(stats_all)
     
     # Create keyboard with View Users button
     keyboard = [
@@ -2938,11 +2948,8 @@ async def show_main_stats(query: CallbackQuery, context: ContextTypes.DEFAULT_TY
     try:
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="markdown")
     except Exception as e:
-        logging.error(f"Error showing main stats: {str(e)}")
-        await query.edit_message_text(
-            text.replace('*', ''),
-            reply_markup=reply_markup
-        )
+        logging.error(f"Error showing main stats with markdown: {str(e)}")
+        await query.edit_message_text(strip_md(text), reply_markup=reply_markup)
 
 
 async def show_users_stats_page(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, page: int):
@@ -2974,9 +2981,8 @@ async def show_users_stats_page(query: CallbackQuery, context: ContextTypes.DEFA
     user_buttons = []
     for rank, (uid, activity) in enumerate(current_users, start=start_idx + 1):
         display_name = await get_telegram_user_display_name(context.bot, uid)
-        text += f"{rank}. {display_name} - {activity:,} actions\n"
+        text += f"{rank}. {escape_md(display_name)} - {activity:,} actions\n"
         
-        # Truncate display name for button if needed
         button_name = display_name[:15] + "..." if len(display_name) > 18 else display_name
         user_buttons.append(InlineKeyboardButton(button_name, callback_data=f"stats_user_{uid}"))
     
@@ -3001,11 +3007,8 @@ async def show_users_stats_page(query: CallbackQuery, context: ContextTypes.DEFA
     try:
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="markdown")
     except Exception as e:
-        logging.error(f"Error showing users stats page: {str(e)}")
-        await query.edit_message_text(
-            text.replace('*', ''),
-            reply_markup=reply_markup
-        )
+        logging.error(f"Error showing users stats page with markdown: {str(e)}")
+        await query.edit_message_text(strip_md(text), reply_markup=reply_markup)
 
 
 async def show_user_stats(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, target_user_id: str):
@@ -3023,7 +3026,7 @@ async def show_user_stats(query: CallbackQuery, context: ContextTypes.DEFAULT_TY
     user_action_count = stats_tracker.get_user_action_count(target_user_id, days=30)
     
     # Format the message
-    text = f"📊 *User Stats: {display_name}*\n"
+    text = f"📊 *User Stats: {escape_md(display_name)}*\n"
     text += f"ID: `{target_user_id}`\n"
     
     if is_blocked:
@@ -3039,10 +3042,10 @@ async def show_user_stats(query: CallbackQuery, context: ContextTypes.DEFAULT_TY
         text += f"Limit: *{user_action_count:,}/{DEFAULT_ACTION_LIMIT:,}* actions (30d, default)\n"
     
     text += "\n📅 *Last 30 Days:*\n"
-    text += format_stats_text(stats_30d, "").replace("📊 **\n\n", "")
+    text += format_stats_text(stats_30d)
     
     text += "\n📈 *All Time:*\n"
-    text += format_stats_text(stats_all, "").replace("📊 **\n\n", "")
+    text += format_stats_text(stats_all)
     
     # Build keyboard with block/unblock and set limit buttons
     block_btn = InlineKeyboardButton(
@@ -3060,11 +3063,8 @@ async def show_user_stats(query: CallbackQuery, context: ContextTypes.DEFAULT_TY
     try:
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="markdown")
     except Exception as e:
-        logging.error(f"Error showing user stats: {str(e)}")
-        await query.edit_message_text(
-            text.replace('*', '').replace('`', ''),
-            reply_markup=reply_markup
-        )
+        logging.error(f"Error showing user stats with markdown: {str(e)}")
+        await query.edit_message_text(strip_md(text), reply_markup=reply_markup)
 
 
 async def show_set_limit(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, target_user_id: str):
@@ -3080,7 +3080,7 @@ async def show_set_limit(query: CallbackQuery, context: ContextTypes.DEFAULT_TYP
     else:
         limit_text = f"{DEFAULT_ACTION_LIMIT} (default)"
     
-    text = f"⚙️ *Set Action Limit: {display_name}*\n\n"
+    text = f"⚙️ *Set Action Limit: {escape_md(display_name)}*\n\n"
     text += f"Current limit: *{limit_text}*\n"
     text += f"Used (30d): *{used:,}* actions\n\n"
     text += "Select new monthly limit:"
@@ -3097,11 +3097,8 @@ async def show_set_limit(query: CallbackQuery, context: ContextTypes.DEFAULT_TYP
     try:
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="markdown")
     except Exception as e:
-        logging.error(f"Error showing set limit: {str(e)}")
-        await query.edit_message_text(
-            text.replace('*', ''),
-            reply_markup=reply_markup
-        )
+        logging.error(f"Error showing set limit with markdown: {str(e)}")
+        await query.edit_message_text(strip_md(text), reply_markup=reply_markup)
 
 # ============== END STATS FUNCTIONALITY ==============
 
