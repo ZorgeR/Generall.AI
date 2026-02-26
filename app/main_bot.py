@@ -20,7 +20,7 @@ from typing import Any
 from pathlib import Path
 # Import the secure container system
 from secure_container.main import initialize_secure_containers, cleanup_containers
-from stats import stats_tracker
+from stats import stats_tracker, DEFAULT_ACTION_LIMIT
 import shutil
 
 # Check if running in Docker
@@ -83,6 +83,7 @@ send_reasoning = True
 
 user_invites = {}
 authorized_users = set(telegram_chat_id)
+blocked_users = set()
 allow_all_users = os.getenv("TELEGRAM_ALLOWED_ALL_USERS", "false") == "true"
 
 # Initialize voice manager
@@ -120,11 +121,11 @@ default_settings = {
         "enabled": True
     },
     "critique": {
-        "enabled": True,
+        "enabled": False,
         "max_iteration": 5
     },
     "judge": {
-        "enabled": True,
+        "enabled": False,
         "max_iteration": 5
     },
     "tools": {
@@ -162,11 +163,11 @@ class UserSettings:
                 "enabled": True
             },
             "critique": {
-                "enabled": True,
+                "enabled": False,
                 "max_iteration": 5
             },
             "judge": {
-                "enabled": True,
+                "enabled": False,
                 "max_iteration": 5
             },
             "tools": {
@@ -730,6 +731,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Unauthorized. You need an invite to use this bot.")
         return
     
+    # Check user limits
+    allowed, used, limit = check_user_limits(user_id)
+    if not allowed:
+        await update.message.reply_text(f"⚠️ You've reached your action limit ({used}/{limit} for 30 days). Contact admin.")
+        return
+    
     # Track message received
     stats_tracker.track_message_received(user_id, "text")
     
@@ -739,7 +746,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Show typing status and send initial message
     await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
     thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
-    
+    limit_info = f"📊 *Usage:* _{used}/{limit} actions (30d)_\n" if limit else ""
+
     async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
         if step == "saving":
             iteration = "final"
@@ -748,6 +756,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await thinking_message.edit_text(
                 f"💭 *Thinking...*\n"
                 f"- - - - \n"
+                f"{limit_info}"
                 f"📝 *Step:* _{step.replace('_', '-')}_\n"
                 f"📋 *Details:* _{details.replace('_', '-')}_\n"
                 f"🔄 *Iterations:* _{iteration}_\n"
@@ -779,6 +788,12 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
     # Check if the user is authorized
     if not is_user_authorized(user_id):
         await update.message.reply_text("Unauthorized. You need an invite to use this bot.")
+        return
+    
+    # Check user limits
+    allowed, used, limit = check_user_limits(user_id)
+    if not allowed:
+        await update.message.reply_text(f"⚠️ You've reached your action limit ({used}/{limit} for 30 days). Contact admin.")
         return
     
     # Track message received
@@ -819,6 +834,7 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
             # Process transcription like a regular message
             await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
             thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
+            limit_info = f"📊 *Usage:* _{used}/{limit} actions (30d)_\n" if limit else ""
             
             async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
                 if step == "saving":
@@ -827,6 +843,7 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 await thinking_message.edit_text(
                     f"💭 *Thinking...*\n"
                     f"- - - - \n"
+                    f"{limit_info}"
                     f"📝 *Step:* _{step.replace('_', '-')}_\n"
                     f"📋 *Details:* _{details.replace('_', '-')}_\n"
                     f"🔄 *Iterations:* _{iteration}_\n"
@@ -1046,6 +1063,8 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
             # Process like a regular message
             await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
             thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
+            _, mg_used, mg_limit = check_user_limits(user_id)
+            mg_limit_info = f"📊 *Usage:* _{mg_used}/{mg_limit} actions (30d)_\n" if mg_limit else ""
             
             async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
                 if step == "saving":
@@ -1054,6 +1073,7 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await thinking_message.edit_text(
                     f"💭 *Thinking...*\n"
                     f"- - - - \n"
+                    f"{mg_limit_info}"
                     f"📝 *Step:* _{step.replace('_', '-')}_\n"
                     f"📋 *Details:* _{details.replace('_', '-')}_\n"
                     f"🔄 *Iterations:* _{iteration}_\n"
@@ -1093,6 +1113,12 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     # Check if the user is authorized
     if not is_user_authorized(user_id):
         await update.message.reply_text("Unauthorized. You need an invite to use this bot.")
+        return
+    
+    # Check user limits
+    allowed, used, limit = check_user_limits(user_id)
+    if not allowed:
+        await update.message.reply_text(f"⚠️ You've reached your action limit ({used}/{limit} for 30 days). Contact admin.")
         return
     
     # Track message received
@@ -1212,6 +1238,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         # Process like a regular message
         await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
         thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
+        limit_info = f"📊 *Usage:* _{used}/{limit} actions (30d)_\n" if limit else ""
         
         async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
             if step == "saving":
@@ -1220,6 +1247,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await thinking_message.edit_text(
                 f"💭 *Thinking...*\n"
                 f"- - - - \n"
+                f"{limit_info}"
                 f"📝 *Step:* _{step.replace('_', '-')}_\n"
                 f"📋 *Details:* _{details.replace('_', '-')}_\n"
                 f"🔄 *Iterations:* _{iteration}_\n"
@@ -1253,6 +1281,12 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     # Check if the user is authorized
     if not is_user_authorized(user_id):
         await update.message.reply_text("Unauthorized. You need an invite to use this bot.")
+        return
+    
+    # Check user limits
+    allowed, used, limit = check_user_limits(user_id)
+    if not allowed:
+        await update.message.reply_text(f"⚠️ You've reached your action limit ({used}/{limit} for 30 days). Contact admin.")
         return
     
     # Track message received
@@ -1315,6 +1349,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         # Process like a regular message
         await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
         thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
+        limit_info = f"📊 *Usage:* _{used}/{limit} actions (30d)_\n" if limit else ""
 
         async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
             if step == "saving":
@@ -1323,6 +1358,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
             await thinking_message.edit_text(
                 f"💭 *Thinking...*\n"
                 f"- - - - \n"
+                f"{limit_info}"
                 f"📝 *Step:* _{step.replace('_', '-')}_\n"
                 f"📋 *Details:* _{details.replace('_', '-')}_\n"
                 f"🔄 *Iterations:* _{iteration}_\n"
@@ -2279,6 +2315,8 @@ async def check_and_process_agent_reminders(context: ContextTypes.DEFAULT_TYPE):
                             print(f"Mock update created: {mock_update}")
                             
                             print("Creating update_thinking_message function")
+                            _, agent_used, agent_limit = check_user_limits(user_id)
+                            agent_limit_info = f"📊 *Usage:* _{agent_used}/{agent_limit} actions (30d)_\n" if agent_limit else ""
                             async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
                                 if step == "saving":
                                     iteration = "final"
@@ -2286,6 +2324,7 @@ async def check_and_process_agent_reminders(context: ContextTypes.DEFAULT_TYPE):
                                 await thinking_message.edit_text(
                                     f"💭 *Processing Agent Task...*\n"
                                     f"- - - - \n"
+                                    f"{agent_limit_info}"
                                     f"📝 *Step:* _{step.replace('_', '-')}_\n"
                                     f"📋 *Details:* _{details.replace('_', '-')}_\n"
                                     f"🔄 *Iterations:* _{iteration}_\n"
@@ -2706,6 +2745,29 @@ async def show_reminders_summary(query: CallbackQuery, user_id: str):
 
 # ============== STATS FUNCTIONALITY ==============
 
+def check_user_limits(user_id: str) -> tuple:
+    """
+    Check if user has exceeded their action limit.
+    Returns: (allowed: bool, used: int, limit: int | None)
+    - limit=None means unlimited (admin or explicitly set to 0)
+    - limit>0 means capped
+    """
+    if user_id == telegram_admin_id:
+        return True, 0, None
+    
+    stats_tracker.ensure_user_limit(user_id)
+    limit = stats_tracker.get_user_limit(user_id)
+    
+    if limit is None or limit == 0:
+        return True, 0, None
+    
+    used = stats_tracker.get_user_action_count(user_id, days=30)
+    if used >= limit:
+        return False, used, limit
+    
+    return True, used, limit
+
+
 async def get_telegram_user_display_name(bot, user_id: str) -> str:
     """Fetch user's display name from Telegram API"""
     try:
@@ -2818,17 +2880,36 @@ async def stats_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     
     if data.startswith("stats_users_page_"):
-        # Show users list at specified page
         page = int(data.replace("stats_users_page_", ""))
         await show_users_stats_page(query, context, page)
     
+    elif data.startswith("stats_limit_"):
+        # stats_limit_{user_id}_{value} - set limit for user
+        parts = data.replace("stats_limit_", "").rsplit("_", 1)
+        target_user_id = parts[0]
+        limit_value = int(parts[1])
+        stats_tracker.set_user_limit(target_user_id, limit_value)
+        await show_user_stats(query, context, target_user_id)
+    
+    elif data.startswith("stats_setlimit_"):
+        target_user_id = data.replace("stats_setlimit_", "")
+        await show_set_limit(query, context, target_user_id)
+    
+    elif data.startswith("stats_block_"):
+        target_user_id = data.replace("stats_block_", "")
+        block_user(target_user_id)
+        await show_user_stats(query, context, target_user_id)
+    
+    elif data.startswith("stats_unblock_"):
+        target_user_id = data.replace("stats_unblock_", "")
+        unblock_user(target_user_id)
+        await show_user_stats(query, context, target_user_id)
+    
     elif data.startswith("stats_user_"):
-        # Show individual user stats
         target_user_id = data.replace("stats_user_", "")
         await show_user_stats(query, context, target_user_id)
     
     elif data == "stats_back_main":
-        # Return to main aggregated stats view
         await show_main_stats(query, context)
 
 
@@ -2936,18 +3017,42 @@ async def show_user_stats(query: CallbackQuery, context: ContextTypes.DEFAULT_TY
     stats_30d = stats_tracker.get_user_stats(target_user_id, days=30)
     stats_all = stats_tracker.get_user_stats(target_user_id, days=None)
     
+    # Get block/limit status
+    is_blocked = target_user_id in blocked_users
+    user_limit = stats_tracker.get_user_limit(target_user_id)
+    user_action_count = stats_tracker.get_user_action_count(target_user_id, days=30)
+    
     # Format the message
     text = f"📊 *User Stats: {display_name}*\n"
-    text += f"ID: `{target_user_id}`\n\n"
+    text += f"ID: `{target_user_id}`\n"
     
-    text += "📅 *Last 30 Days:*\n"
+    if is_blocked:
+        text += "Status: 🚫 *BLOCKED*\n"
+    else:
+        text += "Status: ✅ Active\n"
+    
+    if user_limit is not None and user_limit > 0:
+        text += f"Limit: *{user_action_count:,}/{user_limit:,}* actions (30d)\n"
+    elif user_limit == 0:
+        text += "Limit: ♾ *Unlimited*\n"
+    else:
+        text += f"Limit: *{user_action_count:,}/{DEFAULT_ACTION_LIMIT:,}* actions (30d, default)\n"
+    
+    text += "\n📅 *Last 30 Days:*\n"
     text += format_stats_text(stats_30d, "").replace("📊 **\n\n", "")
     
     text += "\n📈 *All Time:*\n"
     text += format_stats_text(stats_all, "").replace("📊 **\n\n", "")
     
-    # Create keyboard with back button
+    # Build keyboard with block/unblock and set limit buttons
+    block_btn = InlineKeyboardButton(
+        "✅ Unblock User" if is_blocked else "🚫 Block User",
+        callback_data=f"stats_unblock_{target_user_id}" if is_blocked else f"stats_block_{target_user_id}"
+    )
+    limit_btn = InlineKeyboardButton("⚙️ Set Limit", callback_data=f"stats_setlimit_{target_user_id}")
+    
     keyboard = [
+        [block_btn, limit_btn],
         [InlineKeyboardButton("⬅️ Back to Users", callback_data="stats_users_page_1")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -2961,6 +3066,43 @@ async def show_user_stats(query: CallbackQuery, context: ContextTypes.DEFAULT_TY
             reply_markup=reply_markup
         )
 
+
+async def show_set_limit(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, target_user_id: str):
+    """Show limit preset buttons for a user"""
+    display_name = await get_telegram_user_display_name(context.bot, target_user_id)
+    current_limit = stats_tracker.get_user_limit(target_user_id)
+    used = stats_tracker.get_user_action_count(target_user_id, days=30)
+    
+    if current_limit is not None and current_limit > 0:
+        limit_text = f"{current_limit:,}"
+    elif current_limit == 0:
+        limit_text = "Unlimited"
+    else:
+        limit_text = f"{DEFAULT_ACTION_LIMIT} (default)"
+    
+    text = f"⚙️ *Set Action Limit: {display_name}*\n\n"
+    text += f"Current limit: *{limit_text}*\n"
+    text += f"Used (30d): *{used:,}* actions\n\n"
+    text += "Select new monthly limit:"
+    
+    presets = [50, 100, 250, 500, 750, 1000]
+    keyboard = [
+        [InlineKeyboardButton(str(p), callback_data=f"stats_limit_{target_user_id}_{p}") for p in presets[:3]],
+        [InlineKeyboardButton(str(p), callback_data=f"stats_limit_{target_user_id}_{p}") for p in presets[3:]],
+        [InlineKeyboardButton("♾ Unlimited", callback_data=f"stats_limit_{target_user_id}_0")],
+        [InlineKeyboardButton("⬅️ Back", callback_data=f"stats_user_{target_user_id}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="markdown")
+    except Exception as e:
+        logging.error(f"Error showing set limit: {str(e)}")
+        await query.edit_message_text(
+            text.replace('*', ''),
+            reply_markup=reply_markup
+        )
+
 # ============== END STATS FUNCTIONALITY ==============
 
 def ensure_data_directory():
@@ -2969,20 +3111,20 @@ def ensure_data_directory():
 
 def load_authorized_users():
     """Load authorized users from the userlist.json file"""
-    global authorized_users
+    global authorized_users, blocked_users
     try:
         if os.path.exists("data/userlist.json"):
             with open("data/userlist.json", "r") as f:
                 user_data = json.load(f)
                 if "users" in user_data:
-                    # Combine environment chat IDs with saved users
                     authorized_users = set(telegram_chat_id) | set(user_data["users"])
+                if "blocked_users" in user_data:
+                    blocked_users = set(user_data["blocked_users"])
                 if "invites" in user_data:
                     global user_invites
                     user_invites = user_data["invites"]
-            print(f"Loaded {len(authorized_users)} authorized users from userlist.json")
+            print(f"Loaded {len(authorized_users)} authorized users, {len(blocked_users)} blocked from userlist.json")
         else:
-            # Create the file if it doesn't exist
             ensure_data_directory()
             save_authorized_users()
             print("Created new userlist.json file")
@@ -2996,16 +3138,31 @@ def save_authorized_users():
         with open("data/userlist.json", "w") as f:
             json.dump({
                 "users": list(authorized_users),
+                "blocked_users": list(blocked_users),
                 "invites": user_invites
             }, f, indent=2)
     except Exception as e:
         logging.error(f"Error saving authorized users: {str(e)}")
 
+def block_user(user_id: str):
+    """Block a user from using the bot"""
+    global authorized_users, blocked_users
+    authorized_users.discard(user_id)
+    blocked_users.add(user_id)
+    save_authorized_users()
+
+def unblock_user(user_id: str):
+    """Unblock a user and restore their access"""
+    global authorized_users, blocked_users
+    blocked_users.discard(user_id)
+    authorized_users.add(user_id)
+    save_authorized_users()
+
 def is_user_authorized(user_id):
     """Check if a user is authorized to use the bot"""
     if allow_all_users:
-        return True
-    return user_id in authorized_users
+        return user_id not in blocked_users
+    return user_id in authorized_users and user_id not in blocked_users
 
 def generate_invite_code(user_id):
     """Generate a unique invite code for a user"""

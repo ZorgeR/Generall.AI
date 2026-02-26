@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Any, Tuple
 from contextlib import contextmanager
 
 STATS_DB = "data/stats.db"
+DEFAULT_ACTION_LIMIT = 50
 
 
 class StatsTracker:
@@ -56,6 +57,13 @@ class StatsTracker:
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_timestamp 
                 ON stats_events(timestamp)
+            """)
+            
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_limits (
+                    user_id TEXT PRIMARY KEY,
+                    action_limit INTEGER NOT NULL
+                )
             """)
             conn.commit()
     
@@ -347,6 +355,49 @@ class StatsTracker:
             """, (cutoff,))
             
             return [(row["user_id"], row["activity_count"]) for row in cursor]
+    
+    # ---- User Limits ----
+    
+    def ensure_user_limit(self, user_id: str) -> None:
+        """If user has no limit row, insert one with DEFAULT_ACTION_LIMIT"""
+        with self._get_connection() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO user_limits (user_id, action_limit) VALUES (?, ?)",
+                (user_id, DEFAULT_ACTION_LIMIT)
+            )
+            conn.commit()
+    
+    def set_user_limit(self, user_id: str, limit: int) -> None:
+        """Set or update user's action limit. 0 means unlimited."""
+        with self._get_connection() as conn:
+            conn.execute(
+                "INSERT INTO user_limits (user_id, action_limit) VALUES (?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET action_limit = excluded.action_limit",
+                (user_id, limit)
+            )
+            conn.commit()
+    
+    def get_user_limit(self, user_id: str) -> Optional[int]:
+        """Get user's action limit. Returns None if no row exists."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT action_limit FROM user_limits WHERE user_id = ?",
+                (user_id,)
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return row["action_limit"]
+    
+    def get_user_action_count(self, user_id: str, days: int = 30) -> int:
+        """Count all events for a user in the specified time period"""
+        with self._get_connection() as conn:
+            cutoff = self._get_cutoff_timestamp(days)
+            cursor = conn.execute(
+                "SELECT COUNT(*) as count FROM stats_events WHERE user_id = ? AND timestamp >= ?",
+                (user_id, cutoff)
+            )
+            return cursor.fetchone()["count"]
 
 
 # Global singleton instance
