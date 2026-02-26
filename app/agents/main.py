@@ -496,31 +496,42 @@ class ChainOfThoughtAgent:
         """Save conversation summary and full history"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        # Generate conversation summary and topic using OpenAI
         topic_prompt = f"""Extract 2-8 word topic from this conversation (use only alphanumeric and underscores, no spaces):
 Question: {question}
 Response: {response}"""
         
-        topic_response = await asyncio.to_thread(
-            openai_client.chat.completions.create,
-            model=openai_model,
-            messages=[{"role": "user", "content": topic_prompt}]
-        )
-        topic = topic_response.choices[0].message.content.strip()
-        
-        # Generate summary
         summary_prompt = f"""Summarize this conversation concisely (max 3 sentences):
 Question: {question}
 Response: {response}"""
         
-        summary_response = await asyncio.to_thread(
-            openai_client.chat.completions.create,
-            model=openai_model,
-            messages=[{"role": "user", "content": summary_prompt}]
+        # Run topic, summary, and embedding generation in parallel
+        topic_task = asyncio.to_thread(
+            anthropic_client.messages.create,
+            model=anthropic_model_fast,
+            messages=[{"role": "user", "content": [{"type": "text", "text": topic_prompt}]}],
+            max_tokens=50
         )
-        summary = summary_response.choices[0].message.content.strip()
+        summary_task = asyncio.to_thread(
+            anthropic_client.messages.create,
+            model=anthropic_model_fast,
+            messages=[{"role": "user", "content": [{"type": "text", "text": summary_prompt}]}],
+            max_tokens=200
+        )
+        embedding_task = asyncio.to_thread(
+            self.conversation_embeddings.add_conversation,
+            question=question,
+            answer=response,
+            timestamp=timestamp
+        )
         
-        # Prepare conversation data
+        topic_response, summary_response, _ = await asyncio.gather(
+            topic_task, summary_task, embedding_task
+        )
+        
+        topic = topic_response.content[0].text.strip()
+        summary = summary_response.content[0].text.strip()
+        
+        # Save to file
         conversation_data = {
             "timestamp": timestamp,
             "topic": topic,
@@ -530,17 +541,9 @@ Response: {response}"""
             "full_history": messages
         }
         
-        # Save to file with topic in name
         file_path = self.conversations_path / f"conversation_{timestamp}_{topic}.json"
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(conversation_data, f, indent=2, ensure_ascii=False)
-        
-        # Add to vector embeddings
-        self.conversation_embeddings.add_conversation(
-            question=question,
-            answer=response,
-            timestamp=timestamp
-        )
         
         return summary
 
