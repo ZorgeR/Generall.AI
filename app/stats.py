@@ -175,7 +175,7 @@ class StatsTracker:
                 GROUP BY event_subtype
             """, params)
             
-            messages_received = {"text": 0, "voice": 0, "photo": 0, "document": 0, "total": 0}
+            messages_received = {"text": 0, "voice": 0, "video": 0, "photo": 0, "document": 0, "total": 0}
             for row in cursor:
                 if row["event_subtype"] in messages_received:
                     messages_received[row["event_subtype"]] = row["count"]
@@ -272,7 +272,7 @@ class StatsTracker:
                 GROUP BY event_subtype
             """)
             
-            messages_received = {"text": 0, "voice": 0, "photo": 0, "document": 0, "total": 0}
+            messages_received = {"text": 0, "voice": 0, "video": 0, "photo": 0, "document": 0, "total": 0}
             for row in cursor:
                 if row["event_subtype"] in messages_received:
                     messages_received[row["event_subtype"]] = row["count"]

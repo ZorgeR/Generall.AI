@@ -927,6 +927,114 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
             except Exception as e:
                 print(f"Error cleaning up temporary files: {str(e)}")
 
+async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle incoming video and video note messages by extracting audio and transcribing"""
+    user_id = str(update.message.chat_id)
+    
+    if not is_user_authorized(user_id):
+        await update.message.reply_text("Unauthorized. You need an invite to use this bot.")
+        return
+    
+    allowed, used, limit = check_user_limits(user_id)
+    if not allowed:
+        await update.message.reply_text(f"⚠️ You've reached your action limit ({used}/{limit} for 30 days). Contact admin.")
+        return
+    
+    async with get_user_lock(user_id):
+        stats_tracker.track_message_received(user_id, "video")
+        
+        # Get video file from either video or video_note
+        video = update.message.video or update.message.video_note
+        if not video:
+            await update.message.reply_text("❌ Could not process video message.")
+            return
+        
+        caption = update.message.caption or ""
+        
+        temp_dir = "temp_audio"
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        temp_video = os.path.join(temp_dir, f"video_{uuid.uuid4()}.mp4")
+        temp_mp3 = os.path.join(temp_dir, f"video_audio_{uuid.uuid4()}.mp3")
+        
+        status_message = await update.message.reply_text("🎬 *Extracting audio from video...*", parse_mode="markdown")
+        
+        try:
+            video_file = await context.bot.get_file(video.file_id)
+            await video_file.download_to_drive(temp_video)
+            
+            print(f"Downloaded video file to: {temp_video}")
+            
+            # Extract audio from video
+            audio = AudioSegment.from_file(temp_video, format="mp4")
+            audio.export(temp_mp3, format="mp3")
+            
+            print(f"Extracted audio to MP3: {temp_mp3}")
+            
+            await status_message.edit_text("🎙️ *Transcribing audio...*", parse_mode="markdown")
+            transcription = await transcribe_audio(temp_mp3)
+            
+            if transcription:
+                print(f"Video transcription: {transcription}")
+                
+                display_text = f"🎬 *Transcription:*\n{transcription}"
+                if caption:
+                    display_text += f"\n\n📝 *Caption:* {caption}"
+                await status_message.edit_text(display_text, parse_mode="markdown")
+                
+                user_message = transcription
+                if caption:
+                    user_message = f"{caption}\n\n(Voice from video: {transcription})"
+                
+                await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
+                thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
+                
+                async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
+                    if step == "saving":
+                        iteration = "final"
+                        critique = "end"
+                    live_limit_info = ""
+                    if limit:
+                        live_used = stats_tracker.get_user_action_count(user_id, days=30)
+                        live_limit_info = f"📊 *Usage:* _{live_used}/{limit} actions (30d)_\n"
+                    await thinking_message.edit_text(
+                        f"💭 *Thinking...*\n"
+                        f"- - - - \n"
+                        f"{live_limit_info}"
+                        f"📝 *Step:* _{step.replace('_', '-')}_\n"
+                        f"📋 *Details:* _{details.replace('_', '-')}_\n"
+                        f"🔄 *Iterations:* _{iteration}_\n"
+                        f"🎯 *Critiques:* _{critique}_",
+                        parse_mode="markdown"
+                    )
+                
+                try:
+                    response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context)
+                    await send_response_to_user(update, thinking_message, response, user_id)
+                    await send_reasoning_file(update, messages, user_id)
+                    return transcription
+                except Exception as e:
+                    trace_id = str(uuid.uuid4())
+                    await thinking_message.edit_text(text=f"❌ An error occurred. Trace ID: {trace_id}")
+                    logging.error(f"An error occurred with trace ID {trace_id}: {str(e)}")
+            else:
+                await status_message.edit_text("❌ Failed to transcribe audio from video", parse_mode="markdown")
+                return False
+
+        except Exception as e:
+            print(f"Error processing video message: {str(e)}")
+            await status_message.edit_text("❌ Error processing video message", parse_mode="markdown")
+            return None
+        
+        finally:
+            try:
+                if os.path.exists(temp_video):
+                    os.remove(temp_video)
+                if os.path.exists(temp_mp3):
+                    os.remove(temp_mp3)
+            except Exception as e:
+                print(f"Error cleaning up temporary files: {str(e)}")
+
 async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /voice command"""
     user_id = str(update.message.chat_id)
@@ -2826,7 +2934,7 @@ def format_stats_text(stats: dict, title: str = "") -> str:
     msg_recv = stats.get("messages_received", {})
     msg_total = msg_recv.get("total", 0)
     text += f"├─ Messages Received: *{msg_total:,}* total\n"
-    for msg_type in ["text", "voice", "photo", "document"]:
+    for msg_type in ["text", "voice", "video", "photo", "document"]:
         count = msg_recv.get(msg_type, 0)
         if count > 0:
             text += f"│  ├─ {msg_type}: {count:,}\n"
@@ -3453,6 +3561,9 @@ def main():
 
     # Add voice message handler
     app.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
+    
+    # Add video message handler
+    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, handle_video_message))
     
     # Add photo message handler
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
