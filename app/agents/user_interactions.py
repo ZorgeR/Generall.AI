@@ -235,9 +235,9 @@ class UserInteractions:
             except Exception as e:
                 print(f"Error cleaning up temporary audio file: {str(e)}")
             
-            return "Successfully sent voice message to user."
+            return "Requested voice message has been successfully sent to user."
         except Exception as e:
-            return f"Error sending voice message: {str(e)}"
+            return f"Error sending requested voice message: {str(e)}"
 
     async def _set_message_reaction(self, emoji: str) -> str:
         """Set a reaction emoji on the user's message"""
