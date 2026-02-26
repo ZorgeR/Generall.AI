@@ -880,7 +880,6 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     )
                 
                 try:
-                    # Get response using the same logic as handle_message
                     response, messages = await get_answer(transcription, user_id, update_thinking_message, update, context)
                     
                     # Generate and send audio response
@@ -889,12 +888,12 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     
                     try:
                         client = ElevenLabs(api_key=elevenlabs_api_key)
-                        audio_stream = client.generate(
+                        audio_response = client.text_to_speech.convert(
                             text=response,
-                            voice=voice_id,
-                            model="eleven_multilingual_v2"
+                            voice_id=voice_id,
+                            model_id="eleven_multilingual_v2"
                         )
-                        temp_audio_path = await sendvoice_to_user(audio_stream)
+                        temp_audio_path = await sendvoice_to_user(audio_response)
                         audio_file = io.BytesIO(open(temp_audio_path, "rb").read())
                         await update.message.reply_voice(audio_file)
                     except Exception as e:
@@ -1017,12 +1016,12 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     
                     try:
                         client = ElevenLabs(api_key=elevenlabs_api_key)
-                        audio_stream = client.generate(
+                        audio_response = client.text_to_speech.convert(
                             text=response,
-                            voice=voice_id,
-                            model="eleven_multilingual_v2"
+                            voice_id=voice_id,
+                            model_id="eleven_multilingual_v2"
                         )
-                        temp_audio_path = await sendvoice_to_user(audio_stream)
+                        temp_audio_path = await sendvoice_to_user(audio_response)
                         audio_file = io.BytesIO(open(temp_audio_path, "rb").read())
                         await update.message.reply_voice(audio_file)
                     except Exception as e:

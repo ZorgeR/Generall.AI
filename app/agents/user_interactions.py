@@ -208,16 +208,16 @@ class UserInteractions:
             # Initialize ElevenLabs client
             client = ElevenLabs(api_key=self.elevenlabs_api_key)
             
-            # Generate audio stream
-            audio_stream = client.generate(
+            # Generate audio
+            audio_response = client.text_to_speech.convert(
                 text=text,
-                voice=voice_id,
-                model="eleven_multilingual_v2"
+                voice_id=voice_id,
+                model_id="eleven_multilingual_v2"
             )
             
-            # Save audio stream to temporary file
+            # Save audio to temporary file
             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio:
-                for chunk in audio_stream:
+                for chunk in audio_response:
                     temp_audio.write(chunk)
                 temp_audio_path = temp_audio.name
             
