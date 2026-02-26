@@ -746,17 +746,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Show typing status and send initial message
     await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
     thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
-    limit_info = f"📊 *Usage:* _{used}/{limit} actions (30d)_\n" if limit else ""
 
     async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
         if step == "saving":
             iteration = "final"
             critique = "end"
+        live_limit_info = ""
+        if limit:
+            live_used = stats_tracker.get_user_action_count(user_id, days=30)
+            live_limit_info = f"📊 *Usage:* _{live_used}/{limit} actions (30d)_\n"
         try:
             await thinking_message.edit_text(
                 f"💭 *Thinking...*\n"
                 f"- - - - \n"
-                f"{limit_info}"
+                f"{live_limit_info}"
                 f"📝 *Step:* _{step.replace('_', '-')}_\n"
                 f"📋 *Details:* _{details.replace('_', '-')}_\n"
                 f"🔄 *Iterations:* _{iteration}_\n"
@@ -834,16 +837,19 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
             # Process transcription like a regular message
             await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
             thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
-            limit_info = f"📊 *Usage:* _{used}/{limit} actions (30d)_\n" if limit else ""
             
             async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
                 if step == "saving":
                     iteration = "final"
                     critique = "end"
+                live_limit_info = ""
+                if limit:
+                    live_used = stats_tracker.get_user_action_count(user_id, days=30)
+                    live_limit_info = f"📊 *Usage:* _{live_used}/{limit} actions (30d)_\n"
                 await thinking_message.edit_text(
                     f"💭 *Thinking...*\n"
                     f"- - - - \n"
-                    f"{limit_info}"
+                    f"{live_limit_info}"
                     f"📝 *Step:* _{step.replace('_', '-')}_\n"
                     f"📋 *Details:* _{details.replace('_', '-')}_\n"
                     f"🔄 *Iterations:* _{iteration}_\n"
@@ -1063,17 +1069,20 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
             # Process like a regular message
             await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
             thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
-            _, mg_used, mg_limit = check_user_limits(user_id)
-            mg_limit_info = f"📊 *Usage:* _{mg_used}/{mg_limit} actions (30d)_\n" if mg_limit else ""
+            _, _, mg_limit = check_user_limits(user_id)
             
             async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
                 if step == "saving":
                     iteration = "final"
                     critique = "end"
+                live_limit_info = ""
+                if mg_limit:
+                    live_used = stats_tracker.get_user_action_count(user_id, days=30)
+                    live_limit_info = f"📊 *Usage:* _{live_used}/{mg_limit} actions (30d)_\n"
                 await thinking_message.edit_text(
                     f"💭 *Thinking...*\n"
                     f"- - - - \n"
-                    f"{mg_limit_info}"
+                    f"{live_limit_info}"
                     f"📝 *Step:* _{step.replace('_', '-')}_\n"
                     f"📋 *Details:* _{details.replace('_', '-')}_\n"
                     f"🔄 *Iterations:* _{iteration}_\n"
@@ -1238,16 +1247,19 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         # Process like a regular message
         await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
         thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
-        limit_info = f"📊 *Usage:* _{used}/{limit} actions (30d)_\n" if limit else ""
         
         async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
             if step == "saving":
                 iteration = "final"
                 critique = "end"
+            live_limit_info = ""
+            if limit:
+                live_used = stats_tracker.get_user_action_count(user_id, days=30)
+                live_limit_info = f"📊 *Usage:* _{live_used}/{limit} actions (30d)_\n"
             await thinking_message.edit_text(
                 f"💭 *Thinking...*\n"
                 f"- - - - \n"
-                f"{limit_info}"
+                f"{live_limit_info}"
                 f"📝 *Step:* _{step.replace('_', '-')}_\n"
                 f"📋 *Details:* _{details.replace('_', '-')}_\n"
                 f"🔄 *Iterations:* _{iteration}_\n"
@@ -1349,16 +1361,19 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         # Process like a regular message
         await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
         thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
-        limit_info = f"📊 *Usage:* _{used}/{limit} actions (30d)_\n" if limit else ""
 
         async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
             if step == "saving":
                 iteration = "final"
                 critique = "end"
+            live_limit_info = ""
+            if limit:
+                live_used = stats_tracker.get_user_action_count(user_id, days=30)
+                live_limit_info = f"📊 *Usage:* _{live_used}/{limit} actions (30d)_\n"
             await thinking_message.edit_text(
                 f"💭 *Thinking...*\n"
                 f"- - - - \n"
-                f"{limit_info}"
+                f"{live_limit_info}"
                 f"📝 *Step:* _{step.replace('_', '-')}_\n"
                 f"📋 *Details:* _{details.replace('_', '-')}_\n"
                 f"🔄 *Iterations:* _{iteration}_\n"
@@ -2315,16 +2330,19 @@ async def check_and_process_agent_reminders(context: ContextTypes.DEFAULT_TYPE):
                             print(f"Mock update created: {mock_update}")
                             
                             print("Creating update_thinking_message function")
-                            _, agent_used, agent_limit = check_user_limits(user_id)
-                            agent_limit_info = f"📊 *Usage:* _{agent_used}/{agent_limit} actions (30d)_\n" if agent_limit else ""
+                            _, _, agent_limit = check_user_limits(user_id)
                             async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
                                 if step == "saving":
                                     iteration = "final"
                                     critique = "end"
+                                live_limit_info = ""
+                                if agent_limit:
+                                    live_used = stats_tracker.get_user_action_count(user_id, days=30)
+                                    live_limit_info = f"📊 *Usage:* _{live_used}/{agent_limit} actions (30d)_\n"
                                 await thinking_message.edit_text(
                                     f"💭 *Processing Agent Task...*\n"
                                     f"- - - - \n"
-                                    f"{agent_limit_info}"
+                                    f"{live_limit_info}"
                                     f"📝 *Step:* _{step.replace('_', '-')}_\n"
                                     f"📋 *Details:* _{details.replace('_', '-')}_\n"
                                     f"🔄 *Iterations:* _{iteration}_\n"
