@@ -4,7 +4,7 @@
 
 ## 📋 Overview
 
-GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bot communication interface powered by advanced AI models like Claude 3.7 Sonnet and GPT-4o. It provides a seamless interface for users to interact with AI capabilities through Telegram, supporting text, voice, images, documents, and more.
+GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bot communication interface powered by advanced AI models like Claude 4.6 Sonnet and GPT-5.2. It provides a seamless interface for users to interact with AI capabilities through Telegram, supporting text, voice, images, documents, and more.
 
 ## 🔎 At a Glance
 

@@ -65,8 +65,8 @@ else:
 
 import agents.main as agents
 
-anthropic_model = "claude-sonnet-4-5-20250929"
-openai_model = "gpt-5-2025-08-07"
+anthropic_model = "claude-sonnet-4-6"
+openai_model = "gpt-5.2"
 
 user_invite_limit = int(os.getenv("INVITE_LIMIT", "3"))
 telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")

@@ -29,12 +29,13 @@ max_agent_critique_iterations = os.getenv("MAX_AGENT_CRITIQUE_ITERATIONS")
 
 # Anthropic config
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
-anthropic_model = "claude-sonnet-4-5-20250929"
+anthropic_model = "claude-sonnet-4-6"
+anthropic_model_fast = "claude-haiku-4-5"
 anthropic_client = anthropic.Anthropic(api_key=anthropic_api_key)
 
 # OpenAI config
 openai_api_key = os.getenv("OPENAI_API_KEY")
-openai_model = "gpt-5-2025-08-07"
+openai_model = "gpt-5.2"
 openai_client = OpenAI(api_key=openai_api_key)
 
 # Tavily config
@@ -558,6 +559,95 @@ Response: {response}"""
                 return json.load(f)
         return []
 
+    async def _classify_complexity(self, question: str, dialog_history: list = []) -> str:
+        """
+        Classify whether a user message needs the full agent pipeline or a quick response.
+        Returns "simple" or "complex".
+        Biased toward "complex" when uncertain.
+        """
+        try:
+            recent_context = ""
+            if dialog_history:
+                last_messages = dialog_history[-4:]
+                recent_context = "\nRecent conversation:\n" + "\n".join(
+                    f"{m['role']}: {m['content'][:200]}" for m in last_messages
+                )
+
+            prompt = f"""Classify if this user message needs advanced AI capabilities or can be answered with a simple conversational response.
+
+Reply ONLY with "simple" or "complex". Nothing else.
+
+"simple" means:
+- Greetings, small talk, thanks, casual chat
+- Simple factual questions from common knowledge
+- Short confirmations, acknowledgments
+- Questions that can be answered in 1-2 sentences without any research
+
+"complex" means:
+- Needs web search, file operations, code execution, image generation
+- Needs deep analysis, multi-step reasoning, technical knowledge
+- References previous conversations that need memory lookup
+- Asks to create, edit, or transform something
+- Requires specific or up-to-date information
+- Long or detailed questions
+- Anything you're unsure about
+
+When in doubt, answer "complex".
+{recent_context}
+
+User message: {question}"""
+
+            response = await asyncio.to_thread(
+                anthropic_client.messages.create,
+                model=anthropic_model_fast,
+                messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+                max_tokens=10
+            )
+            result = response.content[0].text.strip().lower()
+            print(f"\nComplexity classification: {result}")
+            if result in ("simple", "complex"):
+                return result
+            return "complex"
+        except Exception as e:
+            print(f"Error in complexity classification: {str(e)}")
+            return "complex"
+
+    async def _simple_response(self, context_memory: list, system_context: str, question: str) -> tuple:
+        """Generate a quick response using Haiku for simple messages. No tools, no critique, no judge."""
+        try:
+            processed_messages = []
+            for msg in context_memory:
+                if isinstance(msg["content"], str):
+                    processed_messages.append({
+                        "role": msg["role"],
+                        "content": [{"type": "text", "text": msg["content"]}]
+                    })
+                elif isinstance(msg["content"], list):
+                    processed_messages.append(msg)
+                else:
+                    processed_messages.append({
+                        "role": msg["role"],
+                        "content": [{"type": "text", "text": str(msg["content"])}]
+                    })
+
+            response = await asyncio.to_thread(
+                anthropic_client.messages.create,
+                model=anthropic_model_fast,
+                messages=processed_messages,
+                system=system_context,
+                max_tokens=4096
+            )
+
+            response_text = response.content[0].text
+            thread_messages = [
+                {"role": "user", "content": [{"type": "text", "text": question}]},
+                {"role": "assistant", "content": [{"type": "text", "text": response_text}]}
+            ]
+            return response_text, thread_messages
+        except Exception as e:
+            print(f"Error in simple response, falling back to full agent: {str(e)}")
+            return None, None
+
     async def generate_response(self, question: str, update_status=None) -> str:
         print(f"\n=== Starting Chain of Thought for Question: {question} ===")
         question = f"Message received time in UTC+0: {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}\n\n{question}"
@@ -952,16 +1042,26 @@ You have been asked to answer a query given sources. Consider the following when
         if not settings_dialog_history_enabled or not settings_short_term_memory_enabled:
             dialog_history = []
 
-        response, thread_messages = await self.agent.generate_response(
-            messages=context_memory, 
-            system_role=system_context, 
-            question=question,
-            update_status=update_status,
-            dialog_history=dialog_history,
-            user_settings=self.user_settings
-        )
-        # remove first 2 messages from thread_messages array
-        thread_messages = thread_messages[2:]
+        # Route: classify complexity to decide fast vs full path
+        complexity = await self._classify_complexity(question, dialog_history)
+        
+        if complexity == "simple":
+            if update_status:
+                await update_status(step="initial", details=f"Quick response ({anthropic_model_fast})", iteration=0, critique=0)
+            
+            response, thread_messages = await self._simple_response(context_memory, system_context, question)
+        
+        if complexity != "simple" or response is None:
+            response, thread_messages = await self.agent.generate_response(
+                messages=context_memory, 
+                system_role=system_context, 
+                question=question,
+                update_status=update_status,
+                dialog_history=dialog_history,
+                user_settings=self.user_settings
+            )
+            # remove first 2 messages from thread_messages array
+            thread_messages = thread_messages[2:]
         
         # print("\n========== Thread Messages: ==========")
         #print(json.dumps(thread_messages, indent=2, ensure_ascii=False))
