@@ -1010,6 +1010,24 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 
                 try:
                     response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context)
+                    
+                    # Generate and send audio response
+                    await thinking_message.edit_text("🎙️ *Generating audio...*", parse_mode="markdown")
+                    voice_id = voice_manager.get_user_voice(user_id)
+                    
+                    try:
+                        client = ElevenLabs(api_key=elevenlabs_api_key)
+                        audio_stream = client.generate(
+                            text=response,
+                            voice=voice_id,
+                            model="eleven_multilingual_v2"
+                        )
+                        temp_audio_path = await sendvoice_to_user(audio_stream)
+                        audio_file = io.BytesIO(open(temp_audio_path, "rb").read())
+                        await update.message.reply_voice(audio_file)
+                    except Exception as e:
+                        print(f"Error generating audio: {str(e)}")
+                    
                     await send_response_to_user(update, thinking_message, response, user_id)
                     await send_reasoning_file(update, messages, user_id)
                     return transcription
