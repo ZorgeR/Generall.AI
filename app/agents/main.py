@@ -1,6 +1,7 @@
 import anthropic
 from openai import OpenAI
 import os
+import asyncio
 from dotenv import load_dotenv
 from .file_ops import FileOperations
 from .search_tools import SearchTools
@@ -64,7 +65,7 @@ class AgentAnthropic:
         self.user_interactions = None
         self.thinking = False
 
-    def critique_response(self, question: str, answer: str, dialog_history: list = []) -> str:
+    async def critique_response(self, question: str, answer: str, dialog_history: list = []) -> str:
         """
         Use OpenAI to critique the response for potential issues.
         Returns critique text if issues found, otherwise returns empty string.
@@ -119,7 +120,8 @@ You can suggest assistant to use a tools, if you think that it's necessary, the 
             
             critique_context.append({"role": "user", "content": message_history})
 
-            critique_response = openai_client.beta.chat.completions.parse(
+            critique_response = await asyncio.to_thread(
+                openai_client.beta.chat.completions.parse,
                 model=openai_model,
                 messages=critique_context,
                 response_format=CritiqueResponse
@@ -141,7 +143,7 @@ You can suggest assistant to use a tools, if you think that it's necessary, the 
             print(f"Error in critique: {str(e)}")
             return None
 
-    def judge_response(self, question: str, answer: str) -> bool:
+    async def judge_response(self, question: str, answer: str) -> bool:
         """
         Use Anthropic to judge if the response is complete and satisfactory.
         Returns True if the response is good, False if it needs improvement.
@@ -171,7 +173,8 @@ Response: {answer}
 
 Judge's decision (ONLY answer "Yes" or "No"):"""
 
-            response = self.client.messages.create(
+            response = await asyncio.to_thread(
+                self.client.messages.create,
                 model=self.model,
                 messages=[{
                     "role": "user",
@@ -309,7 +312,8 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
 
             if self.thinking:
                 print(f"\nAgent prepare messages with thinking")
-                response = self.client.messages.create(
+                response = await asyncio.to_thread(
+                    self.client.messages.create,
                     model=self.model,
                     messages=processed_messages,
                     system=system,
@@ -323,7 +327,8 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 )
             else:
                 print(f"\nAgent prepare messages without thinking")
-                response = self.client.messages.create(
+                response = await asyncio.to_thread(
+                    self.client.messages.create,
                     model=self.model,
                     messages=processed_messages,
                     system=system,
@@ -392,7 +397,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             if user_settings.get("critique").get("enabled") and critique < int(user_settings.get("critique").get("max_iteration")):
                 last_step_category = "critique"
                 await update_status(step=last_step_category, details="Starting critique session", iteration=cicles, critique=critique)
-                critique_answer = self.critique_response(question=question, answer=current_text, dialog_history=dialog_history)
+                critique_answer = await self.critique_response(question=question, answer=current_text, dialog_history=dialog_history)
                 print(f"\nCritique: {critique_answer}")
                 if critique_answer:
                     need_rewrite_answer = critique_answer.need_rewrite_answer
@@ -420,7 +425,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                     last_step_category = "judge"
                     await update_status(step=last_step_category, details="Judge evaluating response", iteration=cicles, critique=critique)
                 
-                judge_decision = self.judge_response(question=question, answer=current_text)
+                judge_decision = await self.judge_response(question=question, answer=current_text)
                 if not judge_decision:
                     if judge < user_settings.get("judge").get("max_iteration"):
                         if update_status:
@@ -486,7 +491,7 @@ class ChainOfThoughtAgent:
         else:
             raise ValueError("Currently only Anthropic models are supported with the new tool pattern")
 
-    def _save_conversation(self, question: str, response: str, messages: list):
+    async def _save_conversation(self, question: str, response: str, messages: list):
         """Save conversation summary and full history"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
@@ -495,7 +500,8 @@ class ChainOfThoughtAgent:
 Question: {question}
 Response: {response}"""
         
-        topic_response = openai_client.chat.completions.create(
+        topic_response = await asyncio.to_thread(
+            openai_client.chat.completions.create,
             model=openai_model,
             messages=[{"role": "user", "content": topic_prompt}]
         )
@@ -506,7 +512,8 @@ Response: {response}"""
 Question: {question}
 Response: {response}"""
         
-        summary_response = openai_client.chat.completions.create(
+        summary_response = await asyncio.to_thread(
+            openai_client.chat.completions.create,
             model=openai_model,
             messages=[{"role": "user", "content": summary_prompt}]
         )
@@ -986,7 +993,7 @@ You have been asked to answer a query given sources. Consider the following when
                     thread_messages.remove(message)
 
         # Save conversation history
-        summary = self._save_conversation(question, response, thread_messages)
+        summary = await self._save_conversation(question, response, thread_messages)
         print(f"\nConversation saved. Summary: {summary}")
         
         # Save short term memory

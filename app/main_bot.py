@@ -95,6 +95,15 @@ logging.basicConfig(
     level=logging.INFO
 )
 
+# Per-user locks for sequential message processing
+_user_locks: dict = {}
+
+def get_user_lock(user_id: str) -> asyncio.Lock:
+    """Get or create an asyncio.Lock for a specific user"""
+    if user_id not in _user_locks:
+        _user_locks[user_id] = asyncio.Lock()
+    return _user_locks[user_id]
+
 # Add these at the top level with other global variables
 media_group_id = {}
 media_group_photos = {}
@@ -297,11 +306,13 @@ def split_text_intelligently(text: str, max_length: int = 4000) -> list[str]:
     return chunks
 
 async def describe_document_openai(question, file_path, file_mime_type):
-    message_files = openai_client.files.create(
+    message_files = await asyncio.to_thread(
+        openai_client.files.create,
         file=open(file_path, "rb"),
         purpose="assistants"
     )
-    message = openai_client.chat.completions.create(
+    message = await asyncio.to_thread(
+        openai_client.chat.completions.create,
         model=openai_model,
         messages=[
             {"role": "user", "content": question}
@@ -321,7 +332,8 @@ async def describe_document_anthropic(question, file_path, document_type, file_m
     if document_in_base64 is None:
         return "Error: Document file not found"
 
-    message = anthropic_client.messages.create(
+    message = await asyncio.to_thread(
+        anthropic_client.messages.create,
         model=anthropic_model,
         messages=[
             {
@@ -366,7 +378,8 @@ async def describe_txt(question, txt_path):
     if len(txt_content) > 100000:  # Approximately 100KB
         return await process_large_text(txt_content, question, "text document")
     
-    message = anthropic_client.messages.create(
+    message = await asyncio.to_thread(
+        anthropic_client.messages.create,
         model=anthropic_model,
         messages=[
             {
@@ -401,7 +414,8 @@ async def describe_json(question, json_path):
     if len(json_content) > 100000:  # Approximately 100KB
         return await process_large_text(json_content, question, "JSON document")
     
-    message = anthropic_client.messages.create(
+    message = await asyncio.to_thread(
+        anthropic_client.messages.create,
         model=anthropic_model,
         messages=[
             {
@@ -436,7 +450,8 @@ async def describe_docx(question, docx_path):
     if len(docx_content) > 100000:  # Approximately 100KB
         return await process_large_text(docx_content, question, "Word document")
     
-    message = anthropic_client.messages.create(
+    message = await asyncio.to_thread(
+        anthropic_client.messages.create,
         model=anthropic_model,
         messages=[
             {
@@ -480,7 +495,8 @@ async def describe_xlsx(question, xlsx_path):
     if len(xlsx_content) > 100000:  # Approximately 100KB
         return await process_large_text(xlsx_content, question, "Excel spreadsheet")
     
-    message = anthropic_client.messages.create(
+    message = await asyncio.to_thread(
+        anthropic_client.messages.create,
         model=anthropic_model,
         messages=[
             {
@@ -505,7 +521,8 @@ async def process_large_text(content, question, content_type):
     
     summaries = []
     for i, chunk in enumerate(chunks):
-        message = anthropic_client.messages.create(
+        message = await asyncio.to_thread(
+            anthropic_client.messages.create,
             model=anthropic_model,
             messages=[
                 {
@@ -524,7 +541,8 @@ async def process_large_text(content, question, content_type):
     # Combine the summaries and answer the question
     combined_summary = "\n\n".join([f"Part {i+1} summary: {summary}" for i, summary in enumerate(summaries)])
     
-    final_message = anthropic_client.messages.create(
+    final_message = await asyncio.to_thread(
+        anthropic_client.messages.create,
         model=anthropic_model,
         messages=[
             {
@@ -564,7 +582,8 @@ async def describe_image_anthropic(question, image_path):
     image_media_type = "image/jpeg"
     # image_data = base64.standard_b64encode(image_content).decode("utf-8")
 
-    message = anthropic_client.messages.create(
+    message = await asyncio.to_thread(
+        anthropic_client.messages.create,
         model=anthropic_model,
         max_tokens=1024,
         messages=[
@@ -593,7 +612,8 @@ async def describe_image_anthropic(question, image_path):
 async def describe_image_openai(question, image_path):
     base64_image = encode_image(image_path)
 
-    response = openai_client.chat.completions.create(
+    response = await asyncio.to_thread(
+        openai_client.chat.completions.create,
         model=openai_model,
         messages=[
             {
@@ -616,7 +636,8 @@ async def describe_image_openai(question, image_path):
 
 async def transcribe_audio(audio_file_path):
     with open(audio_file_path, "rb") as audio:
-        response = openai_client_whisper.audio.transcriptions.create(
+        response = await asyncio.to_thread(
+            openai_client_whisper.audio.transcriptions.create,
             model="whisper-1",
             file=audio, 
             response_format="text"
@@ -737,53 +758,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ You've reached your action limit ({used}/{limit} for 30 days). Contact admin.")
         return
     
-    # Track message received
-    stats_tracker.track_message_received(user_id, "text")
-    
-    # Get user's message
-    user_message = update.message.text
-    
-    # Show typing status and send initial message
-    await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
-    thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
+    async with get_user_lock(user_id):
+        # Track message received
+        stats_tracker.track_message_received(user_id, "text")
+        
+        # Get user's message
+        user_message = update.message.text
+        
+        # Show typing status and send initial message
+        await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
+        thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
 
-    async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
-        if step == "saving":
-            iteration = "final"
-            critique = "end"
-        live_limit_info = ""
-        if limit:
-            live_used = stats_tracker.get_user_action_count(user_id, days=30)
-            live_limit_info = f"📊 *Usage:* _{live_used}/{limit} actions (30d)_\n"
+        async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
+            if step == "saving":
+                iteration = "final"
+                critique = "end"
+            live_limit_info = ""
+            if limit:
+                live_used = stats_tracker.get_user_action_count(user_id, days=30)
+                live_limit_info = f"📊 *Usage:* _{live_used}/{limit} actions (30d)_\n"
+            try:
+                await thinking_message.edit_text(
+                    f"💭 *Thinking...*\n"
+                    f"- - - - \n"
+                    f"{live_limit_info}"
+                    f"📝 *Step:* _{step.replace('_', '-')}_\n"
+                    f"📋 *Details:* _{details.replace('_', '-')}_\n"
+                    f"🔄 *Iterations:* _{iteration}_\n"
+                    f"🎯 *Critiques:* _{critique}_",
+                    parse_mode="markdown"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to update thinking message: {str(e)}")
+        
         try:
-            await thinking_message.edit_text(
-                f"💭 *Thinking...*\n"
-                f"- - - - \n"
-                f"{live_limit_info}"
-                f"📝 *Step:* _{step.replace('_', '-')}_\n"
-                f"📋 *Details:* _{details.replace('_', '-')}_\n"
-                f"🔄 *Iterations:* _{iteration}_\n"
-                f"🎯 *Critiques:* _{critique}_",
-                parse_mode="markdown"
-            )
+            # Get response
+            logger.info(f"Processing message for user {user_id}")
+            response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context)
+            logger.info(f"Got response for user {user_id}, sending to user")
+            await send_response_to_user(update, thinking_message, response, user_id)
+            await send_reasoning_file(update, messages, user_id)
+            logger.info(f"Successfully processed message for user {user_id}")
         except Exception as e:
-            logger.warning(f"Failed to update thinking message: {str(e)}")
-    
-    try:
-        # Get response
-        logger.info(f"Processing message for user {user_id}")
-        response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context)
-        logger.info(f"Got response for user {user_id}, sending to user")
-        await send_response_to_user(update, thinking_message, response, user_id)
-        await send_reasoning_file(update, messages, user_id)
-        logger.info(f"Successfully processed message for user {user_id}")
-    except Exception as e:
-        # Edit thinking message with error if something goes wrong
-        trace_id = str(uuid.uuid4())
-        await thinking_message.edit_text(text=f"❌ An error occurred. Trace ID: {trace_id}")
-        logger.error(f"An error occurred with trace ID {trace_id}: {str(e)}")
-        import traceback
-        logger.error(f"Full traceback:\n{traceback.format_exc()}")
+            trace_id = str(uuid.uuid4())
+            await thinking_message.edit_text(text=f"❌ An error occurred. Trace ID: {trace_id}")
+            logger.error(f"An error occurred with trace ID {trace_id}: {str(e)}")
+            import traceback
+            logger.error(f"Full traceback:\n{traceback.format_exc()}")
 
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.chat_id)
@@ -799,112 +820,112 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"⚠️ You've reached your action limit ({used}/{limit} for 30 days). Contact admin.")
         return
     
-    # Track message received
-    stats_tracker.track_message_received(user_id, "voice")
-    
-    voice_message = update.message.voice
-    
-    # Create temporary files in a directory we know exists
-    temp_dir = "temp_audio"
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    temp_ogg = os.path.join(temp_dir, f"voice_{uuid.uuid4()}.oga")
-    temp_mp3 = os.path.join(temp_dir, f"voice_{uuid.uuid4()}.mp3")
-    
-    # Send initial status message
-    status_message = await update.message.reply_text("🎙️ *Transcribing audio...*", parse_mode="markdown")
-    
-    try:
-        # Download voice message
-        voice_file = await context.bot.get_file(voice_message.file_id)
-        await voice_file.download_to_drive(temp_ogg)
+    async with get_user_lock(user_id):
+        # Track message received
+        stats_tracker.track_message_received(user_id, "voice")
         
-        print(f"Downloaded voice file to: {temp_ogg}")
+        voice_message = update.message.voice
         
-        # Convert OGA to MP3
-        audio = AudioSegment.from_file(temp_ogg, format="ogg")
-        audio.export(temp_mp3, format="mp3")
+        # Create temporary files in a directory we know exists
+        temp_dir = "temp_audio"
+        os.makedirs(temp_dir, exist_ok=True)
         
-        print(f"Converted to MP3: {temp_mp3}")
+        temp_ogg = os.path.join(temp_dir, f"voice_{uuid.uuid4()}.oga")
+        temp_mp3 = os.path.join(temp_dir, f"voice_{uuid.uuid4()}.mp3")
         
-        # Transcribe MP3 file
-        transcription = await transcribe_audio(temp_mp3)
+        # Send initial status message
+        status_message = await update.message.reply_text("🎙️ *Transcribing audio...*", parse_mode="markdown")
         
-        if transcription:
-            print(f"Transcription: {transcription}")
-            await status_message.edit_text(f"🎙️ *Transcription:*\n{transcription}", parse_mode="markdown")
+        try:
+            # Download voice message
+            voice_file = await context.bot.get_file(voice_message.file_id)
+            await voice_file.download_to_drive(temp_ogg)
             
-            # Process transcription like a regular message
-            await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
-            thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
+            print(f"Downloaded voice file to: {temp_ogg}")
             
-            async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
-                if step == "saving":
-                    iteration = "final"
-                    critique = "end"
-                live_limit_info = ""
-                if limit:
-                    live_used = stats_tracker.get_user_action_count(user_id, days=30)
-                    live_limit_info = f"📊 *Usage:* _{live_used}/{limit} actions (30d)_\n"
-                await thinking_message.edit_text(
-                    f"💭 *Thinking...*\n"
-                    f"- - - - \n"
-                    f"{live_limit_info}"
-                    f"📝 *Step:* _{step.replace('_', '-')}_\n"
-                    f"📋 *Details:* _{details.replace('_', '-')}_\n"
-                    f"🔄 *Iterations:* _{iteration}_\n"
-                    f"🎯 *Critiques:* _{critique}_",
-                    parse_mode="markdown"
-                )
+            # Convert OGA to MP3
+            audio = AudioSegment.from_file(temp_ogg, format="ogg")
+            audio.export(temp_mp3, format="mp3")
             
-            try:
-                # Get response using the same logic as handle_message
-                response, messages = await get_answer(transcription, user_id, update_thinking_message, update, context)
+            print(f"Converted to MP3: {temp_mp3}")
+            
+            # Transcribe MP3 file
+            transcription = await transcribe_audio(temp_mp3)
+            
+            if transcription:
+                print(f"Transcription: {transcription}")
+                await status_message.edit_text(f"🎙️ *Transcription:*\n{transcription}", parse_mode="markdown")
                 
-                # Generate and send audio response
-                await thinking_message.edit_text("🎙️ *Generating audio...*", parse_mode="markdown")
-                voice_id = voice_manager.get_user_voice(user_id)
+                # Process transcription like a regular message
+                await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
+                thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
+                
+                async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
+                    if step == "saving":
+                        iteration = "final"
+                        critique = "end"
+                    live_limit_info = ""
+                    if limit:
+                        live_used = stats_tracker.get_user_action_count(user_id, days=30)
+                        live_limit_info = f"📊 *Usage:* _{live_used}/{limit} actions (30d)_\n"
+                    await thinking_message.edit_text(
+                        f"💭 *Thinking...*\n"
+                        f"- - - - \n"
+                        f"{live_limit_info}"
+                        f"📝 *Step:* _{step.replace('_', '-')}_\n"
+                        f"📋 *Details:* _{details.replace('_', '-')}_\n"
+                        f"🔄 *Iterations:* _{iteration}_\n"
+                        f"🎯 *Critiques:* _{critique}_",
+                        parse_mode="markdown"
+                    )
                 
                 try:
-                    client = ElevenLabs(api_key=elevenlabs_api_key)
-                    audio_stream = client.generate(
-                        text=response,
-                        voice=voice_id,
-                        model="eleven_multilingual_v2"
-                    )
-                    temp_audio_path = await sendvoice_to_user(audio_stream)
-                    audio_file = io.BytesIO(open(temp_audio_path, "rb").read())
-                    await update.message.reply_voice(audio_file)
+                    # Get response using the same logic as handle_message
+                    response, messages = await get_answer(transcription, user_id, update_thinking_message, update, context)
+                    
+                    # Generate and send audio response
+                    await thinking_message.edit_text("🎙️ *Generating audio...*", parse_mode="markdown")
+                    voice_id = voice_manager.get_user_voice(user_id)
+                    
+                    try:
+                        client = ElevenLabs(api_key=elevenlabs_api_key)
+                        audio_stream = client.generate(
+                            text=response,
+                            voice=voice_id,
+                            model="eleven_multilingual_v2"
+                        )
+                        temp_audio_path = await sendvoice_to_user(audio_stream)
+                        audio_file = io.BytesIO(open(temp_audio_path, "rb").read())
+                        await update.message.reply_voice(audio_file)
+                    except Exception as e:
+                        print(f"Error generating audio: {str(e)}")
+                    
+                    # Send text response
+                    await send_response_to_user(update, thinking_message, response, user_id)
+                    await send_reasoning_file(update, messages, user_id)
+                    
+                    return transcription
                 except Exception as e:
-                    print(f"Error generating audio: {str(e)}")
-                
-                # Send text response
-                await send_response_to_user(update, thinking_message, response, user_id)
-                await send_reasoning_file(update, messages, user_id)
-                
-                return transcription
-            except Exception as e:
-                trace_id = str(uuid.uuid4())
-                await thinking_message.edit_text(text=f"❌ An error occurred. Trace ID: {trace_id}")
-                logging.error(f"An error occurred with trace ID {trace_id}: {str(e)}")
-        else:
-            await status_message.edit_text("❌ Failed to transcribe audio", parse_mode="markdown")
-            return False
+                    trace_id = str(uuid.uuid4())
+                    await thinking_message.edit_text(text=f"❌ An error occurred. Trace ID: {trace_id}")
+                    logging.error(f"An error occurred with trace ID {trace_id}: {str(e)}")
+            else:
+                await status_message.edit_text("❌ Failed to transcribe audio", parse_mode="markdown")
+                return False
 
-    except Exception as e:
-        print(f"Error transcribing voice message: {str(e)}")
-        await status_message.edit_text("❌ Error processing voice message", parse_mode="markdown")
-        return None
-        
-    finally:
-        # Clean up temporary files
-        try:
-            if os.path.exists(temp_ogg):
-                os.remove(temp_ogg)
-            if os.path.exists(temp_mp3):
-                os.remove(temp_mp3)
         except Exception as e:
-            print(f"Error cleaning up temporary files: {str(e)}")
+            print(f"Error transcribing voice message: {str(e)}")
+            await status_message.edit_text("❌ Error processing voice message", parse_mode="markdown")
+            return None
+        
+        finally:
+            try:
+                if os.path.exists(temp_ogg):
+                    os.remove(temp_ogg)
+                if os.path.exists(temp_mp3):
+                    os.remove(temp_mp3)
+            except Exception as e:
+                print(f"Error cleaning up temporary files: {str(e)}")
 
 async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /voice command"""
@@ -1134,11 +1155,10 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     stats_tracker.track_message_received(user_id, "photo")
     
     if update.message.media_group_id:
-        # Cancel any existing delayed task for this user
+        # Media group collection stays outside lock - multiple photos arrive rapidly
         if user_id in media_group_tasks and media_group_tasks[user_id]:
             media_group_tasks[user_id].cancel()
         
-        # Initialize media group data if needed
         if user_id not in media_group_id or media_group_id[user_id] != update.message.media_group_id:
             media_group_id[user_id] = update.message.media_group_id
             media_group_photos[user_id] = []
@@ -1148,12 +1168,10 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 parse_mode="markdown"
             )
         
-        # Update caption if provided
         if update.message.caption and media_group_captions[user_id] == None:
             media_group_captions[user_id] = update.message.caption
 
-        # Add photo to the group
-        photos = [update.message.photo[-1]]  # Get the largest photo
+        photos = [update.message.photo[-1]]
         if photos not in media_group_photos[user_id]:
             media_group_photos[user_id].append(photos)
             await media_group_waiting_message[user_id].edit_text(
@@ -1164,7 +1182,8 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         async def process_media_group_with_timeout():
             try:
                 await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
-                await process_media_group(update, context, user_id)
+                async with get_user_lock(user_id):
+                    await process_media_group(update, context, user_id)
             except asyncio.CancelledError:
                 pass
             except Exception as e:
@@ -1175,116 +1194,107 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     
     # Handle single photo message
-    photos = [update.message.photo[-1]]  # Get the largest photo
-    if update.message.caption == None:
-        caption = "Describe what is in this image in user language."
-        describe_question = caption
-    else:
-        caption = update.message.caption
-        describe_question = f"Describe what is in this image and answer to this question: {caption}"
-    
-    # Send initial status message
-    status_message = await update.message.reply_text("🖼️ *Analyzing images...*", parse_mode="markdown")
-    
-    temp_photos = []  # Keep track of temporary files for cleanup
-    all_descriptions = []  # Store descriptions for all photos
-    image_paths = []  # Store paths to downloaded images
-    
-    try:
-        # Process single photo (rest of the existing code for single photo processing)
-        for i, photo in enumerate(photos, 1):  # Process the single photo
-            try:
-                # Download the photo
-                photo_file = await context.bot.get_file(photo.file_id)
-                temp_dir = "temp_photos"
-                os.makedirs(temp_dir, exist_ok=True)
-                temp_photo = os.path.join(temp_dir, f"photo_{uuid.uuid4()}.jpg")
-                temp_photos.append(temp_photo)
-                await photo_file.download_to_drive(temp_photo)
-                
-                # Save the permanent copy to user's directory
-                user_images_dir = os.path.join("data", user_id, "images")
-                os.makedirs(user_images_dir, exist_ok=True)
-                permanent_image_path = os.path.join(user_images_dir, f"image_{uuid.uuid4()}.jpg")
-                # Copy the image to the permanent location
-                shutil.copy(temp_photo, permanent_image_path)
-                image_paths.append(permanent_image_path)
-                
-                # Get descriptions from both services
-                await status_message.edit_text(f"🤖 *Getting Anthropic description...*", parse_mode="markdown")
-                anthropic_description = await describe_image_anthropic(question=describe_question, image_path=temp_photo)
-                stats_tracker.track_describe_used(user_id, "image_anthropic")
-                
-                await status_message.edit_text(f"🤖 *Getting OpenAI description...*", parse_mode="markdown")
-                openai_description = await describe_image_openai(question=describe_question, image_path=temp_photo)
-                stats_tracker.track_describe_used(user_id, "image_openai")
-                
-                all_descriptions.append({
-                    'anthropic': anthropic_description,
-                    'openai': openai_description,
-                    'path': permanent_image_path
-                })
-                
-            except Exception as e:
-                logging.error(f"Error processing photo {i}: {str(e)}")
-                all_descriptions.append({
-                    'anthropic': f"Error processing image {i}",
-                    'openai': f"Error processing image {i}",
-                    'path': "error_path"
-                })
+    async with get_user_lock(user_id):
+        photos = [update.message.photo[-1]]
+        if update.message.caption == None:
+            caption = "Describe what is in this image in user language."
+            describe_question = caption
+        else:
+            caption = update.message.caption
+            describe_question = f"Describe what is in this image and answer to this question: {caption}"
         
-        # Craft the user question combining caption and all descriptions
-        descriptions_text = "\n\n".join([
-            f"Image {i+1} (path: {desc['path']}):\n"
-            f"Anthropic description: {desc['anthropic']}\n"
-            f"OpenAI description: {desc['openai']}"
-            for i, desc in enumerate(all_descriptions)
-        ])
+        status_message = await update.message.reply_text("🖼️ *Analyzing images...*", parse_mode="markdown")
         
-        user_question = f"{caption}\n\nUser attached {len(all_descriptions)} image(s) to this message. Here are the details about each image from Anthropic and OpenAI:\n\n{descriptions_text}"
+        temp_photos = []
+        all_descriptions = []
+        image_paths = []
         
-        await status_message.edit_text("🤖 *Processing...*", parse_mode="markdown")
-        # Process like a regular message
-        await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
-        thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
+        try:
+            for i, photo in enumerate(photos, 1):
+                try:
+                    photo_file = await context.bot.get_file(photo.file_id)
+                    temp_dir = "temp_photos"
+                    os.makedirs(temp_dir, exist_ok=True)
+                    temp_photo = os.path.join(temp_dir, f"photo_{uuid.uuid4()}.jpg")
+                    temp_photos.append(temp_photo)
+                    await photo_file.download_to_drive(temp_photo)
+                    
+                    user_images_dir = os.path.join("data", user_id, "images")
+                    os.makedirs(user_images_dir, exist_ok=True)
+                    permanent_image_path = os.path.join(user_images_dir, f"image_{uuid.uuid4()}.jpg")
+                    shutil.copy(temp_photo, permanent_image_path)
+                    image_paths.append(permanent_image_path)
+                    
+                    await status_message.edit_text(f"🤖 *Getting Anthropic description...*", parse_mode="markdown")
+                    anthropic_description = await describe_image_anthropic(question=describe_question, image_path=temp_photo)
+                    stats_tracker.track_describe_used(user_id, "image_anthropic")
+                    
+                    await status_message.edit_text(f"🤖 *Getting OpenAI description...*", parse_mode="markdown")
+                    openai_description = await describe_image_openai(question=describe_question, image_path=temp_photo)
+                    stats_tracker.track_describe_used(user_id, "image_openai")
+                    
+                    all_descriptions.append({
+                        'anthropic': anthropic_description,
+                        'openai': openai_description,
+                        'path': permanent_image_path
+                    })
+                    
+                except Exception as e:
+                    logging.error(f"Error processing photo {i}: {str(e)}")
+                    all_descriptions.append({
+                        'anthropic': f"Error processing image {i}",
+                        'openai': f"Error processing image {i}",
+                        'path': "error_path"
+                    })
+            
+            descriptions_text = "\n\n".join([
+                f"Image {i+1} (path: {desc['path']}):\n"
+                f"Anthropic description: {desc['anthropic']}\n"
+                f"OpenAI description: {desc['openai']}"
+                for i, desc in enumerate(all_descriptions)
+            ])
+            
+            user_question = f"{caption}\n\nUser attached {len(all_descriptions)} image(s) to this message. Here are the details about each image from Anthropic and OpenAI:\n\n{descriptions_text}"
+            
+            await status_message.edit_text("🤖 *Processing...*", parse_mode="markdown")
+            await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
+            thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
+            
+            async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
+                if step == "saving":
+                    iteration = "final"
+                    critique = "end"
+                live_limit_info = ""
+                if limit:
+                    live_used = stats_tracker.get_user_action_count(user_id, days=30)
+                    live_limit_info = f"📊 *Usage:* _{live_used}/{limit} actions (30d)_\n"
+                await thinking_message.edit_text(
+                    f"💭 *Thinking...*\n"
+                    f"- - - - \n"
+                    f"{live_limit_info}"
+                    f"📝 *Step:* _{step.replace('_', '-')}_\n"
+                    f"📋 *Details:* _{details.replace('_', '-')}_\n"
+                    f"🔄 *Iterations:* _{iteration}_\n"
+                    f"🎯 *Critiques:* _{critique}_",
+                    parse_mode="markdown"
+                )
+            
+            response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context)
+            await send_response_to_user(update, thinking_message, response, user_id)
+            await send_reasoning_file(update, messages, user_id)
+            await status_message.edit_text("🤖 *Done!*", parse_mode="markdown")
+        except Exception as e:
+            trace_id = str(uuid.uuid4())
+            await status_message.edit_text(text=f"❌ An error occurred while analyzing the images. Trace ID: {trace_id}")
+            logging.error(f"An error occurred with trace ID {trace_id}: {str(e)}")
         
-        async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
-            if step == "saving":
-                iteration = "final"
-                critique = "end"
-            live_limit_info = ""
-            if limit:
-                live_used = stats_tracker.get_user_action_count(user_id, days=30)
-                live_limit_info = f"📊 *Usage:* _{live_used}/{limit} actions (30d)_\n"
-            await thinking_message.edit_text(
-                f"💭 *Thinking...*\n"
-                f"- - - - \n"
-                f"{live_limit_info}"
-                f"📝 *Step:* _{step.replace('_', '-')}_\n"
-                f"📋 *Details:* _{details.replace('_', '-')}_\n"
-                f"🔄 *Iterations:* _{iteration}_\n"
-                f"🎯 *Critiques:* _{critique}_",
-                parse_mode="markdown"
-            )
-        
-        # Get response using the same logic as handle_message
-        response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context)
-        await send_response_to_user(update, thinking_message, response, user_id)
-        await send_reasoning_file(update, messages, user_id)
-        await status_message.edit_text("🤖 *Done!*", parse_mode="markdown")
-    except Exception as e:
-        trace_id = str(uuid.uuid4())
-        await status_message.edit_text(text=f"❌ An error occurred while analyzing the images. Trace ID: {trace_id}")
-        logging.error(f"An error occurred with trace ID {trace_id}: {str(e)}")
-    
-    finally:
-        # Clean up all temporary files
-        for temp_photo in temp_photos:
-            try:
-                if os.path.exists(temp_photo):
-                    os.remove(temp_photo)
-            except Exception as e:
-                print(f"Error cleaning up temporary photo file {temp_photo}: {str(e)}")
+        finally:
+            for temp_photo in temp_photos:
+                try:
+                    if os.path.exists(temp_photo):
+                        os.remove(temp_photo)
+                except Exception as e:
+                    print(f"Error cleaning up temporary photo file {temp_photo}: {str(e)}")
 
 async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming document messages (PDF, TXT, JSON, DOCX, XLSX)"""
@@ -1314,91 +1324,83 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text(f"❌ Only {supported_formats} documents are supported.")
         return
 
-    # Send initial status message
-    doc_type = file_extension.replace(".", "").upper()
-    status_message = await update.message.reply_text(f"📄 *Processing {doc_type} document...*", parse_mode="markdown")
-    
-    temp_file = None
-    try:
-        # Download the document
-        document = update.message.document
-        document_file = await context.bot.get_file(document.file_id)
-        temp_dir = "temp_docs"
-        os.makedirs(temp_dir, exist_ok=True)
-        temp_file = os.path.join(temp_dir, f"doc_{uuid.uuid4()}{file_extension}")
-        await document_file.download_to_drive(temp_file)
-
-        # Get the caption or use default question
-        if update.message.caption == None:
-            caption = "Analyze this document and describe its contents in detail."
-            describe_question = caption
-        else:
-            caption = update.message.caption
-            describe_question = f"Analyze this document and describe its contents in detail. When you are done, answer the following question: {caption}"
-
-        # Get document description
-        await status_message.edit_text(f"🤖 *Analyzing {doc_type} content...*", parse_mode="markdown")
-        document_description = await describe_document(describe_question, temp_file)
+    async with get_user_lock(user_id):
+        doc_type = file_extension.replace(".", "").upper()
+        status_message = await update.message.reply_text(f"📄 *Processing {doc_type} document...*", parse_mode="markdown")
         
-        # Track describe used based on file type
-        describe_type_map = {
-            '.pdf': 'pdf',
-            '.txt': 'txt', '.csv': 'txt', '.py': 'txt', '.sh': 'txt', '.bat': 'txt',
-            '.md': 'txt', '.ps1': 'txt', '.js': 'txt', '.css': 'txt', '.html': 'txt',
-            '.php': 'txt', '.sql': 'txt', '.xml': 'txt', '.yaml': 'txt', '.yml': 'txt',
-            '.toml': 'txt', '.ini': 'txt', '.conf': 'txt', '.log': 'txt', '.jsonl': 'txt',
-            '.json': 'json',
-            '.docx': 'docx',
-            '.xlsx': 'xlsx', '.xls': 'xlsx'
-        }
-        describe_type = describe_type_map.get(file_extension, 'txt')
-        stats_tracker.track_describe_used(user_id, describe_type)
+        temp_file = None
+        try:
+            document = update.message.document
+            document_file = await context.bot.get_file(document.file_id)
+            temp_dir = "temp_docs"
+            os.makedirs(temp_dir, exist_ok=True)
+            temp_file = os.path.join(temp_dir, f"doc_{uuid.uuid4()}{file_extension}")
+            await document_file.download_to_drive(temp_file)
 
-        # Craft the user question combining caption and document description
-        user_question = f"{caption}\n\nUser attached a {doc_type} document to this message. Here is the analysis of document contents:\n\n{document_description}"
+            if update.message.caption == None:
+                caption = "Analyze this document and describe its contents in detail."
+                describe_question = caption
+            else:
+                caption = update.message.caption
+                describe_question = f"Analyze this document and describe its contents in detail. When you are done, answer the following question: {caption}"
 
-        await status_message.edit_text("🤖 *Processing...*", parse_mode="markdown")
-        # Process like a regular message
-        await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
-        thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
+            await status_message.edit_text(f"🤖 *Analyzing {doc_type} content...*", parse_mode="markdown")
+            document_description = await describe_document(describe_question, temp_file)
+            
+            describe_type_map = {
+                '.pdf': 'pdf',
+                '.txt': 'txt', '.csv': 'txt', '.py': 'txt', '.sh': 'txt', '.bat': 'txt',
+                '.md': 'txt', '.ps1': 'txt', '.js': 'txt', '.css': 'txt', '.html': 'txt',
+                '.php': 'txt', '.sql': 'txt', '.xml': 'txt', '.yaml': 'txt', '.yml': 'txt',
+                '.toml': 'txt', '.ini': 'txt', '.conf': 'txt', '.log': 'txt', '.jsonl': 'txt',
+                '.json': 'json',
+                '.docx': 'docx',
+                '.xlsx': 'xlsx', '.xls': 'xlsx'
+            }
+            describe_type = describe_type_map.get(file_extension, 'txt')
+            stats_tracker.track_describe_used(user_id, describe_type)
 
-        async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
-            if step == "saving":
-                iteration = "final"
-                critique = "end"
-            live_limit_info = ""
-            if limit:
-                live_used = stats_tracker.get_user_action_count(user_id, days=30)
-                live_limit_info = f"📊 *Usage:* _{live_used}/{limit} actions (30d)_\n"
-            await thinking_message.edit_text(
-                f"💭 *Thinking...*\n"
-                f"- - - - \n"
-                f"{live_limit_info}"
-                f"📝 *Step:* _{step.replace('_', '-')}_\n"
-                f"📋 *Details:* _{details.replace('_', '-')}_\n"
-                f"🔄 *Iterations:* _{iteration}_\n"
-                f"🎯 *Critiques:* _{critique}_",
-                parse_mode="markdown"
-            )
+            user_question = f"{caption}\n\nUser attached a {doc_type} document to this message. Here is the analysis of document contents:\n\n{document_description}"
 
-        # Get response using the same logic as handle_message
-        response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context)
-        await send_response_to_user(update, thinking_message, response, user_id)
-        await send_reasoning_file(update, messages, user_id)
-        await status_message.edit_text("🤖 *Done!*", parse_mode="markdown")
+            await status_message.edit_text("🤖 *Processing...*", parse_mode="markdown")
+            await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
+            thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
 
-    except Exception as e:
-        trace_id = str(uuid.uuid4())
-        await status_message.edit_text(text=f"❌ An error occurred while analyzing the document. Trace ID: {trace_id}")
-        logging.error(f"An error occurred with trace ID {trace_id}: {str(e)}")
+            async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
+                if step == "saving":
+                    iteration = "final"
+                    critique = "end"
+                live_limit_info = ""
+                if limit:
+                    live_used = stats_tracker.get_user_action_count(user_id, days=30)
+                    live_limit_info = f"📊 *Usage:* _{live_used}/{limit} actions (30d)_\n"
+                await thinking_message.edit_text(
+                    f"💭 *Thinking...*\n"
+                    f"- - - - \n"
+                    f"{live_limit_info}"
+                    f"📝 *Step:* _{step.replace('_', '-')}_\n"
+                    f"📋 *Details:* _{details.replace('_', '-')}_\n"
+                    f"🔄 *Iterations:* _{iteration}_\n"
+                    f"🎯 *Critiques:* _{critique}_",
+                    parse_mode="markdown"
+                )
 
-    finally:
-        # Clean up temporary file
-        if temp_file and os.path.exists(temp_file):
-            try:
-                os.remove(temp_file)
-            except Exception as e:
-                print(f"Error cleaning up temporary file {temp_file}: {str(e)}")
+            response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context)
+            await send_response_to_user(update, thinking_message, response, user_id)
+            await send_reasoning_file(update, messages, user_id)
+            await status_message.edit_text("🤖 *Done!*", parse_mode="markdown")
+
+        except Exception as e:
+            trace_id = str(uuid.uuid4())
+            await status_message.edit_text(text=f"❌ An error occurred while analyzing the document. Trace ID: {trace_id}")
+            logging.error(f"An error occurred with trace ID {trace_id}: {str(e)}")
+
+        finally:
+            if temp_file and os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except Exception as e:
+                    print(f"Error cleaning up temporary file {temp_file}: {str(e)}")
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /settings command"""
