@@ -687,12 +687,22 @@ async def extract_video_screenshots(video_path: str) -> list:
     return screenshot_paths
 
 
-async def describe_video_screenshots(screenshot_paths: list) -> str:
+async def describe_video_screenshots(screenshot_paths: list, transcription: str = "", caption: str = "") -> str:
     """Describe video screenshots using GPT-5-mini with all images in one request."""
     if not screenshot_paths:
         return ""
     
-    content = [{"type": "text", "text": "Describe what's happening in this video based on these 4 screenshots taken at different moments (10%, 40%, 60%, 85% of the video). Give a brief visual summary of the video content."}]
+    prompt = "Describe what's happening in this video based on these 4 screenshots taken at different moments (10%, 40%, 60%, 85% of the video). Give a brief visual summary of the video content."
+    
+    if transcription or caption:
+        prompt += "\n\nAdditional context from the video:"
+        if caption:
+            prompt += f"\nUser's caption: {caption}"
+        if transcription:
+            prompt += f"\nAudio transcription: {transcription}"
+        prompt += "\n\nUse this context to better understand what's shown in the screenshots and what the user is asking about."
+    
+    content = [{"type": "text", "text": prompt}]
     
     for i, path in enumerate(screenshot_paths):
         base64_image = encode_image(path)
@@ -1026,6 +1036,7 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
         stats_tracker.track_message_received(user_id, "video")
         
         # Get video file from video, video_note, or document (sent without compression)
+        is_video_note = update.message.video_note is not None
         video = update.message.video or update.message.video_note or update.message.document
         if not video:
             await update.message.reply_text("❌ Could not process video message.")
@@ -1068,7 +1079,8 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
             video_visual_description = ""
             if screenshot_paths:
                 await status_message.edit_text("🖼️ *Analyzing video frames...*", parse_mode="markdown")
-                video_visual_description = await describe_video_screenshots(screenshot_paths)
+                screenshot_transcription = (transcription or "") if is_video_note else ""
+                video_visual_description = await describe_video_screenshots(screenshot_paths, transcription=screenshot_transcription, caption=caption)
                 if video_visual_description:
                     print(f"Video visual description: {video_visual_description}")
             
@@ -1082,7 +1094,7 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 if transcription:
                     display_text += f"🎙️ *Audio:* {transcription}\n"
                 if video_visual_description:
-                    display_text += f"🖼️ *Visual:* {video_visual_description[:1024]}..."
+                    display_text += f"🖼️ *Visual:* {video_visual_description[:200]}... (Full description in reasoning file)"
                 if caption:
                     display_text += f"\n📝 *Caption:* {caption}"
                 await status_message.edit_text(display_text, parse_mode="markdown")
