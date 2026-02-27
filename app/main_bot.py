@@ -709,7 +709,7 @@ async def describe_video_screenshots(screenshot_paths: list) -> str:
             openai_client.chat.completions.create,
             model="gpt-5-mini",
             messages=[{"role": "user", "content": content}],
-            max_tokens=1024
+            max_completion_tokens=1024
         )
         return response.choices[0].message.content
     except Exception as e:
