@@ -1099,23 +1099,35 @@ You have been asked to answer a query given sources. Consider the following when
         if update_status:
             await update_status(step="saving", details="Saving conversation history", iteration=0, critique=0)
         
+        def _get_msg_text(msg):
+            """Safely extract text from a message content block"""
+            try:
+                content = msg.get('content', [])
+                if isinstance(content, str):
+                    return content
+                if isinstance(content, list) and len(content) > 0:
+                    first = content[0]
+                    if isinstance(first, dict) and first.get('type') == 'text':
+                        return first.get('text', '')
+            except (IndexError, KeyError, TypeError, AttributeError):
+                pass
+            return None
+
         if settings_summarization_history_enabled and settings_short_term_memory_enabled:
-            # remove summary from thread_messages
             for message in summarizations_context:
-                for msg in thread_messages:
-                    if msg['content'][0]['text'] == message['content']:
+                for msg in list(thread_messages):
+                    msg_text = _get_msg_text(msg)
+                    if msg_text is not None and msg_text == message['content']:
                         thread_messages.remove(msg)
 
         if settings_dialog_history_enabled and settings_short_term_memory_enabled:
-            # remove from thread_messages, all messages from dialog_history
             for message in dialog_history:
-                # remove message from thread_messages
-                for msg in thread_messages:
-                    if msg['content'][0]['text'] == message['content']:
+                for msg in list(thread_messages):
+                    msg_text = _get_msg_text(msg)
+                    if msg_text is not None and msg_text == message['content']:
                         thread_messages.remove(msg)
 
         if settings_reasoning_context_enabled and settings_short_term_memory_enabled:
-            # remove from thread_messages, all messages from short_term_memory
             for message in short_term_memory:
                 if message in thread_messages:
                     thread_messages.remove(message)
