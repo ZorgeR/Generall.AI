@@ -676,6 +676,21 @@ User message: {question}"""
             print(f"Error in simple response, falling back to full agent: {str(e)}")
             return None, None
 
+    @staticmethod
+    def _get_msg_text(msg):
+        """Safely extract text from a message content block"""
+        try:
+            content = msg.get('content', [])
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list) and len(content) > 0:
+                first = content[0]
+                if isinstance(first, dict) and first.get('type') == 'text':
+                    return first.get('text', '')
+        except (IndexError, KeyError, TypeError, AttributeError):
+            pass
+        return None
+
     async def generate_response(self, question: str, update_status=None) -> str:
         print(f"\n=== Starting Chain of Thought for Question: {question} ===")
         question = f"Message received time in UTC+0: {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}\n\n{question}"
@@ -1046,7 +1061,9 @@ You have been asked to answer a query given sources. Consider the following when
 
             # load array of previous messages in context_memory
             for message in short_term_memory:
-                context_memory.append({"role": message["role"], "content": message["content"][0]["text"]})
+                text = self._get_msg_text(message)
+                if text:
+                    context_memory.append({"role": message["role"], "content": text})
         
         # Pass user message separately
         user_question = [{"role": "user", "content": question}]
@@ -1099,31 +1116,17 @@ You have been asked to answer a query given sources. Consider the following when
         if update_status:
             await update_status(step="saving", details="Saving conversation history", iteration=0, critique=0)
         
-        def _get_msg_text(msg):
-            """Safely extract text from a message content block"""
-            try:
-                content = msg.get('content', [])
-                if isinstance(content, str):
-                    return content
-                if isinstance(content, list) and len(content) > 0:
-                    first = content[0]
-                    if isinstance(first, dict) and first.get('type') == 'text':
-                        return first.get('text', '')
-            except (IndexError, KeyError, TypeError, AttributeError):
-                pass
-            return None
-
         if settings_summarization_history_enabled and settings_short_term_memory_enabled:
             for message in summarizations_context:
                 for msg in list(thread_messages):
-                    msg_text = _get_msg_text(msg)
+                    msg_text = self._get_msg_text(msg)
                     if msg_text is not None and msg_text == message['content']:
                         thread_messages.remove(msg)
 
         if settings_dialog_history_enabled and settings_short_term_memory_enabled:
             for message in dialog_history:
                 for msg in list(thread_messages):
-                    msg_text = _get_msg_text(msg)
+                    msg_text = self._get_msg_text(msg)
                     if msg_text is not None and msg_text == message['content']:
                         thread_messages.remove(msg)
 

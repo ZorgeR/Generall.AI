@@ -709,7 +709,7 @@ async def describe_video_screenshots(screenshot_paths: list) -> str:
             openai_client.chat.completions.create,
             model="gpt-5-mini",
             messages=[{"role": "user", "content": content}],
-            max_completion_tokens=1024
+            max_completion_tokens=2048
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -796,7 +796,20 @@ async def send_reasoning_file(update: Update, messages, user_id: str):
     try:
         with open(file_path, "w", encoding="utf-8") as f:
             for msg in messages:
-                f.write(msg["content"][0]["text"] + "\n\n========\n\n")
+                try:
+                    content = msg.get("content", [])
+                    if isinstance(content, str):
+                        f.write(content + "\n\n========\n\n")
+                    elif isinstance(content, list) and len(content) > 0:
+                        first = content[0]
+                        if isinstance(first, dict) and first.get("type") == "text":
+                            f.write(first.get("text", "") + "\n\n========\n\n")
+                        elif isinstance(first, dict) and first.get("type") == "tool_use":
+                            f.write(f"[Tool: {first.get('name', 'unknown')}]\n\n========\n\n")
+                        elif isinstance(first, dict) and first.get("type") == "tool_result":
+                            f.write(f"[Tool Result: {first.get('content', '')[:200]}]\n\n========\n\n")
+                except (KeyError, IndexError, TypeError):
+                    pass
         
         await update.message.reply_document(
             document=open(file_path, "rb"), 
@@ -1069,7 +1082,7 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 if transcription:
                     display_text += f"🎙️ *Audio:* {transcription}\n"
                 if video_visual_description:
-                    display_text += f"🖼️ *Visual:* {video_visual_description[:200]}..."
+                    display_text += f"🖼️ *Visual:* {video_visual_description[:1024]}..."
                 if caption:
                     display_text += f"\n📝 *Caption:* {caption}"
                 await status_message.edit_text(display_text, parse_mode="markdown")
