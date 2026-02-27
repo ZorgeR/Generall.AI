@@ -273,17 +273,20 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         cicles = 0
         critique = 0
         judge = 0
+        max_iterations = int(user_settings.get("tools").get("max_iteration", 20))
+        tools_enabled = user_settings.get("tools").get("enabled", True)
         last_step_category = "initial"
         last_tool_name = ""
-        while True:
+        
+        for iteration in range(max_iterations):
+            # Sanitize empty text blocks
             for message in processed_messages:
                 if "content" in message:
                     try:
-                        if message["content"][0]["type"] == "text":
+                        if isinstance(message["content"], list) and message["content"][0].get("type") == "text":
                             if message["content"][0]["text"] == "":
-                                print(f"\nEmpty message detected and replaced.")
                                 message["content"][0]["text"] = "Empty message."
-                    except:
+                    except (IndexError, KeyError, TypeError, AttributeError):
                         pass
 
             if update_status:
@@ -301,18 +304,11 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 else:
                     await update_status(step=last_step_category, details="Additional step", iteration=cicles, critique=critique)
 
-            if self.thinking:
-                tool_choice = {"type": "auto"}
-            else:
-                if last_step_category == "judge" or last_step_category == "critique":
-                    tool_choice = {"type": "any"}
-                else:
-                    tool_choice = {"type": "auto"}
-
-            # print(f"\nNew iteration\nProcessed messages: {processed_messages}\nSystem: {system}")
+            # Always use "auto" so the model can choose to stop with text
+            tool_choice = {"type": "auto"}
 
             if self.thinking:
-                print(f"\nAgent prepare messages with thinking")
+                print(f"\nAgent iteration {iteration} with thinking")
                 response = await asyncio.to_thread(
                     self.client.messages.create,
                     model=self.model,
@@ -327,7 +323,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                     }
                 )
             else:
-                print(f"\nAgent prepare messages without thinking")
+                print(f"\nAgent iteration {iteration} without thinking")
                 response = await asyncio.to_thread(
                     self.client.messages.create,
                     model=self.model,
@@ -346,58 +342,52 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 if content_block.type == 'text':
                     current_text += content_block.text
 
-            # Handle tool calls if present
-            if (response.stop_reason == "tool_use" and response.content) and cicles < int(user_settings.get("tools").get("max_iteration")) and user_settings.get("tools").get("enabled"):
+            # Handle tool calls using proper Anthropic tool_result protocol
+            if response.stop_reason == "tool_use" and tools_enabled and cicles < max_iterations:
                 if update_status:
                     last_step_category = "executing-tools"
                     await update_status(step=last_step_category, details="Executing tools", iteration=cicles, critique=critique)
                 print(f"\nExecuting tool call cycle: {cicles}")
                 
-                tool_results = []
+                # Append the full assistant response (preserves tool_use blocks for the API)
+                processed_messages.append({
+                    "role": "assistant",
+                    "content": [block.model_dump() for block in response.content]
+                })
                 
+                # Execute tools and build proper tool_result blocks
+                tool_result_blocks = []
                 for content_block in response.content:
                     if content_block.type == 'tool_use':
                         cicles += 1
                         print(f"\nExecuting tool: {content_block.name}")
-                        last_step_category = "executing-tools"
-                        await update_status(step=last_step_category, details="Tool name: " + content_block.name, iteration=cicles, critique=critique)
+                        if update_status:
+                            last_step_category = "executing-tools"
+                            await update_status(step=last_step_category, details="Tool name: " + content_block.name, iteration=cicles, critique=critique)
                         last_tool_name = content_block.name
                         result = await self.execute_tool(content_block.name, content_block.input)
-                        tool_results.append({
-                            "tool_name": content_block.name,
-                            "result": result
-                        })
                         print(f"Tool name: {content_block.name}\nTool result: {result}")
+                        
+                        tool_result_blocks.append({
+                            "type": "tool_result",
+                            "tool_use_id": content_block.id,
+                            "content": str(result)
+                        })
                 
-                # Add response and tool results to conversation
-                tool_messages = []
-                for result in tool_results:
-                    print(f"\nTool called: {result['tool_name']}")
-                    tool_messages.append(f"{result['result']}")
+                # Send tool results back as proper tool_result message
+                processed_messages.append({
+                    "role": "user",
+                    "content": tool_result_blocks
+                })
                 
-                # f"""Tool: {result['tool_name']}
-                # Result: {result['result']}
-                # Now you can proceed with the next step, like executing another tools or code."""
-
-                if current_text:  # Only add assistant message if there's content
-                    processed_messages.append({
-                        "role": "assistant", 
-                        "content": [{"type": "text", "text": current_text}]
-                    })
-                
-                if tool_messages:  # Only add tool messages if there are results
-                    processed_messages.append({
-                        "role": "user", 
-                        "content": [{"type": "text", "text": "\n\n".join(tool_messages)}]
-                    })
-                
-                # print(f"\nProcessed messages: {processed_messages}")
-                # Continue the conversation
                 continue
             
+            # If model stopped without tool use, we have a final text response
+            # Run critique if enabled
             if user_settings.get("critique").get("enabled") and critique < int(user_settings.get("critique").get("max_iteration")):
                 last_step_category = "critique"
-                await update_status(step=last_step_category, details="Starting critique session", iteration=cicles, critique=critique)
+                if update_status:
+                    await update_status(step=last_step_category, details="Starting critique session", iteration=cicles, critique=critique)
                 critique_answer = await self.critique_response(question=question, answer=current_text, dialog_history=dialog_history)
                 print(f"\nCritique: {critique_answer}")
                 if critique_answer:
@@ -405,11 +395,10 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                     critique_details = critique_answer.critique_details
                     if need_rewrite_answer and critique < user_settings.get("critique").get("max_iteration"):
                         if update_status:
-                            last_step_category = "critique"
                             await update_status(step=last_step_category, details="Critiquing response", iteration=cicles, critique=critique)
                         print(f"\nCritique iteration: {critique}")
                         critique += 1
-                        if current_text:  # Only add assistant message if there's content
+                        if current_text:
                             processed_messages.append({
                                 "role": "assistant", 
                                 "content": [{"type": "text", "text": current_text}]
@@ -420,7 +409,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                         })
                         continue
 
-            # Add judge evaluation after critique
+            # Run judge if enabled
             if user_settings.get("judge").get("enabled") and judge < int(user_settings.get("judge").get("max_iteration")):
                 if update_status:
                     last_step_category = "judge"
@@ -430,7 +419,6 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 if not judge_decision:
                     if judge < user_settings.get("judge").get("max_iteration"):
                         if update_status:
-                            last_step_category = "judge"
                             await update_status(step=last_step_category, details="Judge requested improvements", iteration=cicles, critique=critique)
                         judge += 1
                         if current_text:
@@ -444,9 +432,46 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                         })
                         continue
             
+            # Done - no more tool calls, critique, or judge needed
             processed_messages.append({"role": "assistant", "content": [{"type": "text", "text": current_text}]})
-            # No more tool calls, return the final response
             return current_text, processed_messages
+        
+        # Iteration limit reached - ask model for a final compiled response
+        print(f"\nWarning: Agent reached max iterations ({max_iterations}), requesting final response")
+        processed_messages.append({
+            "role": "assistant",
+            "content": [{"type": "text", "text": current_text}] if current_text else [{"type": "text", "text": "Processing..."}]
+        })
+        processed_messages.append({
+            "role": "user",
+            "content": [{"type": "text", "text": (
+                "SYSTEM NOTICE: You have reached the maximum iteration limit for this request. "
+                "You must now provide your final response immediately. "
+                "Compile all data, findings, and results you have gathered so far into a complete answer. "
+                "Do NOT call any tools. Your next message will be sent directly to the user. "
+                "If the task is not fully complete, summarize what was done and what remains, so user can ask you to continue if needed."
+            )}]
+        })
+        
+        try:
+            final_response = await asyncio.to_thread(
+                self.client.messages.create,
+                model=self.model,
+                messages=processed_messages,
+                system=system,
+                max_tokens=4096
+            )
+            final_text = ""
+            for block in final_response.content:
+                if block.type == 'text':
+                    final_text += block.text
+            if final_text:
+                current_text = final_text
+        except Exception as e:
+            print(f"Error getting final response: {str(e)}")
+        
+        processed_messages.append({"role": "assistant", "content": [{"type": "text", "text": current_text}]})
+        return current_text, processed_messages
 
 
 class ChainOfThoughtAgent:
