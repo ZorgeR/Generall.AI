@@ -647,6 +647,76 @@ async def transcribe_audio(audio_file_path):
     else:
         return False
 
+async def extract_video_screenshots(video_path: str) -> list:
+    """Extract 4 screenshots from video at 10%, 40%, 60%, 85% positions. Returns list of temp file paths."""
+    import subprocess
+    
+    # Get video duration using ffprobe
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+            capture_output=True, text=True, timeout=30
+        )
+        duration = float(result.stdout.strip())
+    except Exception as e:
+        print(f"Error getting video duration: {e}")
+        return []
+    
+    positions = [0.10, 0.40, 0.60, 0.85]
+    screenshot_paths = []
+    temp_dir = "temp_audio"
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    for pos in positions:
+        timestamp = duration * pos
+        output_path = os.path.join(temp_dir, f"screenshot_{uuid.uuid4()}.jpg")
+        try:
+            await asyncio.to_thread(
+                subprocess.run,
+                ["ffmpeg", "-ss", str(timestamp), "-i", video_path,
+                 "-vframes", "1", "-q:v", "2", "-y", output_path],
+                capture_output=True, timeout=30
+            )
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                screenshot_paths.append(output_path)
+        except Exception as e:
+            print(f"Error extracting screenshot at {pos*100}%: {e}")
+    
+    return screenshot_paths
+
+
+async def describe_video_screenshots(screenshot_paths: list) -> str:
+    """Describe video screenshots using GPT-5-mini with all images in one request."""
+    if not screenshot_paths:
+        return ""
+    
+    content = [{"type": "text", "text": "Describe what's happening in this video based on these 4 screenshots taken at different moments (10%, 40%, 60%, 85% of the video). Give a brief visual summary of the video content."}]
+    
+    for i, path in enumerate(screenshot_paths):
+        base64_image = encode_image(path)
+        position_labels = ["10%", "40%", "60%", "85%"]
+        label = position_labels[i] if i < len(position_labels) else f"{i+1}"
+        content.append({"type": "text", "text": f"Frame at {label}:"})
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+        })
+    
+    try:
+        response = await asyncio.to_thread(
+            openai_client.chat.completions.create,
+            model="gpt-5-mini",
+            messages=[{"role": "user", "content": content}],
+            max_tokens=1024
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"Error describing video screenshots: {e}")
+        return ""
+
+
 async def get_answer(user_message, user_id, update_status=None, update=None, context=None):
     # Handle special cases directly
     if user_message.lower().strip() in ["current time", "time", "what time is it"]:
@@ -956,7 +1026,8 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
         temp_video = os.path.join(temp_dir, f"video_{uuid.uuid4()}.mp4")
         temp_mp3 = os.path.join(temp_dir, f"video_audio_{uuid.uuid4()}.mp3")
         
-        status_message = await update.message.reply_text("🎬 *Extracting audio from video...*", parse_mode="markdown")
+        screenshot_paths = []
+        status_message = await update.message.reply_text("🎬 *Processing video...*", parse_mode="markdown")
         
         try:
             video_file = await context.bot.get_file(video.file_id)
@@ -964,26 +1035,55 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
             
             print(f"Downloaded video file to: {temp_video}")
             
-            # Extract audio from video
-            audio = AudioSegment.from_file(temp_video, format="mp4")
-            audio.export(temp_mp3, format="mp3")
+            # Extract audio and screenshots in parallel
+            await status_message.edit_text("🎬 *Extracting audio and analyzing frames...*", parse_mode="markdown")
+            
+            async def extract_audio():
+                a = AudioSegment.from_file(temp_video, format="mp4")
+                a.export(temp_mp3, format="mp3")
+                return await transcribe_audio(temp_mp3)
+            
+            transcription_task = extract_audio()
+            screenshots_task = extract_video_screenshots(temp_video)
+            
+            transcription, screenshots = await asyncio.gather(transcription_task, screenshots_task)
+            screenshot_paths = screenshots
             
             print(f"Extracted audio to MP3: {temp_mp3}")
             
-            await status_message.edit_text("🎙️ *Transcribing audio...*", parse_mode="markdown")
-            transcription = await transcribe_audio(temp_mp3)
+            # Describe screenshots if we got any
+            video_visual_description = ""
+            if screenshot_paths:
+                await status_message.edit_text("🖼️ *Analyzing video frames...*", parse_mode="markdown")
+                video_visual_description = await describe_video_screenshots(screenshot_paths)
+                if video_visual_description:
+                    print(f"Video visual description: {video_visual_description}")
             
-            if transcription:
-                print(f"Video transcription: {transcription}")
+            await status_message.edit_text("🎙️ *Transcription complete...*", parse_mode="markdown")
+            
+            if transcription or video_visual_description:
+                if transcription:
+                    print(f"Video transcription: {transcription}")
                 
-                display_text = f"🎬 *Transcription:*\n{transcription}"
+                display_text = "🎬 *Video analysis:*\n"
+                if transcription:
+                    display_text += f"🎙️ *Audio:* {transcription}\n"
+                if video_visual_description:
+                    display_text += f"🖼️ *Visual:* {video_visual_description[:200]}..."
                 if caption:
-                    display_text += f"\n\n📝 *Caption:* {caption}"
+                    display_text += f"\n📝 *Caption:* {caption}"
                 await status_message.edit_text(display_text, parse_mode="markdown")
                 
-                user_message = transcription
+                # Build message for agent with all available context
+                parts = []
                 if caption:
-                    user_message = f"{caption}\n\n(Voice from video: {transcription})"
+                    parts.append(f"User caption: {caption}")
+                if transcription:
+                    parts.append(f"Audio transcription from video: {transcription}")
+                if video_visual_description:
+                    parts.append(f"Visual description of video (from 4 screenshots at 10%, 40%, 60%, 85%): {video_visual_description}")
+                
+                user_message = "\n\n".join(parts) if parts else "User sent a video without audio or caption."
                 
                 await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
                 thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
@@ -1035,7 +1135,7 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     await thinking_message.edit_text(text=f"❌ An error occurred. Trace ID: {trace_id}")
                     logging.error(f"An error occurred with trace ID {trace_id}: {str(e)}")
             else:
-                await status_message.edit_text("❌ Failed to transcribe audio from video", parse_mode="markdown")
+                await status_message.edit_text("❌ Could not extract any content from video", parse_mode="markdown")
                 return False
 
         except Exception as e:
@@ -1044,13 +1144,12 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
             return None
         
         finally:
-            try:
-                if os.path.exists(temp_video):
-                    os.remove(temp_video)
-                if os.path.exists(temp_mp3):
-                    os.remove(temp_mp3)
-            except Exception as e:
-                print(f"Error cleaning up temporary files: {str(e)}")
+            for f in [temp_video, temp_mp3] + screenshot_paths:
+                try:
+                    if f and os.path.exists(f):
+                        os.remove(f)
+                except Exception as e:
+                    print(f"Error cleaning up {f}: {str(e)}")
 
 async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /voice command"""
