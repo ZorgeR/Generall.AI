@@ -157,6 +157,10 @@ class SecureToolWrapper:
         """
         logger.info(f"Running search operation {operation} in secure container for user {user_id}")
         
+        # Serialize args as JSON string, then parse in the script via json.loads
+        # to avoid JSON true/false/null being invalid Python literals
+        args_json = json.dumps(args)
+        
         # Create a Python script to perform the search operation
         script = f"""
 import os
@@ -169,19 +173,16 @@ def memory_search(query, case_sensitive=False):
     base_path = Path('.')
     results = []
     
-    # Search through all text files in the directory
     for file_path in base_path.glob('**/*.txt'):
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
                 
-            # Perform search based on case sensitivity
             if case_sensitive:
                 matches = re.finditer(re.escape(query), content)
             else:
                 matches = re.finditer(re.escape(query), content, re.IGNORECASE)
             
-            # Extract matches with context
             for match in matches:
                 start = max(0, match.start() - 100)
                 end = min(len(content), match.end() + 100)
@@ -200,11 +201,10 @@ def memory_search(query, case_sensitive=False):
     
     return results
 
-# Parse arguments
-operation = "{operation}"
-args = {json.dumps(args)}
+args = json.loads({repr(args_json)})
 
-# Execute the operation
+operation = "{operation}"
+
 if operation == "memory_search":
     result = memory_search(
         args.get("query", ""),
@@ -213,7 +213,6 @@ if operation == "memory_search":
 else:
     result = f"Unknown operation: {{operation}}"
 
-# Print the result as JSON
 print(json.dumps(result))
 """
         

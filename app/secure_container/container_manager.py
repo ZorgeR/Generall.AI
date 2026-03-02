@@ -333,6 +333,10 @@ echo "Package installation completed"
         Returns:
             Operation result
         """
+        # Serialize args as JSON string, then parse in the script via json.loads
+        # to avoid JSON true/false/null being invalid Python literals
+        args_json = json.dumps(args)
+        
         # Create a Python script to perform the file operation
         script = f"""
 import os
@@ -340,13 +344,27 @@ import json
 import sys
 from pathlib import Path
 
-def list_files(path='.'):
-    result = []
-    for item in Path(path).iterdir():
+MAX_FILES = 200
+
+def list_files(path='.', page=1):
+    all_items = []
+    base = Path(path)
+    for item in sorted(base.iterdir(), key=lambda x: (x.is_file(), x.name)):
         if item.is_file():
-            result.append({{"name": item.name, "type": "file", "size": item.stat().st_size}})
+            all_items.append({{"name": item.name, "type": "file", "size": item.stat().st_size}})
         elif item.is_dir():
-            result.append({{"name": item.name, "type": "directory"}})
+            sub_count = sum(1 for _ in item.iterdir()) if item.exists() else 0
+            all_items.append({{"name": item.name, "type": "directory", "items": sub_count}})
+
+    total = len(all_items)
+    start = (page - 1) * MAX_FILES
+    end = start + MAX_FILES
+    page_items = all_items[start:end]
+    total_pages = (total + MAX_FILES - 1) // MAX_FILES if total > 0 else 1
+
+    result = {{"files": page_items, "total": total, "page": page, "total_pages": total_pages}}
+    if total > MAX_FILES:
+        result["note"] = f"Showing {{len(page_items)}} of {{total}} items (page {{page}}/{{total_pages}}). Use page parameter to see more."
     return result
 
 def read_file(filename):
@@ -386,14 +404,14 @@ def delete_directory(dirname):
     except Exception as e:
         return str(e)
 
-# Parse arguments
-operation = "{operation}"
-args = {json.dumps(args)}
+args = json.loads({repr(args_json)})
 
-# Execute the operation
+operation = "{operation}"
+
 if operation == "list_files":
     path = args.get("path", ".")
-    result = list_files(path)
+    page = args.get("page", 1)
+    result = list_files(path, page)
 elif operation == "read_file":
     result = read_file(args["filename"])
 elif operation == "create_file":
@@ -407,7 +425,6 @@ elif operation == "delete_directory":
 else:
     result = f"Unknown operation: {{operation}}"
 
-# Print the result as JSON
 print(json.dumps(result))
 """
         

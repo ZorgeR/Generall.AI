@@ -51,10 +51,20 @@ class FileOperations:
         return [
             {
                 "name": "list_files",
-                "description": "List all files in the user's data directory",
+                "description": "List files in the user's data directory. Returns total item count, current page, and total pages. Results are paginated at 200 items per page — use the page parameter to navigate.",
                 "input_schema": {
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Subdirectory path to list (default: root of user data directory)",
+                        },
+                        "page": {
+                            "type": "integer",
+                            "description": "Page number for pagination (default: 1, 200 items per page)",
+                            "default": 1
+                        },
+                    },
                     "required": [],
                 },
             },
@@ -226,7 +236,10 @@ class FileOperations:
     async def execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
         """Execute a tool by name with given arguments"""
         if tool_name == "list_files":
-            return self.list_directory()
+            return self.list_directory(
+                tool_args.get("path", "."),
+                tool_args.get("page", 1)
+            )
         elif tool_name == "create_file":
             return self.create_text_file(tool_args["filename"], tool_args["content"])
         elif tool_name == "read_file":
@@ -262,11 +275,38 @@ class FileOperations:
         else:
             return f"Unknown tool: {tool_name}"
 
-    def list_directory(self) -> str:
-        """List all files in the user's data directory"""
+    def list_directory(self, path: str = ".", page: int = 1) -> str:
+        """List files in the user's data directory with pagination"""
+        MAX_FILES = 200
         try:
-            files = [str(f.relative_to(self.base_path)) for f in self.base_path.glob("**/*") if f.is_file()]
-            return f"Files found: {files}"
+            target = self.base_path / path if path != "." else self.base_path
+            if not target.exists():
+                return f"Directory not found: {path}"
+            
+            all_items = []
+            for item in sorted(target.iterdir(), key=lambda x: (x.is_file(), x.name)):
+                rel = str(item.relative_to(self.base_path))
+                if item.is_file():
+                    all_items.append(f"{rel} ({item.stat().st_size} bytes)")
+                elif item.is_dir():
+                    sub_count = sum(1 for _ in item.iterdir()) if item.exists() else 0
+                    all_items.append(f"{rel}/ ({sub_count} items)")
+            
+            total = len(all_items)
+            start = (page - 1) * MAX_FILES
+            end = start + MAX_FILES
+            page_items = all_items[start:end]
+            total_pages = (total + MAX_FILES - 1) // MAX_FILES if total > 0 else 1
+            
+            result = f"Files found ({total} total"
+            if total > MAX_FILES:
+                result += f", page {page}/{total_pages}"
+            result += f"): {page_items}"
+            
+            if page < total_pages:
+                result += f"\n\nMore files available. Use page={page + 1} to see next page."
+            
+            return result
         except Exception as e:
             return f"Error listing directory: {str(e)}"
 

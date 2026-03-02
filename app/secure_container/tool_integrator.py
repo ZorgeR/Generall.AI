@@ -245,7 +245,10 @@ class ToolIntegrator:
                     # Extract arguments from the method call
                     method_args = {}
                     if method_name == "list_files":
-                        method_args = {"path": kwargs.get("path", ".")}
+                        method_args = {
+                            "path": kwargs.get("path", args[0] if args else "."),
+                            "page": kwargs.get("page", args[1] if len(args) > 1 else 1),
+                        }
                     elif method_name == "read_file":
                         method_args = {"filename": args[0] if args else kwargs.get("filename")}
                     elif method_name == "create_file":
