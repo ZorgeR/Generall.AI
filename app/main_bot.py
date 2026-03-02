@@ -21,6 +21,8 @@ from pathlib import Path
 # Import the secure container system
 from secure_container.main import initialize_secure_containers, cleanup_containers
 from stats import stats_tracker, DEFAULT_ACTION_LIMIT
+from agents.main import streaming_enabled
+import time
 import shutil
 
 # Check if running in Docker
@@ -78,7 +80,7 @@ openai_api_key_whisper = os.getenv("OPENAI_API_KEY_WHISPER")
 openai_client_whisper = OpenAI(api_key=openai_api_key_whisper)
 openai_client = OpenAI(api_key=openai_api_key)
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
-anthropic_client = anthropic.Anthropic(api_key=anthropic_api_key)
+anthropic_client = anthropic.AsyncAnthropic(api_key=anthropic_api_key)
 send_reasoning = True
 
 user_invites = {}
@@ -332,8 +334,7 @@ async def describe_document_anthropic(question, file_path, document_type, file_m
     if document_in_base64 is None:
         return "Error: Document file not found"
 
-    message = await asyncio.to_thread(
-        anthropic_client.messages.create,
+    message = await anthropic_client.messages.create(
         model=anthropic_model,
         messages=[
             {
@@ -378,8 +379,7 @@ async def describe_txt(question, txt_path):
     if len(txt_content) > 100000:  # Approximately 100KB
         return await process_large_text(txt_content, question, "text document")
     
-    message = await asyncio.to_thread(
-        anthropic_client.messages.create,
+    message = await anthropic_client.messages.create(
         model=anthropic_model,
         messages=[
             {
@@ -414,8 +414,7 @@ async def describe_json(question, json_path):
     if len(json_content) > 100000:  # Approximately 100KB
         return await process_large_text(json_content, question, "JSON document")
     
-    message = await asyncio.to_thread(
-        anthropic_client.messages.create,
+    message = await anthropic_client.messages.create(
         model=anthropic_model,
         messages=[
             {
@@ -450,8 +449,7 @@ async def describe_docx(question, docx_path):
     if len(docx_content) > 100000:  # Approximately 100KB
         return await process_large_text(docx_content, question, "Word document")
     
-    message = await asyncio.to_thread(
-        anthropic_client.messages.create,
+    message = await anthropic_client.messages.create(
         model=anthropic_model,
         messages=[
             {
@@ -495,8 +493,7 @@ async def describe_xlsx(question, xlsx_path):
     if len(xlsx_content) > 100000:  # Approximately 100KB
         return await process_large_text(xlsx_content, question, "Excel spreadsheet")
     
-    message = await asyncio.to_thread(
-        anthropic_client.messages.create,
+    message = await anthropic_client.messages.create(
         model=anthropic_model,
         messages=[
             {
@@ -521,8 +518,7 @@ async def process_large_text(content, question, content_type):
     
     summaries = []
     for i, chunk in enumerate(chunks):
-        message = await asyncio.to_thread(
-            anthropic_client.messages.create,
+        message = await anthropic_client.messages.create(
             model=anthropic_model,
             messages=[
                 {
@@ -541,8 +537,7 @@ async def process_large_text(content, question, content_type):
     # Combine the summaries and answer the question
     combined_summary = "\n\n".join([f"Part {i+1} summary: {summary}" for i, summary in enumerate(summaries)])
     
-    final_message = await asyncio.to_thread(
-        anthropic_client.messages.create,
+    final_message = await anthropic_client.messages.create(
         model=anthropic_model,
         messages=[
             {
@@ -582,8 +577,7 @@ async def describe_image_anthropic(question, image_path):
     image_media_type = "image/jpeg"
     # image_data = base64.standard_b64encode(image_content).decode("utf-8")
 
-    message = await asyncio.to_thread(
-        anthropic_client.messages.create,
+    message = await anthropic_client.messages.create(
         model=anthropic_model,
         max_tokens=1024,
         messages=[
@@ -788,7 +782,7 @@ async def describe_video_screenshots(screenshot_paths: list, transcription: str 
         return ""
 
 
-async def get_answer(user_message, user_id, update_status=None, update=None, context=None):
+async def get_answer(user_message, user_id, update_status=None, update=None, context=None, on_text_chunk=None):
     # Handle special cases directly
     if user_message.lower().strip() in ["current time", "time", "what time is it"]:
         current_time = datetime.now()
@@ -813,7 +807,7 @@ async def get_answer(user_message, user_id, update_status=None, update=None, con
     
     # For all other queries, use the agent
     agent = agents.ChainOfThoughtAgent(model_type="anthropic", model=anthropic_model, user_id=user_id, telegram_update=update, user_settings=user_settings)
-    response, messages = await agent.generate_response(user_message, update_status)
+    response, messages = await agent.generate_response(user_message, update_status, on_text_chunk=on_text_chunk)
     print("\nFinal Response with Step-by-Step Reasoning:")
     print(response)
     return response, messages
@@ -895,6 +889,46 @@ async def send_reasoning_file(update: Update, messages, user_id: str):
         except Exception as e:
             print(f"Error removing reasoning file: {str(e)}")
 
+DRAFT_THROTTLE = 0.3
+
+def get_thread_id(update: Update):
+    """Extract message_thread_id from update if available."""
+    if update and update.message and update.message.message_thread_id:
+        return update.message.message_thread_id
+    return None
+
+def create_streaming_callback(bot, user_id: str, message_thread_id: int = None):
+    """Create a throttled on_text_chunk callback for streaming to Telegram draft messages.
+    Returns None if streaming is disabled."""
+    if not streaming_enabled:
+        return None
+    
+    state = {"last_update": 0.0, "draft_id": 1}
+    
+    async def on_text_chunk(text: str, is_thinking: bool = False):
+        now = time.monotonic()
+        if now - state["last_update"] < DRAFT_THROTTLE:
+            return
+        state["last_update"] = now
+        
+        display = text[:4000]
+        if is_thinking:
+            display = f"💭 {display}"
+        
+        try:
+            kwargs = {
+                "chat_id": int(user_id),
+                "draft_id": state["draft_id"],
+                "text": display
+            }
+            if message_thread_id:
+                kwargs["message_thread_id"] = message_thread_id
+            await bot.send_message_draft(**kwargs)
+        except Exception:
+            pass
+    
+    return on_text_chunk
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.chat_id)
     
@@ -920,7 +954,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_message = update.message.text
         
         # Show typing status and send initial message
-        await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
+        await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing', message_thread_id=get_thread_id(update))
         thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
 
         async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
@@ -948,7 +982,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             # Get response
             logger.info(f"Processing message for user {user_id}")
-            response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context)
+            on_text_chunk = create_streaming_callback(context.bot, user_id, get_thread_id(update))
+            response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk)
             logger.info(f"Got response for user {user_id}, sending to user")
             await send_response_to_user(update, thinking_message, response, user_id)
             await send_reasoning_file(update, messages, user_id)
@@ -1012,7 +1047,7 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 await status_message.edit_text(f"🎙️ *Transcription:*\n{display_transcription}", parse_mode="markdown")
                 
                 # Process transcription like a regular message
-                await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
+                await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing', message_thread_id=get_thread_id(update))
                 thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
                 
                 async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
@@ -1035,7 +1070,8 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     )
                 
                 try:
-                    response, messages = await get_answer(transcription, user_id, update_thinking_message, update, context)
+                    on_text_chunk = create_streaming_callback(context.bot, user_id, get_thread_id(update))
+                    response, messages = await get_answer(transcription, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk)
                     
                     # Generate and send audio response
                     await thinking_message.edit_text("🎙️ *Generating audio...*", parse_mode="markdown")
@@ -1198,7 +1234,7 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 
                 user_message = "\n\n".join(parts) if parts else "User sent a video without audio or caption."
                 
-                await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
+                await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing', message_thread_id=get_thread_id(update))
                 thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
                 
                 async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
@@ -1221,7 +1257,8 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     )
                 
                 try:
-                    response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context)
+                    on_text_chunk = create_streaming_callback(context.bot, user_id, get_thread_id(update))
+                    response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk)
                     
                     # Generate and send audio response
                     await thinking_message.edit_text("🎙️ *Generating audio...*", parse_mode="markdown")
@@ -1313,7 +1350,7 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
             
             await status_message.edit_text("🎵 *Audio saved, processing...*", parse_mode="markdown")
             
-            await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
+            await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing', message_thread_id=get_thread_id(update))
             thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
             
             async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
@@ -1335,7 +1372,8 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     parse_mode="markdown"
                 )
             
-            response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context)
+            on_text_chunk = create_streaming_callback(context.bot, user_id, get_thread_id(update))
+            response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk)
             await send_response_to_user(update, thinking_message, response, user_id)
             await send_reasoning_file(update, messages, user_id)
             await status_message.edit_text("🎵 *Done!*", parse_mode="markdown")
@@ -1505,7 +1543,7 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             await status_message.edit_text("🤖 *Processing...*", parse_mode="markdown")
             # Process like a regular message
-            await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
+            await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing', message_thread_id=get_thread_id(update))
             thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
             _, _, mg_limit = check_user_limits(user_id)
             
@@ -1529,7 +1567,8 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
             
             # Get response using the same logic as handle_message
-            response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context)
+            on_text_chunk = create_streaming_callback(context.bot, user_id, get_thread_id(update))
+            response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk)
             await send_response_to_user(update, thinking_message, response, user_id)
             await send_reasoning_file(update, messages, user_id)
             await status_message.edit_text("🤖 *Done!*", parse_mode="markdown")
@@ -1674,7 +1713,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
             user_question = f"{caption}\n\nUser attached {len(all_descriptions)} image(s) to this message. Here are the details about each image from Anthropic and OpenAI:\n\n{descriptions_text}"
             
             await status_message.edit_text("🤖 *Processing...*", parse_mode="markdown")
-            await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
+            await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing', message_thread_id=get_thread_id(update))
             thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
             
             async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
@@ -1696,7 +1735,8 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     parse_mode="markdown"
                 )
             
-            response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context)
+            on_text_chunk = create_streaming_callback(context.bot, user_id, get_thread_id(update))
+            response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk)
             await send_response_to_user(update, thinking_message, response, user_id)
             await send_reasoning_file(update, messages, user_id)
             await status_message.edit_text("🤖 *Done!*", parse_mode="markdown")
@@ -1793,7 +1833,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
             user_question = f"{caption}\n\nUser attached a {doc_type} document to this message.\nFile: {file_name}\nSaved to: {saved_doc_path}\n\nHere is the analysis of document contents:\n\n{document_description}"
 
             await status_message.edit_text("🤖 *Processing...*", parse_mode="markdown")
-            await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
+            await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing', message_thread_id=get_thread_id(update))
             thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
 
             async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
@@ -1815,7 +1855,8 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
                     parse_mode="markdown"
                 )
 
-            response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context)
+            on_text_chunk = create_streaming_callback(context.bot, user_id, get_thread_id(update))
+            response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk)
             await send_response_to_user(update, thinking_message, response, user_id)
             await send_reasoning_file(update, messages, user_id)
             await status_message.edit_text("🤖 *Done!*", parse_mode="markdown")
@@ -2783,13 +2824,14 @@ async def check_and_process_agent_reminders(context: ContextTypes.DEFAULT_TYPE):
                                 )
 
                             print("Calling get_answer with mock update")
-                            # Process the reminder using get_answer with mock Update
+                            on_text_chunk = create_streaming_callback(context.bot, user_id)
                             response, messages = await get_answer(
                                 reminder['text'], 
                                 user_id, 
                                 update_thinking_message,
-                                mock_update,  # Pass the mock Update object
-                                context
+                                mock_update,
+                                context,
+                                on_text_chunk=on_text_chunk
                             )
 
                             print(f"get_answer returned response: {response}")

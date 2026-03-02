@@ -31,7 +31,10 @@ max_agent_critique_iterations = os.getenv("MAX_AGENT_CRITIQUE_ITERATIONS")
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
 anthropic_model = "claude-sonnet-4-6"
 anthropic_model_fast = "claude-haiku-4-5"
-anthropic_client = anthropic.Anthropic(api_key=anthropic_api_key)
+anthropic_client = anthropic.AsyncAnthropic(api_key=anthropic_api_key)
+
+# Streaming config
+streaming_enabled = os.getenv("STREAMING_ENABLED", "false").lower() == "true"
 
 # OpenAI config
 openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -54,7 +57,7 @@ class AgentAnthropic:
     def __init__(self, model: str = anthropic_model, user_id: str = None):
         self.model = model
         self.user_id = user_id
-        self.client = anthropic.Anthropic(api_key=anthropic_api_key)
+        self.client = anthropic.AsyncAnthropic(api_key=anthropic_api_key)
         self.file_ops = None
         self.search_tools = None
         self.code_tools = None
@@ -174,8 +177,7 @@ Response: {answer}
 
 Judge's decision (ONLY answer "Yes" or "No"):"""
 
-            response = await asyncio.to_thread(
-                self.client.messages.create,
+            response = await self.client.messages.create(
                 model=self.model,
                 messages=[{
                     "role": "user",
@@ -242,7 +244,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         else:
             return f"Unknown tool: {tool_name}"
 
-    async def generate_response(self, messages: list = [], prompt: str = "", system_role: str = "", question: str = "", update_status=None, dialog_history: list = [], user_settings: dict = None) -> str:
+    async def generate_response(self, messages: list = [], prompt: str = "", system_role: str = "", question: str = "", update_status=None, dialog_history: list = [], user_settings: dict = None, on_text_chunk=None) -> str:
         processed_messages = []
         system = system_role
         
@@ -307,40 +309,40 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             # Always use "auto" so the model can choose to stop with text
             tool_choice = {"type": "auto"}
 
+            # Build common API kwargs
+            api_kwargs = {
+                "model": self.model,
+                "messages": processed_messages,
+                "system": system,
+                "tools": self.get_tools_schema(),
+                "tool_choice": tool_choice,
+            }
             if self.thinking:
+                api_kwargs["max_tokens"] = 20000
+                api_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 16000}
                 print(f"\nAgent iteration {iteration} with thinking")
-                response = await asyncio.to_thread(
-                    self.client.messages.create,
-                    model=self.model,
-                    messages=processed_messages,
-                    system=system,
-                    max_tokens=20000,
-                    tools=self.get_tools_schema(),
-                    tool_choice=tool_choice,
-                    thinking={
-                        "type": "enabled",
-                        "budget_tokens": 16000
-                    }
-                )
             else:
+                api_kwargs["max_tokens"] = 4096
                 print(f"\nAgent iteration {iteration} without thinking")
-                response = await asyncio.to_thread(
-                    self.client.messages.create,
-                    model=self.model,
-                    messages=processed_messages,
-                    system=system,
-                    max_tokens=4096,
-                    tools=self.get_tools_schema(),
-                    tool_choice=tool_choice
-                )
+
+            current_text = ""
+            
+            if streaming_enabled and on_text_chunk:
+                async with self.client.messages.stream(**api_kwargs) as stream:
+                    async for event in stream:
+                        if event.type == "text":
+                            current_text += event.text
+                            await on_text_chunk(current_text, is_thinking=False)
+                        elif event.type == "thinking":
+                            await on_text_chunk(event.thinking, is_thinking=True)
+                    response = await stream.get_final_message()
+            else:
+                response = await self.client.messages.create(**api_kwargs)
+                for content_block in response.content:
+                    if content_block.type == 'text':
+                        current_text += content_block.text
 
             print("\nResponse:", response)
-
-            # Extract text content from response
-            current_text = ""
-            for content_block in response.content:
-                if content_block.type == 'text':
-                    current_text += content_block.text
 
             # Handle tool calls using proper Anthropic tool_result protocol
             if response.stop_reason == "tool_use" and tools_enabled and cicles < max_iterations:
@@ -454,8 +456,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         })
         
         try:
-            final_response = await asyncio.to_thread(
-                self.client.messages.create,
+            final_response = await self.client.messages.create(
                 model=self.model,
                 messages=processed_messages,
                 system=system,
@@ -530,14 +531,12 @@ Question: {question}
 Response: {response}"""
         
         # Run topic, summary, and embedding generation in parallel
-        topic_task = asyncio.to_thread(
-            anthropic_client.messages.create,
+        topic_task = anthropic_client.messages.create(
             model=anthropic_model_fast,
             messages=[{"role": "user", "content": [{"type": "text", "text": topic_prompt}]}],
             max_tokens=50
         )
-        summary_task = asyncio.to_thread(
-            anthropic_client.messages.create,
+        summary_task = anthropic_client.messages.create(
             model=anthropic_model_fast,
             messages=[{"role": "user", "content": [{"type": "text", "text": summary_prompt}]}],
             max_tokens=200
@@ -625,8 +624,7 @@ When in doubt, answer "complex".
 
 User message: {question}"""
 
-            response = await asyncio.to_thread(
-                anthropic_client.messages.create,
+            response = await anthropic_client.messages.create(
                 model=anthropic_model_fast,
                 messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
                 max_tokens=10
@@ -658,8 +656,7 @@ User message: {question}"""
                         "content": [{"type": "text", "text": str(msg["content"])}]
                     })
 
-            response = await asyncio.to_thread(
-                anthropic_client.messages.create,
+            response = await anthropic_client.messages.create(
                 model=anthropic_model_fast,
                 messages=processed_messages,
                 system=system_context,
@@ -691,7 +688,7 @@ User message: {question}"""
             pass
         return None
 
-    async def generate_response(self, question: str, update_status=None) -> str:
+    async def generate_response(self, question: str, update_status=None, on_text_chunk=None) -> str:
         print(f"\n=== Starting Chain of Thought for Question: {question} ===")
         question = f"Message received time in UTC+0: {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}\n\n{question}"
         
@@ -1098,12 +1095,13 @@ You have been asked to answer a query given sources. Consider the following when
         
         if complexity != "simple" or response is None:
             response, thread_messages = await self.agent.generate_response(
-                messages=context_memory, 
-                system_role=system_context, 
+                messages=context_memory,
+                system_role=system_context,
                 question=question,
                 update_status=update_status,
                 dialog_history=dialog_history,
-                user_settings=self.user_settings
+                user_settings=self.user_settings,
+                on_text_chunk=on_text_chunk
             )
             # remove first 2 messages from thread_messages array
             thread_messages = thread_messages[2:]

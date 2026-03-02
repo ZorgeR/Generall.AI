@@ -26,6 +26,7 @@ services:
       - WORKSPACE_ROOT=/opt/generall.ai/Generall.AI
       - TELEGRAM_USE_LOCAL_API=${TELEGRAM_USE_LOCAL_API:-false}
       - TELEGRAM_LOCAL_API_URL=${TELEGRAM_LOCAL_API_URL:-http://localhost:8081}
+      - STREAMING_ENABLED=${STREAMING_ENABLED:-false}
     restart: always
     privileged: true
     network_mode: host
