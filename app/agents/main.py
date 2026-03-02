@@ -329,13 +329,15 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             current_text = ""
             
             if streaming_enabled and on_text_chunk:
+                accumulated_thinking = ""
                 async with self.client.messages.stream(**api_kwargs) as stream:
                     async for event in stream:
                         if event.type == "text":
                             current_text += event.text
                             await on_text_chunk(current_text, is_thinking=False)
                         elif event.type == "thinking":
-                            await on_text_chunk(event.thinking, is_thinking=True)
+                            accumulated_thinking += event.thinking
+                            await on_text_chunk(accumulated_thinking, is_thinking=True)
                     response = await stream.get_final_message()
             else:
                 response = await self.client.messages.create(**api_kwargs)
@@ -352,10 +354,19 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                     await update_status(step=last_step_category, details="Executing tools", iteration=cicles, critique=critique)
                 print(f"\nExecuting tool call cycle: {cicles}")
                 
-                # Append the full assistant response (preserves tool_use blocks for the API)
+                # Append the full assistant response, filtering to only API-accepted fields
+                cleaned_content = []
+                for block in response.content:
+                    if block.type == "text":
+                        cleaned_content.append({"type": "text", "text": block.text})
+                    elif block.type == "tool_use":
+                        cleaned_content.append({"type": "tool_use", "id": block.id, "name": block.name, "input": block.input})
+                    elif block.type == "thinking":
+                        cleaned_content.append({"type": "thinking", "thinking": block.thinking, "signature": block.signature})
+                
                 processed_messages.append({
                     "role": "assistant",
-                    "content": [block.model_dump() for block in response.content]
+                    "content": cleaned_content
                 })
                 
                 # Execute tools and build proper tool_result blocks
