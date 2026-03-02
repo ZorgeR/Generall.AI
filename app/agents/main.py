@@ -711,6 +711,7 @@ User message: {question}"""
 
     async def generate_response(self, question: str, update_status=None, on_text_chunk=None) -> str:
         print(f"\n=== Starting Chain of Thought for Question: {question} ===")
+        print(f"Thread ID: {self.thread_id or 'None (no topic)'}")
         question = f"Message received time in UTC+0: {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}\n\n{question}"
         
         system_context_generall_ai_v1 = f"""You are a persistent agent (state is automaticly saved and loaded from disk between different sessions) with long-term memory capabilities through file operations, web search, code execution, terminal commands, and more tools.
@@ -1064,9 +1065,11 @@ You have been asked to answer a query given sources. Consider the following when
 
             dialog_history_filename = self._get_memory_filename("dialog_history.json")
             dialog_history_path = self.short_term_memory_path / dialog_history_filename
+            print(f"Loading dialog history from: {dialog_history_path} (exists: {os.path.exists(dialog_history_path)})")
             if os.path.exists(dialog_history_path):
                 with open(dialog_history_path, "r", encoding="utf-8") as f:
                     dialog_history = json.load(f)
+            print(f"Dialog history loaded: {len(dialog_history)} messages")
 
             for message in dialog_history:
                 context_memory.append(message)
@@ -1078,7 +1081,10 @@ You have been asked to answer a query given sources. Consider the following when
             if update_status:
                 await update_status(step="initial", details="Loading reasoning context", iteration=0, critique=0)
 
-            short_term_memory = self._load_short_term_memory() # full context of previous conversations
+            reasoning_filename = self._get_memory_filename("short_term_memory.json")
+            print(f"Loading reasoning context from: {self.short_term_memory_path / reasoning_filename}")
+            short_term_memory = self._load_short_term_memory()
+            print(f"Reasoning context loaded: {len(short_term_memory)} messages")
 
             # load array of previous messages in context_memory
             for message in short_term_memory:
@@ -1110,6 +1116,8 @@ You have been asked to answer a query given sources. Consider the following when
 
         # Route: classify complexity to decide fast vs full path
         complexity = await self._classify_complexity(question, dialog_history)
+        
+        response = None
         
         if complexity == "simple":
             if update_status:
@@ -1162,6 +1170,8 @@ You have been asked to answer a query given sources. Consider the following when
         print(f"\nConversation saved. Summary: {summary}")
         
         # Save short term memory
+        reasoning_save_filename = self._get_memory_filename("short_term_memory.json")
+        print(f"Saving reasoning context to: {self.short_term_memory_path / reasoning_save_filename}")
         self._save_short_term_memory(thread_messages)
 
         dialog = [{"role": "user", "content": question}, {"role": "assistant", "content": response}]
@@ -1169,6 +1179,7 @@ You have been asked to answer a query given sources. Consider the following when
 
         # Save question and response in json array
         dialog_history_filename = self._get_memory_filename("dialog_history.json")
+        print(f"Saving dialog history to: {self.short_term_memory_path / dialog_history_filename}")
         with open(self.short_term_memory_path / dialog_history_filename, "w", encoding="utf-8") as f:
             size_of_dialog_history = settings_dialog_history_size * 2
             dialog_history = dialog_history[-size_of_dialog_history:]

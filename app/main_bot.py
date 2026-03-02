@@ -983,8 +983,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         try:
             # Get response
-            logger.info(f"Processing message for user {user_id}")
             _thread_id = get_thread_id(update)
+            logger.info(f"Processing message for user {user_id}, thread_id={_thread_id}")
             on_text_chunk = create_streaming_callback(context.bot, user_id, _thread_id)
             response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk, message_thread_id=_thread_id)
             logger.info(f"Got response for user {user_id}, sending to user")
