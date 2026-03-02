@@ -145,6 +145,10 @@ class ContainerManager:
         """
         user_dir = self.base_data_path / str(user_id)
         user_dir.mkdir(parents=True, exist_ok=True)
+        # Make the directory world-writable so the non-root `runner` user inside
+        # the secure container can write files (e.g. output files, temp scripts).
+        # The container itself is the security boundary, not the directory permissions.
+        os.chmod(user_dir, 0o777)
         return user_dir
     
     def run_command(self, user_id, command, timeout=60, network_enabled=False):
