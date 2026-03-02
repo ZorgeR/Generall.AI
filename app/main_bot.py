@@ -3853,8 +3853,8 @@ def main():
     logger.info(f"Bot token loaded (length: {len(telegram_bot_token)} chars)")
     
     # Local Telegram Bot API server config
-    telegram_api_url = os.getenv("TELEGRAM_LOCAL_API_URL", "http://localhost:8081")
-    use_local_api = os.getenv("TELEGRAM_USE_LOCAL_API", "true").lower() == "true"
+    use_local_api = os.getenv("TELEGRAM_USE_LOCAL_API", "false").lower() == "true"
+    telegram_local_api_url = os.getenv("TELEGRAM_LOCAL_API_URL", "http://localhost:8081") if use_local_api else None
     
     try:
         builder = Application.builder().token(telegram_bot_token)
@@ -3862,11 +3862,10 @@ def main():
         if use_local_api:
             builder = (
                 builder
-                .base_url(f"{telegram_api_url}/bot")
-                .base_file_url(f"{telegram_api_url}/file/bot")
+                .base_url(f"{telegram_local_api_url}/bot")
                 .local_mode(True)
             )
-            logger.info(f"Using local Telegram Bot API at {telegram_api_url}")
+            logger.info(f"Using local Telegram Bot API at {telegram_local_api_url}")
         
         app = (
             builder

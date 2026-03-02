@@ -20,9 +20,12 @@ services:
     volumes:
       - ./data:/app/data:rw,z,bind
       - /var/run/docker.sock:/var/run/docker.sock
+      - telegram-bot-api-data:/var/lib/telegram-bot-api # if telegram-bot-api used
     environment:
       - PYTHONUNBUFFERED=1
       - WORKSPACE_ROOT=/opt/generall.ai/Generall.AI
+      - TELEGRAM_USE_LOCAL_API=${TELEGRAM_USE_LOCAL_API:-false}
+      - TELEGRAM_LOCAL_API_URL=${TELEGRAM_LOCAL_API_URL:-http://localhost:8081}
     restart: always
     privileged: true
     network_mode: host
