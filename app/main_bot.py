@@ -1008,7 +1008,8 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
             
             if transcription:
                 print(f"Transcription: {transcription}")
-                await status_message.edit_text(f"🎙️ *Transcription:*\n{transcription}", parse_mode="markdown")
+                display_transcription = transcription[:512] + "..." if len(transcription) > 1500 else transcription
+                await status_message.edit_text(f"🎙️ *Transcription:*\n{display_transcription}", parse_mode="markdown")
                 
                 # Process transcription like a regular message
                 await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
@@ -1170,11 +1171,14 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 
                 display_text = "🎬 *Video analysis:*\n"
                 if transcription:
-                    display_text += f"🎙️ *Audio:* {transcription}\n"
+                    display_transcription = transcription[:512] + "..." if len(transcription) > 1500 else transcription
+                    display_text += f"🎙️ *Audio:* {display_transcription}\n"
                 if video_visual_description:
                     display_text += f"🖼️ *Visual:* {video_visual_description[:200]}..."
                 if caption:
                     display_text += f"\n📝 *Caption:* {caption}"
+                if len(display_text) > 4000:
+                    display_text = display_text[:2048] + "..."
                 await status_message.edit_text(display_text, parse_mode="markdown")
                 
                 # Build message for agent with all available context
