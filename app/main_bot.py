@@ -25,6 +25,7 @@ import time
 
 # Streaming config - read directly from env, not imported
 streaming_enabled = os.getenv("STREAMING_ENABLED", "false").lower() == "true"
+print(f"Agent streaming_enabled: {streaming_enabled} (env: {os.getenv('STREAMING_ENABLED', 'not set')})")
 import shutil
 
 # Check if running in Docker
