@@ -272,6 +272,21 @@ print(json.dumps(result))
         logger.info(f"Running shell script in secure container for user {user_id}")
         return self.container_manager.run_shell_script(user_id, script_content, timeout, network_enabled)
     
+    def wrap_python_package_installation(self, user_id: str, package_name: str, timeout: int = 300) -> str:
+        """
+        Wrap a pip package installation to run in a secure container.
+
+        Args:
+            user_id: User ID
+            package_name: Name of the pip package to install
+            timeout: Timeout in seconds
+
+        Returns:
+            Installation output
+        """
+        logger.info(f"Installing pip package {package_name} in secure container for user {user_id}")
+        return self.container_manager.install_python_package(user_id, package_name, timeout)
+
     def wrap_package_installation(self, user_id: str, package_name: str, timeout: int = 300) -> str:
         """
         Wrap a package installation to run in a secure container.

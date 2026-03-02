@@ -177,7 +177,7 @@ class SystemTools:
             },
             {
                 "name": "remove_package",
-                "description": "Remove a package from the user's installed packages list.",
+                "description": "Remove a package from the user's installed apt packages list.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -188,7 +188,49 @@ class SystemTools:
                     },
                     "required": ["package_name"],
                 },
-            }
+            },
+            {
+                "name": "install_python_package",
+                "description": "Install a Python package via pip in the secure container. The package is persisted and automatically reinstalled in future container runs.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "package_name": {
+                            "type": "string",
+                            "description": "The pip package to install (e.g. 'requests', 'numpy==1.26.0').",
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Timeout in seconds (default: 300)",
+                            "default": 300
+                        }
+                    },
+                    "required": ["package_name"],
+                },
+            },
+            {
+                "name": "list_installed_python_packages",
+                "description": "List all Python packages that have been installed for this user via pip.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+            },
+            {
+                "name": "remove_python_package",
+                "description": "Remove a Python package from the user's persisted pip packages list so it is no longer auto-installed in future container runs.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "package_name": {
+                            "type": "string",
+                            "description": "The pip package name to remove from the list.",
+                        }
+                    },
+                    "required": ["package_name"],
+                },
+            },
         ]
     
     def install_package(self, package_name: str, timeout: int = 300) -> str:
@@ -499,6 +541,46 @@ echo "Package {package_name} removed from installed packages list."
         # This will be replaced by the secure wrapper
         return f"Package {package_name} removal requested"
     
+    def install_python_package(self, package_name: str, timeout: int = 300) -> str:
+        """
+        Install a Python package via pip in the secure container.
+
+        Args:
+            package_name: Pip package to install (e.g. "requests" or "numpy==1.26.0")
+            timeout: Timeout in seconds
+
+        Returns:
+            Installation output
+        """
+        logger.info(f"Installing Python package {package_name} for user {self.user_id}")
+        # Replaced by the secure wrapper
+        return f"Python package {package_name} installation requested"
+
+    def list_installed_python_packages(self) -> str:
+        """
+        List all Python packages persisted for this user.
+
+        Returns:
+            List of installed pip packages
+        """
+        logger.info(f"Listing installed Python packages for user {self.user_id}")
+        # Replaced by the secure wrapper
+        return "Listing installed Python packages"
+
+    def remove_python_package(self, package_name: str) -> str:
+        """
+        Remove a Python package from the user's persisted pip list.
+
+        Args:
+            package_name: Pip package name to remove
+
+        Returns:
+            Removal result
+        """
+        logger.info(f"Removing Python package {package_name} from user {self.user_id}'s list")
+        # Replaced by the secure wrapper
+        return f"Python package {package_name} removal requested"
+
     def execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
         """
         Execute a system tool.
@@ -521,6 +603,17 @@ echo "Package {package_name} removed from installed packages list."
             return self.list_installed_packages()
         elif tool_name == "remove_package":
             return self.remove_package(
+                tool_args["package_name"]
+            )
+        elif tool_name == "install_python_package":
+            return self.install_python_package(
+                tool_args["package_name"],
+                tool_args.get("timeout", 300)
+            )
+        elif tool_name == "list_installed_python_packages":
+            return self.list_installed_python_packages()
+        elif tool_name == "remove_python_package":
+            return self.remove_python_package(
                 tool_args["package_name"]
             )
         elif tool_name == "run_shell_script":

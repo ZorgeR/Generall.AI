@@ -163,31 +163,50 @@ class ContainerManager:
         # Ensure user directory exists
         user_dir = self.ensure_user_directory(user_id)
         
-        # Check for user packages file and prepare installation script if needed
+        # Check for user apt packages file and prepare installation script if needed
         packages_file = user_dir / "installed_packages.txt"
+        python_packages_file = user_dir / "installed_python_packages.txt"
         package_installation_prefix = ""
-        
+
+        apt_packages = []
         if packages_file.exists():
             try:
                 with open(packages_file, 'r') as f:
-                    packages = [line.strip() for line in f if line.strip()]
-                
-                if packages:
-                    logger.info(f"Found {len(packages)} installed packages for user {user_id}")
-                    packages_str = " ".join(packages)
-                    # Create a prefix script to install packages before running the actual command
-                    package_installation_prefix = f"""
-#!/bin/bash
-echo "Installing user packages: {packages_str}"
-sudo apt-get update -qq
-sudo apt-get install -y -qq {packages_str} > /dev/null 2>&1
-echo "Package installation completed"
-"""
-                    # If we're installing packages, we need network access
-                    network_enabled = True
-                    logger.info("Network access enabled for package installation")
+                    apt_packages = [line.strip() for line in f if line.strip()]
             except Exception as e:
-                logger.error(f"Error reading packages file for user {user_id}: {str(e)}")
+                logger.error(f"Error reading apt packages file for user {user_id}: {str(e)}")
+
+        pip_packages = []
+        if python_packages_file.exists():
+            try:
+                with open(python_packages_file, 'r') as f:
+                    pip_packages = [line.strip() for line in f if line.strip()]
+            except Exception as e:
+                logger.error(f"Error reading pip packages file for user {user_id}: {str(e)}")
+
+        if apt_packages or pip_packages:
+            prefix_lines = ["#!/bin/bash"]
+            if apt_packages:
+                apt_str = " ".join(apt_packages)
+                logger.info(f"Found {len(apt_packages)} apt packages for user {user_id}")
+                prefix_lines += [
+                    f'echo "Installing apt packages: {apt_str}"',
+                    "sudo apt-get update -qq",
+                    f"sudo apt-get install -y -qq {apt_str} > /dev/null 2>&1",
+                    'echo "Apt package installation completed"',
+                ]
+            if pip_packages:
+                pip_str = " ".join(pip_packages)
+                logger.info(f"Found {len(pip_packages)} pip packages for user {user_id}")
+                prefix_lines += [
+                    f'echo "Installing pip packages: {pip_str}"',
+                    f"pip install --quiet {pip_str} 2>&1",
+                    'echo "Pip package installation completed"',
+                ]
+            package_installation_prefix = "\n".join(prefix_lines) + "\n"
+            # Network access is required to install packages
+            network_enabled = True
+            logger.info("Network access enabled for package installation")
         
         # Generate a unique container name
         container_name = f"{self.container_prefix}{user_id}-{uuid.uuid4().hex[:8]}"
@@ -527,6 +546,53 @@ fi
         
         return result
     
+    def install_python_package(self, user_id, package_name, timeout=300):
+        """
+        Install a Python package via pip in the secure container and persist it
+        to the user's pip package list so it is restored on future runs.
+
+        Args:
+            user_id: User ID
+            package_name: Name of the pip package to install (e.g. "requests==2.31.0" or "requests")
+            timeout: Timeout in seconds
+
+        Returns:
+            Installation output
+        """
+        user_dir = self.ensure_user_directory(user_id)
+
+        script = f"""#!/bin/bash
+set -e
+echo "Installing Python package: {package_name}"
+pip install {package_name}
+if [ $? -eq 0 ]; then
+    echo "Python package {package_name} installed successfully"
+    exit 0
+else
+    echo "Failed to install Python package {package_name}"
+    exit 1
+fi
+"""
+
+        result = self.run_shell_script(user_id, script, timeout, network_enabled=True)
+
+        if "installed successfully" in result:
+            python_packages_file = user_dir / "installed_python_packages.txt"
+
+            existing_packages = set()
+            if python_packages_file.exists():
+                with open(python_packages_file, 'r') as f:
+                    existing_packages = set(line.strip() for line in f if line.strip())
+
+            if package_name not in existing_packages:
+                existing_packages.add(package_name)
+                with open(python_packages_file, 'w') as f:
+                    for pkg in sorted(existing_packages):
+                        f.write(f"{pkg}\n")
+                logger.info(f"Added {package_name} to user {user_id}'s pip package list")
+
+        return result
+
     def cleanup_all_containers(self):
         """Clean up all containers created by this manager"""
         try:

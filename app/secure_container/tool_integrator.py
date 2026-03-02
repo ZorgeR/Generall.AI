@@ -616,7 +616,69 @@ echo "Package {package_name} removed from installed packages list."
             return self.secure_wrapper.wrap_shell_script(self.user_id, script_content, 30, False)
         
         system_tools_class.remove_package = secure_remove_package
-        
+
+        # Patch install_python_package method
+        def secure_install_python_package(self, package_name, timeout=300):
+            """Secure version of install_python_package that runs in a container"""
+            logger.info(f"Intercepted pip package installation for user {self.user_id}: {package_name}")
+            return self.secure_wrapper.wrap_python_package_installation(self.user_id, package_name, timeout)
+
+        system_tools_class.install_python_package = secure_install_python_package
+
+        # Patch list_installed_python_packages method
+        def secure_list_installed_python_packages(self):
+            """Secure version of list_installed_python_packages that runs in a container"""
+            logger.info(f"Intercepted list installed Python packages for user {self.user_id}")
+
+            script_content = """#!/bin/bash
+echo "Installed Python Packages:"
+echo "=========================="
+
+if [ -f "/home/runner/workspace/installed_python_packages.txt" ]; then
+    echo "User-installed pip packages:"
+    sort /home/runner/workspace/installed_python_packages.txt
+    echo ""
+    echo "Verification of installed packages:"
+    while read package; do
+        # Strip version specifier for the check (e.g. "numpy==1.26.0" -> "numpy")
+        pkg_name=$(echo "$package" | cut -d'=' -f1 | cut -d'>' -f1 | cut -d'<' -f1 | cut -d'[' -f1)
+        if pip show "$pkg_name" > /dev/null 2>&1; then
+            echo "✓ $package - installed"
+        else
+            echo "✗ $package - not installed"
+        fi
+    done < /home/runner/workspace/installed_python_packages.txt
+else
+    echo "No user-installed Python packages found."
+fi
+"""
+            return self.secure_wrapper.wrap_shell_script(self.user_id, script_content, 60, False)
+
+        system_tools_class.list_installed_python_packages = secure_list_installed_python_packages
+
+        # Patch remove_python_package method
+        def secure_remove_python_package(self, package_name):
+            """Secure version of remove_python_package that runs in a container"""
+            logger.info(f"Intercepted remove Python package for user {self.user_id}: {package_name}")
+
+            script_content = f"""#!/bin/bash
+echo "Removing Python package from installed list: {package_name}"
+
+if [ ! -f "/home/runner/workspace/installed_python_packages.txt" ]; then
+    echo "No installed Python packages list found."
+    exit 0
+fi
+
+TEMP_FILE=$(mktemp)
+grep -v "^{package_name}$" /home/runner/workspace/installed_python_packages.txt > "$TEMP_FILE" || echo "Package not found in list"
+mv "$TEMP_FILE" /home/runner/workspace/installed_python_packages.txt
+
+echo "Python package {package_name} removed from installed packages list."
+"""
+            return self.secure_wrapper.wrap_shell_script(self.user_id, script_content, 30, False)
+
+        system_tools_class.remove_python_package = secure_remove_python_package
+
         logger.info("System tools patched to use secure container")
     
     def patch_all_tools(self, agent_module):
