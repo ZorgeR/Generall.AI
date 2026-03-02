@@ -3711,12 +3711,7 @@ async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /invite command"""
     user_id = str(update.message.chat_id)
     
-    # Check if the user is authorized
-    if not is_user_authorized(user_id):
-        await update.message.reply_text("Unauthorized. You need an invite to use this bot.")
-        return
-    
-    # Check if args contain a code (someone is trying to use an invite)
+    # Check if args contain a code (someone is trying to USE an invite — allow unauthorized users)
     if context.args and len(context.args) > 0:
         invite_code = context.args[0]
         inviter_id = is_invite_code_valid(invite_code)
@@ -3769,6 +3764,11 @@ async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.error(f"Failed to notify admin: {str(e)}")
         return
     
+    # Only authorized users can create invites
+    if not is_user_authorized(user_id):
+        await update.message.reply_text("Unauthorized. You need an invite to use this bot.")
+        return
+
     # Check if user can create invites
     is_admin = user_id == telegram_admin_id
     invite_count = get_user_invite_count(user_id)
