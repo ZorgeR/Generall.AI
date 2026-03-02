@@ -35,6 +35,7 @@ anthropic_client = anthropic.AsyncAnthropic(api_key=anthropic_api_key)
 
 # Streaming config
 streaming_enabled = os.getenv("STREAMING_ENABLED", "false").lower() == "true"
+print(f"Agent streaming_enabled: {streaming_enabled} (env: {os.getenv('STREAMING_ENABLED', 'not set')})")
 
 # OpenAI config
 openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -476,8 +477,9 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
 
 
 class ChainOfThoughtAgent:
-    def __init__(self, model_type: str = "anthropic", model: str = anthropic_model, user_id: str = "default", telegram_update: telegram.Update = None, user_settings: dict = None):
+    def __init__(self, model_type: str = "anthropic", model: str = anthropic_model, user_id: str = "default", telegram_update: telegram.Update = None, user_settings: dict = None, message_thread_id: int = None):
         self.model_type = model_type
+        self.thread_id = message_thread_id
         
         # Initialize tools
         self.user_id = user_id
@@ -558,6 +560,7 @@ Response: {response}"""
         # Save to file
         conversation_data = {
             "timestamp": timestamp,
+            "thread_id": self.thread_id,
             "topic": topic,
             "summary": summary,
             "question": question,
@@ -571,16 +574,23 @@ Response: {response}"""
         
         return summary
 
+    def _get_memory_filename(self, base_name: str) -> str:
+        """Get topic-specific or default filename for memory files"""
+        if self.thread_id:
+            return f"topic_{self.thread_id}_{base_name}"
+        return base_name
+
     def _save_short_term_memory(self, messages: list):
         """Save conversation history to file for short term memory"""
-        file_path = self.short_term_memory_path / f"short_term_memory.json"
-        # Overwrite file if it already exists
+        filename = self._get_memory_filename("short_term_memory.json")
+        file_path = self.short_term_memory_path / filename
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(messages, f, indent=2, ensure_ascii=False)
 
     def _load_short_term_memory(self):
         """Load conversation history from file for short term memory"""
-        file_path = self.short_term_memory_path / f"short_term_memory.json"
+        filename = self._get_memory_filename("short_term_memory.json")
+        file_path = self.short_term_memory_path / filename
         if file_path.exists():
             with open(file_path, "r", encoding="utf-8") as f:
                 return json.load(f)
@@ -638,7 +648,7 @@ User message: {question}"""
             print(f"Error in complexity classification: {str(e)}")
             return "complex"
 
-    async def _simple_response(self, context_memory: list, system_context: str, question: str) -> tuple:
+    async def _simple_response(self, context_memory: list, system_context: str, question: str, on_text_chunk=None) -> tuple:
         """Generate a quick response using Haiku for simple messages. No tools, no critique, no judge."""
         try:
             processed_messages = []
@@ -656,14 +666,25 @@ User message: {question}"""
                         "content": [{"type": "text", "text": str(msg["content"])}]
                     })
 
-            response = await anthropic_client.messages.create(
-                model=anthropic_model_fast,
-                messages=processed_messages,
-                system=system_context,
-                max_tokens=4096
-            )
+            api_kwargs = {
+                "model": anthropic_model_fast,
+                "messages": processed_messages,
+                "system": system_context,
+                "max_tokens": 4096
+            }
 
-            response_text = response.content[0].text
+            if streaming_enabled and on_text_chunk:
+                response_text = ""
+                async with anthropic_client.messages.stream(**api_kwargs) as stream:
+                    async for event in stream:
+                        if event.type == "text":
+                            response_text += event.text
+                            await on_text_chunk(response_text, is_thinking=False)
+                    response = await stream.get_final_message()
+                response_text = response.content[0].text
+            else:
+                response = await anthropic_client.messages.create(**api_kwargs)
+                response_text = response.content[0].text
             thread_messages = [
                 {"role": "user", "content": [{"type": "text", "text": question}]},
                 {"role": "assistant", "content": [{"type": "text", "text": response_text}]}
@@ -1015,7 +1036,8 @@ You have been asked to answer a query given sources. Consider the following when
             for file in self.conversations_path.glob("*.json"):
                 with open(file, "r", encoding="utf-8") as f:
                     conversation_data = json.load(f)
-                    conversations_summarization.append(f"Topic: {conversation_data['topic']}\nTimestamp: {conversation_data['timestamp']}\nSummary: {conversation_data['summary']}")
+                    thread_label = conversation_data.get('thread_id') or 'general'
+                    conversations_summarization.append(f"Thread: {thread_label}\nTopic: {conversation_data['topic']}\nTimestamp: {conversation_data['timestamp']}\nSummary: {conversation_data['summary']}")
             
             old_conversations_summarization_header = "And here is the summary of last 20 conversations, in chronological order, you can find there more details about this conversations in conversations folder of your long term memory:\n\n"
 
@@ -1038,10 +1060,12 @@ You have been asked to answer a query given sources. Consider the following when
             if update_status:
                 await update_status(step="initial", details="Loading dialog history", iteration=0, critique=0)
 
-            dialog_history = [] # question and response of previous 10 conversations
+            dialog_history = []
 
-            if os.path.exists(self.short_term_memory_path / f"short_term_memory_dialog_history.json"):
-                with open(self.short_term_memory_path / f"short_term_memory_dialog_history.json", "r", encoding="utf-8") as f:
+            dialog_history_filename = self._get_memory_filename("dialog_history.json")
+            dialog_history_path = self.short_term_memory_path / dialog_history_filename
+            if os.path.exists(dialog_history_path):
+                with open(dialog_history_path, "r", encoding="utf-8") as f:
                     dialog_history = json.load(f)
 
             for message in dialog_history:
@@ -1091,7 +1115,7 @@ You have been asked to answer a query given sources. Consider the following when
             if update_status:
                 await update_status(step="initial", details=f"Quick response ({anthropic_model_fast})", iteration=0, critique=0)
             
-            response, thread_messages = await self._simple_response(context_memory, system_context, question)
+            response, thread_messages = await self._simple_response(context_memory, system_context, question, on_text_chunk=on_text_chunk)
         
         if complexity != "simple" or response is None:
             response, thread_messages = await self.agent.generate_response(
@@ -1144,7 +1168,8 @@ You have been asked to answer a query given sources. Consider the following when
         dialog_history.extend(dialog)
 
         # Save question and response in json array
-        with open(self.short_term_memory_path / f"short_term_memory_dialog_history.json", "w", encoding="utf-8") as f:
+        dialog_history_filename = self._get_memory_filename("dialog_history.json")
+        with open(self.short_term_memory_path / dialog_history_filename, "w", encoding="utf-8") as f:
             size_of_dialog_history = settings_dialog_history_size * 2
             dialog_history = dialog_history[-size_of_dialog_history:]
             json.dump(dialog_history, f, indent=2, ensure_ascii=False)

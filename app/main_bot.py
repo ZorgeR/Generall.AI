@@ -21,8 +21,10 @@ from pathlib import Path
 # Import the secure container system
 from secure_container.main import initialize_secure_containers, cleanup_containers
 from stats import stats_tracker, DEFAULT_ACTION_LIMIT
-from agents.main import streaming_enabled
 import time
+
+# Streaming config - read directly from env, not imported
+streaming_enabled = os.getenv("STREAMING_ENABLED", "false").lower() == "true"
 import shutil
 
 # Check if running in Docker
@@ -782,7 +784,7 @@ async def describe_video_screenshots(screenshot_paths: list, transcription: str 
         return ""
 
 
-async def get_answer(user_message, user_id, update_status=None, update=None, context=None, on_text_chunk=None):
+async def get_answer(user_message, user_id, update_status=None, update=None, context=None, on_text_chunk=None, message_thread_id=None):
     # Handle special cases directly
     if user_message.lower().strip() in ["current time", "time", "what time is it"]:
         current_time = datetime.now()
@@ -806,7 +808,7 @@ async def get_answer(user_message, user_id, update_status=None, update=None, con
     UserSettings(user_id).save_settings()
     
     # For all other queries, use the agent
-    agent = agents.ChainOfThoughtAgent(model_type="anthropic", model=anthropic_model, user_id=user_id, telegram_update=update, user_settings=user_settings)
+    agent = agents.ChainOfThoughtAgent(model_type="anthropic", model=anthropic_model, user_id=user_id, telegram_update=update, user_settings=user_settings, message_thread_id=message_thread_id)
     response, messages = await agent.generate_response(user_message, update_status, on_text_chunk=on_text_chunk)
     print("\nFinal Response with Step-by-Step Reasoning:")
     print(response)
@@ -982,8 +984,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             # Get response
             logger.info(f"Processing message for user {user_id}")
-            on_text_chunk = create_streaming_callback(context.bot, user_id, get_thread_id(update))
-            response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk)
+            _thread_id = get_thread_id(update)
+            on_text_chunk = create_streaming_callback(context.bot, user_id, _thread_id)
+            response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk, message_thread_id=_thread_id)
             logger.info(f"Got response for user {user_id}, sending to user")
             await send_response_to_user(update, thinking_message, response, user_id)
             await send_reasoning_file(update, messages, user_id)
@@ -1070,8 +1073,9 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     )
                 
                 try:
-                    on_text_chunk = create_streaming_callback(context.bot, user_id, get_thread_id(update))
-                    response, messages = await get_answer(transcription, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk)
+                    _thread_id = get_thread_id(update)
+                    on_text_chunk = create_streaming_callback(context.bot, user_id, _thread_id)
+                    response, messages = await get_answer(transcription, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk, message_thread_id=_thread_id)
                     
                     # Generate and send audio response
                     await thinking_message.edit_text("🎙️ *Generating audio...*", parse_mode="markdown")
@@ -1257,8 +1261,9 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     )
                 
                 try:
-                    on_text_chunk = create_streaming_callback(context.bot, user_id, get_thread_id(update))
-                    response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk)
+                    _thread_id = get_thread_id(update)
+                    on_text_chunk = create_streaming_callback(context.bot, user_id, _thread_id)
+                    response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk, message_thread_id=_thread_id)
                     
                     # Generate and send audio response
                     await thinking_message.edit_text("🎙️ *Generating audio...*", parse_mode="markdown")
@@ -1372,8 +1377,9 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     parse_mode="markdown"
                 )
             
-            on_text_chunk = create_streaming_callback(context.bot, user_id, get_thread_id(update))
-            response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk)
+            _thread_id = get_thread_id(update)
+            on_text_chunk = create_streaming_callback(context.bot, user_id, _thread_id)
+            response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk, message_thread_id=_thread_id)
             await send_response_to_user(update, thinking_message, response, user_id)
             await send_reasoning_file(update, messages, user_id)
             await status_message.edit_text("🎵 *Done!*", parse_mode="markdown")
@@ -1567,8 +1573,9 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
             
             # Get response using the same logic as handle_message
-            on_text_chunk = create_streaming_callback(context.bot, user_id, get_thread_id(update))
-            response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk)
+            _thread_id = get_thread_id(update)
+            on_text_chunk = create_streaming_callback(context.bot, user_id, _thread_id)
+            response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk, message_thread_id=_thread_id)
             await send_response_to_user(update, thinking_message, response, user_id)
             await send_reasoning_file(update, messages, user_id)
             await status_message.edit_text("🤖 *Done!*", parse_mode="markdown")
@@ -1735,8 +1742,9 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     parse_mode="markdown"
                 )
             
-            on_text_chunk = create_streaming_callback(context.bot, user_id, get_thread_id(update))
-            response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk)
+            _thread_id = get_thread_id(update)
+            on_text_chunk = create_streaming_callback(context.bot, user_id, _thread_id)
+            response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk, message_thread_id=_thread_id)
             await send_response_to_user(update, thinking_message, response, user_id)
             await send_reasoning_file(update, messages, user_id)
             await status_message.edit_text("🤖 *Done!*", parse_mode="markdown")
@@ -1855,8 +1863,9 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
                     parse_mode="markdown"
                 )
 
-            on_text_chunk = create_streaming_callback(context.bot, user_id, get_thread_id(update))
-            response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk)
+            _thread_id = get_thread_id(update)
+            on_text_chunk = create_streaming_callback(context.bot, user_id, _thread_id)
+            response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk, message_thread_id=_thread_id)
             await send_response_to_user(update, thinking_message, response, user_id)
             await send_reasoning_file(update, messages, user_id)
             await status_message.edit_text("🤖 *Done!*", parse_mode="markdown")
@@ -3897,6 +3906,7 @@ def main():
         exit(1)
     
     logger.info(f"Bot token loaded (length: {len(telegram_bot_token)} chars)")
+    logger.info(f"Streaming enabled: {streaming_enabled}")
     
     # Local Telegram Bot API server config
     use_local_api = os.getenv("TELEGRAM_USE_LOCAL_API", "false").lower() == "true"
