@@ -195,12 +195,32 @@ class ContainerManager:
                     f"sudo apt-get install -y -qq {apt_str} > /dev/null 2>&1",
                     'echo "Apt package installation completed"',
                 ]
-            if pip_packages:
-                pip_str = " ".join(pip_packages)
-                logger.info(f"Found {len(pip_packages)} pip packages for user {user_id}")
+                # python3-* apt packages install for Debian's Python 3.11, not the
+                # container's Python 3.12. As a best-effort fallback, also pip-install
+                # the equivalent PyPI packages (strip the "python3-" prefix).
+                pip_from_apt = [
+                    pkg[len("python3-"):] for pkg in apt_packages
+                    if pkg.startswith("python3-")
+                ]
+                if pip_from_apt:
+                    pip_from_apt_str = " ".join(pip_from_apt)
+                    logger.info(f"Adding pip fallback for python3-* apt packages: {pip_from_apt_str}")
+                    prefix_lines += [
+                        f'echo "Installing pip fallbacks for python3-* apt packages: {pip_from_apt_str}"',
+                        # Use --user so runner can write to ~/.local; || true because
+                        # the apt→PyPI name mapping isn't always exact (e.g. python3-pil → Pillow).
+                        f"pip install --user --quiet {pip_from_apt_str} 2>&1 || true",
+                    ]
+            # Collect all pip packages: persisted pip list + any merged above
+            all_pip = list(pip_packages)
+            if all_pip:
+                pip_str = " ".join(all_pip)
+                logger.info(f"Found {len(all_pip)} pip packages for user {user_id}")
                 prefix_lines += [
                     f'echo "Installing pip packages: {pip_str}"',
-                    f"pip install --quiet {pip_str} 2>&1",
+                    # --user: installs to ~/.local/lib/pythonX.Y/site-packages/ which
+                    # Python always checks and which runner can write to without sudo.
+                    f"pip install --user --quiet {pip_str}",
                     'echo "Pip package installation completed"',
                 ]
             package_installation_prefix = "\n".join(prefix_lines) + "\n"
@@ -564,7 +584,9 @@ fi
         script = f"""#!/bin/bash
 set -e
 echo "Installing Python package: {package_name}"
-pip install {package_name}
+# --user: installs to ~/.local so the non-root runner user can write without sudo.
+# Python 3.12 always includes ~/.local/lib/python3.12/site-packages/ in sys.path.
+pip install --user {package_name}
 if [ $? -eq 0 ]; then
     echo "Python package {package_name} installed successfully"
     exit 0
