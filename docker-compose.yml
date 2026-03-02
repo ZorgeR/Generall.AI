@@ -3,6 +3,18 @@ version: '3.8'
 name: generall-ai-stack
 
 services:
+  telegram-bot-api: # to allow download and upload big files to bot
+    image: aiogram/telegram-bot-api:latest
+    environment:
+      TELEGRAM_API_ID: "${TELEGRAM_API_ID}"
+      TELEGRAM_API_HASH: "${TELEGRAM_API_HASH}"
+      TELEGRAM_LOCAL: "true"
+    volumes:
+      - telegram-bot-api-data:/var/lib/telegram-bot-api
+    ports:
+      - "127.0.0.1:8081:8081"
+    restart: always
+
   bot:
     build: ./app
     volumes:
@@ -14,5 +26,10 @@ services:
     restart: always
     privileged: true
     network_mode: host
+    depends_on:
+      - telegram-bot-api # if telegram-bot-api used
     env_file:
       - .env
+
+volumes:
+  telegram-bot-api-data:

@@ -635,16 +635,77 @@ async def describe_image_openai(question, image_path):
     return response.choices[0].message.content
 
 async def transcribe_audio(audio_file_path):
-    with open(audio_file_path, "rb") as audio:
-        response = await asyncio.to_thread(
-            openai_client_whisper.audio.transcriptions.create,
-            model="whisper-1",
-            file=audio, 
-            response_format="text"
-        )
-    if response:
-        return response
-    else:
+    """Transcribe audio file with Whisper. Splits into chunks if file exceeds 25 MB."""
+    max_size = 24 * 1024 * 1024  # 24 MB to stay safely under Whisper's 25 MB limit
+    file_size = os.path.getsize(audio_file_path)
+    
+    if file_size <= max_size:
+        with open(audio_file_path, "rb") as audio:
+            response = await asyncio.to_thread(
+                openai_client_whisper.audio.transcriptions.create,
+                model="whisper-1",
+                file=audio, 
+                response_format="text"
+            )
+        return response if response else False
+    
+    # File too large - split into overlapping chunks and transcribe each
+    print(f"Audio file {file_size / 1024 / 1024:.1f} MB exceeds limit, splitting into chunks")
+    try:
+        audio = AudioSegment.from_file(audio_file_path)
+        chunk_duration_ms = 10 * 60 * 1000  # 10 minutes per chunk
+        overlap_ms = 10 * 1000  # 10 second overlap to avoid losing words at boundaries
+        step_ms = chunk_duration_ms - overlap_ms
+        
+        chunks = []
+        for start in range(0, len(audio), step_ms):
+            end = min(start + chunk_duration_ms, len(audio))
+            chunks.append(audio[start:end])
+            if end >= len(audio):
+                break
+        
+        transcriptions = []
+        temp_dir = "temp_audio"
+        chunk_paths = []
+        
+        for i, chunk in enumerate(chunks):
+            chunk_path = os.path.join(temp_dir, f"chunk_{uuid.uuid4()}.mp3")
+            chunk_paths.append(chunk_path)
+            chunk.export(chunk_path, format="mp3", parameters=["-q:a", "5"])
+            
+            # Use prompt with last words from previous chunk to help Whisper maintain context
+            whisper_prompt = ""
+            if transcriptions:
+                last_words = " ".join(transcriptions[-1].split()[-15:])
+                whisper_prompt = last_words
+            
+            kwargs = {
+                "model": "whisper-1",
+                "file": open(chunk_path, "rb"),
+                "response_format": "text"
+            }
+            if whisper_prompt:
+                kwargs["prompt"] = whisper_prompt
+            
+            response = await asyncio.to_thread(
+                openai_client_whisper.audio.transcriptions.create,
+                **kwargs
+            )
+            if response:
+                transcriptions.append(response)
+            print(f"Transcribed chunk {i+1}/{len(chunks)}")
+        
+        # Cleanup chunk files
+        for p in chunk_paths:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        
+        return " ".join(transcriptions) if transcriptions else False
+    except Exception as e:
+        print(f"Error splitting and transcribing audio: {str(e)}")
         return False
 
 async def extract_video_screenshots(video_path: str) -> list:
@@ -692,7 +753,7 @@ async def describe_video_screenshots(screenshot_paths: list, transcription: str 
     if not screenshot_paths:
         return ""
     
-    prompt = "Describe what's happening in this video based on these 4 screenshots taken at different moments (10%, 40%, 60%, 85% of the video). Give a brief visual summary of the video content."
+    prompt = "Describe what's happening in this video based on these 4 screenshots taken at different moments (10%, 40%, 60%, 85% of the video). Give a brief visual summary for each screenshot and then a overall summary of the video content. If user provided a caption, use it to better understand what's happening in the video or answer to the user's question."
     
     if transcription or caption:
         prompt += "\n\nAdditional context from the video:"
@@ -704,10 +765,10 @@ async def describe_video_screenshots(screenshot_paths: list, transcription: str 
     
     content = [{"type": "text", "text": prompt}]
     
+    position_labels = ["10%", "40%", "60%", "85%"]
     for i, path in enumerate(screenshot_paths):
         base64_image = encode_image(path)
-        position_labels = ["10%", "40%", "60%", "85%"]
-        label = position_labels[i] if i < len(position_labels) else f"{i+1}"
+        label = position_labels[i] if i < len(position_labels) else f"frame {i+1}"
         content.append({"type": "text", "text": f"Frame at {label}:"})
         content.append({
             "type": "image_url",
@@ -1059,6 +1120,12 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
             
             print(f"Downloaded video file to: {temp_video}")
             
+            # Save video to user folder
+            user_video_dir = os.path.join("data", user_id, "videos")
+            os.makedirs(user_video_dir, exist_ok=True)
+            saved_video_path = os.path.join(user_video_dir, f"video_{uuid.uuid4()}.mp4")
+            shutil.copy(temp_video, saved_video_path)
+            
             # Extract audio and screenshots in parallel
             await status_message.edit_text("🎬 *Extracting audio and analyzing frames...*", parse_mode="markdown")
             
@@ -1075,9 +1142,20 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
             
             print(f"Extracted audio to MP3: {temp_mp3}")
             
-            # Describe screenshots if we got any
+            # Save screenshots to user folder and describe them
             video_visual_description = ""
+            saved_screenshot_paths = []
+            position_labels = ["10%", "40%", "60%", "85%"]
+            
             if screenshot_paths:
+                user_images_dir = os.path.join("data", user_id, "images")
+                os.makedirs(user_images_dir, exist_ok=True)
+                
+                for sp in screenshot_paths:
+                    saved_path = os.path.join(user_images_dir, f"video_frame_{uuid.uuid4()}.jpg")
+                    shutil.copy(sp, saved_path)
+                    saved_screenshot_paths.append(saved_path)
+                
                 await status_message.edit_text("🖼️ *Analyzing video frames...*", parse_mode="markdown")
                 screenshot_transcription = (transcription or "") if is_video_note else ""
                 video_visual_description = await describe_video_screenshots(screenshot_paths, transcription=screenshot_transcription, caption=caption)
@@ -1086,7 +1164,7 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
             
             await status_message.edit_text("🎙️ *Transcription complete...*", parse_mode="markdown")
             
-            if transcription or video_visual_description:
+            if transcription or video_visual_description or saved_screenshot_paths:
                 if transcription:
                     print(f"Video transcription: {transcription}")
                 
@@ -1094,19 +1172,25 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 if transcription:
                     display_text += f"🎙️ *Audio:* {transcription}\n"
                 if video_visual_description:
-                    display_text += f"🖼️ *Visual:* {video_visual_description[:200]}... (Full description in reasoning file)"
+                    display_text += f"🖼️ *Visual:* {video_visual_description[:200]}..."
                 if caption:
                     display_text += f"\n📝 *Caption:* {caption}"
                 await status_message.edit_text(display_text, parse_mode="markdown")
                 
                 # Build message for agent with all available context
-                parts = []
+                parts = [f"User sent a video file. Saved to: {saved_video_path}"]
                 if caption:
                     parts.append(f"User caption: {caption}")
                 if transcription:
                     parts.append(f"Audio transcription from video: {transcription}")
                 if video_visual_description:
-                    parts.append(f"Visual description of video (from 4 screenshots at 10%, 40%, 60%, 85%): {video_visual_description}")
+                    parts.append(f"Visual description of video: {video_visual_description}")
+                if saved_screenshot_paths:
+                    frame_lines = []
+                    for i, sp in enumerate(saved_screenshot_paths):
+                        label = position_labels[i] if i < len(position_labels) else f"frame {i+1}"
+                        frame_lines.append(f"  - Frame at {label}: {sp}")
+                    parts.append("Video screenshots saved:\n" + "\n".join(frame_lines))
                 
                 user_message = "\n\n".join(parts) if parts else "User sent a video without audio or caption."
                 
@@ -1175,6 +1259,86 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
                         os.remove(f)
                 except Exception as e:
                     print(f"Error cleaning up {f}: {str(e)}")
+
+async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle incoming audio/music files - store and pass path to agent"""
+    user_id = str(update.message.chat_id)
+    
+    if not is_user_authorized(user_id):
+        await update.message.reply_text("Unauthorized. You need an invite to use this bot.")
+        return
+    
+    allowed, used, limit = check_user_limits(user_id)
+    if not allowed:
+        await update.message.reply_text(f"⚠️ You've reached your action limit ({used}/{limit} for 30 days). Contact admin.")
+        return
+    
+    async with get_user_lock(user_id):
+        stats_tracker.track_message_received(user_id, "audio")
+        
+        audio = update.message.audio
+        if not audio:
+            await update.message.reply_text("❌ Could not process audio file.")
+            return
+        
+        caption = update.message.caption or ""
+        file_name = audio.file_name or f"audio_{uuid.uuid4()}.mp3"
+        
+        # Store in user's audio folder
+        user_audio_dir = os.path.join("data", user_id, "audio")
+        os.makedirs(user_audio_dir, exist_ok=True)
+        audio_path = os.path.join(user_audio_dir, file_name)
+        
+        status_message = await update.message.reply_text("🎵 *Saving audio file...*", parse_mode="markdown")
+        
+        try:
+            audio_file = await context.bot.get_file(audio.file_id)
+            await audio_file.download_to_drive(audio_path)
+            
+            print(f"Saved audio file to: {audio_path}")
+            
+            # Build message for agent
+            duration_str = f"{audio.duration // 60}m{audio.duration % 60}s" if audio.duration else "unknown"
+            user_message = f"User sent an audio file.\nFile: {file_name}\nPath: {audio_path}\nDuration: {duration_str}"
+            if audio.performer:
+                user_message += f"\nPerformer: {audio.performer}"
+            if audio.title:
+                user_message += f"\nTitle: {audio.title}"
+            if caption:
+                user_message += f"\nUser message: {caption}"
+            
+            await status_message.edit_text("🎵 *Audio saved, processing...*", parse_mode="markdown")
+            
+            await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
+            thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
+            
+            async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
+                if step == "saving":
+                    iteration = "final"
+                    critique = "end"
+                live_limit_info = ""
+                if limit:
+                    live_used = stats_tracker.get_user_action_count(user_id, days=30)
+                    live_limit_info = f"📊 *Usage:* _{live_used}/{limit} actions (30d)_\n"
+                await thinking_message.edit_text(
+                    f"💭 *Thinking...*\n"
+                    f"- - - - \n"
+                    f"{live_limit_info}"
+                    f"📝 *Step:* _{step.replace('_', '-')}_\n"
+                    f"📋 *Details:* _{details.replace('_', '-')}_\n"
+                    f"🔄 *Iterations:* _{iteration}_\n"
+                    f"🎯 *Critiques:* _{critique}_",
+                    parse_mode="markdown"
+                )
+            
+            response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context)
+            await send_response_to_user(update, thinking_message, response, user_id)
+            await send_reasoning_file(update, messages, user_id)
+            await status_message.edit_text("🎵 *Done!*", parse_mode="markdown")
+        except Exception as e:
+            trace_id = str(uuid.uuid4())
+            await status_message.edit_text(text=f"❌ An error occurred. Trace ID: {trace_id}")
+            logging.error(f"An error occurred with trace ID {trace_id}: {str(e)}")
 
 async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /voice command"""
@@ -1592,6 +1756,12 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
             os.makedirs(temp_dir, exist_ok=True)
             temp_file = os.path.join(temp_dir, f"doc_{uuid.uuid4()}{file_extension}")
             await document_file.download_to_drive(temp_file)
+            
+            # Save document to user folder
+            user_docs_dir = os.path.join("data", user_id, "documents")
+            os.makedirs(user_docs_dir, exist_ok=True)
+            saved_doc_path = os.path.join(user_docs_dir, file_name)
+            shutil.copy(temp_file, saved_doc_path)
 
             if update.message.caption == None:
                 caption = "Analyze this document and describe its contents in detail."
@@ -1616,7 +1786,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
             describe_type = describe_type_map.get(file_extension, 'txt')
             stats_tracker.track_describe_used(user_id, describe_type)
 
-            user_question = f"{caption}\n\nUser attached a {doc_type} document to this message. Here is the analysis of document contents:\n\n{document_description}"
+            user_question = f"{caption}\n\nUser attached a {doc_type} document to this message.\nFile: {file_name}\nSaved to: {saved_doc_path}\n\nHere is the analysis of document contents:\n\n{document_description}"
 
             await status_message.edit_text("🤖 *Processing...*", parse_mode="markdown")
             await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
@@ -3082,7 +3252,7 @@ def format_stats_text(stats: dict, title: str = "") -> str:
     msg_recv = stats.get("messages_received", {})
     msg_total = msg_recv.get("total", 0)
     text += f"├─ Messages Received: *{msg_total:,}* total\n"
-    for msg_type in ["text", "voice", "video", "photo", "document"]:
+    for msg_type in ["text", "voice", "video", "photo", "audio", "document"]:
         count = msg_recv.get(msg_type, 0)
         if count > 0:
             text += f"│  ├─ {msg_type}: {count:,}\n"
@@ -3682,11 +3852,24 @@ def main():
     
     logger.info(f"Bot token loaded (length: {len(telegram_bot_token)} chars)")
     
+    # Local Telegram Bot API server config
+    telegram_api_url = os.getenv("TELEGRAM_LOCAL_API_URL", "http://localhost:8081")
+    use_local_api = os.getenv("TELEGRAM_USE_LOCAL_API", "true").lower() == "true"
+    
     try:
-        # Create application with job queue enabled and increased timeouts
+        builder = Application.builder().token(telegram_bot_token)
+        
+        if use_local_api:
+            builder = (
+                builder
+                .base_url(f"{telegram_api_url}/bot")
+                .base_file_url(f"{telegram_api_url}/file/bot")
+                .local_mode(True)
+            )
+            logger.info(f"Using local Telegram Bot API at {telegram_api_url}")
+        
         app = (
-            Application.builder()
-            .token(telegram_bot_token)
+            builder
             .connect_timeout(30.0)
             .read_timeout(30.0)
             .write_timeout(30.0)
@@ -3712,6 +3895,9 @@ def main():
     
     # Add video message handler
     app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, handle_video_message))
+    
+    # Add audio/music file handler
+    app.add_handler(MessageHandler(filters.AUDIO, handle_audio_message))
     
     # Add photo message handler
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
