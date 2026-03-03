@@ -216,6 +216,21 @@ class ImageTools:
             }
         ]
 
+    def _resolve_image_path(self, image_path: str) -> Path:
+        """Resolve an image path, trying multiple base directories as fallback."""
+        p = Path(image_path)
+        if p.exists():
+            return p
+        # Try relative to the user's base data directory
+        relative_to_base = self.base_path / image_path
+        if relative_to_base.exists():
+            return relative_to_base
+        # Try relative to the user's images directory (bare filename)
+        relative_to_images = self.images_path / Path(image_path).name
+        if relative_to_images.exists():
+            return relative_to_images
+        return p  # Return original so the caller can report the correct path
+
     async def execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
         if tool_name == "image_generator":
             return await self._image_generator(**tool_args)
@@ -330,7 +345,7 @@ class ImageTools:
         print(f"Editing image with prompt: {prompt}, image_path: {image_path}, Model: {model}")
         try:
             # Verify the image path exists
-            image_path_obj = Path(image_path)
+            image_path_obj = self._resolve_image_path(image_path)
             if not image_path_obj.exists():
                 return f"Error: The image at path {image_path} does not exist."
             
@@ -502,7 +517,7 @@ class ImageTools:
             # Verify all image paths exist
             images = []
             for image_path in image_paths:
-                image_path_obj = Path(image_path)
+                image_path_obj = self._resolve_image_path(image_path)
                 if not image_path_obj.exists():
                     return f"Error: The image at path {image_path} does not exist."
                 images.append(PIL.Image.open(image_path_obj))
