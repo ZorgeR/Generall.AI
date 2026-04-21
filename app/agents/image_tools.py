@@ -55,7 +55,7 @@ class ImageTools:
                         },
                         "model": {
                             "type": "string",
-                            "description": "Model to use: 'Normal' (faster, standard quality, gemini-3.1-flash-image-preview), 'Pro' (higher quality, more control, gemini-3-pro-image-preview), or 'GPT' (OpenAI GPT Image 2, state-of-the-art quality, excellent text rendering). ALWAYS use 'Normal' unless user specifically requests Pro or GPT mode.",
+                            "description": "Model to use: 'Normal' (faster, standard quality, gemini-3.1-flash-image-preview), 'Pro' (higher quality, more control, gemini-3-pro-image-preview), or 'GPT' (OpenAI GPT Image 2, state-of-the-art quality, excellent text rendering, great for screenshot/UI mockup generation). ALWAYS use 'Normal' unless user specifically requests Pro or GPT mode.",
                             "enum": ["Normal", "Pro", "GPT"],
                             "default": "Normal"
                         },
@@ -67,13 +67,13 @@ class ImageTools:
                         },
                         "resolution": {
                             "type": "string",
-                            "description": "Resolution for Pro and GPT modes. Options: '1K', '2K', '4K'. Default is '2K'.",
+                            "description": "Resolution for Pro and GPT modes. Options: '1K', '2K', '4K'. Default is '2K'. Use '4K' ONLY if user explicitly requests 4K or ultra-high resolution.",
                             "enum": ["1K", "2K", "4K"],
                             "default": "2K"
                         },
                         "gpt_quality": {
                             "type": "string",
-                            "description": "Quality for GPT mode only. Options: 'low' (fast drafts), 'medium', 'high' (best quality), 'auto'. Default is 'auto'. Only used when model is 'GPT'.",
+                            "description": "Quality for GPT mode only. Options: 'low' (fast drafts), 'medium', 'high' (best quality, slow and expensive), 'auto'. Default is 'auto'. Use 'high' ONLY if user explicitly requests highest quality. Only used when model is 'GPT'.",
                             "enum": ["low", "medium", "high", "auto"],
                             "default": "auto"
                         },
@@ -162,7 +162,7 @@ class ImageTools:
                         },
                         "model": {
                             "type": "string",
-                            "description": "Model to use: 'Normal' (faster, standard quality, gemini-3.1-flash-image-preview), 'Pro' (higher quality, more control, gemini-3-pro-image-preview), or 'GPT' (OpenAI GPT Image 2, state-of-the-art editing). ALWAYS use 'Normal' unless user specifically requests Pro or GPT mode.",
+                            "description": "Model to use: 'Normal' (faster, standard quality, gemini-3.1-flash-image-preview), 'Pro' (higher quality, more control, gemini-3-pro-image-preview), or 'GPT' (OpenAI GPT Image 2, state-of-the-art editing, great for screenshot/UI mockup editing). ALWAYS use 'Normal' unless user specifically requests Pro or GPT mode.",
                             "enum": ["Normal", "Pro", "GPT"],
                             "default": "Normal"
                         },
@@ -174,13 +174,13 @@ class ImageTools:
                         },
                         "resolution": {
                             "type": "string",
-                            "description": "Resolution for Pro and GPT modes. Options: '1K', '2K', '4K'. Default is '2K'.",
+                            "description": "Resolution for Pro and GPT modes. Options: '1K', '2K', '4K'. Default is '2K'. Use '4K' ONLY if user explicitly requests 4K or ultra-high resolution.",
                             "enum": ["1K", "2K", "4K"],
                             "default": "2K"
                         },
                         "gpt_quality": {
                             "type": "string",
-                            "description": "Quality for GPT mode only. Options: 'low', 'medium', 'high', 'auto'. Default is 'auto'. Only used when model is 'GPT'.",
+                            "description": "Quality for GPT mode only. Options: 'low', 'medium', 'high' (slow and expensive), 'auto'. Default is 'auto'. Use 'high' ONLY if user explicitly requests highest quality. Only used when model is 'GPT'.",
                             "enum": ["low", "medium", "high", "auto"],
                             "default": "auto"
                         },
@@ -219,7 +219,7 @@ class ImageTools:
                         },
                         "model": {
                             "type": "string",
-                            "description": "Model to use: 'Normal' (faster, standard quality, gemini-3.1-flash-image-preview), 'Pro' (higher quality, more control, gemini-3-pro-image-preview), or 'GPT' (OpenAI GPT Image 2, state-of-the-art composition with up to 10 reference images). ALWAYS use 'Normal' unless user specifically requests Pro or GPT mode.",
+                            "description": "Model to use: 'Normal' (faster, standard quality, gemini-3.1-flash-image-preview), 'Pro' (higher quality, more control, gemini-3-pro-image-preview), or 'GPT' (OpenAI GPT Image 2, state-of-the-art composition with up to 10 reference images, great for screenshot/UI mockup composition). ALWAYS use 'Normal' unless user specifically requests Pro or GPT mode.",
                             "enum": ["Normal", "Pro", "GPT"],
                             "default": "Normal"
                         },
@@ -231,13 +231,13 @@ class ImageTools:
                         },
                         "resolution": {
                             "type": "string",
-                            "description": "Resolution for Pro and GPT modes. Options: '1K', '2K', '4K'. Default is '2K'.",
+                            "description": "Resolution for Pro and GPT modes. Options: '1K', '2K', '4K'. Default is '2K'. Use '4K' ONLY if user explicitly requests 4K or ultra-high resolution.",
                             "enum": ["1K", "2K", "4K"],
                             "default": "2K"
                         },
                         "gpt_quality": {
                             "type": "string",
-                            "description": "Quality for GPT mode only. Options: 'low', 'medium', 'high', 'auto'. Default is 'auto'. Only used when model is 'GPT'.",
+                            "description": "Quality for GPT mode only. Options: 'low', 'medium', 'high' (slow and expensive), 'auto'. Default is 'auto'. Use 'high' ONLY if user explicitly requests highest quality. Only used when model is 'GPT'.",
                             "enum": ["low", "medium", "high", "auto"],
                             "default": "auto"
                         },
@@ -321,7 +321,7 @@ class ImageTools:
 
     async def _generate_image_dall_e(self, prompt: str, size: str = "1024x1024", quality: str = "standard", caption: str = "Here is your image") -> str:
         """Generate an image using DALL-E 3 and return the URL"""
-        print(f"Generating image with:\n\nPrompt: {prompt}\n\nSize: {size}\n\nQuality: {quality}\n\n")
+        print(f"Generating image with DALL-E 3 - Prompt: {prompt}, Size: {size}, Quality: {quality}")
         try:
             response = openai_client.images.generate(
                 model="dall-e-3",
@@ -348,7 +348,7 @@ class ImageTools:
             
     async def _generate_multimodal_image_and_text(self, prompt: str, style: str = "3d digital art") -> str:
         """Generate a story with images using Google's Gemini model"""
-        print(f"Generating multimodal story with prompt: {prompt}, style: {style}")
+        print(f"Generating multimodal story with Gemini - Prompt: {prompt}, Style: {style}, Model: gemini-3.1-flash-image-preview")
         try:
             # Format the prompt to include style information
             formatted_prompt = f"Generate a story about {prompt} in a {style} style. For each scene, generate an image."
@@ -417,7 +417,7 @@ class ImageTools:
             
     async def _image_editing(self, prompt: str, image_path: str, model: str = "Normal", aspect_ratio: str = "16:9", resolution: str = "2K", gpt_quality: str = "auto", variants: int = 1, caption: str = "Here is your edited image") -> str:
         """Edit an existing image using Gemini or GPT Image 2"""
-        print(f"Editing image with prompt: {prompt}, image_path: {image_path}, Model: {model}, Variants: {variants}")
+        print(f"Editing image - Prompt: {prompt}, Image: {image_path}, Model: {model}, Aspect Ratio: {aspect_ratio}, Resolution: {resolution}, GPT Quality: {gpt_quality}, Variants: {variants}")
         try:
             image_path_obj = self._resolve_image_path(image_path)
             if not image_path_obj.exists():
@@ -505,7 +505,7 @@ class ImageTools:
 
     async def _gpt_image_edit(self, prompt: str, image_paths: List[Path], size: str = "2048x1152", quality: str = "auto", caption: str = "Here is your edited image") -> str:
         """Edit one or more images using OpenAI GPT Image 2"""
-        print(f"Editing image(s) with GPT Image 2 - Prompt: {prompt}, Images: {image_paths}, Size: {size}")
+        print(f"Editing image(s) with GPT Image 2 - Prompt: {prompt}, Images: {image_paths}, Size: {size}, Quality: {quality}")
         try:
             image_files = [open(str(p), "rb") for p in image_paths]
             
@@ -546,7 +546,7 @@ class ImageTools:
     
     async def _image_generator(self, prompt: str, style: str = "photorealistic", model: str = "Normal", aspect_ratio: str = "16:9", resolution: str = "2K", gpt_quality: str = "auto", gpt_output_format: str = "png", variants: int = 1, caption: str = "Here is your generated image") -> str:
         """Generate a high-quality image from text using Gemini or GPT Image 2"""
-        print(f"Generating image - Prompt: {prompt}, Style: {style}, Model: {model}, Variants: {variants}")
+        print(f"Generating image - Prompt: {prompt}, Style: {style}, Model: {model}, Aspect Ratio: {aspect_ratio}, Resolution: {resolution}, GPT Quality: {gpt_quality}, Output Format: {gpt_output_format}, Variants: {variants}")
         try:
             if model.lower() == "gpt":
                 gpt_size = self._resolve_gpt_size(resolution, aspect_ratio)
@@ -619,9 +619,9 @@ class ImageTools:
         except Exception as e:
             return f"Error generating image: {str(e)}"
 
-    async def _gpt_image_generate(self, prompt: str, size: str = "2048x1152", quality: str = "auto", output_format: str = "png", caption: str = "Here is your generated image", n: int = 1) -> str:
+    async def _gpt_image_generate(self, prompt: str, size: str = "2048x1152", quality: str = "auto", output_format: str = "jpeg", caption: str = "Here is your generated image", n: int = 1) -> str:
         """Generate one or more images using OpenAI GPT Image 2"""
-        print(f"Generating image with GPT Image 2 - Prompt: {prompt}, Size: {size}, Quality: {quality}, N: {n}")
+        print(f"Generating image with GPT Image 2 - Prompt: {prompt}, Size: {size}, Quality: {quality}, N: {n}, Output Format: {output_format}")
         try:
             kwargs = {
                 "model": "gpt-image-2-2026-04-21",
@@ -657,7 +657,7 @@ class ImageTools:
     
     async def _image_composition(self, prompt: str, image_paths: List[str], model: str = "Normal", aspect_ratio: str = "16:9", resolution: str = "2K", gpt_quality: str = "auto", variants: int = 1, caption: str = "Here is your composed image") -> str:
         """Compose a new image from multiple input images using Gemini or GPT Image 2"""
-        print(f"Composing image with prompt: {prompt}, image_paths: {image_paths}, Model: {model}, Variants: {variants}")
+        print(f"Composing image - Prompt: {prompt}, Images: {image_paths}, Model: {model}, Aspect Ratio: {aspect_ratio}, Resolution: {resolution}, GPT Quality: {gpt_quality}, Variants: {variants}")
         try:
             resolved_paths = []
             for image_path in image_paths:
