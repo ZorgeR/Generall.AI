@@ -3,6 +3,7 @@ import os
 from typing import Dict, Any, List
 from dotenv import load_dotenv
 from pathlib import Path
+import math
 import uuid
 import base64
 import telegram
@@ -39,7 +40,7 @@ class ImageTools:
         self.tools_schema = [
             {
                 "name": "image_generator",
-                "description": "Generate high-quality images from text descriptions using Gemini image generation, save to images directory, and send to user via Telegram. ALWAYS use Normal mode by default unless user specifically requests Pro mode.",
+                "description": "Generate high-quality images from text descriptions using AI image generation, save to images directory, and send to user via Telegram. ALWAYS use Normal mode by default unless user specifically requests Pro or GPT mode.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -49,26 +50,44 @@ class ImageTools:
                         },
                         "style": {
                             "type": "string",
-                            "description": "Visual style for the image (e.g., 'photorealistic', 'digital art', 'cartoon', 'anime', 'impressionist', 'minimalist')",
+                            "description": "Visual style for the image (e.g., 'photorealistic', 'digital art', 'cartoon', 'anime', 'impressionist', 'minimalist'). Used for Normal and Pro modes.",
                             "default": "photorealistic"
                         },
                         "model": {
                             "type": "string",
-                            "description": "Model to use: 'Normal' (faster, standard quality, gemini-2.5-flash-image) or 'Pro' (higher quality, more control, gemini-3-pro-image-preview). ALWAYS use 'Normal' unless user specifically requests Pro mode.",
-                            "enum": ["Normal", "Pro"],
+                            "description": "Model to use: 'Normal' (faster, standard quality, gemini-3.1-flash-image-preview), 'Pro' (higher quality, more control, gemini-3-pro-image-preview), or 'GPT' (OpenAI GPT Image 2, state-of-the-art quality, excellent text rendering). ALWAYS use 'Normal' unless user specifically requests Pro or GPT mode.",
+                            "enum": ["Normal", "Pro", "GPT"],
                             "default": "Normal"
                         },
                         "aspect_ratio": {
                             "type": "string",
-                            "description": "Aspect ratio for Pro mode only. Options: '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'. Default is '16:9'. Only used when model is 'Pro'.",
+                            "description": "Aspect ratio for Pro and GPT modes. Options: '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'. Default is '16:9'.",
                             "enum": ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"],
                             "default": "16:9"
                         },
                         "resolution": {
                             "type": "string",
-                            "description": "Resolution for Pro mode only. Options: '1K', '2K', '4K'. Default is '2K'. Only used when model is 'Pro'.",
+                            "description": "Resolution for Pro and GPT modes. Options: '1K', '2K', '4K'. Default is '2K'.",
                             "enum": ["1K", "2K", "4K"],
                             "default": "2K"
+                        },
+                        "gpt_quality": {
+                            "type": "string",
+                            "description": "Quality for GPT mode only. Options: 'low' (fast drafts), 'medium', 'high' (best quality), 'auto'. Default is 'auto'. Only used when model is 'GPT'.",
+                            "enum": ["low", "medium", "high", "auto"],
+                            "default": "auto"
+                        },
+                        "gpt_output_format": {
+                            "type": "string",
+                            "description": "Output format for GPT mode only. 'jpeg' is faster than 'png'. Default is 'png'. Only used when model is 'GPT'.",
+                            "enum": ["png", "jpeg", "webp"],
+                            "default": "jpeg"
+                        },
+                        "variants": {
+                            "type": "integer",
+                            "description": "Number of image variants to generate. Default is 1. Set higher (up to 4) when user wants multiple options to choose from.",
+                            "enum": [1, 2, 3, 4],
+                            "default": 1
                         },
                         "caption": {
                             "type": "string",
@@ -129,7 +148,7 @@ class ImageTools:
             },
             {
                 "name": "image_editing",
-                "description": "Edit and transform existing images using Gemini's advanced image editing capabilities. Supports adding, removing, or modifying elements, changing styles, adjusting colors, and mask-free editing. ALWAYS use Normal mode by default unless user specifically requests Pro mode.",
+                "description": "Edit and transform existing images using advanced AI image editing capabilities. Supports adding, removing, or modifying elements, changing styles, adjusting colors, and mask-free editing. ALWAYS use Normal mode by default unless user specifically requests Pro or GPT mode.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -143,21 +162,33 @@ class ImageTools:
                         },
                         "model": {
                             "type": "string",
-                            "description": "Model to use: 'Normal' (faster, standard quality, gemini-2.5-flash-image) or 'Pro' (higher quality, more control, gemini-3-pro-image-preview). ALWAYS use 'Normal' unless user specifically requests Pro mode.",
-                            "enum": ["Normal", "Pro"],
+                            "description": "Model to use: 'Normal' (faster, standard quality, gemini-3.1-flash-image-preview), 'Pro' (higher quality, more control, gemini-3-pro-image-preview), or 'GPT' (OpenAI GPT Image 2, state-of-the-art editing). ALWAYS use 'Normal' unless user specifically requests Pro or GPT mode.",
+                            "enum": ["Normal", "Pro", "GPT"],
                             "default": "Normal"
                         },
                         "aspect_ratio": {
                             "type": "string",
-                            "description": "Aspect ratio for Pro mode only. Options: '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'. Default is '16:9'. Only used when model is 'Pro'.",
+                            "description": "Aspect ratio for Pro and GPT modes. Options: '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'. Default is '16:9'.",
                             "enum": ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"],
                             "default": "16:9"
                         },
                         "resolution": {
                             "type": "string",
-                            "description": "Resolution for Pro mode only. Options: '1K', '2K', '4K'. Default is '2K'. Only used when model is 'Pro'.",
+                            "description": "Resolution for Pro and GPT modes. Options: '1K', '2K', '4K'. Default is '2K'.",
                             "enum": ["1K", "2K", "4K"],
                             "default": "2K"
+                        },
+                        "gpt_quality": {
+                            "type": "string",
+                            "description": "Quality for GPT mode only. Options: 'low', 'medium', 'high', 'auto'. Default is 'auto'. Only used when model is 'GPT'.",
+                            "enum": ["low", "medium", "high", "auto"],
+                            "default": "auto"
+                        },
+                        "variants": {
+                            "type": "integer",
+                            "description": "Number of edit variants to generate. Default is 1. Set higher (up to 4) when user wants multiple options to choose from.",
+                            "enum": [1, 2, 3, 4],
+                            "default": 1
                         },
                         "caption": {
                             "type": "string",
@@ -170,7 +201,7 @@ class ImageTools:
             },
             {
                 "name": "image_composition",
-                "description": "Compose a new image using multiple input images with Gemini's advanced multi-image processing. Perfect for style transfer, combining elements from different images, or creating composite scenes. ALWAYS use Normal mode by default unless user specifically requests Pro mode.",
+                "description": "Compose a new image using multiple input images with advanced AI multi-image processing. Perfect for style transfer, combining elements from different images, or creating composite scenes. ALWAYS use Normal mode by default unless user specifically requests Pro or GPT mode. GPT mode supports up to 10 reference images.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -180,30 +211,41 @@ class ImageTools:
                         },
                         "image_paths": {
                             "type": "array",
-                            "description": "Array of paths to image files to be used in composition. Should contain 2-3 images for best results.",
+                            "description": "Array of paths to image files to be used in composition. For Normal/Pro: 2-3 images. For GPT: up to 10 images.",
                             "items": {
                                 "type": "string"
                             },
-                            "minItems": 2,
-                            "maxItems": 3
+                            "minItems": 2
                         },
                         "model": {
                             "type": "string",
-                            "description": "Model to use: 'Normal' (faster, standard quality, gemini-2.5-flash-image) or 'Pro' (higher quality, more control, gemini-3-pro-image-preview). ALWAYS use 'Normal' unless user specifically requests Pro mode.",
-                            "enum": ["Normal", "Pro"],
+                            "description": "Model to use: 'Normal' (faster, standard quality, gemini-3.1-flash-image-preview), 'Pro' (higher quality, more control, gemini-3-pro-image-preview), or 'GPT' (OpenAI GPT Image 2, state-of-the-art composition with up to 10 reference images). ALWAYS use 'Normal' unless user specifically requests Pro or GPT mode.",
+                            "enum": ["Normal", "Pro", "GPT"],
                             "default": "Normal"
                         },
                         "aspect_ratio": {
                             "type": "string",
-                            "description": "Aspect ratio for Pro mode only. Options: '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'. Default is '16:9'. Only used when model is 'Pro'.",
+                            "description": "Aspect ratio for Pro and GPT modes. Options: '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'. Default is '16:9'.",
                             "enum": ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"],
                             "default": "16:9"
                         },
                         "resolution": {
                             "type": "string",
-                            "description": "Resolution for Pro mode only. Options: '1K', '2K', '4K'. Default is '2K'. Only used when model is 'Pro'.",
+                            "description": "Resolution for Pro and GPT modes. Options: '1K', '2K', '4K'. Default is '2K'.",
                             "enum": ["1K", "2K", "4K"],
                             "default": "2K"
+                        },
+                        "gpt_quality": {
+                            "type": "string",
+                            "description": "Quality for GPT mode only. Options: 'low', 'medium', 'high', 'auto'. Default is 'auto'. Only used when model is 'GPT'.",
+                            "enum": ["low", "medium", "high", "auto"],
+                            "default": "auto"
+                        },
+                        "variants": {
+                            "type": "integer",
+                            "description": "Number of composition variants to generate. Default is 1. Set higher (up to 4) when user wants multiple options to choose from.",
+                            "enum": [1, 2, 3, 4],
+                            "default": 1
                         },
                         "caption": {
                             "type": "string",
@@ -230,6 +272,39 @@ class ImageTools:
         if relative_to_images.exists():
             return relative_to_images
         return p  # Return original so the caller can report the correct path
+
+    def _resolve_gpt_size(self, resolution: str, aspect_ratio: str) -> str:
+        """Translate resolution + aspect_ratio into a GPT Image 2 pixel size string.
+        
+        GPT Image 2 constraints: edges multiples of 16, max edge 3840,
+        ratio ≤ 3:1, total pixels 655,360..8,294,400.
+        """
+        target_map = {"1K": 1024, "2K": 2048, "4K": 3840}
+        target = target_map.get(resolution, 2048)
+
+        w_r, h_r = (int(x) for x in aspect_ratio.split(":"))
+
+        if w_r >= h_r:
+            w = target
+            h = round(target * h_r / w_r / 16) * 16
+        else:
+            h = target
+            w = round(target * w_r / h_r / 16) * 16
+
+        min_px, max_px = 655360, 8294400
+        total = w * h
+        if total < min_px:
+            scale = math.ceil(math.sqrt(min_px / total) * 100) / 100
+            w = round(w * scale / 16) * 16
+            h = round(h * scale / 16) * 16
+        if w * h > max_px:
+            scale = math.sqrt(max_px / (w * h))
+            w = int(w * scale / 16) * 16
+            h = int(h * scale / 16) * 16
+
+        w = max(min(w, 3840), 16)
+        h = max(min(h, 3840), 16)
+        return f"{w}x{h}"
 
     async def execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
         if tool_name == "image_generator":
@@ -279,7 +354,7 @@ class ImageTools:
             formatted_prompt = f"Generate a story about {prompt} in a {style} style. For each scene, generate an image."
             
             response = genai_client.models.generate_content(
-                model="gemini-2.5-flash-image",
+                model="gemini-3.1-flash-image-preview",
                 contents=formatted_prompt,
                 config=types.GenerateContentConfig(
                     response_modalities=["Text", "Image"],
@@ -340,22 +415,29 @@ class ImageTools:
         except Exception as e:
             return f"Error generating multimodal story: {str(e)}"
             
-    async def _image_editing(self, prompt: str, image_path: str, model: str = "Normal", aspect_ratio: str = "16:9", resolution: str = "2K", caption: str = "Here is your edited image") -> str:
-        """Edit an existing image using Google's Gemini model"""
-        print(f"Editing image with prompt: {prompt}, image_path: {image_path}, Model: {model}")
+    async def _image_editing(self, prompt: str, image_path: str, model: str = "Normal", aspect_ratio: str = "16:9", resolution: str = "2K", gpt_quality: str = "auto", variants: int = 1, caption: str = "Here is your edited image") -> str:
+        """Edit an existing image using Gemini or GPT Image 2"""
+        print(f"Editing image with prompt: {prompt}, image_path: {image_path}, Model: {model}, Variants: {variants}")
         try:
-            # Verify the image path exists
             image_path_obj = self._resolve_image_path(image_path)
             if not image_path_obj.exists():
                 return f"Error: The image at path {image_path} does not exist."
             
-            # Open the image using PIL
+            if model.lower() == "gpt":
+                gpt_size = self._resolve_gpt_size(resolution, aspect_ratio)
+                all_results = []
+                for i in range(variants):
+                    r = await self._gpt_image_edit(
+                        prompt, [image_path_obj], gpt_size, gpt_quality,
+                        f"{caption} (variant {i + 1}/{variants})" if variants > 1 else caption
+                    )
+                    all_results.append(r)
+                return "\n".join(all_results)
+            
             source_image = PIL.Image.open(image_path_obj)
             
-            # Select model based on mode
-            model_name = "gemini-3-pro-image-preview" if model.lower() == "pro" else "gemini-2.5-flash-image"
+            model_name = "gemini-3-pro-image-preview" if model.lower() == "pro" else "gemini-3.1-flash-image-preview"
             
-            # Build config based on mode
             if model == "Pro":
                 config = types.GenerateContentConfig(
                     response_modalities=["Text", "Image"],
@@ -369,174 +451,247 @@ class ImageTools:
                     response_modalities=["Text", "Image"]
                 )
             
-            # Call Gemini API to transform the image
-            response = genai_client.models.generate_content(
-                model=model_name,
-                contents=(
-                    prompt,
-                    source_image
-                ),
-                config=config,
-            )
-            
-            contents = response.candidates[0].content.parts
-            
-            all_parts = []
-            for content in contents:
-                if 'text' in content.model_fields_set:
-                    all_parts.append(TextPart(content.text))
-                elif 'inline_data' in content.model_fields_set:
-                    all_parts.append(InlineDataPart(
-                        content.inline_data.mime_type,
-                        content.inline_data.data
-                    ))
-            
+            all_saved_paths = []
             result_message = "Image transformation results:\n\n"
-            transformed_image_sent = False
             
-            for part in all_parts:
-                if isinstance(part, TextPart):
-                    # Send any explanatory text from Gemini about the transformation
-                    try: # as markdown
-                        await self.telegram_update.message.reply_text(f"Text explanation:\n\n{part.text}", parse_mode="markdown")
-                    except Exception:
-                        # check length of text and split to chunks of 3000 characters
-                        text_chunks = [part.text[i:i+3000] for i in range(0, len(part.text), 3000)]
-                        sub_part_count = 0
-                        for chunk in text_chunks:
-                            sub_part_count += 1
-                            try:
-                                await self.telegram_update.message.reply_text(f"Text explanation subpart {sub_part_count}:\n\n{chunk}", parse_mode="markdown")
-                            except Exception:
-                                await self.telegram_update.message.reply_text(f"Text explanation subpart {sub_part_count}:\n\n{chunk}")
-                    result_message += f"Text explanation sent to user: \n\n{part.text}\n\n"
-                elif isinstance(part, InlineDataPart):
-                    # Save and send the transformed image
-                    extension = part.mime_type.split('/')[-1]
-                    transformed_image_path = self.images_path / f"transformed_{uuid.uuid4()}.{extension}"
-                    with open(transformed_image_path, "wb") as f:
-                        f.write(part.data)
-                    
-                    with open(transformed_image_path, 'rb') as file:
-                        await self.telegram_update.message.reply_document(
-                            document=file,
-                            caption=caption
-                        )
-                    
-                    result_message += f"Transformed image saved to: {transformed_image_path} and sent to user.\n"
-                    transformed_image_sent = True
+            for variant_idx in range(variants):
+                response = genai_client.models.generate_content(
+                    model=model_name,
+                    contents=(
+                        prompt,
+                        source_image
+                    ),
+                    config=config,
+                )
+                
+                contents = response.candidates[0].content.parts
+                
+                for content in contents:
+                    if 'text' in content.model_fields_set:
+                        try:
+                            await self.telegram_update.message.reply_text(f"Text explanation:\n\n{content.text}", parse_mode="markdown")
+                        except Exception:
+                            text_chunks = [content.text[i:i+3000] for i in range(0, len(content.text), 3000)]
+                            for sub_idx, chunk in enumerate(text_chunks):
+                                try:
+                                    await self.telegram_update.message.reply_text(f"Text explanation subpart {sub_idx + 1}:\n\n{chunk}", parse_mode="markdown")
+                                except Exception:
+                                    await self.telegram_update.message.reply_text(f"Text explanation subpart {sub_idx + 1}:\n\n{chunk}")
+                        result_message += f"Text explanation sent to user: \n\n{content.text}\n\n"
+                    elif 'inline_data' in content.model_fields_set:
+                        extension = content.inline_data.mime_type.split('/')[-1]
+                        transformed_image_path = self.images_path / f"transformed_{uuid.uuid4()}.{extension}"
+                        with open(transformed_image_path, "wb") as f:
+                            f.write(content.inline_data.data)
+                        
+                        variant_caption = f"{caption} (variant {variant_idx + 1}/{variants})" if variants > 1 else caption
+                        with open(transformed_image_path, 'rb') as file:
+                            await self.telegram_update.message.reply_document(
+                                document=file,
+                                caption=variant_caption
+                            )
+                        
+                        all_saved_paths.append(str(transformed_image_path))
             
-            if transformed_image_sent:
-                result_message += "Image transformation completed successfully.\n"
+            if all_saved_paths:
+                paths_str = "\n".join(f"  - {p}" for p in all_saved_paths)
+                result_message += f"Edited {len(all_saved_paths)} image(s) and sent to user.\nSaved to:\n{paths_str}\nImage transformation completed successfully.\n"
             else:
                 result_message += "Warning: No transformed image was generated. The model only provided text response.\n"
                 
             return result_message
         except Exception as e:
             return f"Error editing image: {str(e)}"
-    
-    async def _image_generator(self, prompt: str, style: str = "photorealistic", model: str = "Normal", aspect_ratio: str = "16:9", resolution: str = "2K", caption: str = "Here is your generated image") -> str:
-        """Generate a high-quality image from text using Google's Gemini model"""
-        print(f"Generating image with Gemini - Prompt: {prompt}, Style: {style}, Model: {model}")
+
+    async def _gpt_image_edit(self, prompt: str, image_paths: List[Path], size: str = "2048x1152", quality: str = "auto", caption: str = "Here is your edited image") -> str:
+        """Edit one or more images using OpenAI GPT Image 2"""
+        print(f"Editing image(s) with GPT Image 2 - Prompt: {prompt}, Images: {image_paths}, Size: {size}")
         try:
-            # Format the prompt to include style information
+            image_files = [open(str(p), "rb") for p in image_paths]
+            
+            kwargs = {
+                "model": "gpt-image-2-2026-04-21",
+                "prompt": prompt,
+                "quality": quality,
+                "size": size,
+            }
+            
+            if len(image_files) == 1:
+                kwargs["image"] = image_files[0]
+            else:
+                kwargs["image"] = image_files
+
+            try:
+                result = openai_client.images.edit(**kwargs)
+            finally:
+                for f in image_files:
+                    f.close()
+
+            image_base64 = result.data[0].b64_json
+            image_bytes = base64.b64decode(image_base64)
+            
+            image_path = self.images_path / f"gpt_edited_{uuid.uuid4()}.png"
+            with open(image_path, "wb") as f:
+                f.write(image_bytes)
+            
+            with open(image_path, 'rb') as file:
+                await self.telegram_update.message.reply_document(
+                    document=file,
+                    caption=caption
+                )
+            
+            return f"Image edited with GPT Image 2 and saved to: {image_path} and sent to user.\nImage editing completed successfully.\n"
+        except Exception as e:
+            return f"Error editing image with GPT Image 2: {str(e)}"
+    
+    async def _image_generator(self, prompt: str, style: str = "photorealistic", model: str = "Normal", aspect_ratio: str = "16:9", resolution: str = "2K", gpt_quality: str = "auto", gpt_output_format: str = "png", variants: int = 1, caption: str = "Here is your generated image") -> str:
+        """Generate a high-quality image from text using Gemini or GPT Image 2"""
+        print(f"Generating image - Prompt: {prompt}, Style: {style}, Model: {model}, Variants: {variants}")
+        try:
+            if model.lower() == "gpt":
+                gpt_size = self._resolve_gpt_size(resolution, aspect_ratio)
+                return await self._gpt_image_generate(prompt, gpt_size, gpt_quality, gpt_output_format, caption, n=variants)
+            
             if style and style != "photorealistic":
                 formatted_prompt = f"Create a {style} style image: {prompt}"
             else:
                 formatted_prompt = prompt
             
-            # Select model based on mode
-            model_name = "gemini-3-pro-image-preview" if model.lower() == "pro" else "gemini-2.5-flash-image"
+            model_name = "gemini-3-pro-image-preview" if model.lower() == "pro" else "gemini-3.1-flash-image-preview"
             
-            # Build config based on mode
-            if model == "Pro":
-                config = types.GenerateContentConfig(
-                    image_config=types.ImageConfig(
-                        aspect_ratio=aspect_ratio,
-                        image_size=resolution
-                    )
-                )
-                response = genai_client.models.generate_content(
-                    model=model_name,
-                    contents=[formatted_prompt],
-                    config=config
-                )
-            else:
-                response = genai_client.models.generate_content(
-                    model=model_name,
-                    contents=[formatted_prompt],
-                )
-            
-            # Process the response and extract images
-            contents = response.candidates[0].content.parts
-            
-            image_saved = False
+            all_saved_paths = []
             result_message = ""
             
-            for part in contents:
-                if 'text' in part.model_fields_set and part.text:
-                    # Send any accompanying text
-                    try:
-                        await self.telegram_update.message.reply_text(part.text, parse_mode="markdown")
-                    except Exception:
-                        await self.telegram_update.message.reply_text(part.text)
-                    result_message += f"Generated text: {part.text}\n\n"
-                    
-                elif 'inline_data' in part.model_fields_set:
-                    # Save and send the generated image
-                    extension = part.inline_data.mime_type.split('/')[-1]
-                    if extension == 'jpeg':
-                        extension = 'jpg'
-                    image_path = self.images_path / f"generated_{uuid.uuid4()}.{extension}"
-                    
-                    with open(image_path, "wb") as f:
-                        f.write(part.inline_data.data)
-                    
-                    with open(image_path, 'rb') as file:
-                        await self.telegram_update.message.reply_document(
-                            document=file,
-                            caption=caption
+            for variant_idx in range(variants):
+                if model == "Pro":
+                    config = types.GenerateContentConfig(
+                        image_config=types.ImageConfig(
+                            aspect_ratio=aspect_ratio,
+                            image_size=resolution
                         )
-                    
-                    result_message += f"Image generated and saved to: {image_path} and sent to user.\n"
-                    image_saved = True
+                    )
+                    response = genai_client.models.generate_content(
+                        model=model_name,
+                        contents=[formatted_prompt],
+                        config=config
+                    )
+                else:
+                    response = genai_client.models.generate_content(
+                        model=model_name,
+                        contents=[formatted_prompt],
+                    )
+                
+                contents = response.candidates[0].content.parts
+                
+                for part in contents:
+                    if 'text' in part.model_fields_set and part.text:
+                        try:
+                            await self.telegram_update.message.reply_text(part.text, parse_mode="markdown")
+                        except Exception:
+                            await self.telegram_update.message.reply_text(part.text)
+                        result_message += f"Generated text: {part.text}\n\n"
+                        
+                    elif 'inline_data' in part.model_fields_set:
+                        extension = part.inline_data.mime_type.split('/')[-1]
+                        if extension == 'jpeg':
+                            extension = 'jpg'
+                        image_path = self.images_path / f"generated_{uuid.uuid4()}.{extension}"
+                        
+                        with open(image_path, "wb") as f:
+                            f.write(part.inline_data.data)
+                        
+                        variant_caption = f"{caption} (variant {variant_idx + 1}/{variants})" if variants > 1 else caption
+                        with open(image_path, 'rb') as file:
+                            await self.telegram_update.message.reply_document(
+                                document=file,
+                                caption=variant_caption
+                            )
+                        
+                        all_saved_paths.append(str(image_path))
             
-            if image_saved:
-                result_message += "Image generation completed successfully.\n"
+            if all_saved_paths:
+                paths_str = "\n".join(f"  - {p}" for p in all_saved_paths)
+                result_message += f"Generated {len(all_saved_paths)} image(s) and sent to user.\nSaved to:\n{paths_str}\nImage generation completed successfully.\n"
             else:
                 result_message += "Warning: No image was generated. The model only provided text response.\n"
                 
             return result_message
         except Exception as e:
             return f"Error generating image: {str(e)}"
-    
-    async def _image_composition(self, prompt: str, image_paths: List[str], model: str = "Normal", aspect_ratio: str = "16:9", resolution: str = "2K", caption: str = "Here is your composed image") -> str:
-        """Compose a new image from multiple input images using Google's Gemini model"""
-        print(f"Composing image with prompt: {prompt}, image_paths: {image_paths}, Model: {model}")
+
+    async def _gpt_image_generate(self, prompt: str, size: str = "2048x1152", quality: str = "auto", output_format: str = "png", caption: str = "Here is your generated image", n: int = 1) -> str:
+        """Generate one or more images using OpenAI GPT Image 2"""
+        print(f"Generating image with GPT Image 2 - Prompt: {prompt}, Size: {size}, Quality: {quality}, N: {n}")
         try:
-            # Verify all image paths exist
-            images = []
+            kwargs = {
+                "model": "gpt-image-2-2026-04-21",
+                "prompt": prompt,
+                "quality": quality,
+                "output_format": output_format,
+                "size": size,
+                "n": n,
+            }
+
+            result = openai_client.images.generate(**kwargs)
+
+            ext = "jpg" if output_format == "jpeg" else output_format
+            saved_paths = []
+            for idx, item in enumerate(result.data):
+                image_bytes = base64.b64decode(item.b64_json)
+                image_path = self.images_path / f"gpt_generated_{uuid.uuid4()}.{ext}"
+                with open(image_path, "wb") as f:
+                    f.write(image_bytes)
+                
+                variant_caption = f"{caption} (variant {idx + 1}/{n})" if n > 1 else caption
+                with open(image_path, 'rb') as file:
+                    await self.telegram_update.message.reply_document(
+                        document=file,
+                        caption=variant_caption
+                    )
+                saved_paths.append(str(image_path))
+            
+            paths_str = "\n".join(f"  - {p}" for p in saved_paths)
+            return f"Generated {len(saved_paths)} image(s) with GPT Image 2 and sent to user.\nSaved to:\n{paths_str}\nImage generation completed successfully.\n"
+        except Exception as e:
+            return f"Error generating image with GPT Image 2: {str(e)}"
+    
+    async def _image_composition(self, prompt: str, image_paths: List[str], model: str = "Normal", aspect_ratio: str = "16:9", resolution: str = "2K", gpt_quality: str = "auto", variants: int = 1, caption: str = "Here is your composed image") -> str:
+        """Compose a new image from multiple input images using Gemini or GPT Image 2"""
+        print(f"Composing image with prompt: {prompt}, image_paths: {image_paths}, Model: {model}, Variants: {variants}")
+        try:
+            resolved_paths = []
             for image_path in image_paths:
                 image_path_obj = self._resolve_image_path(image_path)
                 if not image_path_obj.exists():
                     return f"Error: The image at path {image_path} does not exist."
-                images.append(PIL.Image.open(image_path_obj))
+                resolved_paths.append(image_path_obj)
             
-            if len(images) < 2:
+            if len(resolved_paths) < 2:
                 return "Error: At least 2 images are required for composition."
-            if len(images) > 3:
-                return "Error: Maximum 3 images are supported for composition."
             
-            # Build the content list with images and prompt
-            contents = []
-            for i, image in enumerate(images):
-                contents.append(image)
-            contents.append(prompt)
+            if model.lower() == "gpt":
+                gpt_size = self._resolve_gpt_size(resolution, aspect_ratio)
+                all_results = []
+                for i in range(variants):
+                    r = await self._gpt_image_edit(
+                        prompt, resolved_paths, gpt_size, gpt_quality,
+                        f"{caption} (variant {i + 1}/{variants})" if variants > 1 else caption
+                    )
+                    all_results.append(r)
+                return "\n".join(all_results)
             
-            # Select model based on mode
-            model_name = "gemini-3-pro-image-preview" if model.lower() == "pro" else "gemini-2.5-flash-image"
+            if len(resolved_paths) > 3:
+                return "Error: Maximum 3 images are supported for composition with Normal/Pro mode. Use GPT mode for more images."
             
-            # Build config based on mode
+            images = [PIL.Image.open(p) for p in resolved_paths]
+            
+            input_contents = []
+            for image in images:
+                input_contents.append(image)
+            input_contents.append(prompt)
+            
+            model_name = "gemini-3-pro-image-preview" if model.lower() == "pro" else "gemini-3.1-flash-image-preview"
+            
             if model == "Pro":
                 config = types.GenerateContentConfig(
                     response_modalities=["Text", "Image"],
@@ -550,54 +705,52 @@ class ImageTools:
                     response_modalities=["Text", "Image"]
                 )
             
-            # Call Gemini API for image composition
-            response = genai_client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=config,
-            )
-            
-            response_parts = response.candidates[0].content.parts
-            
+            all_saved_paths = []
             result_message = "Image composition results:\n\n"
-            composed_image_sent = False
             
-            for part in response_parts:
-                if 'text' in part.model_fields_set and part.text:
-                    # Send any explanatory text from Gemini about the composition
-                    try:
-                        await self.telegram_update.message.reply_text(f"Composition details:\n\n{part.text}", parse_mode="markdown")
-                    except Exception:
-                        # Handle text length by splitting if needed
-                        text_chunks = [part.text[i:i+3000] for i in range(0, len(part.text), 3000)]
-                        for i, chunk in enumerate(text_chunks):
-                            try:
-                                await self.telegram_update.message.reply_text(f"Composition details (part {i+1}):\n\n{chunk}", parse_mode="markdown")
-                            except Exception:
-                                await self.telegram_update.message.reply_text(f"Composition details (part {i+1}):\n\n{chunk}")
-                    result_message += f"Composition explanation sent to user: \n\n{part.text}\n\n"
-                    
-                elif 'inline_data' in part.model_fields_set:
-                    # Save and send the composed image
-                    extension = part.inline_data.mime_type.split('/')[-1]
-                    if extension == 'jpeg':
-                        extension = 'jpg'
-                    composed_image_path = self.images_path / f"composed_{uuid.uuid4()}.{extension}"
-                    
-                    with open(composed_image_path, "wb") as f:
-                        f.write(part.inline_data.data)
-                    
-                    with open(composed_image_path, 'rb') as file:
-                        await self.telegram_update.message.reply_document(
-                            document=file,
-                            caption=caption
-                        )
-                    
-                    result_message += f"Composed image saved to: {composed_image_path} and sent to user.\n"
-                    composed_image_sent = True
+            for variant_idx in range(variants):
+                response = genai_client.models.generate_content(
+                    model=model_name,
+                    contents=input_contents,
+                    config=config,
+                )
+                
+                response_parts = response.candidates[0].content.parts
+                
+                for part in response_parts:
+                    if 'text' in part.model_fields_set and part.text:
+                        try:
+                            await self.telegram_update.message.reply_text(f"Composition details:\n\n{part.text}", parse_mode="markdown")
+                        except Exception:
+                            text_chunks = [part.text[i:i+3000] for i in range(0, len(part.text), 3000)]
+                            for i, chunk in enumerate(text_chunks):
+                                try:
+                                    await self.telegram_update.message.reply_text(f"Composition details (part {i+1}):\n\n{chunk}", parse_mode="markdown")
+                                except Exception:
+                                    await self.telegram_update.message.reply_text(f"Composition details (part {i+1}):\n\n{chunk}")
+                        result_message += f"Composition explanation sent to user: \n\n{part.text}\n\n"
+                        
+                    elif 'inline_data' in part.model_fields_set:
+                        extension = part.inline_data.mime_type.split('/')[-1]
+                        if extension == 'jpeg':
+                            extension = 'jpg'
+                        composed_image_path = self.images_path / f"composed_{uuid.uuid4()}.{extension}"
+                        
+                        with open(composed_image_path, "wb") as f:
+                            f.write(part.inline_data.data)
+                        
+                        variant_caption = f"{caption} (variant {variant_idx + 1}/{variants})" if variants > 1 else caption
+                        with open(composed_image_path, 'rb') as file:
+                            await self.telegram_update.message.reply_document(
+                                document=file,
+                                caption=variant_caption
+                            )
+                        
+                        all_saved_paths.append(str(composed_image_path))
             
-            if composed_image_sent:
-                result_message += "Image composition completed successfully.\n"
+            if all_saved_paths:
+                paths_str = "\n".join(f"  - {p}" for p in all_saved_paths)
+                result_message += f"Composed {len(all_saved_paths)} image(s) and sent to user.\nSaved to:\n{paths_str}\nImage composition completed successfully.\n"
             else:
                 result_message += "Warning: No composed image was generated. The model only provided text response.\n"
                 
