@@ -1046,10 +1046,27 @@ You have been asked to answer a query given sources. Consider the following when
             conversations_summarization = []
                 
             for file in self.conversations_path.glob("*.json"):
-                with open(file, "r", encoding="utf-8") as f:
-                    conversation_data = json.load(f)
-                    thread_label = conversation_data.get('thread_id') or 'general'
-                    conversations_summarization.append(f"Thread: {thread_label}\nTopic: {conversation_data['topic']}\nTimestamp: {conversation_data['timestamp']}\nSummary: {conversation_data['summary']}")
+                try:
+                    with open(file, "r", encoding="utf-8") as f:
+                        conversation_data = json.load(f)
+                except (OSError, json.JSONDecodeError) as e:
+                    print(f"Skipping unreadable conversation file {file}: {e}")
+                    continue
+
+                thread_label = conversation_data.get('thread_id') or 'general'
+                topic = conversation_data.get('topic') or 'general'
+                timestamp = conversation_data.get('timestamp') or ''
+                summary = conversation_data.get('summary')
+                if not summary:
+                    # Fallback to question/response so older files (pre-topic/summary) still contribute context
+                    q = conversation_data.get('question') or ''
+                    r = conversation_data.get('response') or ''
+                    if not (q or r):
+                        continue
+                    summary = f"Q: {q}\nA: {r}"
+                conversations_summarization.append(
+                    f"Thread: {thread_label}\nTopic: {topic}\nTimestamp: {timestamp}\nSummary: {summary}"
+                )
             
             old_conversations_summarization_header = "And here is the summary of last 20 conversations, in chronological order, you can find there more details about this conversations in conversations folder of your long term memory:\n\n"
 
