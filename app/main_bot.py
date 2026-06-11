@@ -86,7 +86,7 @@ openai_client = OpenAI(api_key=openai_api_key)
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
 anthropic_client = anthropic.AsyncAnthropic(api_key=anthropic_api_key)
 send_reasoning = True
-MAX_IMAGE_SIZE = int(os.getenv("MAX_IMAGE_SIZE", "1024") or "1024")
+max_image_resolution_vision = int(os.getenv("MAX_IMAGE_RESOLUTION_VISION", "1024") or "1024")
 
 user_invites = {}
 authorized_users = set(telegram_chat_id)
@@ -254,13 +254,13 @@ def encode_image(image_path):
     image_bytes = b""
     try:
         with Image.open(image_path) as img:
-            needs_resizing = max(img.size) > MAX_IMAGE_SIZE
+            needs_resizing = max(img.size) > max_image_resolution_vision
             is_jpeg = (img.format or "").upper() in ("JPEG", "JPG")
 
             if needs_resizing or not is_jpeg:
                 if needs_resizing:
                     resample_filter = getattr(Image, 'Resampling', Image).LANCZOS
-                    img.thumbnail((MAX_IMAGE_SIZE, MAX_IMAGE_SIZE), resample_filter)
+                    img.thumbnail((max_image_resolution_vision, max_image_resolution_vision), resample_filter)
 
                 buffer = io.BytesIO()
                 if img.mode != "RGB":
@@ -1487,7 +1487,7 @@ async def voice_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="markdown"
         )
 
-async def queue_image_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str, image_ref, caption: str | None):
+async def queue_image_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str, image_ref: Any, caption: str | None):
     """Collect Telegram album image refs and process them after updates stop arriving."""
     if user_id in media_group_tasks and media_group_tasks[user_id]:
         media_group_tasks[user_id].cancel()
@@ -1530,9 +1530,9 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
             print(f"User {user_id} is waiting for media group, but it is not in media_group_photos")
             return
 
-        if user_id in media_group_waiting_message and media_group_waiting_message[user_id]:
-            await media_group_waiting_message[user_id].edit_text("🖼️ *Processing media group...*", parse_mode="markdown")
-        
+        status_message = media_group_waiting_message.get(user_id)
+        media_group_waiting_message[user_id] = None
+
         image_refs = media_group_photos[user_id]
         
         # Track media group processed
@@ -1541,7 +1541,7 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
         print(f"User {user_id} has {len(image_refs)} images in media group")
 
         _, _, mg_limit = check_user_limits(user_id)
-        await process_image_message(update, context, user_id, image_refs, media_group_captions[user_id], mg_limit)
+        await process_image_message(update, context, user_id, image_refs, media_group_captions[user_id], mg_limit, status_message)
     finally:
         # Clean up media group data
         media_group_id[user_id] = None
@@ -1578,7 +1578,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     # Handle single photo message
     await process_image_message(update, context, user_id, [update.message.photo[-1]], update.message.caption, limit)
 
-async def process_image_message(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str, image_refs: list, caption: str, limit: int | None = None):
+async def process_image_message(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str, image_refs: list, caption: str | None, limit: int | None = None, status_message: Any = None):
     """Process one or more Telegram image file refs through the photo analysis pipeline."""
     async with get_user_lock(user_id):
         photos = image_refs
@@ -1588,7 +1588,10 @@ async def process_image_message(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             describe_question = f"Describe what is in this image and answer to this question: {caption}"
         
-        status_message = await update.message.reply_text("🖼️ *Analyzing images...*", parse_mode="markdown")
+        if status_message:
+            await status_message.edit_text("🖼️ *Analyzing images...*", parse_mode="markdown")
+        else:
+            status_message = await update.message.reply_text("🖼️ *Analyzing images...*", parse_mode="markdown")
         
         temp_photos = []
         all_descriptions = []

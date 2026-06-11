@@ -10,12 +10,14 @@ import telegram
 from google import genai
 from google.genai import types
 import PIL.Image
+import PIL.ImageOps
 load_dotenv()
 
 openai_api_key = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=openai_api_key)
 google_api_key = os.getenv("GOOGLE_API_KEY")
 genai_client = genai.Client(api_key=google_api_key)
+max_image_resolution_edit = int(os.getenv("MAX_IMAGE_RESOLUTION_EDIT", "4096") or "4096")
 
 class TextPart:
     def __init__(self, text):
@@ -273,6 +275,37 @@ class ImageTools:
             return relative_to_images
         return p  # Return original so the caller can report the correct path
 
+    def _prepare_image_for_edit(self, image_path: Path, temp_paths: List[Path]) -> Path:
+        """Create a temporary downsized JPEG for oversized edit inputs."""
+        if max_image_resolution_edit > 0:
+            try:
+                with PIL.Image.open(image_path) as img:
+                    img = PIL.ImageOps.exif_transpose(img)
+                    if max(img.size) > max_image_resolution_edit:
+                        img.thumbnail(
+                            (max_image_resolution_edit, max_image_resolution_edit),
+                            getattr(PIL.Image, "Resampling", PIL.Image).LANCZOS
+                        )
+                        if img.mode != "RGB":
+                            img = img.convert("RGB")
+
+                        temp_path = self.images_path / f"edit_input_{uuid.uuid4()}.jpg"
+                        temp_paths.append(temp_path)
+                        img.save(temp_path, format="JPEG", quality=90, optimize=True)
+                        return temp_path
+            except Exception as e:
+                print(f"Failed to prepare image for edit, using original file: {e}")
+
+        return image_path
+
+    def _cleanup_temp_images(self, temp_paths: List[Path]) -> None:
+        for temp_path in temp_paths:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except Exception as e:
+                print(f"Failed to remove temporary image {temp_path}: {e}")
+
     def _resolve_gpt_size(self, resolution: str, aspect_ratio: str) -> str:
         """Translate resolution + aspect_ratio into a GPT Image 2 pixel size string.
         
@@ -418,6 +451,8 @@ class ImageTools:
     async def _image_editing(self, prompt: str, image_path: str, model: str = "Normal", aspect_ratio: str = "16:9", resolution: str = "2K", gpt_quality: str = "auto", variants: int = 1, caption: str = "Here is your edited image") -> str:
         """Edit an existing image using Gemini or GPT Image 2"""
         print(f"Editing image - Prompt: {prompt}, Image: {image_path}, Model: {model}, Aspect Ratio: {aspect_ratio}, Resolution: {resolution}, GPT Quality: {gpt_quality}, Variants: {variants}")
+        temp_paths: List[Path] = []
+        source_image = None
         try:
             image_path_obj = self._resolve_image_path(image_path)
             if not image_path_obj.exists():
@@ -433,8 +468,9 @@ class ImageTools:
                     )
                     all_results.append(r)
                 return "\n".join(all_results)
-            
-            source_image = PIL.Image.open(image_path_obj)
+
+            source_image_path = self._prepare_image_for_edit(image_path_obj, temp_paths)
+            source_image = PIL.Image.open(source_image_path)
             
             model_name = "gemini-3-pro-image-preview" if model.lower() == "pro" else "gemini-3.1-flash-image-preview"
             
@@ -465,7 +501,7 @@ class ImageTools:
                 )
                 
                 contents = response.candidates[0].content.parts
-                
+
                 for content in contents:
                     if 'text' in content.model_fields_set:
                         try:
@@ -490,24 +526,32 @@ class ImageTools:
                                 document=file,
                                 caption=variant_caption
                             )
-                        
+
                         all_saved_paths.append(str(transformed_image_path))
-            
+
             if all_saved_paths:
                 paths_str = "\n".join(f"  - {p}" for p in all_saved_paths)
                 result_message += f"Edited {len(all_saved_paths)} image(s) and sent to user.\nSaved to:\n{paths_str}\nImage transformation completed successfully.\n"
             else:
                 result_message += "Warning: No transformed image was generated. The model only provided text response.\n"
-                
+
             return result_message
         except Exception as e:
             return f"Error editing image: {str(e)}"
+        finally:
+            if source_image:
+                source_image.close()
+            self._cleanup_temp_images(temp_paths)
 
     async def _gpt_image_edit(self, prompt: str, image_paths: List[Path], size: str = "2048x1152", quality: str = "auto", caption: str = "Here is your edited image") -> str:
         """Edit one or more images using OpenAI GPT Image 2"""
         print(f"Editing image(s) with GPT Image 2 - Prompt: {prompt}, Images: {image_paths}, Size: {size}, Quality: {quality}")
+        temp_paths: List[Path] = []
         try:
-            image_files = [open(str(p), "rb") for p in image_paths]
+            image_files = [
+                open(str(self._prepare_image_for_edit(p, temp_paths)), "rb")
+                for p in image_paths
+            ]
             
             kwargs = {
                 "model": "gpt-image-2-2026-04-21",
@@ -526,6 +570,7 @@ class ImageTools:
             finally:
                 for f in image_files:
                     f.close()
+                self._cleanup_temp_images(temp_paths)
 
             image_base64 = result.data[0].b64_json
             image_bytes = base64.b64decode(image_base64)
@@ -658,6 +703,8 @@ class ImageTools:
     async def _image_composition(self, prompt: str, image_paths: List[str], model: str = "Normal", aspect_ratio: str = "16:9", resolution: str = "2K", gpt_quality: str = "auto", variants: int = 1, caption: str = "Here is your composed image") -> str:
         """Compose a new image from multiple input images using Gemini or GPT Image 2"""
         print(f"Composing image - Prompt: {prompt}, Images: {image_paths}, Model: {model}, Aspect Ratio: {aspect_ratio}, Resolution: {resolution}, GPT Quality: {gpt_quality}, Variants: {variants}")
+        temp_paths: List[Path] = []
+        images: List[PIL.Image.Image] = []
         try:
             resolved_paths = []
             for image_path in image_paths:
@@ -683,7 +730,11 @@ class ImageTools:
             if len(resolved_paths) > 3:
                 return "Error: Maximum 3 images are supported for composition with Normal/Pro mode. Use GPT mode for more images."
             
-            images = [PIL.Image.open(p) for p in resolved_paths]
+            prepared_paths = [
+                self._prepare_image_for_edit(p, temp_paths)
+                for p in resolved_paths
+            ]
+            images = [PIL.Image.open(p) for p in prepared_paths]
             
             input_contents = []
             for image in images:
@@ -716,7 +767,7 @@ class ImageTools:
                 )
                 
                 response_parts = response.candidates[0].content.parts
-                
+
                 for part in response_parts:
                     if 'text' in part.model_fields_set and part.text:
                         try:
@@ -753,8 +804,11 @@ class ImageTools:
                 result_message += f"Composed {len(all_saved_paths)} image(s) and sent to user.\nSaved to:\n{paths_str}\nImage composition completed successfully.\n"
             else:
                 result_message += "Warning: No composed image was generated. The model only provided text response.\n"
-                
+
             return result_message
         except Exception as e:
             return f"Error composing image: {str(e)}"
-
+        finally:
+            for image in images:
+                image.close()
+            self._cleanup_temp_images(temp_paths)
