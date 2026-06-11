@@ -22,6 +22,7 @@ from pathlib import Path
 from secure_container.main import initialize_secure_containers, cleanup_containers
 from stats import stats_tracker, DEFAULT_ACTION_LIMIT
 import time
+from PIL import Image
 
 # Streaming config - read directly from env, not imported
 streaming_enabled = os.getenv("STREAMING_ENABLED", "false").lower() == "true"
@@ -85,6 +86,7 @@ openai_client = OpenAI(api_key=openai_api_key)
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
 anthropic_client = anthropic.AsyncAnthropic(api_key=anthropic_api_key)
 send_reasoning = True
+MAX_IMAGE_SIZE = int(os.getenv("MAX_IMAGE_SIZE", "1024") or "1024")
 
 user_invites = {}
 authorized_users = set(telegram_chat_id)
@@ -249,8 +251,31 @@ class UserSettings:
         return max(1, min(20, max_results))
 
 def encode_image(image_path):
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode('utf-8')
+    image_bytes = b""
+    try:
+        with Image.open(image_path) as img:
+            needs_resizing = max(img.size) > MAX_IMAGE_SIZE
+            is_jpeg = (img.format or "").upper() in ("JPEG", "JPG")
+
+            if needs_resizing or not is_jpeg:
+                if needs_resizing:
+                    resample_filter = getattr(Image, 'Resampling', Image).LANCZOS
+                    img.thumbnail((MAX_IMAGE_SIZE, MAX_IMAGE_SIZE), resample_filter)
+
+                buffer = io.BytesIO()
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                img.save(buffer, format="JPEG", quality=85)
+                image_bytes = buffer.getvalue()
+    except Exception as e:
+        logger.warning(f"Error compressing image: {e}. Falling back to original size.")
+
+    if not image_bytes:
+        with open(image_path, "rb") as image_file:
+            image_bytes = image_file.read()
+
+
+    return base64.b64encode(image_bytes).decode('utf-8')
 
 
 def split_text_intelligently(text: str, max_length: int = 4000) -> list[str]:
@@ -1462,24 +1487,59 @@ async def voice_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="markdown"
         )
 
+async def queue_image_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str, image_ref, caption: str | None):
+    """Collect Telegram album image refs and process them after updates stop arriving."""
+    if user_id in media_group_tasks and media_group_tasks[user_id]:
+        media_group_tasks[user_id].cancel()
+
+    if user_id not in media_group_id or media_group_id[user_id] != update.message.media_group_id:
+        media_group_id[user_id] = update.message.media_group_id
+        media_group_photos[user_id] = []
+        media_group_captions[user_id] = None
+        media_group_waiting_message[user_id] = await update.message.reply_text(
+            "🖼️ *Image media group received... Waiting for images...*",
+            parse_mode="markdown"
+        )
+
+    if caption and media_group_captions[user_id] is None:
+        media_group_captions[user_id] = caption
+
+    if image_ref not in media_group_photos[user_id]:
+        media_group_photos[user_id].append(image_ref)
+        await media_group_waiting_message[user_id].edit_text(
+            f"🖼️ *Image {len(media_group_photos[user_id])} received... Waiting for other images...*",
+            parse_mode="markdown"
+        )
+
+    async def process_media_group_with_timeout():
+        try:
+            await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
+            await process_media_group(update, context, user_id)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logging.error(f"Error in process_media_group_with_timeout: {str(e)}")
+
+    task = asyncio.create_task(process_media_group_with_timeout())
+    media_group_tasks[user_id] = task
+
 async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str):
-    """Process all photos in a media group"""
+    """Process all images in a media group"""
     try:
-        if not user_id in media_group_photos:
+        if user_id not in media_group_photos or not media_group_photos[user_id]:
             print(f"User {user_id} is waiting for media group, but it is not in media_group_photos")
             return
 
         if user_id in media_group_waiting_message and media_group_waiting_message[user_id]:
             await media_group_waiting_message[user_id].edit_text("🖼️ *Processing media group...*", parse_mode="markdown")
         
-        photos = media_group_photos[user_id]
+        image_refs = media_group_photos[user_id]
         
         # Track media group processed
-        stats_tracker.track_media_group_processed(user_id, len(photos))
+        stats_tracker.track_media_group_processed(user_id, len(image_refs))
 
-        print(f"User {user_id} has {len(photos)} photos in media group")
+        print(f"User {user_id} has {len(image_refs)} images in media group")
 
-        image_refs = [photo_group[0] for photo_group in photos]
         _, _, mg_limit = check_user_limits(user_id)
         await process_image_message(update, context, user_id, image_refs, media_group_captions[user_id], mg_limit)
     finally:
@@ -1512,41 +1572,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     stats_tracker.track_message_received(user_id, "photo")
     
     if update.message.media_group_id:
-        # Media group collection stays outside lock - multiple photos arrive rapidly
-        if user_id in media_group_tasks and media_group_tasks[user_id]:
-            media_group_tasks[user_id].cancel()
-        
-        if user_id not in media_group_id or media_group_id[user_id] != update.message.media_group_id:
-            media_group_id[user_id] = update.message.media_group_id
-            media_group_photos[user_id] = []
-            media_group_captions[user_id] = None
-            media_group_waiting_message[user_id] = await update.message.reply_text(
-                "🖼️ *Image media group received... Waiting for images...*",
-                parse_mode="markdown"
-            )
-        
-        if update.message.caption and media_group_captions[user_id] == None:
-            media_group_captions[user_id] = update.message.caption
-
-        photos = [update.message.photo[-1]]
-        if photos not in media_group_photos[user_id]:
-            media_group_photos[user_id].append(photos)
-            await media_group_waiting_message[user_id].edit_text(
-                f"🖼️ *Image {len(media_group_photos[user_id])} received... Waiting for other images...*",
-                parse_mode="markdown"
-            )
-        
-        async def process_media_group_with_timeout():
-            try:
-                await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
-                await process_media_group(update, context, user_id)
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logging.error(f"Error in process_media_group_with_timeout: {str(e)}")
-        
-        task = asyncio.create_task(process_media_group_with_timeout())
-        media_group_tasks[user_id] = task
+        await queue_image_media_group(update, context, user_id, update.message.photo[-1], update.message.caption)
         return
     
     # Handle single photo message
@@ -1686,6 +1712,9 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     image_extensions = ['.jpg', '.jpeg']
     if file_extension in image_extensions:
         stats_tracker.track_message_received(user_id, "photo")
+        if update.message.media_group_id:
+            await queue_image_media_group(update, context, user_id, update.message.document, update.message.caption)
+            return
         await process_image_message(update, context, user_id, [update.message.document], update.message.caption, limit)
         return
 
