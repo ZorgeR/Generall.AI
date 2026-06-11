@@ -118,6 +118,7 @@ media_group_photos = {}
 media_group_captions = {}
 media_group_waiting_message = {}
 media_group_tasks = {}
+media_group_processing = {}
 MEDIA_GROUP_TIMEOUT = 10.0
 
 
@@ -1498,7 +1499,10 @@ async def voice_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def queue_image_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str, image_ref: Any, caption: str | None):
     """Collect Telegram album image refs and process them after updates stop arriving."""
-    if user_id in media_group_tasks and media_group_tasks[user_id]:
+    is_same_media_group = user_id in media_group_id and media_group_id[user_id] == update.message.media_group_id
+    is_processing = media_group_processing.get(user_id) and is_same_media_group
+
+    if user_id in media_group_tasks and media_group_tasks[user_id] and not is_processing:
         media_group_tasks[user_id].cancel()
 
     if user_id not in media_group_id or media_group_id[user_id] != update.message.media_group_id:
@@ -1515,10 +1519,15 @@ async def queue_image_media_group(update: Update, context: ContextTypes.DEFAULT_
 
     if image_ref not in media_group_photos[user_id]:
         media_group_photos[user_id].append(image_ref)
-        await media_group_waiting_message[user_id].edit_text(
-            f"🖼️ *Image {len(media_group_photos[user_id])} received... Waiting for other images...*",
-            parse_mode="markdown"
-        )
+        waiting_message = media_group_waiting_message.get(user_id)
+        if waiting_message and not is_processing:
+            await waiting_message.edit_text(
+                f"🖼️ *Image {len(media_group_photos[user_id])} received... Waiting for other images...*",
+                parse_mode="markdown"
+            )
+
+    if is_processing:
+        return
 
     async def process_media_group_with_timeout():
         try:
@@ -1534,13 +1543,13 @@ async def queue_image_media_group(update: Update, context: ContextTypes.DEFAULT_
 
 async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str):
     """Process all images in a media group"""
+    media_group_processing[user_id] = True
     try:
         if user_id not in media_group_photos or not media_group_photos[user_id]:
             print(f"User {user_id} is waiting for media group, but it is not in media_group_photos")
             return
 
         status_message = media_group_waiting_message.get(user_id)
-        media_group_waiting_message[user_id] = None
 
         image_refs = media_group_photos[user_id]
         
@@ -1561,6 +1570,8 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
         media_group_waiting_message[user_id] = None
         if user_id in media_group_tasks:
             del media_group_tasks[user_id]
+        if user_id in media_group_processing:
+            del media_group_processing[user_id]
 
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming photo messages with support for multiple photos"""
