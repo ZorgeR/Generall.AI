@@ -8,6 +8,7 @@ boto3>=1.36.0
 loguru>=0.7.0
 elevenlabs>=0.3.0
 pydub>=0.25.1 # winget install ffmpeg
+audioop-lts>=0.2.2; python_version >= "3.13"
 ffmpeg-downloader # ffdl install --add-path
 requests>=2.31.0
 beautifulsoup4>=4.12.0
