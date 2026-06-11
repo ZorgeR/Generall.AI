@@ -23,6 +23,7 @@ from secure_container.main import initialize_secure_containers, cleanup_containe
 from stats import stats_tracker, DEFAULT_ACTION_LIMIT
 import time
 from PIL import Image
+from image_utils import IMAGE_EXTENSIONS, is_jpeg_image, save_image_as_jpeg
 
 # Streaming config - read directly from env, not imported
 streaming_enabled = os.getenv("STREAMING_ENABLED", "false").lower() == "true"
@@ -276,6 +277,14 @@ def encode_image(image_path):
 
 
     return base64.b64encode(image_bytes).decode('utf-8')
+
+
+def prepare_downloaded_image_for_vision(source_path: str, target_path: str) -> None:
+    if is_jpeg_image(source_path):
+        shutil.copy(source_path, target_path)
+        return
+
+    save_image_as_jpeg(source_path, target_path, quality=90)
 
 
 def split_text_intelligently(text: str, max_length: int = 4000) -> list[str]:
@@ -1603,9 +1612,17 @@ async def process_image_message(update: Update, context: ContextTypes.DEFAULT_TY
                     photo_file = await context.bot.get_file(photo.file_id)
                     temp_dir = "temp_photos"
                     os.makedirs(temp_dir, exist_ok=True)
+                    original_extension = os.path.splitext(getattr(photo, "file_name", "") or "")[1].lower()
+                    if original_extension not in IMAGE_EXTENSIONS:
+                        original_extension = ".jpg"
+
+                    temp_download = os.path.join(temp_dir, f"photo_{uuid.uuid4()}{original_extension}")
+                    temp_photos.append(temp_download)
+                    await photo_file.download_to_drive(temp_download)
+
                     temp_photo = os.path.join(temp_dir, f"photo_{uuid.uuid4()}.jpg")
                     temp_photos.append(temp_photo)
-                    await photo_file.download_to_drive(temp_photo)
+                    prepare_downloaded_image_for_vision(temp_download, temp_photo)
                     
                     user_images_dir = os.path.join("data", user_id, "images")
                     os.makedirs(user_images_dir, exist_ok=True)
@@ -1712,7 +1729,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         await handle_video_message(update, context)
         return
     
-    image_extensions = ['.jpg', '.jpeg']
+    image_extensions = IMAGE_EXTENSIONS
     if file_extension in image_extensions:
         stats_tracker.track_message_received(user_id, "photo")
         if update.message.media_group_id:
@@ -1728,7 +1745,8 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     
     if file_extension not in supported_extensions:
         supported_formats = ", ".join([ext.replace(".", "").upper() for ext in supported_extensions])
-        await update.message.reply_text(f"❌ Only {supported_formats} documents and JPG/JPEG images are supported.")
+        supported_image_formats = "/".join(ext.replace(".", "").upper() for ext in image_extensions)
+        await update.message.reply_text(f"❌ Only {supported_formats} documents and {supported_image_formats} images are supported.")
         return
 
     async with get_user_lock(user_id):

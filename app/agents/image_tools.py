@@ -11,6 +11,7 @@ from google import genai
 from google.genai import types
 import PIL.Image
 import PIL.ImageOps
+from image_utils import JPEG_FORMATS
 load_dotenv()
 
 openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -276,25 +277,31 @@ class ImageTools:
         return p  # Return original so the caller can report the correct path
 
     def _prepare_image_for_edit(self, image_path: Path, temp_paths: List[Path]) -> Path:
-        """Create a temporary downsized JPEG for oversized edit inputs."""
-        if max_image_resolution_edit > 0:
-            try:
-                with PIL.Image.open(image_path) as img:
+        """Create a temporary JPEG for resized or non-JPEG edit inputs."""
+        try:
+            with PIL.Image.open(image_path) as img:
+                image_format = (img.format or "").upper()
+                needs_resizing = max_image_resolution_edit > 0 and max(img.size) > max_image_resolution_edit
+                needs_conversion = image_format not in JPEG_FORMATS
+
+                if needs_resizing or needs_conversion:
                     img = PIL.ImageOps.exif_transpose(img)
-                    if max(img.size) > max_image_resolution_edit:
+
+                    if needs_resizing:
                         img.thumbnail(
                             (max_image_resolution_edit, max_image_resolution_edit),
                             getattr(PIL.Image, "Resampling", PIL.Image).LANCZOS
                         )
-                        if img.mode != "RGB":
-                            img = img.convert("RGB")
 
-                        temp_path = self.images_path / f"edit_input_{uuid.uuid4()}.jpg"
-                        temp_paths.append(temp_path)
-                        img.save(temp_path, format="JPEG", quality=90, optimize=True)
-                        return temp_path
-            except Exception as e:
-                print(f"Failed to prepare image for edit, using original file: {e}")
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+
+                    temp_path = self.images_path / f"edit_input_{uuid.uuid4()}.jpg"
+                    temp_paths.append(temp_path)
+                    img.save(temp_path, format="JPEG", quality=90, optimize=True)
+                    return temp_path
+        except Exception as e:
+            print(f"Failed to prepare image for edit, using original file: {e}")
 
         return image_path
 
