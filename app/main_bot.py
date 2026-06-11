@@ -1479,116 +1479,9 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         print(f"User {user_id} has {len(photos)} photos in media group")
 
-        if media_group_captions[user_id] == None:
-            caption = "Describe what is in this image in user language."
-            describe_question = caption
-        else:
-            caption = media_group_captions[user_id]
-            describe_question = f"Describe what is in this image and answer to this question: {caption}"
-
-        
-        # Send initial status message
-        status_message = await update.message.reply_text("🖼️ *Analyzing images...*", parse_mode="markdown")
-        
-        temp_photos = []  # Keep track of temporary files for cleanup
-        all_descriptions = []  # Store descriptions for all photos
-        image_paths = []  # Store paths to downloaded images
-        
-        try:
-            # Process each photo
-            for i, photo_group in enumerate(photos, 1):
-                try:
-                    photo = photo_group[0]  # Get the photo from the group
-                    # Download the photo
-                    photo_file = await context.bot.get_file(photo.file_id)
-                    temp_dir = f"./data/{user_id}/temp_photos"
-                    os.makedirs(temp_dir, exist_ok=True)
-                    temp_photo = os.path.join(temp_dir, f"photo_{uuid.uuid4()}.jpg")
-                    temp_photos.append(temp_photo)
-                    await photo_file.download_to_drive(temp_photo)
-                    
-                    # Save the permanent copy to user's directory
-                    user_images_dir = os.path.join("data", user_id, "images")
-                    os.makedirs(user_images_dir, exist_ok=True)
-                    permanent_image_path = os.path.join(user_images_dir, f"image_{uuid.uuid4()}.jpg")
-                    # Copy the image to the permanent location
-                    shutil.copy(temp_photo, permanent_image_path)
-                    image_paths.append(permanent_image_path)
-                    
-                    # Get descriptions from both services
-                    await status_message.edit_text(f"🤖 *Getting Anthropic description for image {i}...*", parse_mode="markdown")
-                    anthropic_description = await describe_image_anthropic(question=describe_question, image_path=temp_photo)
-                    stats_tracker.track_describe_used(user_id, "image_anthropic")
-                    
-                    await status_message.edit_text(f"🤖 *Getting OpenAI description for image {i}...*", parse_mode="markdown")
-                    openai_description = await describe_image_openai(question=describe_question, image_path=temp_photo)
-                    stats_tracker.track_describe_used(user_id, "image_openai")
-                    
-                    all_descriptions.append({
-                        'anthropic': anthropic_description,
-                        'openai': openai_description,
-                        'path': permanent_image_path
-                    })
-                    
-                except Exception as e:
-                    logging.error(f"Error processing photo {i}: {str(e)}")
-                    all_descriptions.append({
-                        'anthropic': f"Error processing image {i}",
-                        'openai': f"Error processing image {i}",
-                        'path': "error_path"
-                    })
-            
-            # Craft the user question combining caption and all descriptions
-            descriptions_text = "\n\n".join([
-                f"Image {i+1} (path: {desc['path']}):\n"
-                f"Anthropic description: {desc['anthropic']}\n"
-                f"OpenAI description: {desc['openai']}"
-                for i, desc in enumerate(all_descriptions)
-            ])
-            
-            user_question = f"{caption}\n\nUser attached {len(all_descriptions)} image(s) to this message. Here are the details about each image from Anthropic and OpenAI:\n\n{descriptions_text}"
-            
-            await status_message.edit_text("🤖 *Processing...*", parse_mode="markdown")
-            # Process like a regular message
-            await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing', message_thread_id=get_thread_id(update))
-            thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
-            _, _, mg_limit = check_user_limits(user_id)
-            
-            async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
-                if step == "saving":
-                    iteration = "final"
-                    critique = "end"
-                live_limit_info = ""
-                if mg_limit:
-                    live_used = stats_tracker.get_user_action_count(user_id, days=30)
-                    live_limit_info = f"📊 *Usage:* _{live_used}/{mg_limit} actions (30d)_\n"
-                await thinking_message.edit_text(
-                    f"💭 *Thinking...*\n"
-                    f"- - - - \n"
-                    f"{live_limit_info}"
-                    f"📝 *Step:* _{step.replace('_', '-')}_\n"
-                    f"📋 *Details:* _{details.replace('_', '-')}_\n"
-                    f"🔄 *Iterations:* _{iteration}_\n"
-                    f"🎯 *Critiques:* _{critique}_",
-                    parse_mode="markdown"
-                )
-            
-            # Get response using the same logic as handle_message
-            _thread_id = get_thread_id(update)
-            on_text_chunk = create_streaming_callback(context.bot, user_id, _thread_id)
-            response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk, message_thread_id=_thread_id)
-            await send_response_to_user(update, thinking_message, response, user_id)
-            await send_reasoning_file(update, messages, user_id)
-            await status_message.edit_text("🤖 *Done!*", parse_mode="markdown")
-            
-        finally:
-            # Clean up all temporary files
-            for temp_photo in temp_photos:
-                try:
-                    if os.path.exists(temp_photo):
-                        os.remove(temp_photo)
-                except Exception as e:
-                    print(f"Error cleaning up temporary photo file {temp_photo}: {str(e)}")
+        image_refs = [photo_group[0] for photo_group in photos]
+        _, _, mg_limit = check_user_limits(user_id)
+        await process_image_message(update, context, user_id, image_refs, media_group_captions[user_id], mg_limit)
     finally:
         # Clean up media group data
         media_group_id[user_id] = None
@@ -1646,8 +1539,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         async def process_media_group_with_timeout():
             try:
                 await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
-                async with get_user_lock(user_id):
-                    await process_media_group(update, context, user_id)
+                await process_media_group(update, context, user_id)
             except asyncio.CancelledError:
                 pass
             except Exception as e:
@@ -1658,13 +1550,16 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     
     # Handle single photo message
+    await process_image_message(update, context, user_id, [update.message.photo[-1]], update.message.caption, limit)
+
+async def process_image_message(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str, image_refs: list, caption: str, limit: int | None = None):
+    """Process one or more Telegram image file refs through the photo analysis pipeline."""
     async with get_user_lock(user_id):
-        photos = [update.message.photo[-1]]
-        if update.message.caption == None:
+        photos = image_refs
+        if caption is None:
             caption = "Describe what is in this image in user language."
             describe_question = caption
         else:
-            caption = update.message.caption
             describe_question = f"Describe what is in this image and answer to this question: {caption}"
         
         status_message = await update.message.reply_text("🖼️ *Analyzing images...*", parse_mode="markdown")
@@ -1689,11 +1584,12 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     shutil.copy(temp_photo, permanent_image_path)
                     image_paths.append(permanent_image_path)
                     
-                    await status_message.edit_text(f"🤖 *Getting Anthropic description...*", parse_mode="markdown")
+                    image_suffix = f" for image {i}" if len(photos) > 1 else ""
+                    await status_message.edit_text(f"🤖 *Getting Anthropic description{image_suffix}...*", parse_mode="markdown")
                     anthropic_description = await describe_image_anthropic(question=describe_question, image_path=temp_photo)
                     stats_tracker.track_describe_used(user_id, "image_anthropic")
                     
-                    await status_message.edit_text(f"🤖 *Getting OpenAI description...*", parse_mode="markdown")
+                    await status_message.edit_text(f"🤖 *Getting OpenAI description{image_suffix}...*", parse_mode="markdown")
                     openai_description = await describe_image_openai(question=describe_question, image_path=temp_photo)
                     stats_tracker.track_describe_used(user_id, "image_openai")
                     
@@ -1787,6 +1683,12 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         await handle_video_message(update, context)
         return
     
+    image_extensions = ['.jpg', '.jpeg']
+    if file_extension in image_extensions:
+        stats_tracker.track_message_received(user_id, "photo")
+        await process_image_message(update, context, user_id, [update.message.document], update.message.caption, limit)
+        return
+
     # Track message received
     stats_tracker.track_message_received(user_id, "document")
     
@@ -1794,7 +1696,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     
     if file_extension not in supported_extensions:
         supported_formats = ", ".join([ext.replace(".", "").upper() for ext in supported_extensions])
-        await update.message.reply_text(f"❌ Only {supported_formats} documents are supported.")
+        await update.message.reply_text(f"❌ Only {supported_formats} documents and JPG/JPEG images are supported.")
         return
 
     async with get_user_lock(user_id):
