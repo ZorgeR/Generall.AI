@@ -46,22 +46,25 @@ openai_client = OpenAI(api_key=openai_api_key)
 tavily_api_key = os.getenv("TAVILY_API_KEY")
 tavily_client = TavilyClient(api_key=tavily_api_key)
 
-# Appended to every system prompt: answers are converted from Markdown into
-# Telegram entities by telegram_md, so the model can use the full feature set.
+# Appended to every system prompt. Answers are delivered as Bot API 10.1 rich
+# messages when the server supports them (telegram_rich), and converted into
+# Telegram entities otherwise (telegram_md) - so the model can write full
+# Markdown either way.
 TELEGRAM_FORMATTING_RULES = """
 <telegram_formatting>
-Your answer is rendered as rich Telegram formatting, so write plain Markdown and it becomes real styling:
-- **bold**, *italic*, __underline__, ~~strikethrough~~ and ||spoiler|| (hidden until the user taps it - good for punchlines, answers to puzzles and anything worth hiding)
+Your answer is delivered as a Telegram rich message, so write plain Markdown and it becomes real formatting:
+- **bold**, *italic*, __underline__, ~~strikethrough~~, ==highlight== and ||spoiler|| (hidden until the user taps it - good for punchlines, answers to puzzles and anything worth hiding)
 - `inline code`, and fenced code blocks with a language tag (```python) for syntax highlighting
 - [links](https://example.com) with descriptive labels instead of bare URLs
 - > blockquotes; a long quote is collapsed into an expandable one automatically
-- headings (#, ##, ###), bullet lists, numbered lists, nested lists and - [ ] / - [x] task lists
-- tables, rendered as an aligned monospace grid - keep them to 2-3 short columns so they fit a phone screen; wide tables are reflowed into a list
+- headings (# through ######), bullet lists, numbered lists, nested lists and - [ ] / - [x] checklists
+- tables with alignment; keep them to a few short columns so they stay readable on a phone
+- LaTeX math: $inline$ and $$display$$
+- footnotes ([^1]) and collapsible sections (<details><summary>...</summary>...</details>)
 
 Keep in mind:
-- Telegram has no heading sizes: a heading is shown as bold, so keep the structure shallow and rely on short paragraphs.
-- Never write raw HTML, and prefer plain text over LaTeX: math is shown as monospace text, not typeset.
-- Long answers are split into several messages automatically at paragraph boundaries - do not add "part 1/2" markers yourself.
+- Not every client gets the full set: on older ones the answer degrades to bold/italic/code/quotes, and tables become a monospace grid. Write so the meaning survives that - do not rely on a heading or a table alone to carry the point.
+- Never write raw HTML other than <details>, and do not add "part 1/2" markers: long answers are split automatically at paragraph boundaries.
 </telegram_formatting>
 """
 

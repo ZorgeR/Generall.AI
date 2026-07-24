@@ -22,6 +22,7 @@ from pathlib import Path
 from secure_container.main import initialize_secure_containers, cleanup_containers
 from stats import stats_tracker, DEFAULT_ACTION_LIMIT
 from telegram_md import edit_rich, edit_status, reply_rich, reply_status, render_plain, send_rich
+from telegram_rich import edit_rich_message, rich_enabled, send_rich_draft, send_rich_message
 import time
 
 # Streaming config - read directly from env, not imported
@@ -824,12 +825,35 @@ async def sendvoice_to_user(audio_stream):
 
     return temp_audio_path
 
-async def send_response_to_user(update: Update, thinking_message, response: str, user_id: str = None):
-    """Send the bot's answer, rendered as rich Telegram markup.
+async def send_answer(bot, chat_id, text: str, **kwargs):
+    """Send text with the best formatting available: rich message, else entities."""
+    if rich_enabled():
+        try:
+            if await send_rich_message(bot, chat_id, text, **kwargs):
+                return
+        except Exception as e:
+            logger.warning(f"Rich message send failed, falling back: {str(e)}")
+    await send_rich(bot, chat_id, text, **kwargs)
 
-    The answer is converted from Markdown to Telegram entities (bold, italic,
-    underline, strikethrough, spoilers, code blocks, links, quotes, tables) and
-    split at block boundaries when it exceeds a single message.
+
+async def edit_answer(message, text: str, reply_to=None, **kwargs):
+    """Replace a message with an answer, rich if the server supports it."""
+    if message is not None and rich_enabled():
+        try:
+            if await edit_rich_message(message.get_bot(), message.chat_id, message.message_id, text, **kwargs):
+                return
+        except Exception as e:
+            logger.warning(f"Rich message edit failed, falling back: {str(e)}")
+    await edit_rich(message, text, reply_to=reply_to, **kwargs)
+
+
+async def send_response_to_user(update: Update, thinking_message, response: str, user_id: str = None):
+    """Send the bot's answer with the richest formatting the server supports.
+
+    First choice is a Bot API 10.1 rich message, which renders the model's
+    Markdown as-is - real headings, tables, checklists, LaTeX, collapsible
+    sections. If the server does not have that method, the answer is converted
+    into MarkdownV2 entities instead, and plain text is the last resort.
     """
     # Track message sent
     if user_id:
@@ -839,7 +863,7 @@ async def send_response_to_user(update: Update, thinking_message, response: str,
         response = "🤖 **No response from the AI.**"
 
     try:
-        await edit_rich(thinking_message, response, reply_to=update.message)
+        await edit_answer(thinking_message, response, reply_to=update.message)
     except Exception as e:
         logger.warning(f"Failed to send formatted response: {str(e)}")
         for chunk in split_text_intelligently(render_plain(response)):
@@ -924,35 +948,43 @@ def get_thread_id(update: Update):
     return None
 
 def create_streaming_callback(bot, user_id: str, message_thread_id: int = None):
-    """Create a throttled on_text_chunk callback for streaming to Telegram draft messages.
-    Returns None if streaming is disabled."""
+    """Create a throttled on_text_chunk callback for streaming to Telegram drafts.
+
+    Partial answers stream as rich drafts when the server supports Bot API
+    10.1, so formatting appears while the answer is still being written and
+    reasoning goes into a native thinking block. Plain text drafts are the
+    fallback. Returns None if streaming is disabled.
+    """
     if not streaming_enabled:
         return None
-    
+
     state = {"last_update": 0.0, "draft_id": 1}
-    
+
     async def on_text_chunk(text: str, is_thinking: bool = False):
         now = time.monotonic()
         if now - state["last_update"] < DRAFT_THROTTLE:
             return
         state["last_update"] = now
-        
+
+        kwargs = {"message_thread_id": message_thread_id} if message_thread_id else {}
+
+        if await send_rich_draft(bot, user_id, state["draft_id"], text, thinking=is_thinking, **kwargs):
+            return
+
         display = text[:4000]
         if is_thinking:
             display = f"💭 {display}"
-        
+
         try:
-            kwargs = {
-                "chat_id": int(user_id),
-                "draft_id": state["draft_id"],
-                "text": display
-            }
-            if message_thread_id:
-                kwargs["message_thread_id"] = message_thread_id
-            await bot.send_message_draft(**kwargs)
+            await bot.send_message_draft(
+                chat_id=int(user_id),
+                draft_id=state["draft_id"],
+                text=display,
+                **kwargs
+            )
         except Exception:
             pass
-    
+
     return on_text_chunk
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2560,7 +2592,7 @@ async def check_and_send_reminders(context: ContextTypes.DEFAULT_TYPE):
                         try:
                             if reminder.get("type", "user") == "user":
                                 # Send user reminder
-                                await send_rich(context.bot, user_id, f"🔔 **Reminder**\n\n{reminder['text']}")
+                                await send_answer(context.bot, user_id, f"🔔 **Reminder**\n\n{reminder['text']}")
 
                             # Handle periodic reminders
                             if reminder.get("is_periodic", False):
@@ -2657,7 +2689,7 @@ async def check_and_process_agent_reminders(context: ContextTypes.DEFAULT_TYPE):
 
                             print("Sending initial message to user")
                             try:
-                                await send_rich(
+                                await send_answer(
                                     context.bot,
                                     user_id,
                                     "🤖 **Agent Reminder Task**\n\nProcessing scheduled task:\n" + reminder['text']
@@ -2705,7 +2737,7 @@ async def check_and_process_agent_reminders(context: ContextTypes.DEFAULT_TYPE):
                             print(f"get_answer returned response: {response}")
                             # Send the response
                             try:
-                                await edit_rich(thinking_message, response)
+                                await edit_answer(thinking_message, response)
                             except Exception as e:
                                 logging.error(f"Error sending response to user {user_id}: {str(e)}")
                                 for chunk in split_text_intelligently(render_plain(response)):

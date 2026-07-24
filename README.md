@@ -32,7 +32,7 @@ GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bo
 - **📦 Package Management**: Install and run packages in a secure containerized environment
 - **📁 File Sharing**: Send files directly to users through Telegram
 - **📱 SMS Messaging**: Send SMS text messages to phone numbers via Twilio integration
-- **✍️ Rich Message Formatting**: Answers are converted from Markdown into native Telegram entities - bold, italic, underline, strikethrough, spoilers, syntax-highlighted code blocks, links, expandable quotes, tables and task lists
+- **✍️ Rich Message Formatting**: Answers are delivered as Bot API 10.1 rich messages - real headings, tables, checklists, LaTeX, collapsible sections and streaming drafts with native thinking blocks - degrading automatically to MarkdownV2 entities on older API servers
 - **⚙️ Customizable Settings**: Fine-tune the assistant's behavior through an interactive settings menu
 - **🧠 Persistent Memory**: Maintain conversation context across sessions
 - **🔌 Advanced Agent Architecture**: Powered by a modular agent system with specialized tools for different tasks
@@ -204,9 +204,24 @@ Customize voice parameters including voice model selection, stability, clarity, 
 
 ### ✍️ Rich Message Formatting
 
-Everything the agent writes is Markdown, and `app/telegram_md.py` renders it into real Telegram formatting before it is sent, using the Bot API's `MarkdownV2` entities:
+Everything the agent writes is Markdown, and the bot delivers it with the richest formatting the Telegram server supports.
 
-| Written by the agent | Shown in Telegram |
+**Preferred path - Rich Messages (Bot API 10.1, June 2026).** `app/telegram_rich.py` sends the Markdown as-is through `sendRichMessage`, which renders it natively:
+
+- headings `#`-`######`, paragraphs, dividers and footers
+- tables with alignment, ordered/unordered/nested lists and `- [x]` checklists
+- blockquotes with credit, pull quotes, collapsible `<details>` sections
+- code blocks with language highlighting, `==highlight==`, `||spoiler||`, sub/superscript
+- LaTeX - `$inline$` and `$$display$$` - footnotes and anchors
+- media blocks: photo, video, audio, voice, collages, slideshows, maps
+
+Limits per rich message: 32,768 characters, 500 blocks, nesting depth 16, 50 media attachments, 20 table columns.
+
+**Streaming.** When `STREAMING_ENABLED=true`, partial answers stream through `sendRichMessageDraft`, so formatting appears while the answer is still being written, and the agent's reasoning goes into a native thinking block (`<tg-thinking>`) instead of an edited "💭 Thinking..." message. Drafts are private-chat only and are previews - the final answer is still sent as a real message.
+
+**Fallback path - MarkdownV2.** python-telegram-bot has no typed methods for Rich Messages yet, so the calls go through `Bot.do_api_request`. If the server is older than Bot API 10.1 - including a self-hosted `telegram-bot-api` that has not been updated - the first rejection latches the rich path off for the process, and `app/telegram_md.py` takes over: it parses the same Markdown into MarkdownV2 entities.
+
+| Written by the agent | MarkdownV2 fallback |
 | --- | --- |
 | `**text**`, `*text*` | bold, italic |
 | `__text__`, `~~text~~` | underline, strikethrough |
@@ -221,8 +236,10 @@ Everything the agent writes is Markdown, and `app/telegram_md.py` renders it int
 Practical consequences:
 
 - **No more broken messages.** Everything outside markup is escaped, so an underscore in `file_name.py` or a stray bracket no longer makes Telegram reject the whole answer.
-- **Safe splitting.** Answers longer than 4096 characters are split at paragraph boundaries instead of mid-entity, and a code block that spans the split is re-opened with the same language in the next message.
-- **Graceful degradation.** Each message tries `MarkdownV2`, then `HTML`, then plain text, so a malformed fragment never costs the user the answer.
+- **Safe splitting.** Answers longer than one message are split at paragraph boundaries instead of mid-entity, and a code block that spans the split is re-opened with the same language in the next message.
+- **Graceful degradation.** Rich message -> MarkdownV2 -> HTML -> plain text, decided per message, so a malformed fragment never costs the user the answer.
+
+Set `RICH_MESSAGES_ENABLED=false` to stay on the MarkdownV2 path.
 
 Formatting is covered by unit tests:
 
