@@ -10,6 +10,7 @@ import telegram
 from google import genai
 from google.genai import types
 import PIL.Image
+from telegram_md import reply_rich
 load_dotenv()
 
 openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -383,18 +384,7 @@ class ImageTools:
             for part in all_parts:
                 part_count += 1
                 if isinstance(part, TextPart):
-                    try: # as markdown
-                        await self.telegram_update.message.reply_text(f"Part {part_count}:\n\n{part.text}", parse_mode="markdown")
-                    except Exception:
-                        # check length of text and split to chunks of 3000 characters
-                        text_chunks = [part.text[i:i+3000] for i in range(0, len(part.text), 3000)]
-                        sub_part_count = 0
-                        for chunk in text_chunks:
-                            sub_part_count += 1
-                            try:
-                                await self.telegram_update.message.reply_text(f"Part {part_count} subpart {sub_part_count}:\n\n{chunk}", parse_mode="markdown")
-                            except Exception:
-                                await self.telegram_update.message.reply_text(f"Part {part_count} subpart {sub_part_count}:\n\n{chunk}")
+                    await reply_rich(self.telegram_update.message, f"**Part {part_count}:**\n\n{part.text}")
                     result_message += f"Part {part_count}:\n\n{part.text}\n\n"
                 elif isinstance(part, InlineDataPart):
                     image_count += 1
@@ -468,15 +458,7 @@ class ImageTools:
                 
                 for content in contents:
                     if 'text' in content.model_fields_set:
-                        try:
-                            await self.telegram_update.message.reply_text(f"Text explanation:\n\n{content.text}", parse_mode="markdown")
-                        except Exception:
-                            text_chunks = [content.text[i:i+3000] for i in range(0, len(content.text), 3000)]
-                            for sub_idx, chunk in enumerate(text_chunks):
-                                try:
-                                    await self.telegram_update.message.reply_text(f"Text explanation subpart {sub_idx + 1}:\n\n{chunk}", parse_mode="markdown")
-                                except Exception:
-                                    await self.telegram_update.message.reply_text(f"Text explanation subpart {sub_idx + 1}:\n\n{chunk}")
+                        await reply_rich(self.telegram_update.message, f"**Text explanation:**\n\n{content.text}")
                         result_message += f"Text explanation sent to user: \n\n{content.text}\n\n"
                     elif 'inline_data' in content.model_fields_set:
                         extension = content.inline_data.mime_type.split('/')[-1]
@@ -585,10 +567,7 @@ class ImageTools:
                 
                 for part in contents:
                     if 'text' in part.model_fields_set and part.text:
-                        try:
-                            await self.telegram_update.message.reply_text(part.text, parse_mode="markdown")
-                        except Exception:
-                            await self.telegram_update.message.reply_text(part.text)
+                        await reply_rich(self.telegram_update.message, part.text)
                         result_message += f"Generated text: {part.text}\n\n"
                         
                     elif 'inline_data' in part.model_fields_set:
@@ -719,15 +698,7 @@ class ImageTools:
                 
                 for part in response_parts:
                     if 'text' in part.model_fields_set and part.text:
-                        try:
-                            await self.telegram_update.message.reply_text(f"Composition details:\n\n{part.text}", parse_mode="markdown")
-                        except Exception:
-                            text_chunks = [part.text[i:i+3000] for i in range(0, len(part.text), 3000)]
-                            for i, chunk in enumerate(text_chunks):
-                                try:
-                                    await self.telegram_update.message.reply_text(f"Composition details (part {i+1}):\n\n{chunk}", parse_mode="markdown")
-                                except Exception:
-                                    await self.telegram_update.message.reply_text(f"Composition details (part {i+1}):\n\n{chunk}")
+                        await reply_rich(self.telegram_update.message, f"**Composition details:**\n\n{part.text}")
                         result_message += f"Composition explanation sent to user: \n\n{part.text}\n\n"
                         
                     elif 'inline_data' in part.model_fields_set:

@@ -32,6 +32,7 @@ GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bo
 - **📦 Package Management**: Install and run packages in a secure containerized environment
 - **📁 File Sharing**: Send files directly to users through Telegram
 - **📱 SMS Messaging**: Send SMS text messages to phone numbers via Twilio integration
+- **✍️ Rich Message Formatting**: Answers are converted from Markdown into native Telegram entities - bold, italic, underline, strikethrough, spoilers, syntax-highlighted code blocks, links, expandable quotes, tables and task lists
 - **⚙️ Customizable Settings**: Fine-tune the assistant's behavior through an interactive settings menu
 - **🧠 Persistent Memory**: Maintain conversation context across sessions
 - **🔌 Advanced Agent Architecture**: Powered by a modular agent system with specialized tools for different tasks
@@ -200,6 +201,34 @@ Bot to Admin: "🔔 New user joined!
 
 ### 🎤 Voice Settings
 Customize voice parameters including voice model selection, stability, clarity, and style. The bot can both listen to your voice messages and respond with generated voice using ElevenLabs.
+
+### ✍️ Rich Message Formatting
+
+Everything the agent writes is Markdown, and `app/telegram_md.py` renders it into real Telegram formatting before it is sent, using the Bot API's `MarkdownV2` entities:
+
+| Written by the agent | Shown in Telegram |
+| --- | --- |
+| `**text**`, `*text*` | bold, italic |
+| `__text__`, `~~text~~` | underline, strikethrough |
+| `\|\|text\|\|` | spoiler, hidden until tapped |
+| `` `code` ``, ```` ```python ```` | inline code, highlighted code block |
+| `[label](url)`, `![alt](url)` | inline link |
+| `> quote` | blockquote; long quotes become expandable |
+| `#`, `##`, `###` | bold headings |
+| `-`, `1.`, `- [x]` | bullet, numbered and task lists, nested |
+| Markdown tables | aligned monospace grid, or a reflowed list when too wide for a phone |
+
+Practical consequences:
+
+- **No more broken messages.** Everything outside markup is escaped, so an underscore in `file_name.py` or a stray bracket no longer makes Telegram reject the whole answer.
+- **Safe splitting.** Answers longer than 4096 characters are split at paragraph boundaries instead of mid-entity, and a code block that spans the split is re-opened with the same language in the next message.
+- **Graceful degradation.** Each message tries `MarkdownV2`, then `HTML`, then plain text, so a malformed fragment never costs the user the answer.
+
+Formatting is covered by unit tests:
+
+```bash
+cd app && python -m unittest discover tests
+```
 
 ### 📄 PDF Processing
 Upload PDFs to extract and analyze content. The bot can understand complex documents, summarize contents, answer questions about the document, and provide insights.

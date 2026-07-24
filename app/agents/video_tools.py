@@ -228,8 +228,7 @@ class VideoTools:
             
             # Notify user that video generation started (it can take some time)
             await self.telegram_update.message.reply_text(
-                f"🎬 Video generation started ({aspect_ratio}, {quality})... This may take 1-2 minutes. Please wait.",
-                parse_mode="markdown"
+                f"🎬 Video generation started ({aspect_ratio}, {quality})... This may take 1-2 minutes. Please wait."
             )
             
             # Configure video generation
@@ -293,8 +292,7 @@ class VideoTools:
             print(error_message)
             try:
                 await self.telegram_update.message.reply_text(
-                    "❌ Sorry, video generation failed. Please try again.",
-                    parse_mode="markdown"
+                    "❌ Sorry, video generation failed. Please try again."
                 )
             except Exception:
                 pass
@@ -317,8 +315,7 @@ class VideoTools:
             
             # Notify user that video generation started (it can take some time)
             await self.telegram_update.message.reply_text(
-                f"🎬 Video generation from image started ({aspect_ratio}, {quality})... This may take 1-2 minutes. Please wait.",
-                parse_mode="markdown"
+                f"🎬 Video generation from image started ({aspect_ratio}, {quality})... This may take 1-2 minutes. Please wait."
             )
             
             # Configure video generation
@@ -385,8 +382,7 @@ class VideoTools:
             print(error_message)
             try:
                 await self.telegram_update.message.reply_text(
-                    "❌ Sorry, video generation from image failed. Please try again.",
-                    parse_mode="markdown"
+                    "❌ Sorry, video generation from image failed. Please try again."
                 )
             except Exception:
                 pass
@@ -416,8 +412,7 @@ class VideoTools:
             
             # Notify user that video generation started
             await self.telegram_update.message.reply_text(
-                f"🎬 Video generation with {len(reference_images)} reference image(s) started ({aspect_ratio}, {quality})... This may take 1-2 minutes. Please wait.",
-                parse_mode="markdown"
+                f"🎬 Video generation with {len(reference_images)} reference image(s) started ({aspect_ratio}, {quality})... This may take 1-2 minutes. Please wait."
             )
             
             # Configure video generation
@@ -484,8 +479,7 @@ class VideoTools:
             print(error_message)
             try:
                 await self.telegram_update.message.reply_text(
-                    "❌ Sorry, video generation with reference images failed. Please try again.",
-                    parse_mode="markdown"
+                    "❌ Sorry, video generation with reference images failed. Please try again."
                 )
             except Exception:
                 pass
@@ -513,8 +507,7 @@ class VideoTools:
             
             # Notify user that video generation started
             await self.telegram_update.message.reply_text(
-                f"🎬 Video interpolation started ({aspect_ratio}, {quality})... This may take 1-2 minutes. Please wait.",
-                parse_mode="markdown"
+                f"🎬 Video interpolation started ({aspect_ratio}, {quality})... This may take 1-2 minutes. Please wait."
             )
             
             # Configure video generation with last frame
@@ -583,8 +576,7 @@ class VideoTools:
             print(error_message)
             try:
                 await self.telegram_update.message.reply_text(
-                    "❌ Sorry, interpolated video generation failed. Please try again.",
-                    parse_mode="markdown"
+                    "❌ Sorry, interpolated video generation failed. Please try again."
                 )
             except Exception:
                 pass
@@ -609,8 +601,7 @@ class VideoTools:
             
             # Notify user that video extension started
             await self.telegram_update.message.reply_text(
-                f"🎬 Video extension started ({quality})... This may take 1-2 minutes. Please wait.",
-                parse_mode="markdown"
+                f"🎬 Video extension started ({quality})... This may take 1-2 minutes. Please wait."
             )
             
             # Configure video generation
@@ -674,8 +665,7 @@ class VideoTools:
             print(error_message)
             try:
                 await self.telegram_update.message.reply_text(
-                    "❌ Sorry, video extension failed. Please try again.",
-                    parse_mode="markdown"
+                    "❌ Sorry, video extension failed. Please try again."
                 )
             except Exception:
                 pass

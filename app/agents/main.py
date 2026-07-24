@@ -46,6 +46,25 @@ openai_client = OpenAI(api_key=openai_api_key)
 tavily_api_key = os.getenv("TAVILY_API_KEY")
 tavily_client = TavilyClient(api_key=tavily_api_key)
 
+# Appended to every system prompt: answers are converted from Markdown into
+# Telegram entities by telegram_md, so the model can use the full feature set.
+TELEGRAM_FORMATTING_RULES = """
+<telegram_formatting>
+Your answer is rendered as rich Telegram formatting, so write plain Markdown and it becomes real styling:
+- **bold**, *italic*, __underline__, ~~strikethrough~~ and ||spoiler|| (hidden until the user taps it - good for punchlines, answers to puzzles and anything worth hiding)
+- `inline code`, and fenced code blocks with a language tag (```python) for syntax highlighting
+- [links](https://example.com) with descriptive labels instead of bare URLs
+- > blockquotes; a long quote is collapsed into an expandable one automatically
+- headings (#, ##, ###), bullet lists, numbered lists, nested lists and - [ ] / - [x] task lists
+- tables, rendered as an aligned monospace grid - keep them to 2-3 short columns so they fit a phone screen; wide tables are reflowed into a list
+
+Keep in mind:
+- Telegram has no heading sizes: a heading is shown as bold, so keep the structure shallow and rely on short paragraphs.
+- Never write raw HTML, and prefer plain text over LaTeX: math is shown as monospace text, not typeset.
+- Long answers are split into several messages automatically at paragraph boundaries - do not add "part 1/2" markers yourself.
+</telegram_formatting>
+"""
+
 # Critique response pydantic model
 class CritiqueResponse(BaseModel):
     critique_details: str
@@ -1011,6 +1030,9 @@ You have been asked to answer a query given sources. Consider the following when
             system_context = system_context_perplexity_r1
         else:
             system_context = system_context_generall_ai_v2
+
+        # Every answer is rendered into Telegram entities before it is sent.
+        system_context = system_context + TELEGRAM_FORMATTING_RULES
 
         # Search for relevant past conversations
         if self.user_settings.get("semantic_search").get("enabled"):

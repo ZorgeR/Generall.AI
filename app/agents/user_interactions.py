@@ -10,6 +10,7 @@ import tempfile
 import io
 from elevenlabs.client import ElevenLabs
 from voice import VoiceManager
+from telegram_md import reply_rich
 import base64
 
 load_dotenv()
@@ -183,21 +184,13 @@ class UserInteractions:
         return f"Unknown tool: {tool_name}"
 
     async def _send_user_message(self, message: str) -> str:
-        """Send a message to the user via Telegram"""
+        """Send a message to the user via Telegram, rendered as rich Markdown"""
         try:
             print(f"Sending message to user: {message}")
-            await self.telegram_update.message.reply_text(
-                text=message,
-                parse_mode='Markdown'
-            )
+            await reply_rich(self.telegram_update.message, message)
             return f"Successfully sent message to user."
         except Exception as e:
-            print(f"Fail to send Markdown message, trying plain text")
-            try:
-                await self.telegram_update.message.reply_text(text=message)
-                return f"Successfully sent message to user."
-            except Exception as e:
-                return f"Error sending message: {str(e)}"
+            return f"Error sending message: {str(e)}"
 
     async def _send_voice_message(self, text: str) -> str:
         """Convert text to speech and send it as a voice message to the user"""

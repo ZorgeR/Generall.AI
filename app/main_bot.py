@@ -21,6 +21,7 @@ from pathlib import Path
 # Import the secure container system
 from secure_container.main import initialize_secure_containers, cleanup_containers
 from stats import stats_tracker, DEFAULT_ACTION_LIMIT
+from telegram_md import edit_rich, edit_status, reply_rich, reply_status, render_plain, send_rich
 import time
 
 # Streaming config - read directly from env, not imported
@@ -824,33 +825,25 @@ async def sendvoice_to_user(audio_stream):
     return temp_audio_path
 
 async def send_response_to_user(update: Update, thinking_message, response: str, user_id: str = None):
-    """Helper function to send bot's response to the user, handling long messages and markdown formatting"""
+    """Send the bot's answer, rendered as rich Telegram markup.
+
+    The answer is converted from Markdown to Telegram entities (bold, italic,
+    underline, strikethrough, spoilers, code blocks, links, quotes, tables) and
+    split at block boundaries when it exceeds a single message.
+    """
     # Track message sent
     if user_id:
         stats_tracker.track_message_sent(user_id)
-    
+
+    if not response:
+        response = "🤖 **No response from the AI.**"
+
     try:
-        # Try sending with markdown
-        if len(response) > 4000:
-            chunks = split_text_intelligently(response)
-            for chunk in chunks:
-                await update.message.reply_text(chunk, parse_mode="markdown")
-            await thinking_message.edit_text(text="Сообщение было длинным, поэтому разбито на несколько частей...", parse_mode="markdown")
-        else:
-            if response == "" or response == None:
-                response = "🤖 *No response from the AI.*"
-            await thinking_message.edit_text(text=response, parse_mode="markdown")
+        await edit_rich(thinking_message, response, reply_to=update.message)
     except Exception as e:
-        # Fallback to plain text if markdown fails
-        if len(response) > 4000:
-            chunks = split_text_intelligently(response)
-            for chunk in chunks:
-                await update.message.reply_text(chunk)
-            await thinking_message.edit_text(text="Сообщение было длинным, поэтому разбито на несколько частей...")
-        else:
-            if response == "" or response == None:
-                response = "🤖 No response from the AI."
-            await thinking_message.edit_text(text=response)
+        logger.warning(f"Failed to send formatted response: {str(e)}")
+        for chunk in split_text_intelligently(render_plain(response)):
+            await update.message.reply_text(chunk)
 
 async def send_reasoning_file(update: Update, messages, user_id: str):
     """Helper function to send reasoning file if enabled"""
@@ -893,6 +886,36 @@ async def send_reasoning_file(update: Update, messages, user_id: str):
             print(f"Error removing reasoning file: {str(e)}")
 
 DRAFT_THROTTLE = 0.3
+
+def make_thinking_updater(thinking_message, user_id: str, limit=None, title: str = "💭 **Thinking...**"):
+    """Build the progress callback that keeps a status message up to date.
+
+    The status text is plain Markdown and is rendered into Telegram entities,
+    so step names and details containing ``_``, ``*`` or ``[`` are escaped
+    instead of breaking the message.
+    """
+
+    async def update_thinking_message(step: str, details: str, iteration, critique):
+        if step == "saving":
+            iteration = "final"
+            critique = "end"
+        usage_line = ""
+        if limit:
+            live_used = stats_tracker.get_user_action_count(user_id, days=30)
+            usage_line = f"📊 **Usage:** _{live_used}/{limit} actions (30d)_\n"
+        await edit_status(
+            thinking_message,
+            f"{title}\n"
+            f"- - - -\n"
+            f"{usage_line}"
+            f"📝 **Step:** _{step}_\n"
+            f"📋 **Details:** _{details}_\n"
+            f"🔄 **Iterations:** _{iteration}_\n"
+            f"🎯 **Critiques:** _{critique}_"
+        )
+
+    return update_thinking_message
+
 
 def get_thread_id(update: Update):
     """Extract message_thread_id from update if available."""
@@ -958,29 +981,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Show typing status and send initial message
         await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing', message_thread_id=get_thread_id(update))
-        thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
+        thinking_message = await reply_status(update.message, "💭 **Thinking...**")
 
-        async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
-            if step == "saving":
-                iteration = "final"
-                critique = "end"
-            live_limit_info = ""
-            if limit:
-                live_used = stats_tracker.get_user_action_count(user_id, days=30)
-                live_limit_info = f"📊 *Usage:* _{live_used}/{limit} actions (30d)_\n"
-            try:
-                await thinking_message.edit_text(
-                    f"💭 *Thinking...*\n"
-                    f"- - - - \n"
-                    f"{live_limit_info}"
-                    f"📝 *Step:* _{step.replace('_', '-')}_\n"
-                    f"📋 *Details:* _{details.replace('_', '-')}_\n"
-                    f"🔄 *Iterations:* _{iteration}_\n"
-                    f"🎯 *Critiques:* _{critique}_",
-                    parse_mode="markdown"
-                )
-            except Exception as e:
-                logger.warning(f"Failed to update thinking message: {str(e)}")
+        update_thinking_message = make_thinking_updater(thinking_message, user_id, limit)
         
         try:
             # Get response
@@ -1027,7 +1030,7 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         temp_mp3 = os.path.join(temp_dir, f"voice_{uuid.uuid4()}.mp3")
         
         # Send initial status message
-        status_message = await update.message.reply_text("🎙️ *Transcribing audio...*", parse_mode="markdown")
+        status_message = await reply_status(update.message, "🎙️ **Transcribing audio...**")
         
         try:
             # Download voice message
@@ -1048,30 +1051,13 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
             if transcription:
                 print(f"Transcription: {transcription}")
                 display_transcription = transcription[:512] + "..." if len(transcription) > 1500 else transcription
-                await status_message.edit_text(f"🎙️ *Transcription:*\n{display_transcription}", parse_mode="markdown")
+                await edit_status(status_message, f"🎙️ **Transcription:**\n{display_transcription}")
                 
                 # Process transcription like a regular message
                 await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing', message_thread_id=get_thread_id(update))
-                thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
+                thinking_message = await reply_status(update.message, "💭 **Thinking...**")
                 
-                async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
-                    if step == "saving":
-                        iteration = "final"
-                        critique = "end"
-                    live_limit_info = ""
-                    if limit:
-                        live_used = stats_tracker.get_user_action_count(user_id, days=30)
-                        live_limit_info = f"📊 *Usage:* _{live_used}/{limit} actions (30d)_\n"
-                    await thinking_message.edit_text(
-                        f"💭 *Thinking...*\n"
-                        f"- - - - \n"
-                        f"{live_limit_info}"
-                        f"📝 *Step:* _{step.replace('_', '-')}_\n"
-                        f"📋 *Details:* _{details.replace('_', '-')}_\n"
-                        f"🔄 *Iterations:* _{iteration}_\n"
-                        f"🎯 *Critiques:* _{critique}_",
-                        parse_mode="markdown"
-                    )
+                update_thinking_message = make_thinking_updater(thinking_message, user_id, limit)
                 
                 try:
                     _thread_id = get_thread_id(update)
@@ -1079,7 +1065,7 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     response, messages = await get_answer(transcription, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk, message_thread_id=_thread_id)
                     
                     # Generate and send audio response
-                    await thinking_message.edit_text("🎙️ *Generating audio...*", parse_mode="markdown")
+                    await edit_status(thinking_message, "🎙️ **Generating audio...**")
                     voice_id = voice_manager.get_user_voice(user_id)
                     
                     try:
@@ -1105,12 +1091,12 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     await thinking_message.edit_text(text=f"❌ An error occurred. Trace ID: {trace_id}")
                     logging.error(f"An error occurred with trace ID {trace_id}: {str(e)}")
             else:
-                await status_message.edit_text("❌ Failed to transcribe audio", parse_mode="markdown")
+                await edit_status(status_message, "❌ Failed to transcribe audio")
                 return False
 
         except Exception as e:
             print(f"Error transcribing voice message: {str(e)}")
-            await status_message.edit_text("❌ Error processing voice message", parse_mode="markdown")
+            await edit_status(status_message, "❌ Error processing voice message")
             return None
         
         finally:
@@ -1154,7 +1140,7 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
         temp_mp3 = os.path.join(temp_dir, f"video_audio_{uuid.uuid4()}.mp3")
         
         screenshot_paths = []
-        status_message = await update.message.reply_text("🎬 *Processing video...*", parse_mode="markdown")
+        status_message = await reply_status(update.message, "🎬 **Processing video...**")
         
         try:
             video_file = await context.bot.get_file(video.file_id)
@@ -1169,7 +1155,7 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
             shutil.copy(temp_video, saved_video_path)
             
             # Extract audio and screenshots in parallel
-            await status_message.edit_text("🎬 *Extracting audio and analyzing frames...*", parse_mode="markdown")
+            await edit_status(status_message, "🎬 **Extracting audio and analyzing frames...**")
             
             async def extract_audio():
                 a = AudioSegment.from_file(temp_video, format="mp4")
@@ -1198,13 +1184,13 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     shutil.copy(sp, saved_path)
                     saved_screenshot_paths.append(saved_path)
                 
-                await status_message.edit_text("🖼️ *Analyzing video frames...*", parse_mode="markdown")
+                await edit_status(status_message, "🖼️ **Analyzing video frames...**")
                 screenshot_transcription = (transcription or "") if is_video_note else ""
                 video_visual_description = await describe_video_screenshots(screenshot_paths, transcription=screenshot_transcription, caption=caption)
                 if video_visual_description:
                     print(f"Video visual description: {video_visual_description}")
             
-            await status_message.edit_text("🎙️ *Transcription complete...*", parse_mode="markdown")
+            await edit_status(status_message, "🎙️ **Transcription complete...**")
             
             if transcription or video_visual_description or saved_screenshot_paths:
                 if transcription:
@@ -1240,26 +1226,9 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 user_message = "\n\n".join(parts) if parts else "User sent a video without audio or caption."
                 
                 await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing', message_thread_id=get_thread_id(update))
-                thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
+                thinking_message = await reply_status(update.message, "💭 **Thinking...**")
                 
-                async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
-                    if step == "saving":
-                        iteration = "final"
-                        critique = "end"
-                    live_limit_info = ""
-                    if limit:
-                        live_used = stats_tracker.get_user_action_count(user_id, days=30)
-                        live_limit_info = f"📊 *Usage:* _{live_used}/{limit} actions (30d)_\n"
-                    await thinking_message.edit_text(
-                        f"💭 *Thinking...*\n"
-                        f"- - - - \n"
-                        f"{live_limit_info}"
-                        f"📝 *Step:* _{step.replace('_', '-')}_\n"
-                        f"📋 *Details:* _{details.replace('_', '-')}_\n"
-                        f"🔄 *Iterations:* _{iteration}_\n"
-                        f"🎯 *Critiques:* _{critique}_",
-                        parse_mode="markdown"
-                    )
+                update_thinking_message = make_thinking_updater(thinking_message, user_id, limit)
                 
                 try:
                     _thread_id = get_thread_id(update)
@@ -1267,7 +1236,7 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk, message_thread_id=_thread_id)
                     
                     # Generate and send audio response
-                    await thinking_message.edit_text("🎙️ *Generating audio...*", parse_mode="markdown")
+                    await edit_status(thinking_message, "🎙️ **Generating audio...**")
                     voice_id = voice_manager.get_user_voice(user_id)
                     
                     try:
@@ -1291,12 +1260,12 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     await thinking_message.edit_text(text=f"❌ An error occurred. Trace ID: {trace_id}")
                     logging.error(f"An error occurred with trace ID {trace_id}: {str(e)}")
             else:
-                await status_message.edit_text("❌ Could not extract any content from video", parse_mode="markdown")
+                await edit_status(status_message, "❌ Could not extract any content from video")
                 return False
 
         except Exception as e:
             print(f"Error processing video message: {str(e)}")
-            await status_message.edit_text("❌ Error processing video message", parse_mode="markdown")
+            await edit_status(status_message, "❌ Error processing video message")
             return None
         
         finally:
@@ -1336,7 +1305,7 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
         os.makedirs(user_audio_dir, exist_ok=True)
         audio_path = os.path.join(user_audio_dir, file_name)
         
-        status_message = await update.message.reply_text("🎵 *Saving audio file...*", parse_mode="markdown")
+        status_message = await reply_status(update.message, "🎵 **Saving audio file...**")
         
         try:
             audio_file = await context.bot.get_file(audio.file_id)
@@ -1354,36 +1323,19 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
             if caption:
                 user_message += f"\nUser message: {caption}"
             
-            await status_message.edit_text("🎵 *Audio saved, processing...*", parse_mode="markdown")
+            await edit_status(status_message, "🎵 **Audio saved, processing...**")
             
             await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing', message_thread_id=get_thread_id(update))
-            thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
+            thinking_message = await reply_status(update.message, "💭 **Thinking...**")
             
-            async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
-                if step == "saving":
-                    iteration = "final"
-                    critique = "end"
-                live_limit_info = ""
-                if limit:
-                    live_used = stats_tracker.get_user_action_count(user_id, days=30)
-                    live_limit_info = f"📊 *Usage:* _{live_used}/{limit} actions (30d)_\n"
-                await thinking_message.edit_text(
-                    f"💭 *Thinking...*\n"
-                    f"- - - - \n"
-                    f"{live_limit_info}"
-                    f"📝 *Step:* _{step.replace('_', '-')}_\n"
-                    f"📋 *Details:* _{details.replace('_', '-')}_\n"
-                    f"🔄 *Iterations:* _{iteration}_\n"
-                    f"🎯 *Critiques:* _{critique}_",
-                    parse_mode="markdown"
-                )
+            update_thinking_message = make_thinking_updater(thinking_message, user_id, limit)
             
             _thread_id = get_thread_id(update)
             on_text_chunk = create_streaming_callback(context.bot, user_id, _thread_id)
             response, messages = await get_answer(user_message, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk, message_thread_id=_thread_id)
             await send_response_to_user(update, thinking_message, response, user_id)
             await send_reasoning_file(update, messages, user_id)
-            await status_message.edit_text("🎵 *Done!*", parse_mode="markdown")
+            await edit_status(status_message, "🎵 **Done!**")
         except Exception as e:
             trace_id = str(uuid.uuid4())
             await status_message.edit_text(text=f"❌ An error occurred. Trace ID: {trace_id}")
@@ -1470,7 +1422,7 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         if user_id in media_group_waiting_message and media_group_waiting_message[user_id]:
-            await media_group_waiting_message[user_id].edit_text("🖼️ *Processing media group...*", parse_mode="markdown")
+            await edit_status(media_group_waiting_message[user_id], "🖼️ **Processing media group...**")
         
         photos = media_group_photos[user_id]
         
@@ -1488,7 +1440,7 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         
         # Send initial status message
-        status_message = await update.message.reply_text("🖼️ *Analyzing images...*", parse_mode="markdown")
+        status_message = await reply_status(update.message, "🖼️ **Analyzing images...**")
         
         temp_photos = []  # Keep track of temporary files for cleanup
         all_descriptions = []  # Store descriptions for all photos
@@ -1516,11 +1468,11 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
                     image_paths.append(permanent_image_path)
                     
                     # Get descriptions from both services
-                    await status_message.edit_text(f"🤖 *Getting Anthropic description for image {i}...*", parse_mode="markdown")
+                    await edit_status(status_message, f"🤖 **Getting Anthropic description for image {i}...**")
                     anthropic_description = await describe_image_anthropic(question=describe_question, image_path=temp_photo)
                     stats_tracker.track_describe_used(user_id, "image_anthropic")
                     
-                    await status_message.edit_text(f"🤖 *Getting OpenAI description for image {i}...*", parse_mode="markdown")
+                    await edit_status(status_message, f"🤖 **Getting OpenAI description for image {i}...**")
                     openai_description = await describe_image_openai(question=describe_question, image_path=temp_photo)
                     stats_tracker.track_describe_used(user_id, "image_openai")
                     
@@ -1548,30 +1500,13 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             user_question = f"{caption}\n\nUser attached {len(all_descriptions)} image(s) to this message. Here are the details about each image from Anthropic and OpenAI:\n\n{descriptions_text}"
             
-            await status_message.edit_text("🤖 *Processing...*", parse_mode="markdown")
+            await edit_status(status_message, "🤖 **Processing...**")
             # Process like a regular message
             await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing', message_thread_id=get_thread_id(update))
-            thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
+            thinking_message = await reply_status(update.message, "💭 **Thinking...**")
             _, _, mg_limit = check_user_limits(user_id)
             
-            async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
-                if step == "saving":
-                    iteration = "final"
-                    critique = "end"
-                live_limit_info = ""
-                if mg_limit:
-                    live_used = stats_tracker.get_user_action_count(user_id, days=30)
-                    live_limit_info = f"📊 *Usage:* _{live_used}/{mg_limit} actions (30d)_\n"
-                await thinking_message.edit_text(
-                    f"💭 *Thinking...*\n"
-                    f"- - - - \n"
-                    f"{live_limit_info}"
-                    f"📝 *Step:* _{step.replace('_', '-')}_\n"
-                    f"📋 *Details:* _{details.replace('_', '-')}_\n"
-                    f"🔄 *Iterations:* _{iteration}_\n"
-                    f"🎯 *Critiques:* _{critique}_",
-                    parse_mode="markdown"
-                )
+            update_thinking_message = make_thinking_updater(thinking_message, user_id, mg_limit)
             
             # Get response using the same logic as handle_message
             _thread_id = get_thread_id(update)
@@ -1579,7 +1514,7 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
             response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk, message_thread_id=_thread_id)
             await send_response_to_user(update, thinking_message, response, user_id)
             await send_reasoning_file(update, messages, user_id)
-            await status_message.edit_text("🤖 *Done!*", parse_mode="markdown")
+            await edit_status(status_message, "🤖 **Done!**")
             
         finally:
             # Clean up all temporary files
@@ -1627,10 +1562,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
             media_group_id[user_id] = update.message.media_group_id
             media_group_photos[user_id] = []
             media_group_captions[user_id] = None
-            media_group_waiting_message[user_id] = await update.message.reply_text(
-                "🖼️ *Image media group received... Waiting for images...*",
-                parse_mode="markdown"
-            )
+            media_group_waiting_message[user_id] = await reply_status(update.message, "🖼️ **Image media group received... Waiting for images...**")
         
         if update.message.caption and media_group_captions[user_id] == None:
             media_group_captions[user_id] = update.message.caption
@@ -1638,10 +1570,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         photos = [update.message.photo[-1]]
         if photos not in media_group_photos[user_id]:
             media_group_photos[user_id].append(photos)
-            await media_group_waiting_message[user_id].edit_text(
-                f"🖼️ *Image {len(media_group_photos[user_id])} received... Waiting for other images...*",
-                parse_mode="markdown"
-            )
+            await edit_status(media_group_waiting_message[user_id], f"🖼️ **Image {len(media_group_photos[user_id])} received... Waiting for other images...**")
         
         async def process_media_group_with_timeout():
             try:
@@ -1667,7 +1596,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
             caption = update.message.caption
             describe_question = f"Describe what is in this image and answer to this question: {caption}"
         
-        status_message = await update.message.reply_text("🖼️ *Analyzing images...*", parse_mode="markdown")
+        status_message = await reply_status(update.message, "🖼️ **Analyzing images...**")
         
         temp_photos = []
         all_descriptions = []
@@ -1689,11 +1618,11 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     shutil.copy(temp_photo, permanent_image_path)
                     image_paths.append(permanent_image_path)
                     
-                    await status_message.edit_text(f"🤖 *Getting Anthropic description...*", parse_mode="markdown")
+                    await edit_status(status_message, f"🤖 **Getting Anthropic description...**")
                     anthropic_description = await describe_image_anthropic(question=describe_question, image_path=temp_photo)
                     stats_tracker.track_describe_used(user_id, "image_anthropic")
                     
-                    await status_message.edit_text(f"🤖 *Getting OpenAI description...*", parse_mode="markdown")
+                    await edit_status(status_message, f"🤖 **Getting OpenAI description...**")
                     openai_description = await describe_image_openai(question=describe_question, image_path=temp_photo)
                     stats_tracker.track_describe_used(user_id, "image_openai")
                     
@@ -1720,35 +1649,18 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
             
             user_question = f"{caption}\n\nUser attached {len(all_descriptions)} image(s) to this message. Here are the details about each image from Anthropic and OpenAI:\n\n{descriptions_text}"
             
-            await status_message.edit_text("🤖 *Processing...*", parse_mode="markdown")
+            await edit_status(status_message, "🤖 **Processing...**")
             await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing', message_thread_id=get_thread_id(update))
-            thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
+            thinking_message = await reply_status(update.message, "💭 **Thinking...**")
             
-            async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
-                if step == "saving":
-                    iteration = "final"
-                    critique = "end"
-                live_limit_info = ""
-                if limit:
-                    live_used = stats_tracker.get_user_action_count(user_id, days=30)
-                    live_limit_info = f"📊 *Usage:* _{live_used}/{limit} actions (30d)_\n"
-                await thinking_message.edit_text(
-                    f"💭 *Thinking...*\n"
-                    f"- - - - \n"
-                    f"{live_limit_info}"
-                    f"📝 *Step:* _{step.replace('_', '-')}_\n"
-                    f"📋 *Details:* _{details.replace('_', '-')}_\n"
-                    f"🔄 *Iterations:* _{iteration}_\n"
-                    f"🎯 *Critiques:* _{critique}_",
-                    parse_mode="markdown"
-                )
+            update_thinking_message = make_thinking_updater(thinking_message, user_id, limit)
             
             _thread_id = get_thread_id(update)
             on_text_chunk = create_streaming_callback(context.bot, user_id, _thread_id)
             response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk, message_thread_id=_thread_id)
             await send_response_to_user(update, thinking_message, response, user_id)
             await send_reasoning_file(update, messages, user_id)
-            await status_message.edit_text("🤖 *Done!*", parse_mode="markdown")
+            await edit_status(status_message, "🤖 **Done!**")
         except Exception as e:
             trace_id = str(uuid.uuid4())
             await status_message.edit_text(text=f"❌ An error occurred while analyzing the images. Trace ID: {trace_id}")
@@ -1799,7 +1711,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 
     async with get_user_lock(user_id):
         doc_type = file_extension.replace(".", "").upper()
-        status_message = await update.message.reply_text(f"📄 *Processing {doc_type} document...*", parse_mode="markdown")
+        status_message = await reply_status(update.message, f"📄 **Processing {doc_type} document...**")
         
         temp_file = None
         try:
@@ -1823,7 +1735,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
                 caption = update.message.caption
                 describe_question = f"Analyze this document and describe its contents in detail. When you are done, answer the following question: {caption}"
 
-            await status_message.edit_text(f"🤖 *Analyzing {doc_type} content...*", parse_mode="markdown")
+            await edit_status(status_message, f"🤖 **Analyzing {doc_type} content...**")
             document_description = await describe_document(describe_question, temp_file)
             
             describe_type_map = {
@@ -1841,35 +1753,18 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 
             user_question = f"{caption}\n\nUser attached a {doc_type} document to this message.\nFile: {file_name}\nSaved to: {saved_doc_path}\n\nHere is the analysis of document contents:\n\n{document_description}"
 
-            await status_message.edit_text("🤖 *Processing...*", parse_mode="markdown")
+            await edit_status(status_message, "🤖 **Processing...**")
             await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing', message_thread_id=get_thread_id(update))
-            thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
+            thinking_message = await reply_status(update.message, "💭 **Thinking...**")
 
-            async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
-                if step == "saving":
-                    iteration = "final"
-                    critique = "end"
-                live_limit_info = ""
-                if limit:
-                    live_used = stats_tracker.get_user_action_count(user_id, days=30)
-                    live_limit_info = f"📊 *Usage:* _{live_used}/{limit} actions (30d)_\n"
-                await thinking_message.edit_text(
-                    f"💭 *Thinking...*\n"
-                    f"- - - - \n"
-                    f"{live_limit_info}"
-                    f"📝 *Step:* _{step.replace('_', '-')}_\n"
-                    f"📋 *Details:* _{details.replace('_', '-')}_\n"
-                    f"🔄 *Iterations:* _{iteration}_\n"
-                    f"🎯 *Critiques:* _{critique}_",
-                    parse_mode="markdown"
-                )
+            update_thinking_message = make_thinking_updater(thinking_message, user_id, limit)
 
             _thread_id = get_thread_id(update)
             on_text_chunk = create_streaming_callback(context.bot, user_id, _thread_id)
             response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk, message_thread_id=_thread_id)
             await send_response_to_user(update, thinking_message, response, user_id)
             await send_reasoning_file(update, messages, user_id)
-            await status_message.edit_text("🤖 *Done!*", parse_mode="markdown")
+            await edit_status(status_message, "🤖 **Done!**")
 
         except Exception as e:
             trace_id = str(uuid.uuid4())
@@ -2664,19 +2559,8 @@ async def check_and_send_reminders(context: ContextTypes.DEFAULT_TYPE):
                         # Handle reminder based on type
                         try:
                             if reminder.get("type", "user") == "user":
-                                try:
-                                    # Send user reminder
-                                    await context.bot.send_message(
-                                        chat_id=user_id,
-                                        text=f"🔔 *Reminder*\n\n{reminder['text']}",
-                                        parse_mode='Markdown'
-                                    )
-                                except Exception as e:
-                                    logging.error(f"Error sending Markdown reminder to user {user_id}: {str(e)}")
-                                    await context.bot.send_message(
-                                        chat_id=user_id,
-                                        text=f"🔔 *Reminder*\n\n{reminder['text']}"
-                                    )
+                                # Send user reminder
+                                await send_rich(context.bot, user_id, f"🔔 **Reminder**\n\n{reminder['text']}")
 
                             # Handle periodic reminders
                             if reminder.get("is_periodic", False):
@@ -2773,27 +2657,18 @@ async def check_and_process_agent_reminders(context: ContextTypes.DEFAULT_TYPE):
 
                             print("Sending initial message to user")
                             try:
-                                initial_message = await context.bot.send_message(
-                                    chat_id=user_id,
-                                    text="🤖 *Agent Reminder Task*\n\nProcessing scheduled task:\n" + reminder['text'],
-                                    parse_mode="markdown"
+                                await send_rich(
+                                    context.bot,
+                                    user_id,
+                                    "🤖 **Agent Reminder Task**\n\nProcessing scheduled task:\n" + reminder['text']
                                 )
-                                print(f"Initial message sent: {initial_message.message_id}")
                             except Exception as e:
-                                try:
-                                    initial_message = await context.bot.send_message(
-                                        chat_id=user_id,
-                                        text="🤖 *Agent Reminder Task*\n\nProcessing scheduled task:\n" + reminder['text']
-                                    )
-                                    print(f"Initial message sent: {initial_message.message_id}")
-                                except Exception as e:
-                                    logging.error(f"Error sending initial message: {str(e)}")
+                                logging.error(f"Error sending initial message: {str(e)}")
 
                             # Send thinking message to user
                             thinking_message = await context.bot.send_message(
                                 chat_id=user_id,
-                                text="💭 *Processing Agent Task...*",
-                                parse_mode="markdown"
+                                text="💭 Processing Agent Task..."
                             )
                             print(f"Thinking message sent: {thinking_message.message_id}")
 
@@ -2814,24 +2689,7 @@ async def check_and_process_agent_reminders(context: ContextTypes.DEFAULT_TYPE):
                             
                             print("Creating update_thinking_message function")
                             _, _, agent_limit = check_user_limits(user_id)
-                            async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
-                                if step == "saving":
-                                    iteration = "final"
-                                    critique = "end"
-                                live_limit_info = ""
-                                if agent_limit:
-                                    live_used = stats_tracker.get_user_action_count(user_id, days=30)
-                                    live_limit_info = f"📊 *Usage:* _{live_used}/{agent_limit} actions (30d)_\n"
-                                await thinking_message.edit_text(
-                                    f"💭 *Processing Agent Task...*\n"
-                                    f"- - - - \n"
-                                    f"{live_limit_info}"
-                                    f"📝 *Step:* _{step.replace('_', '-')}_\n"
-                                    f"📋 *Details:* _{details.replace('_', '-')}_\n"
-                                    f"🔄 *Iterations:* _{iteration}_\n"
-                                    f"🎯 *Critiques:* _{critique}_",
-                                    parse_mode="markdown"
-                                )
+                            update_thinking_message = make_thinking_updater(thinking_message, user_id, agent_limit, title="💭 **Processing Agent Task...**")
 
                             print("Calling get_answer with mock update")
                             on_text_chunk = create_streaming_callback(context.bot, user_id)
@@ -2846,28 +2704,12 @@ async def check_and_process_agent_reminders(context: ContextTypes.DEFAULT_TYPE):
 
                             print(f"get_answer returned response: {response}")
                             # Send the response
-                            if len(response) > 4000:
-                                await thinking_message.edit_text("Processing complete. Response is long, sending in parts...")
-                                chunks = split_text_intelligently(response)
-                                for chunk in chunks:
-                                    try:
-                                        await context.bot.send_message(
-                                            chat_id=user_id,
-                                            text=chunk,
-                                            parse_mode="markdown"
-                                        )
-                                    except Exception as e:
-                                        logging.error(f"Error sending Markdown response part to user {user_id}: {str(e)}")
-                                        await context.bot.send_message(
-                                            chat_id=user_id,
-                                            text=chunk
-                                        )
-                            else:
-                                try:
-                                    await thinking_message.edit_text(text=response, parse_mode="markdown")
-                                except Exception as e:
-                                    logging.error(f"Error sending response to user {user_id}: {str(e)}")
-                                    await thinking_message.edit_text(text=response)
+                            try:
+                                await edit_rich(thinking_message, response)
+                            except Exception as e:
+                                logging.error(f"Error sending response to user {user_id}: {str(e)}")
+                                for chunk in split_text_intelligently(render_plain(response)):
+                                    await context.bot.send_message(chat_id=user_id, text=chunk)
 
                             print("Sending reasoning file if available")
                             # Send reasoning file if available
