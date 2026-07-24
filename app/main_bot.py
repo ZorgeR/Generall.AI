@@ -22,6 +22,8 @@ from pathlib import Path
 from secure_container.main import initialize_secure_containers, cleanup_containers
 from stats import stats_tracker, DEFAULT_ACTION_LIMIT
 import time
+from PIL import Image
+from image_utils import IMAGE_EXTENSIONS, is_jpeg_image, save_image_as_jpeg
 
 # Streaming config - read directly from env, not imported
 streaming_enabled = os.getenv("STREAMING_ENABLED", "false").lower() == "true"
@@ -85,6 +87,7 @@ openai_client = OpenAI(api_key=openai_api_key)
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
 anthropic_client = anthropic.AsyncAnthropic(api_key=anthropic_api_key)
 send_reasoning = True
+max_image_resolution_vision = int(os.getenv("MAX_IMAGE_RESOLUTION_VISION", "1024") or "1024")
 
 user_invites = {}
 authorized_users = set(telegram_chat_id)
@@ -115,6 +118,7 @@ media_group_photos = {}
 media_group_captions = {}
 media_group_waiting_message = {}
 media_group_tasks = {}
+media_group_processing = {}
 MEDIA_GROUP_TIMEOUT = 10.0
 
 
@@ -249,8 +253,39 @@ class UserSettings:
         return max(1, min(20, max_results))
 
 def encode_image(image_path):
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode('utf-8')
+    image_bytes = b""
+    try:
+        with Image.open(image_path) as img:
+            needs_resizing = max(img.size) > max_image_resolution_vision
+            is_jpeg = (img.format or "").upper() in ("JPEG", "JPG")
+
+            if needs_resizing or not is_jpeg:
+                if needs_resizing:
+                    resample_filter = getattr(Image, 'Resampling', Image).LANCZOS
+                    img.thumbnail((max_image_resolution_vision, max_image_resolution_vision), resample_filter)
+
+                buffer = io.BytesIO()
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                img.save(buffer, format="JPEG", quality=85)
+                image_bytes = buffer.getvalue()
+    except Exception as e:
+        logger.warning(f"Error compressing image: {e}. Falling back to original size.")
+
+    if not image_bytes:
+        with open(image_path, "rb") as image_file:
+            image_bytes = image_file.read()
+
+
+    return base64.b64encode(image_bytes).decode('utf-8')
+
+
+def prepare_downloaded_image_for_vision(source_path: str, target_path: str) -> None:
+    if is_jpeg_image(source_path):
+        shutil.copy(source_path, target_path)
+        return
+
+    save_image_as_jpeg(source_path, target_path, quality=90)
 
 
 def split_text_intelligently(text: str, max_length: int = 4000) -> list[str]:
@@ -1462,133 +1497,69 @@ async def voice_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="markdown"
         )
 
+async def queue_image_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str, image_ref: Any, caption: str | None):
+    """Collect Telegram album image refs and process them after updates stop arriving."""
+    is_same_media_group = user_id in media_group_id and media_group_id[user_id] == update.message.media_group_id
+    is_processing = media_group_processing.get(user_id) and is_same_media_group
+
+    if user_id in media_group_tasks and media_group_tasks[user_id] and not is_processing:
+        media_group_tasks[user_id].cancel()
+
+    if user_id not in media_group_id or media_group_id[user_id] != update.message.media_group_id:
+        media_group_id[user_id] = update.message.media_group_id
+        media_group_photos[user_id] = []
+        media_group_captions[user_id] = None
+        media_group_waiting_message[user_id] = await update.message.reply_text(
+            "🖼️ *Image media group received... Waiting for images...*",
+            parse_mode="markdown"
+        )
+
+    if caption and media_group_captions[user_id] is None:
+        media_group_captions[user_id] = caption
+
+    if image_ref not in media_group_photos[user_id]:
+        media_group_photos[user_id].append(image_ref)
+        waiting_message = media_group_waiting_message.get(user_id)
+        if waiting_message and not is_processing:
+            await waiting_message.edit_text(
+                f"🖼️ *Image {len(media_group_photos[user_id])} received... Waiting for other images...*",
+                parse_mode="markdown"
+            )
+
+    if is_processing:
+        return
+
+    async def process_media_group_with_timeout():
+        try:
+            await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
+            await process_media_group(update, context, user_id)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logging.error(f"Error in process_media_group_with_timeout: {str(e)}")
+
+    task = asyncio.create_task(process_media_group_with_timeout())
+    media_group_tasks[user_id] = task
+
 async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str):
-    """Process all photos in a media group"""
+    """Process all images in a media group"""
+    media_group_processing[user_id] = True
     try:
-        if not user_id in media_group_photos:
+        if user_id not in media_group_photos or not media_group_photos[user_id]:
             print(f"User {user_id} is waiting for media group, but it is not in media_group_photos")
             return
 
-        if user_id in media_group_waiting_message and media_group_waiting_message[user_id]:
-            await media_group_waiting_message[user_id].edit_text("🖼️ *Processing media group...*", parse_mode="markdown")
-        
-        photos = media_group_photos[user_id]
+        status_message = media_group_waiting_message.get(user_id)
+
+        image_refs = media_group_photos[user_id]
         
         # Track media group processed
-        stats_tracker.track_media_group_processed(user_id, len(photos))
+        stats_tracker.track_media_group_processed(user_id, len(image_refs))
 
-        print(f"User {user_id} has {len(photos)} photos in media group")
+        print(f"User {user_id} has {len(image_refs)} images in media group")
 
-        if media_group_captions[user_id] == None:
-            caption = "Describe what is in this image in user language."
-            describe_question = caption
-        else:
-            caption = media_group_captions[user_id]
-            describe_question = f"Describe what is in this image and answer to this question: {caption}"
-
-        
-        # Send initial status message
-        status_message = await update.message.reply_text("🖼️ *Analyzing images...*", parse_mode="markdown")
-        
-        temp_photos = []  # Keep track of temporary files for cleanup
-        all_descriptions = []  # Store descriptions for all photos
-        image_paths = []  # Store paths to downloaded images
-        
-        try:
-            # Process each photo
-            for i, photo_group in enumerate(photos, 1):
-                try:
-                    photo = photo_group[0]  # Get the photo from the group
-                    # Download the photo
-                    photo_file = await context.bot.get_file(photo.file_id)
-                    temp_dir = f"./data/{user_id}/temp_photos"
-                    os.makedirs(temp_dir, exist_ok=True)
-                    temp_photo = os.path.join(temp_dir, f"photo_{uuid.uuid4()}.jpg")
-                    temp_photos.append(temp_photo)
-                    await photo_file.download_to_drive(temp_photo)
-                    
-                    # Save the permanent copy to user's directory
-                    user_images_dir = os.path.join("data", user_id, "images")
-                    os.makedirs(user_images_dir, exist_ok=True)
-                    permanent_image_path = os.path.join(user_images_dir, f"image_{uuid.uuid4()}.jpg")
-                    # Copy the image to the permanent location
-                    shutil.copy(temp_photo, permanent_image_path)
-                    image_paths.append(permanent_image_path)
-                    
-                    # Get descriptions from both services
-                    await status_message.edit_text(f"🤖 *Getting Anthropic description for image {i}...*", parse_mode="markdown")
-                    anthropic_description = await describe_image_anthropic(question=describe_question, image_path=temp_photo)
-                    stats_tracker.track_describe_used(user_id, "image_anthropic")
-                    
-                    await status_message.edit_text(f"🤖 *Getting OpenAI description for image {i}...*", parse_mode="markdown")
-                    openai_description = await describe_image_openai(question=describe_question, image_path=temp_photo)
-                    stats_tracker.track_describe_used(user_id, "image_openai")
-                    
-                    all_descriptions.append({
-                        'anthropic': anthropic_description,
-                        'openai': openai_description,
-                        'path': permanent_image_path
-                    })
-                    
-                except Exception as e:
-                    logging.error(f"Error processing photo {i}: {str(e)}")
-                    all_descriptions.append({
-                        'anthropic': f"Error processing image {i}",
-                        'openai': f"Error processing image {i}",
-                        'path': "error_path"
-                    })
-            
-            # Craft the user question combining caption and all descriptions
-            descriptions_text = "\n\n".join([
-                f"Image {i+1} (path: {desc['path']}):\n"
-                f"Anthropic description: {desc['anthropic']}\n"
-                f"OpenAI description: {desc['openai']}"
-                for i, desc in enumerate(all_descriptions)
-            ])
-            
-            user_question = f"{caption}\n\nUser attached {len(all_descriptions)} image(s) to this message. Here are the details about each image from Anthropic and OpenAI:\n\n{descriptions_text}"
-            
-            await status_message.edit_text("🤖 *Processing...*", parse_mode="markdown")
-            # Process like a regular message
-            await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing', message_thread_id=get_thread_id(update))
-            thinking_message = await update.message.reply_text("💭 *Thinking...*", parse_mode="markdown")
-            _, _, mg_limit = check_user_limits(user_id)
-            
-            async def update_thinking_message(step: str, details: str, iteration: int, critique: int):
-                if step == "saving":
-                    iteration = "final"
-                    critique = "end"
-                live_limit_info = ""
-                if mg_limit:
-                    live_used = stats_tracker.get_user_action_count(user_id, days=30)
-                    live_limit_info = f"📊 *Usage:* _{live_used}/{mg_limit} actions (30d)_\n"
-                await thinking_message.edit_text(
-                    f"💭 *Thinking...*\n"
-                    f"- - - - \n"
-                    f"{live_limit_info}"
-                    f"📝 *Step:* _{step.replace('_', '-')}_\n"
-                    f"📋 *Details:* _{details.replace('_', '-')}_\n"
-                    f"🔄 *Iterations:* _{iteration}_\n"
-                    f"🎯 *Critiques:* _{critique}_",
-                    parse_mode="markdown"
-                )
-            
-            # Get response using the same logic as handle_message
-            _thread_id = get_thread_id(update)
-            on_text_chunk = create_streaming_callback(context.bot, user_id, _thread_id)
-            response, messages = await get_answer(user_question, user_id, update_thinking_message, update, context, on_text_chunk=on_text_chunk, message_thread_id=_thread_id)
-            await send_response_to_user(update, thinking_message, response, user_id)
-            await send_reasoning_file(update, messages, user_id)
-            await status_message.edit_text("🤖 *Done!*", parse_mode="markdown")
-            
-        finally:
-            # Clean up all temporary files
-            for temp_photo in temp_photos:
-                try:
-                    if os.path.exists(temp_photo):
-                        os.remove(temp_photo)
-                except Exception as e:
-                    print(f"Error cleaning up temporary photo file {temp_photo}: {str(e)}")
+        _, _, mg_limit = check_user_limits(user_id)
+        await process_image_message(update, context, user_id, image_refs, media_group_captions[user_id], mg_limit, status_message)
     finally:
         # Clean up media group data
         media_group_id[user_id] = None
@@ -1599,6 +1570,8 @@ async def process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE
         media_group_waiting_message[user_id] = None
         if user_id in media_group_tasks:
             del media_group_tasks[user_id]
+        if user_id in media_group_processing:
+            del media_group_processing[user_id]
 
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming photo messages with support for multiple photos"""
@@ -1619,55 +1592,26 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     stats_tracker.track_message_received(user_id, "photo")
     
     if update.message.media_group_id:
-        # Media group collection stays outside lock - multiple photos arrive rapidly
-        if user_id in media_group_tasks and media_group_tasks[user_id]:
-            media_group_tasks[user_id].cancel()
-        
-        if user_id not in media_group_id or media_group_id[user_id] != update.message.media_group_id:
-            media_group_id[user_id] = update.message.media_group_id
-            media_group_photos[user_id] = []
-            media_group_captions[user_id] = None
-            media_group_waiting_message[user_id] = await update.message.reply_text(
-                "🖼️ *Image media group received... Waiting for images...*",
-                parse_mode="markdown"
-            )
-        
-        if update.message.caption and media_group_captions[user_id] == None:
-            media_group_captions[user_id] = update.message.caption
-
-        photos = [update.message.photo[-1]]
-        if photos not in media_group_photos[user_id]:
-            media_group_photos[user_id].append(photos)
-            await media_group_waiting_message[user_id].edit_text(
-                f"🖼️ *Image {len(media_group_photos[user_id])} received... Waiting for other images...*",
-                parse_mode="markdown"
-            )
-        
-        async def process_media_group_with_timeout():
-            try:
-                await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
-                async with get_user_lock(user_id):
-                    await process_media_group(update, context, user_id)
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logging.error(f"Error in process_media_group_with_timeout: {str(e)}")
-        
-        task = asyncio.create_task(process_media_group_with_timeout())
-        media_group_tasks[user_id] = task
+        await queue_image_media_group(update, context, user_id, update.message.photo[-1], update.message.caption)
         return
     
     # Handle single photo message
+    await process_image_message(update, context, user_id, [update.message.photo[-1]], update.message.caption, limit)
+
+async def process_image_message(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str, image_refs: list, caption: str | None, limit: int | None = None, status_message: Any = None):
+    """Process one or more Telegram image file refs through the photo analysis pipeline."""
     async with get_user_lock(user_id):
-        photos = [update.message.photo[-1]]
-        if update.message.caption == None:
+        photos = image_refs
+        if caption is None:
             caption = "Describe what is in this image in user language."
             describe_question = caption
         else:
-            caption = update.message.caption
             describe_question = f"Describe what is in this image and answer to this question: {caption}"
         
-        status_message = await update.message.reply_text("🖼️ *Analyzing images...*", parse_mode="markdown")
+        if status_message:
+            await status_message.edit_text("🖼️ *Analyzing images...*", parse_mode="markdown")
+        else:
+            status_message = await update.message.reply_text("🖼️ *Analyzing images...*", parse_mode="markdown")
         
         temp_photos = []
         all_descriptions = []
@@ -1679,9 +1623,17 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     photo_file = await context.bot.get_file(photo.file_id)
                     temp_dir = "temp_photos"
                     os.makedirs(temp_dir, exist_ok=True)
+                    original_extension = os.path.splitext(getattr(photo, "file_name", "") or "")[1].lower()
+                    if original_extension not in IMAGE_EXTENSIONS:
+                        original_extension = ".jpg"
+
+                    temp_download = os.path.join(temp_dir, f"photo_{uuid.uuid4()}{original_extension}")
+                    temp_photos.append(temp_download)
+                    await photo_file.download_to_drive(temp_download)
+
                     temp_photo = os.path.join(temp_dir, f"photo_{uuid.uuid4()}.jpg")
                     temp_photos.append(temp_photo)
-                    await photo_file.download_to_drive(temp_photo)
+                    prepare_downloaded_image_for_vision(temp_download, temp_photo)
                     
                     user_images_dir = os.path.join("data", user_id, "images")
                     os.makedirs(user_images_dir, exist_ok=True)
@@ -1689,11 +1641,12 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     shutil.copy(temp_photo, permanent_image_path)
                     image_paths.append(permanent_image_path)
                     
-                    await status_message.edit_text(f"🤖 *Getting Anthropic description...*", parse_mode="markdown")
+                    image_suffix = f" for image {i}" if len(photos) > 1 else ""
+                    await status_message.edit_text(f"🤖 *Getting Anthropic description{image_suffix}...*", parse_mode="markdown")
                     anthropic_description = await describe_image_anthropic(question=describe_question, image_path=temp_photo)
                     stats_tracker.track_describe_used(user_id, "image_anthropic")
                     
-                    await status_message.edit_text(f"🤖 *Getting OpenAI description...*", parse_mode="markdown")
+                    await status_message.edit_text(f"🤖 *Getting OpenAI description{image_suffix}...*", parse_mode="markdown")
                     openai_description = await describe_image_openai(question=describe_question, image_path=temp_photo)
                     stats_tracker.track_describe_used(user_id, "image_openai")
                     
@@ -1787,6 +1740,15 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         await handle_video_message(update, context)
         return
     
+    image_extensions = IMAGE_EXTENSIONS
+    if file_extension in image_extensions:
+        stats_tracker.track_message_received(user_id, "photo")
+        if update.message.media_group_id:
+            await queue_image_media_group(update, context, user_id, update.message.document, update.message.caption)
+            return
+        await process_image_message(update, context, user_id, [update.message.document], update.message.caption, limit)
+        return
+
     # Track message received
     stats_tracker.track_message_received(user_id, "document")
     
@@ -1794,7 +1756,8 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     
     if file_extension not in supported_extensions:
         supported_formats = ", ".join([ext.replace(".", "").upper() for ext in supported_extensions])
-        await update.message.reply_text(f"❌ Only {supported_formats} documents are supported.")
+        supported_image_formats = "/".join(ext.replace(".", "").upper() for ext in image_extensions)
+        await update.message.reply_text(f"❌ Only {supported_formats} documents and {supported_image_formats} images are supported.")
         return
 
     async with get_user_lock(user_id):

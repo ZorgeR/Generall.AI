@@ -4,3 +4,8 @@ __pycache__/
 .DS_Store
 data/
 .vscode/
+
+# Temporary media directories
+temp_photos/
+temp_docs/
+temp_audio/
