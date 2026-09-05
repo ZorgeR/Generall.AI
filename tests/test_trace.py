@@ -1,7 +1,7 @@
 import time
 
 from agents.trace import ToolCall, ToolTrace, describe_args
-from bot.agent_runner import render_trace, trace_summary
+from bot.agent_runner import entity_safe, render_trace, trace_summary
 
 
 def test_describe_args_prefers_informative_keys_and_truncates():
@@ -62,3 +62,17 @@ def test_trace_summary_line():
     single = ToolTrace()
     single.start("x", {}).done("ok", ok=True)
     assert "1 tool call in" in trace_summary(single)
+
+
+def test_entity_safe_never_escapes_inside_legacy_entities():
+    # Legacy Markdown forbids backslash escapes inside *bold* / _italic_: the characters are replaced.
+    assert entity_safe("Processing tool results run_command") == "Processing tool results run-command"
+    assert entity_safe("a*b`c[d") == "a-b-c-d"
+    assert "\\" not in entity_safe("run_command")
+
+
+def test_rendered_trace_lines_keep_escapes_outside_entities():
+    trace = ToolTrace()
+    trace.start("run_command", {"command": "for ip in 1.1.1.1 8.8.8.8; do echo \"=== $ip\"; done"}).done("ok", ok=True)
+    line = render_trace(trace).splitlines()[1]
+    assert line.startswith("✅ `run_command` for ip in 1.1.1.1 8.8.8.8; do echo \"=== $ip\"; done · ")
