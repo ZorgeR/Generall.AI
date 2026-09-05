@@ -92,10 +92,11 @@ async def run_turn(
     """Run the agent on ``prompt`` and deliver the result. Returns None after reporting an error."""
     from stats import stats_tracker
 
-    sender = ChatSender(bot, chat_id, thread_id, reply_to_message_id)
     settings = UserSettings(user_id)
     settings.save()  # persist any defaults added since the file was written
     user_settings: dict[str, Any] = settings.as_dict()
+    rich_enabled = bool(settings.get("rich_messages", "enabled"))
+    sender = ChatSender(bot, chat_id, thread_id, reply_to_message_id, rich=rich_enabled)
 
     await sender.typing()
     if status is None:
@@ -115,7 +116,7 @@ async def run_turn(
         )
         await sender.edit_text(status, text)
 
-    on_text_chunk = create_streaming_callback(bot, chat_id, thread_id)
+    on_text_chunk = create_streaming_callback(bot, chat_id, thread_id, rich=rich_enabled)
 
     try:
         agents = _agents()

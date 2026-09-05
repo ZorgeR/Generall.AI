@@ -1,0 +1,216 @@
+# Manual production deploy: Actions -> "Deploy to production" -> Run workflow.
+#
+# Everything comes from the GitHub environment named PROD:
+#   - SERVER_ADDR, SERVER_USER, SERVER_SSH_KEY, SERVER_CODE_ROOT_PATH (secrets or
+#     variables) say how to reach the server; optional SERVER_SSH_PORT and
+#     SERVER_KNOWN_HOSTS (a known_hosts line that pins the host key).
+#   - every OTHER secret and variable becomes one line of the server's .env
+#     (deploy/render_env.py; secrets win over variables on the same key).
+# Protection rules on the PROD environment (required reviewers, branch limits)
+# gate the job before any step runs. Secret values are never printed: the log
+# shows key names only.
+name: Deploy to production
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to deploy: branch, tag or full commit SHA"
+        type: string
+        required: true
+        default: main
+      dry_run:
+        description: "Dry run: only compare the rendered .env keys with the server's, change nothing"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prod-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: "${{ inputs.dry_run && 'Dry run' || 'Deploy' }} ${{ inputs.ref }}"
+    runs-on: ubuntu-latest
+    environment: PROD
+    timeout-minutes: 30
+    env:
+      # Deploy-only settings; each may live in PROD as a secret or as a variable.
+      SERVER_ADDR: ${{ secrets.SERVER_ADDR || vars.SERVER_ADDR }}
+      SERVER_USER: ${{ secrets.SERVER_USER || vars.SERVER_USER }}
+      SERVER_CODE_ROOT_PATH: ${{ secrets.SERVER_CODE_ROOT_PATH || vars.SERVER_CODE_ROOT_PATH }}
+      SERVER_SSH_PORT: ${{ secrets.SERVER_SSH_PORT || vars.SERVER_SSH_PORT || '22' }}
+      DEPLOY_REF: ${{ inputs.ref }}
+      DRY_RUN: ${{ inputs.dry_run }}
+
+    steps:
+      - name: Check out ${{ inputs.ref }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Check the deploy settings
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY || vars.SERVER_SSH_KEY }}
+        run: |
+          set +x
+          missing=""
+          for name in SERVER_ADDR SERVER_USER SERVER_SSH_KEY SERVER_CODE_ROOT_PATH; do
+            [ -n "${!name}" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Not set in the PROD environment (as a secret or a variable):$missing"
+            exit 1
+          fi
+          for name in SERVER_ADDR SERVER_USER SERVER_CODE_ROOT_PATH SERVER_SSH_PORT; do
+            case "${!name}" in
+              *[[:space:]]*) echo "::error::$name must not contain whitespace (check for a pasted newline)"; exit 1 ;;
+            esac
+          done
+          case "$SERVER_CODE_ROOT_PATH" in
+            /*) ;;
+            *) echo "::error::SERVER_CODE_ROOT_PATH must be an absolute path"; exit 1 ;;
+          esac
+          echo "ENV_FILE=$RUNNER_TEMP/prod.env" >> "$GITHUB_ENV"
+          echo "Deploy settings OK (ref: $DEPLOY_REF, dry run: $DRY_RUN)"
+
+      - name: Render .env from the PROD environment
+        env:
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: |
+          set +x
+          python3 deploy/render_env.py "$ENV_FILE"
+
+      - name: Set up SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY || vars.SERVER_SSH_KEY }}
+          SERVER_KNOWN_HOSTS: ${{ secrets.SERVER_KNOWN_HOSTS || vars.SERVER_KNOWN_HOSTS }}
+        run: |
+          set +x
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          if [ -n "$SERVER_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$SERVER_KNOWN_HOSTS" > ~/.ssh/known_hosts
+            echo "Host key: pinned from SERVER_KNOWN_HOSTS"
+          else
+            ssh-keyscan -H -T 10 -p "$SERVER_SSH_PORT" "$SERVER_ADDR" > ~/.ssh/known_hosts 2>/dev/null || true
+            if [ ! -s ~/.ssh/known_hosts ]; then
+              echo "::error::ssh-keyscan got no host key from the server (unreachable, or port $SERVER_SSH_PORT closed)"
+              exit 1
+            fi
+            echo "Host key: fetched with ssh-keyscan (trust on first use; set SERVER_KNOWN_HOSTS to pin it)"
+          fi
+          cat > ~/.ssh/config <<EOF
+          Host prod
+            HostName $SERVER_ADDR
+            Port $SERVER_SSH_PORT
+            User $SERVER_USER
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            BatchMode yes
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            ConnectTimeout 20
+            ServerAliveInterval 30
+            ServerAliveCountMax 6
+            LogLevel ERROR
+          EOF
+          ssh prod 'echo "Connected to $(hostname) as $(id -un); $(docker compose version)"'
+
+      - name: Dry run - compare .env keys with the server
+        if: inputs.dry_run
+        run: |
+          set +x
+          export LC_ALL=C
+          cut -d= -f1 "$ENV_FILE" | sort -u > "$RUNNER_TEMP/rendered.keys"
+
+          # Read-only look at the server: current commit, modified tracked files and the
+          # key names of its .env (stdout -> keys file, stderr -> info file). Values stay there.
+          ssh prod "ROOT=$(printf '%q' "$SERVER_CODE_ROOT_PATH") bash -s" <<'REMOTE' > "$RUNNER_TEMP/server.keys.raw" 2> "$RUNNER_TEMP/server.info" || true
+          set -euo pipefail
+          cd "$ROOT"
+          echo "checkout: $(git log -1 --oneline) [$(git rev-parse --abbrev-ref HEAD)]" >&2
+          git status --porcelain --untracked-files=no | sed 's/^/modified: /' >&2
+          if [ -f .env ]; then
+            sed -E -n 's/^(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=.*/\2/p' .env
+          else
+            echo "no .env on the server yet" >&2
+          fi
+          REMOTE
+          sort -u "$RUNNER_TEMP/server.keys.raw" > "$RUNNER_TEMP/server.keys"
+
+          echo "::group::Server state"
+          cat "$RUNNER_TEMP/server.info"
+          echo "::endgroup::"
+          if ! grep -q '^checkout: ' "$RUNNER_TEMP/server.info"; then
+            echo "::error::Could not read the checkout on the server (see 'Server state' above)"
+            exit 1
+          fi
+          if grep -q '^modified: ' "$RUNNER_TEMP/server.info"; then
+            echo "::warning::Tracked files are modified on the server; a real deploy refuses to run until they are reverted or committed"
+          fi
+          if grep -q '^no .env' "$RUNNER_TEMP/server.info"; then
+            echo "::warning::The server has no .env yet; every rendered key would be new"
+          fi
+
+          comm -23 "$RUNNER_TEMP/rendered.keys" "$RUNNER_TEMP/server.keys" > "$RUNNER_TEMP/missing.keys"
+          comm -13 "$RUNNER_TEMP/rendered.keys" "$RUNNER_TEMP/server.keys" > "$RUNNER_TEMP/extra.keys"
+          comm -12 "$RUNNER_TEMP/rendered.keys" "$RUNNER_TEMP/server.keys" > "$RUNNER_TEMP/common.keys"
+          for kind in missing extra common; do
+            case "$kind" in
+              missing) title="Missing on the server (would be ADDED)" ;;
+              extra)   title="Only on the server (would be REMOVED)" ;;
+              common)  title="In both" ;;
+            esac
+            echo "::group::$title: $(wc -l < "$RUNNER_TEMP/$kind.keys")"
+            cat "$RUNNER_TEMP/$kind.keys"
+            echo "::endgroup::"
+          done
+          if [ -s "$RUNNER_TEMP/extra.keys" ]; then
+            echo "::warning::$(wc -l < "$RUNNER_TEMP/extra.keys") key(s) exist only in the server's .env and would be dropped by a real deploy: $(paste -sd, "$RUNNER_TEMP/extra.keys"). Add them to the PROD environment first."
+          fi
+          echo "Dry run finished; nothing was changed on the server."
+
+      - name: Upload the rendered .env as .env.new
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set +x
+          chmod 600 "$ENV_FILE"
+          scp -q "$ENV_FILE" "prod:$SERVER_CODE_ROOT_PATH/.env.new"
+          echo "Uploaded .env.new ($(wc -l < "$ENV_FILE") keys)"
+
+      - name: Deploy on the server
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set +x
+          ssh prod "REF=$(printf '%q' "$DEPLOY_REF") ROOT=$(printf '%q' "$SERVER_CODE_ROOT_PATH") bash -s" < deploy/remote_deploy.sh
+
+      - name: Write the job summary
+        if: success()
+        env:
+          ACTOR: ${{ github.actor }}
+        run: |
+          set +x
+          {
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "### Dry run of \`$DEPLOY_REF\` against PROD (nothing changed)"
+            else
+              echo "### Deployed \`$DEPLOY_REF\` to PROD"
+            fi
+            echo
+            echo "- Triggered by @$ACTOR"
+            echo "- Keys in the rendered .env: $(wc -l < "$ENV_FILE")"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Server diagnostics after a failure
+        if: failure()
+        run: |
+          set +x
+          ssh prod "cd $(printf '%q' "$SERVER_CODE_ROOT_PATH") && docker compose ps && echo && docker compose logs --tail 200 --no-log-prefix bot" \
+            || echo "::warning::Could not collect diagnostics from the server"

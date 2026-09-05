@@ -198,6 +198,18 @@ Bot to Admin: "🔔 New user joined!
 
 ## 🔄 Advanced Features
 
+### ✨ Rich Messages
+
+Answers are sent as **rich Telegram messages** (Bot API 10.1): real GitHub-flavored Markdown with
+headings, tables, task lists, fenced code blocks, block quotes and LaTeX math, rendered natively by
+the Telegram app. While the answer is being generated (with `STREAMING_ENABLED=true`) the draft
+streams with live formatting and the model's thinking shows in Telegram's "Thinking…" block.
+
+Rich messages are on by default and can be switched per chat in `/settings` → **Rich Messages**.
+Turn them off if your Telegram app is too old and shows "unsupported message"; the bot then uses
+classic Markdown formatting. If the Bot API server (the `telegram-bot-api` sidecar) is older than
+10.1 the bot detects it once and falls back to MarkdownV2 formatting (tables as monospace blocks).
+
 ### 🎤 Voice Settings
 Customize voice parameters including voice model selection, stability, clarity, and style. The bot can both listen to your voice messages and respond with generated voice using ElevenLabs.
 
@@ -335,6 +347,7 @@ The bot can:
 - **💻 Operating Systems**: Linux (recommended for production), macOS, Windows
 - **🚀 Deployment**: Docker-based deployment supported across all major platforms
 - **🐍 Python Version**: 3.12+ required
+- **📱 Telegram clients**: rich message rendering needs a Telegram app released after Bot API 10.1 (older apps show "unsupported message"; switch Rich Messages off in `/settings`)
 - **🖥️ Hardware Requirements**: 
   - Minimum: 4GB RAM, 2 CPU cores
   - Recommended: 8GB+ RAM, 4+ CPU cores (especially for handling multiple conversations)
@@ -402,6 +415,7 @@ The application is configured via environment variables in the `.env` file. Key 
 4. Use `/settings` to customize the bot's behavior
 5. Use `/reminders` to manage your reminders
 6. Use `/cancel` to stop the task that is running and clear your queue
+7. Use `/settings` → Rich Messages to switch between rich and classic formatting
 
 ### ⏳ Queues and isolation
 
@@ -411,12 +425,51 @@ processed in order, each as its own turn. Queues are fully isolated: a long task
 as video generation or a sandboxed command, never delays other users. `MAX_CONCURRENT_TURNS`,
 `MAX_SANDBOX_CONTAINERS` and `TURN_TIMEOUT_SECONDS` in `.env` bound the whole process.
 
+## 🚀 Deploying to production
+
+Production is deployed by a manual GitHub Actions run (`.github/workflows/deploy.yml` plus the
+`deploy/` helpers) instead of the hand-typed `ssh … && git pull && docker compose …` routine. All of
+its configuration lives in the GitHub environment named **`PROD`**.
+
+**The Deploy button**: Actions → *Deploy to production* → *Run workflow*. Pick the git ref to deploy
+(branch, tag or full commit SHA; default `main`) and, optionally, tick *dry run*. If `PROD` has
+*required reviewers* configured, the run pauses for their approval before it touches the server.
+
+**Server connection** — four `SERVER_*` entries in `PROD` (secrets or variables; they never reach
+the server's `.env`): `SERVER_ADDR` (IP or host name), `SERVER_USER` (`root`), `SERVER_SSH_KEY`
+(an OpenSSH private key whose public half is in the server's `authorized_keys`) and
+`SERVER_CODE_ROOT_PATH` (the checkout, e.g. `/opt/generall.ai/Generall.AI`). Optional:
+`SERVER_SSH_PORT` (default 22) and `SERVER_KNOWN_HOSTS` (a `known_hosts` line that pins the host
+key; without it the key is fetched with `ssh-keyscan` on every run).
+
+**Application configuration**: every *other* secret and variable visible to `PROD` becomes one
+`KEY=value` line of the server's `.env` (secrets win over variables with the same name; keys must
+look like `TELEGRAM_BOT_TOKEN`, i.e. match `^[A-Z][A-Z0-9_]*$`). To add or change a setting, edit it
+in `PROD` and deploy — no workflow change is needed, and the server's `.env` should not be edited by
+hand any more (the previous file is kept as `.env.bak`). `deploy/render_env.py` quotes values as
+needed and skips values containing newlines; the job log shows key names only, never values.
+
+**First run**: start with a *dry run*. It renders the file, connects to the server and lists the keys
+missing there (would be added), the keys that exist only in the server's current `.env` (would be
+dropped — add them to `PROD` first) and the keys present in both. Nothing is changed on the server.
+
+**What a real deploy does** (`deploy/remote_deploy.sh`, streamed over SSH): refuses to run if
+tracked files are modified on the server; `git fetch` and checkout of the chosen ref; installs the
+uploaded `.env`; `docker compose pull telegram-bot-api` (best effort), `docker compose build --pull
+bot`, `docker compose up -d --remove-orphans`; then waits up to 90 s for the `bot` container to be
+running and to log `is running`. If it does not, the job fails and prints `docker compose ps` and the
+last log lines (the previous commit and `.env.bak` are named for a manual rollback). `data/` is never
+touched, and a concurrency group runs deploys one at a time.
+
 ## ❓ Troubleshooting
 
 - **🤖 Bot not responding**: Check your Telegram token and allowed chat IDs
 - **🎤 Voice features not working**: Ensure FFmpeg is properly installed
 - **🐳 Container issues**: Verify Docker is running and the user has appropriate permissions
 - **🔑 API errors**: Check your API keys and network connection
+- **✨ Answers arrive as "unsupported message"**: update the Telegram app, or turn Rich Messages off in `/settings`
+- **✨ Answers have no headings/tables and the log says rich messages are not supported**: the
+  `telegram-bot-api` sidecar is older than Bot API 10.1; run `docker compose pull telegram-bot-api && docker compose up -d`
 
 ## 📄 License
 
