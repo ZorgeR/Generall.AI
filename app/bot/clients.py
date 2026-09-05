@@ -1,18 +1,13 @@
-"""Lazily constructed API clients and model names used by the Telegram layer.
+"""Lazily constructed API clients used by the Telegram layer.
 
 Clients are created on first use so importing the package never requires API
-keys (the agent package still builds its own clients at import time).
+keys (the agent package still builds its own clients at import time). Model
+names and request options live in the top-level ``models`` module.
 """
 from __future__ import annotations
 
 import os
 from functools import lru_cache
-
-ANTHROPIC_MODEL = "claude-sonnet-4-6"
-OPENAI_MODEL = "gpt-5.2"
-VIDEO_FRAMES_MODEL = "gpt-5-mini"
-WHISPER_MODEL = "whisper-1"
-TTS_MODEL = "eleven_multilingual_v2"
 
 
 @lru_cache(maxsize=1)

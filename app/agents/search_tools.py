@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import json
+from models import PERPLEXITY_MODEL, PERPLEXITY_MODELS, PERPLEXITY_REASONING_MODEL
 
 class SearchTools:
     def __init__(self, user_id: str = None):
@@ -122,8 +123,8 @@ class SearchTools:
                         "model": {
                             "type": "string",
                             "description": "Model to use for research: sonar-reasoning-pro (step by step reasoning, slower but more thorough), sonar-pro (faster advanced research, but without step by step reasoning), sonar (faster, cheaper, but for most basic research)",
-                            "enum": ["sonar-reasoning-pro", "sonar-pro", "sonar"],
-                            "default": "sonar"
+                            "enum": list(PERPLEXITY_MODELS),
+                            "default": PERPLEXITY_MODEL
                         },
                         "mode": {
                             "type": "string",
@@ -168,7 +169,7 @@ class SearchTools:
         elif tool_name == "deep_research":
             return self.deep_research(
                 query=tool_args["query"],
-                model=tool_args.get("model", "sonar"),
+                model=tool_args.get("model", PERPLEXITY_MODEL),
                 mode=tool_args.get("mode", "copilot"),
                 focus=tool_args.get("focus", "analysis")
             )
@@ -336,7 +337,7 @@ class SearchTools:
     def deep_research(
         self,
         query: str,
-        model: str = "sonar",
+        model: str = PERPLEXITY_MODEL,
         mode: str = "copilot",
         focus: str = "analysis"
     ) -> str:
@@ -362,7 +363,7 @@ class SearchTools:
                 system_prompt += "Help guide the research process with relevant insights."
 
             # Add reasoning instruction for sonar-reasoning-pro
-            if model == "sonar-reasoning-pro":
+            if model == PERPLEXITY_REASONING_MODEL:
                 system_prompt += " Break down your analysis into clear steps, showing your reasoning process."
 
             # Prepare the API request payload
@@ -378,7 +379,7 @@ class SearchTools:
                         "content": query
                     }
                 ],
-                "max_tokens": 4000 if model == "sonar-reasoning-pro" else 2000,  # More tokens for reasoning model
+                "max_tokens": 4000 if model == PERPLEXITY_REASONING_MODEL else 2000,  # More tokens for reasoning model
                 "temperature": 0.7,
                 "top_p": 0.9,
                 "return_images": False,

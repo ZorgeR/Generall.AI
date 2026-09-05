@@ -7,6 +7,7 @@ from typing import Any, Dict
 
 from dotenv import load_dotenv
 
+from models import TTS_MODEL
 from reminders_store import reminders_store
 from voice import VoiceManager
 
@@ -205,7 +206,7 @@ class UserInteractions:
                 stream = client.text_to_speech.convert(
                     text=text,
                     voice_id=voice_id,
-                    model_id="eleven_multilingual_v2"
+                    model_id=TTS_MODEL
                 )
                 return b"".join(stream)
 

@@ -9,6 +9,7 @@ import uuid
 from google import genai
 from google.genai import types
 from google.genai.types import Image, VideoGenerationReferenceImage
+from models import VEO_MODEL
 
 load_dotenv()
 
@@ -17,7 +18,6 @@ logger = logging.getLogger(__name__)
 google_api_key = os.getenv("GOOGLE_API_KEY")
 genai_client = genai.Client(api_key=google_api_key)
 
-VEO_MODEL = "veo-3.1-generate-preview"
 MAX_WAIT_SECONDS = 300  # 5 minutes max
 POLL_INTERVAL_SECONDS = 20
 

@@ -20,16 +20,21 @@ import json
 from datetime import datetime
 from pathlib import Path
 from pydantic import BaseModel
+from models import (
+    ANTHROPIC_MODEL,
+    ANTHROPIC_MODEL_FAST,
+    OPENAI_MODEL,
+    anthropic_request_options,
+    openai_reasoning_options,
+)
 
 load_dotenv()
 
 max_agent_tools_iterations = os.getenv("MAX_AGENT_TOOLS_ITERATIONS")
 max_agent_critique_iterations = os.getenv("MAX_AGENT_CRITIQUE_ITERATIONS")
 
-# Anthropic config
+# Anthropic config (model names and request options live in models.py)
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
-anthropic_model = "claude-sonnet-4-6"
-anthropic_model_fast = "claude-haiku-4-5"
 anthropic_client = anthropic.AsyncAnthropic(api_key=anthropic_api_key)
 
 # Streaming config
@@ -60,7 +65,6 @@ Your reply is delivered as a plain Telegram message where only *bold*, _italic_ 
 
 # OpenAI config
 openai_api_key = os.getenv("OPENAI_API_KEY")
-openai_model = "gpt-5.2"
 openai_client = OpenAI(api_key=openai_api_key)
 
 # Tavily config
@@ -76,7 +80,7 @@ class JudgeResponse(BaseModel):
     judge_decision: bool
 
 class AgentAnthropic:
-    def __init__(self, model: str = anthropic_model, user_id: str = None):
+    def __init__(self, model: str = ANTHROPIC_MODEL, user_id: str = None):
         self.model = model
         self.user_id = user_id
         self.client = anthropic.AsyncAnthropic(api_key=anthropic_api_key)
@@ -148,9 +152,10 @@ You can suggest assistant to use a tools, if you think that it's necessary, the 
 
             critique_response = await asyncio.to_thread(
                 openai_client.beta.chat.completions.parse,
-                model=openai_model,
+                model=OPENAI_MODEL,
                 messages=critique_context,
-                response_format=CritiqueResponse
+                response_format=CritiqueResponse,
+                **openai_reasoning_options(OPENAI_MODEL),
             )
             
             critique = critique_response.choices[0].message.content.strip()
@@ -206,6 +211,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                     "content": [{"type": "text", "text": judge_prompt}]
                 }],
                 max_tokens=100,
+                **anthropic_request_options(thinking=False),
                 system="You are AI assistant as a judge, and you must respond with ONLY 'Yes' or 'No'. You task is to judge if the response is complete and correct and relevant to the user question."
             )
 
@@ -341,9 +347,10 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 "tools": self.get_tools_schema(),
                 "tool_choice": tool_choice,
             }
+            # effort + adaptive/disabled thinking for the main model (models.py)
+            api_kwargs.update(anthropic_request_options(thinking=self.thinking))
             if self.thinking:
                 api_kwargs["max_tokens"] = 20000
-                api_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 16000}
                 print(f"\nAgent iteration {iteration} with thinking")
             else:
                 api_kwargs["max_tokens"] = 4096
@@ -495,7 +502,8 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 model=self.model,
                 messages=processed_messages,
                 system=system,
-                max_tokens=4096
+                max_tokens=4096,
+                **anthropic_request_options(thinking=False),
             )
             final_text = ""
             for block in final_response.content:
@@ -511,7 +519,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
 
 
 class ChainOfThoughtAgent:
-    def __init__(self, model_type: str = "anthropic", model: str = anthropic_model, user_id: str = "default", sender=None, user_settings: dict = None, message_thread_id: int = None):
+    def __init__(self, model_type: str = "anthropic", model: str = ANTHROPIC_MODEL, user_id: str = "default", sender=None, user_settings: dict = None, message_thread_id: int = None):
         """
         Args:
             sender: bot.sender.ChatSender bound to the user's chat; tools use it to send
@@ -574,12 +582,12 @@ Response: {response}"""
         
         # Run topic, summary, and embedding generation in parallel
         topic_task = anthropic_client.messages.create(
-            model=anthropic_model_fast,
+            model=ANTHROPIC_MODEL_FAST,
             messages=[{"role": "user", "content": [{"type": "text", "text": topic_prompt}]}],
             max_tokens=50
         )
         summary_task = anthropic_client.messages.create(
-            model=anthropic_model_fast,
+            model=ANTHROPIC_MODEL_FAST,
             messages=[{"role": "user", "content": [{"type": "text", "text": summary_prompt}]}],
             max_tokens=200
         )
@@ -675,7 +683,7 @@ When in doubt, answer "complex".
 User message: {question}"""
 
             response = await anthropic_client.messages.create(
-                model=anthropic_model_fast,
+                model=ANTHROPIC_MODEL_FAST,
                 messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
                 max_tokens=10
             )
@@ -707,7 +715,7 @@ User message: {question}"""
                     })
 
             api_kwargs = {
-                "model": anthropic_model_fast,
+                "model": ANTHROPIC_MODEL_FAST,
                 "messages": processed_messages,
                 "system": system_context,
                 "max_tokens": 4096
@@ -1190,7 +1198,7 @@ You have been asked to answer a query given sources. Consider the following when
         
         if complexity == "simple":
             if update_status:
-                await update_status(step="initial", details=f"Quick response ({anthropic_model_fast})", iteration=0, critique=0)
+                await update_status(step="initial", details=f"Quick response ({ANTHROPIC_MODEL_FAST})", iteration=0, critique=0)
             
             response, thread_messages = await self._simple_response(context_memory, system_context, question, on_text_chunk=on_text_chunk)
         
