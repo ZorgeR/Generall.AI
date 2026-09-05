@@ -192,3 +192,35 @@ def openai_reasoning_options(model: str) -> dict:
     if model in OPENAI_REASONING_MODELS:
         return {"reasoning_effort": OPENAI_REASONING_EFFORT}
     return {}
+
+
+# ---------------------------------------------------------------------------
+# Pricing (USD per million tokens: input, output) for the token accounting shown
+# in the status summary and the admin /stats view. Cache reads cost 10% of the
+# input price, cache writes 125% (5-minute entries; the hourly system block is
+# written rarely). Unknown models get no cost estimate, only token counts.
+# ---------------------------------------------------------------------------
+MODEL_PRICES: dict[str, tuple[float, float]] = {
+    "claude-sonnet-5": (2.0, 10.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+    "claude-opus-5": (5.0, 25.0),
+    "claude-opus-4-8": (5.0, 25.0),
+    "claude-opus-4-7": (5.0, 25.0),
+}
+CACHE_READ_MULTIPLIER = 0.1
+CACHE_WRITE_MULTIPLIER = 1.25
+
+
+def estimate_cost(model: str, input_tokens: int = 0, output_tokens: int = 0, cache_read_tokens: int = 0, cache_write_tokens: int = 0) -> float | None:
+    """USD estimate for one model's usage, or None when the model is not in MODEL_PRICES."""
+    prices = MODEL_PRICES.get(model)
+    if prices is None:
+        return None
+    price_in, price_out = prices
+    return (
+        input_tokens * price_in
+        + cache_read_tokens * price_in * CACHE_READ_MULTIPLIER
+        + cache_write_tokens * price_in * CACHE_WRITE_MULTIPLIER
+        + output_tokens * price_out
+    ) / 1_000_000

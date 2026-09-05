@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -23,79 +22,13 @@ from bot.media import synthesize_speech, user_dir
 from bot.queue import JobContext
 from bot.sender import ChatSender
 from bot.settings import UserSettings
+from bot.status import StatusMessage, entity_safe, render_trace, trace_summary, usage_text  # noqa: F401 (re-exported)
 from bot.streaming import create_streaming_callback
-from bot.ui import escape_markdown
 from models import ANTHROPIC_MODEL
 
 logger = logging.getLogger(__name__)
 
 THINKING = "💭 *Thinking...*"
-TRACE_LINES = 10  # most recent tool calls shown in the status message
-
-
-_ENTITY_UNSAFE = re.compile(r"[_*`\[]")
-
-
-def entity_safe(text: str) -> str:
-    """Text placed INSIDE a legacy-Markdown entity (*bold* / _italic_).
-
-    Legacy Markdown does not allow backslash escapes inside an entity, so the special
-    characters are replaced instead of escaped (``run_command`` -> ``run-command``).
-    """
-    return _ENTITY_UNSAFE.sub("-", str(text))
-
-
-def _fmt_seconds(seconds: float) -> str:
-    return f"{seconds:.1f}s" if seconds < 10 else f"{int(round(seconds))}s"
-
-
-def _fmt_tokens(n: int) -> str:
-    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
-
-
-def usage_text(trace) -> str:
-    """Token usage of the turn so far, with the share served from the prompt cache."""
-    if not trace or not trace.api_calls:
-        return ""
-    prompt = trace.input_tokens + trace.cache_read_tokens + trace.cache_write_tokens
-    text = f"🧮 {trace.api_calls} call{'s' if trace.api_calls != 1 else ''} · in {_fmt_tokens(prompt)}"
-    if trace.cache_read_tokens:
-        text += f" ({int(round(trace.cache_hit_ratio * 100))}% cached)"
-    return text + f" · out {_fmt_tokens(trace.output_tokens)}"
-
-
-def render_trace(trace, limit: int = TRACE_LINES) -> str:
-    """The tool-call list shown under the status header (legacy Markdown)."""
-    from agents.trace import describe_args
-
-    if not trace or not trace.calls:
-        return ""
-    lines = [f"🔧 *Tools* ({trace.total}, {_fmt_seconds(trace.elapsed)})"]
-    calls = trace.calls[-limit:]
-    if len(trace.calls) > limit:
-        lines.append(f"… {len(trace.calls) - limit} earlier")
-    for call in calls:
-        icon = "⏳" if call.running else ("✅" if call.ok else "❌")
-        indent = "  " * call.depth
-        args = describe_args(call.args)
-        line = f"{indent}{icon} `{call.name}`"
-        if args:
-            line += f" {escape_markdown(args)}"
-        if not call.running:
-            line += f" · {_fmt_seconds(call.duration)}"
-        lines.append(line)
-    return "\n".join(lines)
-
-
-def trace_summary(trace) -> str:
-    """One line kept above the answer once the turn is over."""
-    parts = ", ".join(f"{name} ×{n}" if n > 1 else name for name, n in trace.counts_by_name())
-    text = f"🔧 *{trace.total} tool call{'s' if trace.total != 1 else ''} in {_fmt_seconds(trace.elapsed)}*"
-    if trace.errors:
-        text += f" · {trace.errors} failed"
-    text = f"{text}: {escape_markdown(parts)}"
-    usage = usage_text(trace)
-    return f"{text}\n{usage}" if usage else text
 
 
 @dataclass
@@ -129,6 +62,28 @@ def reasoning_text(messages: list) -> str:
         except (KeyError, IndexError, TypeError, AttributeError):
             continue
     return "\n\n========\n\n".join(out) + "\n\n========\n\n" if out else ""
+
+
+def record_usage(stats_tracker, user_id: str, trace) -> None:
+    """Token accounting: one usage row per model used in this turn (never raises)."""
+    try:
+        from models import estimate_cost
+
+        for model, u in (trace.usage_by_model or {}).items():
+            stats_tracker.track_usage(
+                user_id,
+                model=model,
+                api_calls=u["api_calls"],
+                input_tokens=u["input_tokens"],
+                output_tokens=u["output_tokens"],
+                cache_read_tokens=u["cache_read_tokens"],
+                cache_write_tokens=u["cache_write_tokens"],
+                tool_calls=trace.total,
+                duration_s=trace.elapsed,
+                cost_usd=estimate_cost(model, u["input_tokens"], u["output_tokens"], u["cache_read_tokens"], u["cache_write_tokens"]),
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Could not record token usage for %s: %s", user_id, e)
 
 
 async def send_reasoning_file(sender: ChatSender, messages: list, settings: UserSettings, caption: str = "Reasoning history.") -> None:
@@ -174,26 +129,15 @@ async def run_turn(
     from agents.trace import ToolTrace
 
     trace = ToolTrace()
+    status_msg = StatusMessage(sender, status, rich=rich_enabled, header=header)
+    keep_summary = bool(settings.get("trace", "keep_summary"))
 
     async def update_status(step: str, details: str, iteration: Any, critique: Any) -> None:
         if step == "saving":
             iteration, critique = "final", "end"
         if ctx is not None:
             ctx.set_progress(f"{step}: {details}"[:120])
-        text = (
-            f"{header}\n- - - - \n{usage_line(user_id, limit)}"
-            f"📝 *Step:* _{entity_safe(step)}_\n"
-            f"📋 *Details:* _{entity_safe(details)}_\n"
-            f"🔄 *Iterations:* _{iteration}_\n"
-            f"🎯 *Critiques:* _{critique}_"
-        )
-        trace_text = render_trace(trace)
-        if trace_text:
-            text += "\n\n" + trace_text
-        usage = usage_text(trace)
-        if usage:
-            text += "\n" + usage
-        await sender.edit_text(status, text, fallback="strip")
+        await status_msg.update(step=step, details=details, iteration=iteration, critique=critique, trace=trace, quota=usage_line(user_id, limit))
 
     on_text_chunk = create_streaming_callback(bot, chat_id, thread_id, rich=rich_enabled)
 
@@ -209,9 +153,10 @@ async def run_turn(
         )
         response, messages = await agent.generate_response(prompt, update_status, on_text_chunk=on_text_chunk, trace=trace)
         stats_tracker.track_message_sent(user_id)
+        record_usage(stats_tracker, user_id, trace)
 
         if speak and response:
-            await sender.edit_text(status, "🎙️ *Generating audio...*")
+            await status_msg.update(step="audio", details="Generating audio", iteration="final", critique="end", trace=trace)
             from voice import VoiceManager
 
             voice_id = VoiceManager().get_user_voice(user_id)
@@ -222,21 +167,21 @@ async def run_turn(
                 except Exception as e:  # noqa: BLE001
                     logger.error("Error sending voice reply: %s", e)
 
-        if rich_enabled and trace.calls:
-            # Keep the status message as a compact record of the tool calls above the answer
-            # (a rich answer cannot replace it anyway); without tool calls it is deleted as before.
+        if rich_enabled:
+            # The answer is a new rich message; the status is shortened into the turn summary
+            # (tool calls, thinking, tokens) above it, or deleted when the user turned that off.
             await sender.send_markdown(response)
-            await sender.edit_text(status, trace_summary(trace))
+            await status_msg.finish(trace, keep=keep_summary)
         else:
             await sender.send_markdown(response, edit=status)
         await send_reasoning_file(sender, messages, settings, caption=reasoning_caption)
         return TurnResult(response=response, messages=messages)
     except asyncio.CancelledError:
         reason = ctx.cancel_reason if ctx else None
-        await sender.edit_text(status, "🛑 Stopped." if reason == "user" else "🛑 Cancelled.", markdown=False)
+        await status_msg.set_text("🛑 Stopped." if reason == "user" else "🛑 Cancelled.")
         raise
     except Exception as e:  # noqa: BLE001
         trace_id = str(uuid.uuid4())
         logger.exception("Turn failed for user %s (trace %s): %s", user_id, trace_id, e)
-        await sender.edit_text(status, f"❌ An error occurred. Trace ID: {trace_id}", markdown=False)
+        await status_msg.set_text(f"❌ An error occurred. Trace ID: {trace_id}")
         return None

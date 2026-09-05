@@ -6,7 +6,7 @@ the UI behaves the same; authorization is handled by ``AuthMiddleware``.
 
 callback_data scheme: ``settings_<token>[_<action>[_<value>]]`` where
 ``<token>`` is a short name (summarization, dialog, reasoning, memory,
-critique, judge, tools, semantic, thinking, rich, transcript, main), parsed with a plain
+critique, judge, tools, semantic, thinking, rich, transcript, trace, main), parsed with a plain
 ``split("_")``. ``settings_system_prompt`` and
 ``settings_system_prompt_set_<type>`` are special-cased because of the
 underscore in their token.
@@ -121,6 +121,8 @@ def _overview(user_settings: UserSettings) -> tuple[str, InlineKeyboardMarkup]:
         "🧵 *Transcript*: "
         f"{_mark(s.get('transcript', 'enabled'))} | "
         f"Context: {int(s.get('transcript', 'max_context_tokens') or 0) // 1000}k\n"
+        "🧾 *Turn Summary*: "
+        f"{_mark(s.get('trace', 'keep_summary'))}\n"
         "🧩 *System Prompt*: "
         f"{s.get('system_prompt', 'type')}\n\n"
         "Select a setting to configure:"
@@ -151,6 +153,9 @@ def _overview(user_settings: UserSettings) -> tuple[str, InlineKeyboardMarkup]:
             [
                 InlineKeyboardButton(text="✨ Rich Messages", callback_data="settings_rich"),
                 InlineKeyboardButton(text="🧵 Transcript", callback_data="settings_transcript"),
+            ],
+            [
+                InlineKeyboardButton(text="🧾 Turn Summary", callback_data="settings_trace"),
             ],
         ]
     )
@@ -326,6 +331,12 @@ async def settings_button(callback: CallbackQuery) -> None:
             current = user_settings.get("rich_messages", "enabled")
             user_settings.set("rich_messages", not current, "enabled")
         await show_rich_menu(message, user_settings)
+
+    elif category == "trace":
+        if action == "toggle":
+            current = user_settings.get("trace", "keep_summary")
+            user_settings.set("trace", not current, "keep_summary")
+        await show_trace_menu(message, user_settings)
 
     elif category == "transcript":
         if action == "toggle":
@@ -586,6 +597,28 @@ async def show_rich_menu(message: Message, user_settings: UserSettings) -> None:
         "Turn this off if your Telegram app shows them as\n"
         "\"unsupported message\" (old client); answers then use\n"
         "classic Markdown formatting.",
+        keyboard,
+    )
+
+
+async def show_trace_menu(message: Message, user_settings: UserSettings) -> None:
+    """Show the turn-summary (status message) settings menu."""
+    enabled = user_settings.get("trace", "keep_summary")
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [_toggle_button(enabled, "settings_trace_toggle")],
+            [_back_button()],
+        ]
+    )
+    await edit_md(
+        message,
+        "*Turn Summary Settings*\n\n"
+        f"Status: {_status(enabled)}\n\n"
+        "While the bot works, the status message shows the tool\n"
+        "calls as they run. When the answer is ready the status is\n"
+        "shortened into a summary kept above the answer, with\n"
+        "expandable tool calls, the model's thinking and the token\n"
+        "usage. Off: the status message is deleted instead.",
         keyboard,
     )
 

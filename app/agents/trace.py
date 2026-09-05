@@ -6,10 +6,14 @@ one-line summary above the answer afterwards. Pure data, no Telegram or API impo
 """
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 
 PREVIEW_CHARS = 60
+ARGS_CHARS = 500  # JSON of a call's arguments kept for the expandable summary
+RESULT_CHARS = 800  # beginning of a call's result kept for the expandable summary
+THINKING_CHARS = 6000  # of the model's (summarized) thinking kept per turn
 # Argument keys worth showing, most informative first.
 _ARG_PRIORITY = ("query", "command", "script", "code", "url", "prompt", "text", "message", "path", "filename", "file_path")
 
@@ -47,7 +51,19 @@ class ToolCall:
     finished: float | None = None
     ok: bool | None = None
     preview: str = ""
+    result_excerpt: str = ""
     depth: int = 0  # >0 for calls made by a subagent (rendered indented)
+
+    @property
+    def args_text(self) -> str:
+        """Arguments as compact JSON for the expandable summary (truncated)."""
+        if not self.args:
+            return ""
+        try:
+            text = json.dumps(self.args, ensure_ascii=False, indent=1)
+        except (TypeError, ValueError):
+            text = str(self.args)
+        return text if len(text) <= ARGS_CHARS else text[: ARGS_CHARS - 1] + "…"
 
     @property
     def running(self) -> bool:
@@ -61,6 +77,8 @@ class ToolCall:
         self.finished = time.monotonic()
         self.ok = ok
         self.preview = _first_line(result)
+        text = (result or "").strip()
+        self.result_excerpt = text if len(text) <= RESULT_CHARS else text[: RESULT_CHARS - 1] + "…"
 
 
 @dataclass
@@ -87,17 +105,49 @@ class ToolTrace:
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    usage_by_model: dict = field(default_factory=dict)  # model -> the same five counters
+    thinking: list[str] = field(default_factory=list)  # summarized thinking of the turn, in order
 
-    def add_usage(self, usage) -> None:
-        """Accumulate a Messages API ``usage`` object (attributes or dict)."""
+    def add_usage(self, usage, model: str | None = None) -> None:
+        """Accumulate a Messages API ``usage`` object (attributes or dict), per model too."""
         if usage is None:
             return
         get = usage.get if isinstance(usage, dict) else (lambda k, d=None: getattr(usage, k, d))
-        self.api_calls += 1
-        self.input_tokens += int(get("input_tokens") or 0)
-        self.output_tokens += int(get("output_tokens") or 0)
-        self.cache_read_tokens += int(get("cache_read_input_tokens") or 0)
-        self.cache_write_tokens += int(get("cache_creation_input_tokens") or 0)
+        counts = {
+            "api_calls": 1,
+            "input_tokens": int(get("input_tokens") or 0),
+            "output_tokens": int(get("output_tokens") or 0),
+            "cache_read_tokens": int(get("cache_read_input_tokens") or 0),
+            "cache_write_tokens": int(get("cache_creation_input_tokens") or 0),
+        }
+        for key, value in counts.items():
+            setattr(self, key, getattr(self, key) + value)
+        bucket = self.usage_by_model.setdefault(model or "unknown", {k: 0 for k in counts})
+        for key, value in counts.items():
+            bucket[key] += value
+
+    def add_thinking(self, text: str) -> None:
+        text = (text or "").strip()
+        if text:
+            self.thinking.append(text)
+
+    @property
+    def thinking_text(self) -> str:
+        text = "\n\n".join(self.thinking)
+        return text if len(text) <= THINKING_CHARS else text[: THINKING_CHARS - 1] + "…"
+
+    @property
+    def cost_usd(self) -> float | None:
+        """Estimated cost of the turn (models with a known price only), None when nothing is known."""
+        from models import estimate_cost
+
+        total, known = 0.0, False
+        for model, u in self.usage_by_model.items():
+            cost = estimate_cost(model, u["input_tokens"], u["output_tokens"], u["cache_read_tokens"], u["cache_write_tokens"])
+            if cost is not None:
+                total += cost
+                known = True
+        return total if known else None
 
     @property
     def cache_hit_ratio(self) -> float:

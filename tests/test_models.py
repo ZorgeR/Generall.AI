@@ -115,3 +115,11 @@ def test_openai_reasoning_options(clean_models):
     assert m.openai_reasoning_options(m.EMBEDDING_MODEL) == {}
     assert m.openai_reasoning_options(m.GPT_IMAGE_MODEL) == {}
     assert m.openai_reasoning_options(m.DALLE_MODEL) == {}
+
+
+def test_estimate_cost(clean_models):
+    m = clean_models
+    # 1M input at $2 + 1M cache reads at 10% + 1M cache writes at 125% + 1M output at $10
+    assert m.estimate_cost("claude-sonnet-5", 1_000_000, 1_000_000, 1_000_000, 1_000_000) == 2.0 + 0.2 + 2.5 + 10.0
+    assert m.estimate_cost("claude-haiku-4-5", 1000, 0) == 0.001
+    assert m.estimate_cost("some-unknown-model", 1000, 1000) is None

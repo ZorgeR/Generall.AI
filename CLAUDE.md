@@ -40,7 +40,10 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
                             send_markdown renders LLM answers as rich messages with tiered fallback
     rich.py                 rich-message helpers: split/convert (telegramify-markdown), inline media extraction,
                             sticky "unsupported" flag
-    agent_runner.py         run_turn(): builds ChainOfThoughtAgent, status edits, streaming, voice reply, answer, reasoning file
+    agent_runner.py         run_turn(): builds ChainOfThoughtAgent, status updates, streaming, voice reply, answer,
+                            reasoning file, token accounting (record_usage)
+    status.py               StatusMessage: rich status edited in place (progress blocks → end-of-turn summary with
+                            expandable tool calls, thinking, tokens/cost) with legacy-Markdown fallback
     media.py                Whisper transcription, Claude/GPT image+document description, video frames, TTS, ffmpeg setup
     streaming.py            throttled draft streaming (rich drafts + <tg-thinking> block, plain draft fallback)
     auth.py                 AuthStore (`auth` singleton): allow/block lists + invite codes in data/userlist.json
@@ -218,8 +221,10 @@ messages.on_text (bot/handlers/messages.py)      [AuthMiddleware(check_limits=Tr
 worker → _run_text → bot.agent_runner.run_turn(bot, user_id, chat_id, prompt, thread_id, reply_to, ctx, limit)
     sender = ChatSender(bot, chat_id, thread_id, reply_to_message_id)
     UserSettings(user_id).save() (persists backfilled defaults) → user_settings dict
-    status = sender.send_text("💭 *Thinking...*"); update_status() edits it (usage line, step, iteration,
-    then the tool trace: last 10 calls with ⏳/✅/❌, args preview, duration)
+    status = sender.send_text("💭 *Thinking...*") wrapped in bot.status.StatusMessage; update_status() edits it
+    in place: in rich mode editMessageText(rich_message=blocks) (header, step, iterations, an open
+    details block with the last 15 tool calls, usage line); a rejected rich edit switches that status to
+    the legacy-Markdown text (last 10 calls), a 404 marks rich unsupported process-wide
     agents.ChainOfThoughtAgent(model=models.ANTHROPIC_MODEL, user_id, sender, user_settings, thread_id)
     .generate_response(question, update_status, on_text_chunk)
        ├─ question = "Message received time in UTC+0: <ts>\n\n" + text     (stored everywhere in this form)
@@ -245,8 +250,11 @@ worker → _run_text → bot.agent_runner.run_turn(bot, user_id, chat_id, prompt
           (a failed Haiku summary is logged, the answer is still returned) → (response, messages)
     stats_tracker.track_message_sent
     speak? → ElevenLabs TTS (to_thread) → sender.send_voice
-    sender.send_markdown(response, edit=status)   (rich mode with tool calls: send without edit, then
-       the status is edited into the one-line trace summary and kept above the answer)
+    record_usage(): one usage_events row per model of the turn (tokens, cache, tool calls, cost estimate)
+    rich mode: sender.send_markdown(response) then status_msg.finish(trace, keep=trace.keep_summary):
+       the status is edited into the summary (headline, collapsible "Tool calls (N)" with one details
+       block per call: args JSON + result excerpt, collapsible "💭 Thinking", usage + ≈$cost), sized
+       under 28 KB; keep_summary off → deleted. Legacy mode: sender.send_markdown(response, edit=status)
        rich (default): split ≤32 KB → sendRichMessage(markdown) → on parse error rich HTML
        (telegramify-markdown) → on 404 sticky MarkdownV2 → legacy Markdown → raw; status deleted after
        legacy (rich_messages off): ≤4000 edit status in place; else new chunks + notice
@@ -367,7 +375,8 @@ All paths are relative to the process cwd (`app/` in Docker → `/app/data`, bin
 ```
 data/
   userlist.json                     {users:[chat_id...], blocked_users:[...], invites:{inviter:{code:{created_at,used_by}}}}
-  stats.db (+ -wal/-shm)            SQLite: stats_events(user_id,event_type,event_subtype,extra_data,timestamp), user_limits(user_id,action_limit)
+  stats.db (+ -wal/-shm)            SQLite: stats_events(user_id,event_type,event_subtype,extra_data,timestamp), user_limits(user_id,action_limit),
+                                    usage_events(user_id,timestamp,model,api_calls,input/output/cache_read/cache_write_tokens,tool_calls,duration_s,cost_usd)
   <chat_id>/
     settings.json                   per-user settings (see table); merged over defaults on load, unknown keys preserved
     conversations/conversation_<YYYYmmdd_HHMMSS>_<topic>.json
@@ -419,7 +428,10 @@ Memory semantics worth knowing before touching `ChainOfThoughtAgent.generate_res
   passes the top-level `cache_control={"type": "ephemeral"}` so the API places an automatic breakpoint on
   the conversation tail. Everything volatile (time, memory hits) goes into the `<context>` block prepended to
   the newest user message at request time by `AgentAnthropic._request_messages`; it is never stored.
-  `ToolTrace.add_usage` accumulates `usage` per turn and the status line shows the cached share.
+  `ToolTrace.add_usage(usage, model)` accumulates `usage` per turn and per model; the status line shows the
+  cached share and an estimated cost (`models.MODEL_PRICES`, cache reads ×0.1, writes ×1.25), and
+  `agent_runner.record_usage` stores one `usage_events` row per model; `/stats` (admin) shows tokens, cost
+  and top spenders. Haiku side calls (topic/summary/classifier) are not counted.
   Legacy mode still has no caching (its system prompt embeds the time).
 
 ## User settings (`data/<uid>/settings.json`)
@@ -441,6 +453,7 @@ every `set`. `run_turn` saves once per turn so new defaults reach disk. Agent co
 | `semantic_search` | enabled (true), max_results (3, 1..20) | FAISS hits in system prompt |
 | `thinking` | enabled (true) | on ("deep"): adaptive thinking, `display: summarized`, effort `ANTHROPIC_EFFORT` (high), max_tokens `ANTHROPIC_MAX_TOKENS` (64000); off ("light"): still adaptive, `display: omitted`, effort `ANTHROPIC_EFFORT_LIGHT` (low), max_tokens 16000. Never `disabled` (`models.anthropic_request_options` / `anthropic_max_tokens`) |
 | `rich_messages` | enabled (true) | answers as Telegram rich messages (native GFM); off = legacy Markdown v1 path; also selects the `<formatting>` prompt section and rich vs plain streaming drafts |
+| `trace` | keep_summary (true) | end of turn: status shortened into the rich summary above the answer (expandable tool calls, thinking, tokens); off = deleted |
 | `transcript` | enabled (true), max_context_tokens (120000, 20k..400k), keep_tool_results_turns (3), max_tool_result_chars (20000) | transcript mode (real conversation replayed as is); when on, `dialog_history`/`reasoning_context` are ignored for the prompt (dialog_history.json is still kept current) and `summarization_history.size` = recent summaries in the `<memory>` block |
 | `system_prompt` | type ("generall-ai-v2"; also generall-ai-v1, perplexity-deep-research, perplexity-r1) | prompt selection |
 
@@ -579,11 +592,15 @@ name; a new temp dir needs its own `.gitignore` line).
   in the cwd (the other modules import it lazily).
 - Dead code: `JudgeResponse`, `tavily_client` in `agents/main.py`, `describe_document_openai` was removed.
 - `bot.rich` marks rich messages unsupported for the whole process on the first 404 from
-  `sendRichMessage`/`sendRichMessageDraft`; a wrong verdict (e.g. a transient 404) needs a restart.
+  `sendRichMessage`/`sendRichMessageDraft`/a rich `editMessageText`; a wrong verdict (e.g. a transient 404) needs a restart.
   `TelegramBadRequest` on a rich send is treated as "this text", not "this server".
 - `agents/main.py` appends `RICH_FORMATTING_GUIDE` / `LEGACY_FORMATTING_GUIDE` to every system
   prompt after selection; the `generall-ai-*` prompts still say nothing about formatting themselves.
 - Roadmap and design notes for transcript / prompt caching / subagents: `docs/agent-roadmap.md`.
+- The status message starts as a plain legacy-Markdown message (handlers create it before the settings are
+  read) and becomes rich on its first `editMessageText(rich_message=...)`; if that edit is rejected the
+  status stays plain for the turn (`StatusMessage.rich = False`). Headers like `💭 *Thinking...*` are
+  legacy Markdown; `status.plain_header` strips the marks for rich blocks.
 - Transcript mode: `AgentAnthropic.generate_response` returns ALL messages (incoming + appended); the transcript
   path slices `[base_len:]` and drops `_ephemeral` ones, so never insert or drop messages in the request path.
   `_request_messages` strips every key starting with `_` before sending. Old tool results are replaced by

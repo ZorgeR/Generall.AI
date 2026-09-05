@@ -26,6 +26,9 @@ DEFAULT_SETTINGS: dict[str, dict[str, Any]] = {
     # One real conversation transcript per chat/topic (tool calls and results included).
     # When on, dialog_history and reasoning_context are ignored; summaries still feed the memory block.
     "transcript": {"enabled": True, "max_context_tokens": 120000, "keep_tool_results_turns": 3, "max_tool_result_chars": 20000},
+    # After a turn the status message is shortened into a summary (tool calls, thinking, tokens)
+    # kept above the answer; off = delete it as before.
+    "trace": {"keep_summary": True},
 }
 
 SYSTEM_PROMPT_TYPES = ("generall-ai-v2", "generall-ai-v1", "perplexity-deep-research", "perplexity-r1")

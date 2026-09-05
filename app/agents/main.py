@@ -454,7 +454,10 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
 
             print("\nResponse:", response)
             if trace is not None:
-                trace.add_usage(getattr(response, "usage", None))
+                trace.add_usage(getattr(response, "usage", None), model=self.model)
+                for block in response.content:
+                    if getattr(block, "type", None) == "thinking" and getattr(block, "thinking", ""):
+                        trace.add_thinking(block.thinking)
 
             # Handle tool calls using proper Anthropic tool_result protocol
             if response.stop_reason == "tool_use" and tools_enabled and budget.remaining > 0:
@@ -591,7 +594,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             async with self.client.messages.stream(**final_kwargs) as stream:
                 final_response = await stream.get_final_message()
             if trace is not None:
-                trace.add_usage(getattr(final_response, "usage", None))
+                trace.add_usage(getattr(final_response, "usage", None), model=self.model)
             final_text = anthropic_text(final_response)
             if final_text:
                 current_text = final_text
