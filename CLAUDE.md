@@ -74,7 +74,9 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
     embeddings.py           ConversationEmbeddings: OpenAI ada-002 + FAISS per user
     system_tools.py         SystemTools: apt/pip/service/network tools — NOT wired into the agent
     paths.py                resolve_under(): safe resolution of model-supplied paths inside data/<uid>
-    trace.py                ToolTrace/ToolCall: per-turn record of tool calls (rendered by bot/agent_runner)
+    trace.py                ToolTrace/ToolCall/TurnBudget: per-turn tool calls, token usage, shared tool budget
+    transcript.py           TranscriptStore + size control: one real API transcript per chat/topic (transcript mode)
+    subagent.py             SubagentTools: run_subagent tool (fresh AgentAnthropic, shared budget, nested trace)
     __init__.py             imports SystemTools; the package object is what the patcher needs
   secure_container/
     main.py                 initialize_secure_containers() / cleanup_containers()
@@ -289,7 +291,8 @@ Wiring is entirely manual in `agents/main.py` and there is no registry:
 
 1. `AgentAnthropic.__init__`: a `self.<name> = None` slot.
 2. `AgentAnthropic.get_tools_schema`: `tools.extend(self.<name>.tools_schema)` — fixed order
-   file_ops, search, code, terminal, time, image, video, sms, user_interactions.
+   file_ops, search, code, terminal, time, image, video, sms, user_interactions, subagents; then filtered by
+   `allowed_tools` when set (subagent subsets).
 3. `AgentAnthropic.execute_tool`: an `elif` that checks `tool_name in [t["name"] for t in
    provider.tools_schema]`. Async providers are awaited (file_ops, image, video, user_interactions);
    synchronous ones are run via `asyncio.to_thread` (search, code, terminal, sms); time is called
@@ -320,6 +323,7 @@ Effective tool list as the model sees it (after patching):
 | VideoTools | `video_generator`, `image_to_video_generator`, `video_from_reference_images`, `video_interpolation_generator`, `video_extension_generator` | bot process (Veo in worker threads, async polling up to 5 min) |
 | SMSTools | `send_sms` | bot process, worker thread |
 | UserInteractions | `send_user_telegram_message`, `send_voice_message`, `set_message_reaction`, `schedule_reminder`, `send_file_content_to_user_via_telegram` | bot process |
+| SubagentTools | `run_subagent` (task, tools subset, model main/fast, max_tool_calls) | bot process: a fresh `AgentAnthropic` with the same providers, empty non-persisted context, budget slice of the parent's `TurnBudget`, trace depth 1; main agent only (a subagent has no `run_subagent`) |
 
 Unreachable: all 11 `SystemTools` tools (`install_package`, `run_shell_script` duplicates plus
 `check_system_info`, `manage_service`, `monitor_process`, `network_diagnostics`,
@@ -372,6 +376,9 @@ data/
                                     last dialog_history.size Q/A PAIRS (size*2 entries) as plain strings
     short_term_memory/[topic_<thread>_]short_term_memory.json
                                     block-structured messages of (mostly) the last turn ("reasoning context")
+    transcripts/[topic_<thread>_]transcript.json
+                                    transcript mode: {version, user_id, thread_id, created, updated, model, seeded_from,
+                                    messages:[exact API messages]}; pruned per settings; atomic write
     embeddings/faiss_index.bin, metadata.json
                                     IndexFlatL2(1536) over "Question: ..\nAnswer: .." with text-embedding-ada-002
     reminders/reminders.json        list of {id (8 hex), user_id, text, time (ISO UTC), type: user|agent,
@@ -390,7 +397,11 @@ app/voice/config.json               MUTATED at runtime by /voice (per-user voice
 
 Memory semantics worth knowing before touching `ChainOfThoughtAgent.generate_response`:
 
-- Forum topics: `message_thread_id` only prefixes the two short-term files (`topic_<id>_...`).
+- Transcript mode is the default: the prompt is the stored API transcript (tool calls, results and thinking
+  blocks included) plus the `<context>` block; the bullets below describe the legacy files, which are still
+  written (summaries, FAISS, dialog_history.json) but only read for the prompt when `transcript.enabled` is off.
+- Forum topics: `message_thread_id` prefixes the transcript and the two short-term files (`topic_<id>_...`), so
+  a new topic is a fresh context; there is no `/new` command on purpose.
   Conversation summaries and the FAISS index are shared across threads.
 - Summaries are read with `Path.glob` (unsorted) and sliced
   `[:-dialog_history.size][-summarization_history.size:]`. Sizes come clamped 1..50 from the UI;
@@ -403,8 +414,13 @@ Memory semantics worth knowing before touching `ChainOfThoughtAgent.generate_res
 - Reloading `short_term_memory.json` keeps only messages whose first block is `text`. With thinking
   on, intermediate tool-calling assistant turns start with a `thinking` block and are dropped; the
   final answer (re-appended as text-only) is kept. Tool-result user messages are never reloaded.
-- No prompt caching anywhere (`cache_control` count is 0); the full tool schema and system prompt
-  (the Perplexity ones are very long) are resent every iteration.
+- Prompt caching (transcript mode): the static system prompt is one `text` block with an explicit
+  `cache_control` breakpoint (`SYSTEM_CACHE_TTL`), covering the tool schemas before it; every request also
+  passes the top-level `cache_control={"type": "ephemeral"}` so the API places an automatic breakpoint on
+  the conversation tail. Everything volatile (time, memory hits) goes into the `<context>` block prepended to
+  the newest user message at request time by `AgentAnthropic._request_messages`; it is never stored.
+  `ToolTrace.add_usage` accumulates `usage` per turn and the status line shows the cached share.
+  Legacy mode still has no caching (its system prompt embeds the time).
 
 ## User settings (`data/<uid>/settings.json`)
 
@@ -425,6 +441,7 @@ every `set`. `run_turn` saves once per turn so new defaults reach disk. Agent co
 | `semantic_search` | enabled (true), max_results (3, 1..20) | FAISS hits in system prompt |
 | `thinking` | enabled (true) | on ("deep"): adaptive thinking, `display: summarized`, effort `ANTHROPIC_EFFORT` (high), max_tokens `ANTHROPIC_MAX_TOKENS` (64000); off ("light"): still adaptive, `display: omitted`, effort `ANTHROPIC_EFFORT_LIGHT` (low), max_tokens 16000. Never `disabled` (`models.anthropic_request_options` / `anthropic_max_tokens`) |
 | `rich_messages` | enabled (true) | answers as Telegram rich messages (native GFM); off = legacy Markdown v1 path; also selects the `<formatting>` prompt section and rich vs plain streaming drafts |
+| `transcript` | enabled (true), max_context_tokens (120000, 20k..400k), keep_tool_results_turns (3), max_tool_result_chars (20000) | transcript mode (real conversation replayed as is); when on, `dialog_history`/`reasoning_context` are ignored for the prompt (dialog_history.json is still kept current) and `summarization_history.size` = recent summaries in the `<memory>` block |
 | `system_prompt` | type ("generall-ai-v2"; also generall-ai-v1, perplexity-deep-research, perplexity-r1) | prompt selection |
 
 Edited through `/settings` (`bot/handlers/settings_ui.py`). callback_data is
@@ -489,6 +506,7 @@ SearchTools and the embeddings `OpenAI` are per instance; ElevenLabs is per call
 | `FFMPEG_DIR` | bot/media (Windows only) | directory holding ffmpeg.exe when not on PATH |
 | `MAX_AGENT_TOOLS_ITERATIONS`, `MAX_AGENT_CRITIQUE_ITERATIONS` | read, never used | obsolete; per-user settings replaced them |
 | `BROWSER_SERVICE_URL` | nobody | listed in `.env.example`, unused |
+| `PROMPT_CACHING` (true), `SYSTEM_CACHE_TTL` (1h), `ANTHROPIC_MAX_TOKENS_FAST` (16000) | `models` | explicit breakpoint on the static system block + top-level automatic caching of the conversation tail (`cache_control` kwarg); max_tokens for fast-model subagents |
 
 Never commit `.env`, `data/`, `temp_photos/`, `temp_docs/`, `temp_audio/` (git-ignored by exact
 name; a new temp dir needs its own `.gitignore` line).
@@ -565,7 +583,14 @@ name; a new temp dir needs its own `.gitignore` line).
   `TelegramBadRequest` on a rich send is treated as "this text", not "this server".
 - `agents/main.py` appends `RICH_FORMATTING_GUIDE` / `LEGACY_FORMATTING_GUIDE` to every system
   prompt after selection; the `generall-ai-*` prompts still say nothing about formatting themselves.
-- Roadmap for the transcript / prompt caching / subagents work: `docs/agent-roadmap.md`.
+- Roadmap and design notes for transcript / prompt caching / subagents: `docs/agent-roadmap.md`.
+- Transcript mode: `AgentAnthropic.generate_response` returns ALL messages (incoming + appended); the transcript
+  path slices `[base_len:]` and drops `_ephemeral` ones, so never insert or drop messages in the request path.
+  `_request_messages` strips every key starting with `_` before sending. Old tool results are replaced by
+  `CLEARED_MARKER` (pairing kept); the oldest half becomes one `<earlier_conversation_summary>` user message
+  (consecutive user messages are merged by the API). Server-side compaction is not used yet (beta).
+- Subagents share the parent's `TurnBudget`: the child gets `min(max_tool_calls, remaining)` and its used calls
+  are charged to the parent afterwards; a child never persists a transcript and runs with judge/critique off.
 
 ## How to make common changes
 
@@ -576,6 +601,8 @@ name; a new temp dir needs its own `.gitignore` line).
 - **Add a user setting**: add the category to `DEFAULT_SETTINGS` in `bot/settings.py`, render it in
   `settings_ui.py` (overview text, keyboard, `show_<cat>_menu`, `elif category ==` branch with the
   short token), then read it in `agents/main.py` via the `user_settings` dict.
+- **Add a memory source to the prompt**: extend `ChainOfThoughtAgent._request_context` (transcript mode); never
+  put per-turn text into the static system prompt, it breaks the cache.
 - **Add a system prompt**: define `system_context_<name>` inside
   `ChainOfThoughtAgent.generate_response`, add the selection `elif`, the display-name branch, add the
   name to `SYSTEM_PROMPT_TYPES` in `bot/settings.py` (the menu is generated from it).
@@ -601,3 +628,11 @@ name; a new temp dir needs its own `.gitignore` line).
   `TAVILY_API_KEY` set to any non-empty value, run `python -c "import bot.app, agents.main, models"`. It
   catches syntax and import errors in the whole bot and tool code. Running `main_bot.py` additionally
   needs Docker and a real token.
+       ├─ TRANSCRIPT MODE (default, transcript.enabled): _generate_with_transcript → load
+       │     data/<uid>/transcripts/[topic_<id>_]transcript.json (seeded from dialog_history.json on first use);
+       │     static prompt (time stripped) as ONE cached system block (ttl SYSTEM_CACHE_TTL); <context> = time +
+       │     <memory> (recent summaries + FAISS hits) prepended to the newest user message AT REQUEST TIME only;
+       │     Haiku complexity check on the text view; tool loop on the real transcript; then append the turn
+       │     (judge/critique/SYSTEM NOTICE messages carry _ephemeral and are dropped), prune (cap tool results,
+       │     clear results older than keep_tool_results_turns, summarize oldest half with Haiku when above
+       │     max_context_tokens), save; summaries/FAISS/dialog_history.json still written. LEGACY MODE below:

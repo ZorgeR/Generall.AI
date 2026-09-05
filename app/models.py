@@ -143,6 +143,32 @@ def anthropic_max_tokens(thinking: bool | None = None) -> int:
     return ANTHROPIC_MAX_TOKENS_LIGHT if thinking is False else ANTHROPIC_MAX_TOKENS
 
 
+ANTHROPIC_MAX_TOKENS_FAST = int(_env("ANTHROPIC_MAX_TOKENS_FAST", "16000"))
+
+
+def request_options_for(model: str, thinking: bool | None = None) -> dict:
+    """Request options for any Anthropic model: nothing for the fast model (Haiku rejects
+    ``effort`` and adaptive thinking), :func:`anthropic_request_options` otherwise."""
+    if model == ANTHROPIC_MODEL_FAST:
+        return {}
+    return anthropic_request_options(thinking)
+
+
+def max_tokens_for(model: str, thinking: bool | None = None) -> int:
+    if model == ANTHROPIC_MODEL_FAST:
+        return ANTHROPIC_MAX_TOKENS_FAST
+    return anthropic_max_tokens(thinking)
+
+
+# ---------------------------------------------------------------------------
+# Prompt caching (agents/main.py): the static system prompt gets an explicit
+# breakpoint with this TTL; the conversation tail uses the API's automatic
+# breakpoint. PROMPT_CACHING=false turns both off (debugging only).
+# ---------------------------------------------------------------------------
+PROMPT_CACHING = _env("PROMPT_CACHING", "true").strip().lower() in ("1", "true", "yes", "on")
+SYSTEM_CACHE_TTL = _env("SYSTEM_CACHE_TTL", "1h")  # "5m" | "1h"
+
+
 def anthropic_text(message) -> str:
     """The concatenated text blocks of a Messages API response.
 

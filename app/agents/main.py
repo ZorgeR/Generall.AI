@@ -24,11 +24,19 @@ from models import (
     ANTHROPIC_MODEL,
     ANTHROPIC_MODEL_FAST,
     OPENAI_MODEL,
+    PROMPT_CACHING,
+    SYSTEM_CACHE_TTL,
     anthropic_max_tokens,
     anthropic_request_options,
     anthropic_text,
+    max_tokens_for,
     openai_reasoning_options,
+    request_options_for,
 )
+from agents.trace import TurnBudget
+from agents.subagent import SubagentTools
+from agents.transcript import clone, estimate_tokens, prune, sanitize_turn, strip_private_keys, text_only_view, transcript_store
+import re as _re
 
 load_dotenv()
 
@@ -95,6 +103,10 @@ class AgentAnthropic:
         self.video_tools = None
         self.sms_tools = None
         self.user_interactions = None
+        self.subagents = None          # SubagentTools provider (main agent only; subagents get none)
+        self.allowed_tools = None      # optional set of tool names exposed to the model (subagent subsets)
+        self.trace_depth = 0           # >0 inside a subagent: its trace lines render indented
+        self.budget = None             # agents.trace.TurnBudget shared with subagents
         self.thinking = False
 
     async def critique_response(self, question: str, answer: str, dialog_history: list = []) -> str:
@@ -245,6 +257,10 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             tools.extend(self.sms_tools.tools_schema)
         if self.user_interactions:
             tools.extend(self.user_interactions.tools_schema)
+        if self.subagents:
+            tools.extend(self.subagents.tools_schema)
+        if self.allowed_tools is not None:
+            tools = [t for t in tools if t["name"] in self.allowed_tools]
         return tools
 
     async def execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
@@ -273,8 +289,26 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             return await asyncio.to_thread(self.sms_tools.execute_tool, tool_name, tool_args)
         elif self.user_interactions and tool_name in [t["name"] for t in self.user_interactions.tools_schema]:
             return await self.user_interactions.execute_tool(tool_name, tool_args)
+        elif self.subagents and tool_name in [t["name"] for t in self.subagents.tools_schema]:
+            return await self.subagents.execute_tool(tool_name, tool_args)
         else:
             return f"Unknown tool: {tool_name}"
+
+    @staticmethod
+    def _request_messages(messages: list, context_index: int | None = None, request_context: str | None = None) -> list:
+        """The messages actually sent: private ``_…`` keys stripped, and the volatile per-turn
+        context (time, memory) prepended to the message at ``context_index`` at request time,
+        so the stored transcript never contains it and the cached prefix stays stable."""
+        out = []
+        for i, m in enumerate(messages):
+            clean = {k: v for k, v in m.items() if not str(k).startswith("_")}
+            if request_context and i == context_index:
+                content = clean.get("content")
+                if isinstance(content, str):
+                    content = [{"type": "text", "text": content}]
+                clean["content"] = [{"type": "text", "text": request_context}] + list(content or [])
+            out.append(clean)
+        return out
 
     async def run_tool_batch(self, tool_blocks: list, trace=None, refresh=None) -> list:
         """Run every tool_use block of one assistant message concurrently.
@@ -287,7 +321,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         """
 
         async def run_one(block):
-            call = trace.start(block.name, block.input) if trace is not None else None
+            call = trace.start(block.name, block.input, depth=self.trace_depth) if trace is not None else None
             try:
                 text = str(await self.execute_tool(block.name, block.input))
                 is_error = False
@@ -308,7 +342,13 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
 
         return list(await asyncio.gather(*(run_one(block) for block in tool_blocks)))
 
-    async def generate_response(self, messages: list = [], prompt: str = "", system_role: str = "", question: str = "", update_status=None, dialog_history: list = [], user_settings: dict = None, on_text_chunk=None, trace=None) -> str:
+    async def generate_response(self, messages: list = [], prompt: str = "", system_role="", question: str = "", update_status=None, dialog_history: list = [], user_settings: dict = None, on_text_chunk=None, trace=None, request_context: str | None = None, budget=None) -> str:
+        """Run the tool loop. ``system_role`` may be a string or a list of system blocks (with
+        cache_control). ``request_context`` is volatile text prepended to the LAST message of
+        ``messages`` at request time only. ``budget`` (TurnBudget) bounds tool calls across the
+        main agent and its subagents; without it the tools.max_iteration setting applies.
+        Returns (final_text, all messages incl. the ones appended this turn; messages the API
+        must not keep carry ``_ephemeral``)."""
         processed_messages = []
         system = system_role
         
@@ -336,10 +376,13 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 "content": [{"type": "text", "text": prompt}]
             }]
 
+        context_index = len(processed_messages) - 1 if request_context and processed_messages else None
+
         cicles = 0
         critique = 0
         judge = 0
         max_iterations = int(user_settings.get("tools").get("max_iteration", 20))
+        budget = budget or self.budget or TurnBudget(max_iterations)
         tools_enabled = user_settings.get("tools").get("enabled", True)
         last_step_category = "initial"
         last_tool_name = ""
@@ -376,15 +419,19 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             # Build common API kwargs
             api_kwargs = {
                 "model": self.model,
-                "messages": processed_messages,
+                "messages": self._request_messages(processed_messages, context_index, request_context),
                 "system": system,
                 "tools": self.get_tools_schema(),
                 "tool_choice": tool_choice,
             }
+            if PROMPT_CACHING:
+                # automatic breakpoint on the conversation tail (the static system block
+                # carries its own explicit breakpoint, see ChainOfThoughtAgent._system_blocks)
+                api_kwargs["cache_control"] = {"type": "ephemeral"}
             # Effort + adaptive thinking for the main model (models.py). Thinking tokens
             # count against max_tokens, so the ceiling leaves room for reasoning and answer.
-            api_kwargs.update(anthropic_request_options(thinking=self.thinking))
-            api_kwargs["max_tokens"] = anthropic_max_tokens(self.thinking)
+            api_kwargs.update(request_options_for(self.model, self.thinking))
+            api_kwargs["max_tokens"] = max_tokens_for(self.model, self.thinking)
             print(f"\nAgent iteration {iteration} ({'deep' if self.thinking else 'light'} thinking, max_tokens={api_kwargs['max_tokens']})")
 
             # Always stream: a large max_tokens is only allowed on streaming requests, and a
@@ -406,9 +453,11 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 response = await stream.get_final_message()
 
             print("\nResponse:", response)
+            if trace is not None:
+                trace.add_usage(getattr(response, "usage", None))
 
             # Handle tool calls using proper Anthropic tool_result protocol
-            if response.stop_reason == "tool_use" and tools_enabled and cicles < max_iterations:
+            if response.stop_reason == "tool_use" and tools_enabled and budget.remaining > 0:
                 if update_status:
                     last_step_category = "executing-tools"
                     await update_status(step=last_step_category, details="Executing tools", iteration=cicles, critique=critique)
@@ -432,6 +481,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 # Execute every requested tool concurrently and build proper tool_result blocks
                 tool_blocks = [b for b in response.content if b.type == 'tool_use']
                 cicles += len(tool_blocks)
+                budget.take(len(tool_blocks))
                 last_tool_name = tool_blocks[-1].name if tool_blocks else last_tool_name
                 last_step_category = "executing-tools"
                 print(f"\nExecuting {len(tool_blocks)} tool(s): {', '.join(b.name for b in tool_blocks)}")
@@ -470,11 +520,13 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                         if current_text:
                             processed_messages.append({
                                 "role": "assistant", 
-                                "content": [{"type": "text", "text": current_text}]
+                                "content": [{"type": "text", "text": current_text}],
+                                "_ephemeral": True,  # the draft the critique rejected
                             })
                         processed_messages.append({
                             "role": "user", 
-                            "content": [{"type": "text", "text": f"This message not from User, it's from automated critique system to check if answer is complete and correct. Critique details: {critique_details}\n\nPlease continue. Answer may be improved."}]
+                            "content": [{"type": "text", "text": f"This message not from User, it's from automated critique system to check if answer is complete and correct. Critique details: {critique_details}\n\nPlease continue. Answer may be improved."}],
+                            "_ephemeral": True,
                         })
                         continue
 
@@ -493,11 +545,13 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                         if current_text:
                             processed_messages.append({
                                 "role": "assistant", 
-                                "content": [{"type": "text", "text": current_text}]
+                                "content": [{"type": "text", "text": current_text}],
+                                "_ephemeral": True,  # the draft the judge rejected
                             })
                         processed_messages.append({
                             "role": "user",
-                            "content": [{"type": "text", "text": "This message not from User, it's from automated judge system to check if answer is complete and correct. Please continue. Answer not complete at this moment."}]
+                            "content": [{"type": "text", "text": "This message not from User, it's from automated judge system to check if answer is complete and correct. Please continue. Answer not complete at this moment."}],
+                            "_ephemeral": True,
                         })
                         continue
             
@@ -506,10 +560,11 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             return current_text, processed_messages
         
         # Iteration limit reached - ask model for a final compiled response
-        print(f"\nWarning: Agent reached max iterations ({max_iterations}), requesting final response")
+        print(f"\nWarning: Agent reached the tool-call budget ({budget.limit}), requesting final response")
         processed_messages.append({
             "role": "assistant",
-            "content": [{"type": "text", "text": current_text}] if current_text else [{"type": "text", "text": "Processing..."}]
+            "content": [{"type": "text", "text": current_text}] if current_text else [{"type": "text", "text": "Processing..."}],
+            "_ephemeral": True,
         })
         processed_messages.append({
             "role": "user",
@@ -519,18 +574,24 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 "Compile all data, findings, and results you have gathered so far into a complete answer. "
                 "Do NOT call any tools. Your next message will be sent directly to the user. "
                 "If the task is not fully complete, summarize what was done and what remains, so user can ask you to continue if needed."
-            )}]
+            )}],
+            "_ephemeral": True,
         })
         
         try:
-            async with self.client.messages.stream(
-                model=self.model,
-                messages=processed_messages,
-                system=system,
-                max_tokens=anthropic_max_tokens(self.thinking),
-                **anthropic_request_options(thinking=self.thinking),
-            ) as stream:
+            final_kwargs = {
+                "model": self.model,
+                "messages": self._request_messages(processed_messages, context_index, request_context),
+                "system": system,
+                "max_tokens": max_tokens_for(self.model, self.thinking),
+                **request_options_for(self.model, self.thinking),
+            }
+            if PROMPT_CACHING:
+                final_kwargs["cache_control"] = {"type": "ephemeral"}
+            async with self.client.messages.stream(**final_kwargs) as stream:
                 final_response = await stream.get_final_message()
+            if trace is not None:
+                trace.add_usage(getattr(final_response, "usage", None))
             final_text = anthropic_text(final_response)
             if final_text:
                 current_text = final_text
@@ -587,6 +648,8 @@ class ChainOfThoughtAgent:
             self.agent.video_tools = self.video_tools
             self.agent.sms_tools = self.sms_tools
             self.agent.user_interactions = self.user_interactions
+            self.subagents = SubagentTools(self.agent, self.user_settings)
+            self.agent.subagents = self.subagents
             self.agent.thinking = self.user_settings.get("thinking").get("enabled", False)
         else:
             raise ValueError("Currently only Anthropic models are supported with the new tool pattern")
@@ -779,6 +842,201 @@ User message: {question}"""
         except (IndexError, KeyError, TypeError, AttributeError):
             pass
         return None
+
+    # ------------------------------------------------------------------
+    # Transcript mode (docs/agent-roadmap.md, B1/B2): one real conversation per chat/topic,
+    # replayed as is, with a cache-friendly request layout.
+    # ------------------------------------------------------------------
+    _TIME_BLOCK_RE = _re.compile(r"\n?<current_time>.*?</current_time>\n?", _re.S)
+    _TIME_LINE_RE = _re.compile(r"^[ \t]*Current time in UTC\+0:.*$", _re.M)
+
+    def _static_system_prompt(self, system_context: str) -> str:
+        """The selected prompt without anything that changes per turn, so the prefix can be cached."""
+        text = self._TIME_BLOCK_RE.sub("\n", system_context)
+        text = self._TIME_LINE_RE.sub("", text)
+        return text.strip() + "\n"
+
+    @staticmethod
+    def _system_blocks(static_prompt: str):
+        """System prompt as one cached block (explicit breakpoint), or a plain string when caching is off."""
+        if not PROMPT_CACHING:
+            return static_prompt
+        return [{"type": "text", "text": static_prompt, "cache_control": {"type": "ephemeral", "ttl": SYSTEM_CACHE_TTL}}]
+
+    def _recent_summaries(self, limit: int) -> list[str]:
+        """Newest conversation summaries (the file name embeds the timestamp, so sorting by name works)."""
+        if limit <= 0 or not self.conversations_path.exists():
+            return []
+        lines: list[str] = []
+        for file in sorted(self.conversations_path.glob("conversation_*.json"), reverse=True)[:limit]:
+            try:
+                with open(file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            summary = data.get("summary") or ""
+            if not summary:
+                q, r = (data.get("question") or "")[:200], (data.get("response") or "")[:300]
+                if not (q or r):
+                    continue
+                summary = f"Q: {q} / A: {r}"
+            lines.append(f"• [{data.get('timestamp', '')}] {data.get('topic') or 'general'}: {' '.join(summary.split())}")
+        return lines
+
+    async def _semantic_hits(self, question: str, k: int) -> list[str]:
+        try:
+            hits = await asyncio.to_thread(self.conversation_embeddings.search_conversations, query=question, k=k)
+        except Exception as e:  # noqa: BLE001
+            print(f"Semantic search failed, continuing without it: {e}")
+            return []
+        lines = []
+        for conv in hits or []:
+            q = " ".join(str(conv.get("question", "")).split())[:200]
+            a = " ".join(str(conv.get("answer", "")).split())[:300]
+            lines.append(f"• [{conv.get('timestamp', '')}] Q: {q} / A: {a}")
+        return lines
+
+    async def _request_context(self, question: str, update_status=None) -> str:
+        """Volatile per-turn context: time plus the long-term memory retrieved for this question.
+
+        Prepended to the newest user message at request time only (never stored), so the
+        cached prefix (tools, system prompt, earlier transcript) stays byte-stable.
+        """
+        s = self.user_settings
+        parts = [f"Current time in UTC+0: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"]
+        memory: list[str] = []
+        if s.get("summarization_history", {}).get("enabled", True) and s.get("short_term_memory", {}).get("enabled", True):
+            recent = self._recent_summaries(int(s.get("summarization_history", {}).get("size", 5)))
+            if recent:
+                memory.append("Recent conversations (newest first):\n" + "\n".join(recent))
+        if s.get("semantic_search", {}).get("enabled", True):
+            if update_status:
+                await update_status(step="initial", details="Searching memory", iteration=0, critique=0)
+            hits = await self._semantic_hits(question, int(s.get("semantic_search", {}).get("max_results", 3)))
+            if hits:
+                memory.append("Related earlier conversations (semantic search):\n" + "\n".join(hits))
+        if memory:
+            parts.append("<memory>\n" + "\n\n".join(memory) + "\n</memory>")
+        return "<context>\n" + "\n".join(parts) + "\n</context>"
+
+    async def _summarize_messages(self, old: list[dict]) -> str:
+        """Fast-model summary of the oldest part of a transcript (used by transcript.prune)."""
+        view = text_only_view(old)
+        text = "\n\n".join(f"{m['role'].upper()}: {m['content'][:4000]}" for m in view)[:60000]
+        tools = sorted({b["name"] for m in old if m.get("role") == "assistant"
+                        for b in (m.get("content") or []) if isinstance(b, dict) and b.get("type") == "tool_use"})
+        prompt = (
+            "Summarize this earlier part of a conversation between a user and their personal AI assistant. "
+            "Keep every fact, decision, name, number, file path, URL and open task the assistant may need later; "
+            "drop chit-chat. At most 400 words, plain text.\n"
+            f"Tools the assistant used in this part: {', '.join(tools) or 'none'}.\n\n{text}"
+        )
+        response = await anthropic_client.messages.create(
+            model=ANTHROPIC_MODEL_FAST,
+            messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+            max_tokens=1200,
+        )
+        return anthropic_text(response).strip()
+
+    def _load_legacy_dialog_history(self) -> list:
+        path = self.short_term_memory_path / self._get_memory_filename("dialog_history.json")
+        if not path.exists():
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except (OSError, json.JSONDecodeError):
+            return []
+
+    def _append_legacy_dialog_history(self, question: str, response: str) -> None:
+        """Keep the classic dialog history current so switching Transcript off still has context."""
+        history = self._load_legacy_dialog_history()
+        history.extend([{"role": "user", "content": question}, {"role": "assistant", "content": response}])
+        size = int(self.user_settings.get("dialog_history", {}).get("size", 10)) * 2
+        self.short_term_memory_path.mkdir(parents=True, exist_ok=True)
+        with open(self.short_term_memory_path / self._get_memory_filename("dialog_history.json"), "w", encoding="utf-8") as f:
+            json.dump(history[-size:], f, indent=2, ensure_ascii=False)
+
+    async def _generate_with_transcript(self, question: str, system_context: str, update_status=None, on_text_chunk=None, trace=None):
+        ts = self.user_settings.get("transcript", {})
+        if update_status:
+            await update_status(step="initial", details="Loading transcript", iteration=0, critique=0)
+        transcript = transcript_store.load(self.user_id, self.thread_id)
+        if not transcript.messages and not transcript_store.exists(self.user_id, self.thread_id):
+            legacy = self._load_legacy_dialog_history()
+            if legacy:
+                transcript = transcript_store.seed_from_dialog_history(self.user_id, self.thread_id, legacy)
+                print(f"Transcript seeded from dialog history: {len(transcript.messages)} messages")
+        print(f"Transcript loaded: {len(transcript.messages)} messages (~{estimate_tokens(transcript.messages)} tokens)")
+
+        static_prompt = self._static_system_prompt(system_context)
+        request_context = await self._request_context(question, update_status)
+        if self.subagents is not None:
+            self.subagents.update_status = update_status
+            self.subagents.trace = trace
+
+        history_view = text_only_view(transcript.messages)
+        complexity = await self._classify_complexity(question, history_view)
+        user_message = {"role": "user", "content": [{"type": "text", "text": question}]}
+        base_len = len(transcript.messages)
+        response, new_messages = None, []
+
+        if complexity == "simple":
+            if update_status:
+                await update_status(step="initial", details=f"Quick response ({ANTHROPIC_MODEL_FAST})", iteration=0, critique=0)
+            simple_context = history_view + [{"role": "user", "content": f"{request_context}\n\n{question}"}]
+            response, _ = await self._simple_response(simple_context, static_prompt, question, on_text_chunk=on_text_chunk)
+            if response is not None:
+                new_messages = [user_message, {"role": "assistant", "content": [{"type": "text", "text": response}]}]
+
+        if response is None:
+            self.agent.budget = TurnBudget(int(self.user_settings.get("tools", {}).get("max_iteration", 20)))
+            response, all_messages = await self.agent.generate_response(
+                messages=transcript.messages + [user_message],
+                system_role=self._system_blocks(static_prompt),
+                question=question,
+                update_status=update_status,
+                dialog_history=history_view[-10:],
+                user_settings=self.user_settings,
+                on_text_chunk=on_text_chunk,
+                trace=trace,
+                request_context=request_context,
+                budget=self.agent.budget,
+            )
+            new_messages = strip_private_keys([m for m in all_messages[base_len:] if not m.get("_ephemeral")])
+        new_messages = sanitize_turn(new_messages, response or "")
+
+        print(response)
+        if update_status:
+            await update_status(step="saving", details="Saving transcript", iteration=0, critique=0)
+
+        # Persist the transcript first (local, cheap), then the long-term memory (API calls). A
+        # failure here must never turn into an error for the user: the answer is already generated.
+        try:
+            transcript.messages.extend(clone(new_messages))
+            transcript.model = self.agent.model
+            stats = await prune(
+                transcript.messages,
+                max_context_tokens=int(ts.get("max_context_tokens", 120000)),
+                keep_tool_results_turns=int(ts.get("keep_tool_results_turns", 3)),
+                max_tool_result_chars=int(ts.get("max_tool_result_chars", 20000)),
+                summarize=self._summarize_messages,
+            )
+            transcript_store.save(transcript)
+            print(f"Transcript saved: {len(transcript.messages)} messages (~{estimate_tokens(transcript.messages)} tokens), prune={stats}")
+        except Exception as e:  # noqa: BLE001
+            print(f"WARNING: failed to save transcript: {e}")
+        try:
+            summary = await self._save_conversation(question, response, new_messages)
+            print(f"\nConversation saved. Summary: {summary}")
+        except Exception as e:  # noqa: BLE001
+            print(f"WARNING: failed to save long-term conversation memory: {e}")
+        try:
+            self._append_legacy_dialog_history(question, response)
+        except Exception as e:  # noqa: BLE001
+            print(f"WARNING: failed to update dialog history: {e}")
+        return response, new_messages
 
     async def generate_response(self, question: str, update_status=None, on_text_chunk=None, trace=None) -> str:
         print(f"\n=== Starting Chain of Thought for Question: {question} ===")
@@ -1077,6 +1335,9 @@ You have been asked to answer a query given sources. Consider the following when
             system_context += RICH_FORMATTING_GUIDE
         else:
             system_context += LEGACY_FORMATTING_GUIDE
+
+        if (self.user_settings or {}).get("transcript", {}).get("enabled", True):
+            return await self._generate_with_transcript(question, system_context, update_status, on_text_chunk, trace)
 
         # Search for relevant past conversations
         if self.user_settings.get("semantic_search").get("enabled"):
