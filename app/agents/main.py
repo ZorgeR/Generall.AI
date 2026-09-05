@@ -24,7 +24,9 @@ from models import (
     ANTHROPIC_MODEL,
     ANTHROPIC_MODEL_FAST,
     OPENAI_MODEL,
+    anthropic_max_tokens,
     anthropic_request_options,
+    anthropic_text,
     openai_reasoning_options,
 )
 
@@ -210,13 +212,13 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                     "role": "user",
                     "content": [{"type": "text", "text": judge_prompt}]
                 }],
-                max_tokens=100,
+                max_tokens=2048,  # adaptive thinking counts against this; the verdict itself is one word
                 **anthropic_request_options(thinking=False),
                 system="You are AI assistant as a judge, and you must respond with ONLY 'Yes' or 'No'. You task is to judge if the response is complete and correct and relevant to the user question."
             )
 
-            judge_decision = response.content[0].text.strip().lower()
-            return judge_decision == "yes"
+            judge_decision = anthropic_text(response).strip().lower()
+            return judge_decision.startswith("yes")
 
         except Exception as e:
             print(f"Error in judge: {str(e)}")
@@ -347,33 +349,29 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 "tools": self.get_tools_schema(),
                 "tool_choice": tool_choice,
             }
-            # effort + adaptive/disabled thinking for the main model (models.py)
+            # Effort + adaptive thinking for the main model (models.py). Thinking tokens
+            # count against max_tokens, so the ceiling leaves room for reasoning and answer.
             api_kwargs.update(anthropic_request_options(thinking=self.thinking))
-            if self.thinking:
-                api_kwargs["max_tokens"] = 20000
-                print(f"\nAgent iteration {iteration} with thinking")
-            else:
-                api_kwargs["max_tokens"] = 4096
-                print(f"\nAgent iteration {iteration} without thinking")
+            api_kwargs["max_tokens"] = anthropic_max_tokens(self.thinking)
+            print(f"\nAgent iteration {iteration} ({'deep' if self.thinking else 'light'} thinking, max_tokens={api_kwargs['max_tokens']})")
 
+            # Always stream: a large max_tokens is only allowed on streaming requests, and a
+            # long turn can never trip the SDK's 10-minute non-streaming limit. Draft updates
+            # are forwarded to Telegram only when streaming to the user is enabled.
             current_text = ""
-            
-            if streaming_enabled and on_text_chunk:
-                accumulated_thinking = ""
-                async with self.client.messages.stream(**api_kwargs) as stream:
-                    async for event in stream:
-                        if event.type == "text":
-                            current_text += event.text
+            accumulated_thinking = ""
+            forward = bool(streaming_enabled and on_text_chunk)
+            async with self.client.messages.stream(**api_kwargs) as stream:
+                async for event in stream:
+                    if event.type == "text":
+                        current_text += event.text
+                        if forward:
                             await on_text_chunk(current_text, is_thinking=False)
-                        elif event.type == "thinking":
-                            accumulated_thinking += event.thinking
+                    elif event.type == "thinking" and forward:
+                        accumulated_thinking += event.thinking
+                        if accumulated_thinking.strip():
                             await on_text_chunk(accumulated_thinking, is_thinking=True)
-                    response = await stream.get_final_message()
-            else:
-                response = await self.client.messages.create(**api_kwargs)
-                for content_block in response.content:
-                    if content_block.type == 'text':
-                        current_text += content_block.text
+                response = await stream.get_final_message()
 
             print("\nResponse:", response)
 
@@ -498,17 +496,15 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         })
         
         try:
-            final_response = await self.client.messages.create(
+            async with self.client.messages.stream(
                 model=self.model,
                 messages=processed_messages,
                 system=system,
-                max_tokens=4096,
-                **anthropic_request_options(thinking=False),
-            )
-            final_text = ""
-            for block in final_response.content:
-                if block.type == 'text':
-                    final_text += block.text
+                max_tokens=anthropic_max_tokens(self.thinking),
+                **anthropic_request_options(thinking=self.thinking),
+            ) as stream:
+                final_response = await stream.get_final_message()
+            final_text = anthropic_text(final_response)
             if final_text:
                 current_text = final_text
         except Exception as e:

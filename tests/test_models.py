@@ -6,7 +6,7 @@ import pytest
 import models
 
 OVERRIDE_VARS = [
-    "ANTHROPIC_MODEL", "ANTHROPIC_EFFORT", "ANTHROPIC_MODEL_FAST",
+    "ANTHROPIC_MODEL", "ANTHROPIC_EFFORT", "ANTHROPIC_EFFORT_LIGHT", "ANTHROPIC_MAX_TOKENS", "ANTHROPIC_MAX_TOKENS_LIGHT", "ANTHROPIC_MODEL_FAST",
     "OPENAI_MODEL", "VIDEO_FRAMES_MODEL", "OPENAI_REASONING_EFFORT",
     "WHISPER_MODEL", "EMBEDDING_MODEL", "EMBEDDING_DIMENSION",
     "GEMINI_IMAGE_MODEL_FLASH", "GEMINI_IMAGE_MODEL_PRO", "GPT_IMAGE_MODEL", "DALLE_MODEL",
@@ -28,6 +28,8 @@ def test_defaults(clean_models):
     m = clean_models
     assert m.ANTHROPIC_MODEL == "claude-sonnet-5"
     assert m.ANTHROPIC_EFFORT == "high"
+    assert m.ANTHROPIC_EFFORT_LIGHT == "low"
+    assert (m.ANTHROPIC_MAX_TOKENS, m.ANTHROPIC_MAX_TOKENS_LIGHT) == (64000, 16000)
     assert m.ANTHROPIC_MODEL_FAST == "claude-haiku-4-5"
     assert m.OPENAI_MODEL == "gpt-5.6-terra"
     assert m.VIDEO_FRAMES_MODEL == "gpt-5.6-luna"
@@ -68,20 +70,41 @@ def test_env_override_is_honoured(clean_models, monkeypatch):
 
 def test_anthropic_request_options(clean_models):
     m = clean_models
-    effort = {"output_config": {"effort": "high"}}
-    assert m.anthropic_request_options() == effort
-    assert m.anthropic_request_options(thinking=None) == effort
+    high = {"output_config": {"effort": "high"}}
+    assert m.anthropic_request_options() == high
+    assert m.anthropic_request_options(thinking=None) == high
+    # thinking on: full effort, summarized display for the streaming block / reasoning file
     assert m.anthropic_request_options(thinking=True) == {
-        **effort, "thinking": {"type": "adaptive", "display": "summarized"},
+        **high, "thinking": {"type": "adaptive", "display": "summarized"},
     }
-    assert m.anthropic_request_options(thinking=False) == {**effort, "thinking": {"type": "disabled"}}
+    # thinking off: still adaptive (never "disabled"), lighter effort, nothing displayed
+    assert m.anthropic_request_options(thinking=False) == {
+        "output_config": {"effort": "low"}, "thinking": {"type": "adaptive", "display": "omitted"},
+    }
+    assert m.anthropic_request_options(thinking=False, effort="medium")["output_config"] == {"effort": "medium"}
     # Sonnet 5 rejects the old fixed budget and the effort must not be top-level.
     for opts in (m.anthropic_request_options(True), m.anthropic_request_options(False)):
-        assert "budget_tokens" not in opts.get("thinking", {})
+        assert "budget_tokens" not in opts["thinking"] and opts["thinking"]["type"] == "adaptive"
         assert "effort" not in opts
     # helpers hand out fresh dicts, so a caller mutating one cannot leak into the next call
     m.anthropic_request_options()["output_config"]["effort"] = "low"
-    assert m.anthropic_request_options() == effort
+    assert m.anthropic_request_options() == high
+
+
+def test_anthropic_max_tokens_leave_room_for_thinking(clean_models):
+    m = clean_models
+    assert m.anthropic_max_tokens(True) == 64000
+    assert m.anthropic_max_tokens(None) == 64000
+    assert m.anthropic_max_tokens(False) == 16000
+    assert m.ANTHROPIC_MAX_TOKENS_LIGHT <= 21000  # the SDK's non-streaming ceiling (media calls do not stream)
+
+
+def test_anthropic_text_skips_thinking_blocks(clean_models):
+    from types import SimpleNamespace as NS
+
+    message = NS(content=[NS(type="thinking", thinking="hmm"), NS(type="text", text="Yes"), NS(type="text", text=".")])
+    assert clean_models.anthropic_text(message) == "Yes."
+    assert clean_models.anthropic_text(NS(content=[])) == ""
 
 
 def test_openai_reasoning_options(clean_models):

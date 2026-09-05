@@ -26,6 +26,7 @@ from models import (
     VIDEO_FRAMES_MODEL,
     WHISPER_MODEL,
     anthropic_request_options,
+    anthropic_text,
     openai_reasoning_options,
 )
 from bot.config import config
@@ -139,7 +140,7 @@ async def describe_image_anthropic(question: str, image_path: str) -> str:
     base64_image = await asyncio.to_thread(encode_image, image_path)
     message = await anthropic_client().messages.create(
         model=ANTHROPIC_MODEL,
-        max_tokens=1024,
+        max_tokens=4096,  # adaptive thinking counts against this
         **anthropic_request_options(thinking=False),
         messages=[{
             "role": "user",
@@ -149,7 +150,7 @@ async def describe_image_anthropic(question: str, image_path: str) -> str:
             ],
         }],
     )
-    return message.content[0].text
+    return anthropic_text(message)
 
 
 async def describe_image_openai(question: str, image_path: str) -> str:
@@ -172,7 +173,7 @@ async def describe_image_openai(question: str, image_path: str) -> str:
 # ---------------------------------------------------------------------------
 # documents
 # ---------------------------------------------------------------------------
-async def _ask_anthropic(system: str, text: str, max_tokens: int = 4096) -> str:
+async def _ask_anthropic(system: str, text: str, max_tokens: int = 8192) -> str:
     message = await anthropic_client().messages.create(
         model=ANTHROPIC_MODEL,
         messages=[{"role": "user", "content": [{"type": "text", "text": text}]}],
@@ -180,7 +181,7 @@ async def _ask_anthropic(system: str, text: str, max_tokens: int = 4096) -> str:
         max_tokens=max_tokens,
         **anthropic_request_options(thinking=False),
     )
-    return message.content[0].text
+    return anthropic_text(message)
 
 
 async def describe_document_anthropic(question: str, file_path: str, document_type: str, mime_type: str) -> str:
@@ -199,10 +200,10 @@ async def describe_document_anthropic(question: str, file_path: str, document_ty
             ],
         }],
         system="You are a very professional document analyze specialist. Analyze the given document in a detailed way, to answer user's question.",
-        max_tokens=4096,
+        max_tokens=16000,  # adaptive thinking counts against this; still under the non-streaming limit
         **anthropic_request_options(thinking=False),
     )
-    return message.content[0].text
+    return anthropic_text(message)
 
 
 async def process_large_text(content: str, question: str, content_type: str) -> str:
@@ -440,7 +441,7 @@ async def describe_video_screenshots(screenshot_paths: list[str], transcription:
             openai_client().chat.completions.create,
             model=VIDEO_FRAMES_MODEL,
             messages=[{"role": "user", "content": content}],
-            max_completion_tokens=8192,  # reasoning tokens count against this cap
+            # no max_completion_tokens: it would cap hidden reasoning + answer together
             **openai_reasoning_options(VIDEO_FRAMES_MODEL),
         )
         return response.choices[0].message.content or ""

@@ -33,8 +33,21 @@ def _env(name: str, default: str) -> str:
 # ---------------------------------------------------------------------------
 ANTHROPIC_MODEL = _env("ANTHROPIC_MODEL", "claude-sonnet-5")
 # Passed as ``output_config={"effort": ...}`` on every call to ANTHROPIC_MODEL.
-# Sonnet 5 accepts low | medium | high | xhigh | max.
+# Sonnet 5 accepts low | medium | high | xhigh | max. ANTHROPIC_EFFORT is the
+# level for the user's "thinking on" mode; ANTHROPIC_EFFORT_LIGHT for "thinking
+# off" and for internal calls (judge, image/document descriptions). Thinking is
+# adaptive in both cases: Anthropic's guidance for Sonnet 5 is to lower effort
+# rather than disable thinking (disabled thinking can leak tool calls into text).
 ANTHROPIC_EFFORT = _env("ANTHROPIC_EFFORT", "high")
+ANTHROPIC_EFFORT_LIGHT = _env("ANTHROPIC_EFFORT_LIGHT", "low")
+# max_tokens ceilings. There is no separate thinking budget any more: thinking
+# tokens count against max_tokens, so the ceiling must leave room for the
+# reasoning AND the answer (Sonnet 5 allows up to 128k). The agent loop always
+# streams, which is what makes the large value safe: the SDK refuses roughly
+# > 21k tokens on non-streaming calls because they could exceed its 10-minute
+# request timeout.
+ANTHROPIC_MAX_TOKENS = int(_env("ANTHROPIC_MAX_TOKENS", "64000"))
+ANTHROPIC_MAX_TOKENS_LIGHT = int(_env("ANTHROPIC_MAX_TOKENS_LIGHT", "16000"))
 
 # ---------------------------------------------------------------------------
 # Anthropic fast - topic/summary, complexity classifier, "simple" answers
@@ -50,7 +63,9 @@ OPENAI_MODEL = _env("OPENAI_MODEL", "gpt-5.6-terra")
 VIDEO_FRAMES_MODEL = _env("VIDEO_FRAMES_MODEL", "gpt-5.6-luna")
 # ``reasoning_effort`` for both models above (low | medium | high). Reasoning
 # models reject ``temperature`` / ``top_p`` and take ``max_completion_tokens``
-# instead of ``max_tokens``; openai_reasoning_options() below adds the effort.
+# instead of ``max_tokens``; that cap covers the hidden reasoning AND the
+# visible answer, so the calls leave it unset and let the model's own output
+# limit apply. openai_reasoning_options() below adds the effort.
 OPENAI_REASONING_EFFORT = _env("OPENAI_REASONING_EFFORT", "high")
 OPENAI_REASONING_MODELS = frozenset({OPENAI_MODEL, VIDEO_FRAMES_MODEL})
 
@@ -97,22 +112,48 @@ TTS_MODEL = _env("TTS_MODEL", "eleven_multilingual_v2")
 # ---------------------------------------------------------------------------
 # Request options
 # ---------------------------------------------------------------------------
-def anthropic_request_options(thinking: bool | None = None) -> dict:
+def anthropic_request_options(thinking: bool | None = None, *, effort: str | None = None) -> dict:
     """kwargs for ``messages.create`` / ``messages.stream`` on ANTHROPIC_MODEL.
 
-    Always sets ``output_config.effort`` (GA, no beta header). ``thinking`` maps
-    the user's thinking switch onto the API: ``True`` -> adaptive thinking with a
-    summarized display (there is no ``budget_tokens`` any more; Sonnet 5 rejects
-    it), ``False`` -> explicitly disabled (Sonnet 5 runs adaptive thinking when
-    the parameter is omitted, which would eat small ``max_tokens`` budgets),
-    ``None`` -> leave the parameter out. Not for ANTHROPIC_MODEL_FAST.
+    Adaptive thinking is the only thinking mode on Sonnet 5 (a fixed
+    ``budget_tokens`` is rejected) and it runs whether the parameter is present
+    or omitted, so the user's thinking switch selects *how much*:
+
+    * ``True``  -> effort ANTHROPIC_EFFORT, ``display: "summarized"`` (feeds the
+      streaming thinking block and the reasoning file)
+    * ``False`` -> effort ANTHROPIC_EFFORT_LIGHT, ``display: "omitted"`` (faster
+      and cheaper; the model still reasons briefly when it must)
+    * ``None``  -> effort only, thinking left to the API default (adaptive)
+
+    ``effort`` overrides the level. Not for ANTHROPIC_MODEL_FAST: Haiku rejects
+    ``effort``.
     """
-    options: dict = {"output_config": {"effort": ANTHROPIC_EFFORT}}
+    if effort is None:
+        effort = ANTHROPIC_EFFORT_LIGHT if thinking is False else ANTHROPIC_EFFORT
+    options: dict = {"output_config": {"effort": effort}}
     if thinking is True:
         options["thinking"] = {"type": "adaptive", "display": "summarized"}
     elif thinking is False:
-        options["thinking"] = {"type": "disabled"}
+        options["thinking"] = {"type": "adaptive", "display": "omitted"}
     return options
+
+
+def anthropic_max_tokens(thinking: bool | None = None) -> int:
+    """The max_tokens ceiling matching :func:`anthropic_request_options`."""
+    return ANTHROPIC_MAX_TOKENS_LIGHT if thinking is False else ANTHROPIC_MAX_TOKENS
+
+
+def anthropic_text(message) -> str:
+    """The concatenated text blocks of a Messages API response.
+
+    With adaptive thinking the first content block can be a ``thinking`` block,
+    so ``message.content[0].text`` is not safe any more.
+    """
+    return "".join(
+        getattr(block, "text", "") or ""
+        for block in getattr(message, "content", []) or []
+        if getattr(block, "type", None) == "text"
+    )
 
 
 def openai_reasoning_options(model: str) -> dict:

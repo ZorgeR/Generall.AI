@@ -229,12 +229,13 @@ worker → _run_text → bot.agent_runner.run_turn(bot, user_id, chat_id, prompt
        │     + the question                       (all three gated by short_term_memory.enabled too)
        ├─ _classify_complexity (Haiku) → "simple": tool-less Haiku answer; on any error fall back ↓
        ├─ AgentAnthropic.generate_response: for iteration in range(tools.max_iteration):
-       │     messages.create/stream(model, system, tools=get_tools_schema(), output_config.effort, thinking adaptive|disabled)
+       │     messages.stream (always) (model, system, tools=get_tools_schema(), output_config.effort, adaptive thinking,
+       │        max_tokens 64000 deep / 16000 light; thinking tokens count against it)
        │     stop_reason == tool_use AND tools.enabled AND cicles < max → run each block,
        │        append ONE user msg of tool_results, continue      (cicles counts tool_use BLOCKS)
        │     gate fails → tool_use blocks silently dropped, text goes on to critique/judge/return
        │     else optional critique (OpenAI gpt-5.6-terra) / judge (Claude yes/no) re-prompts → return
-       │     for-loop exhausted → forced "SYSTEM NOTICE" final call without tools or thinking
+       │     for-loop exhausted → forced "SYSTEM NOTICE" final call without tools (same thinking mode)
        └─ strip pre-loaded context from thread_messages; persist memory inside try/except
           (a failed Haiku summary is logged, the answer is still returned) → (response, messages)
     stats_tracker.track_message_sent
@@ -415,7 +416,7 @@ every `set`. `run_turn` saves once per turn so new defaults reach disk. Agent co
 | `judge` | enabled (false), max_iteration (5, 1..300) | Claude yes/no completeness re-prompts |
 | `tools` | enabled (true), max_iteration (20, 1..300) | the agent loop bound (this, not the env var) |
 | `semantic_search` | enabled (true), max_results (3, 1..20) | FAISS hits in system prompt |
-| `thinking` | enabled (true) | on: `thinking={"type": "adaptive", "display": "summarized"}`, max_tokens 20000; off: `thinking={"type": "disabled"}`, max_tokens 4096 (`models.anthropic_request_options`); effort is `high` either way |
+| `thinking` | enabled (true) | on ("deep"): adaptive thinking, `display: summarized`, effort `ANTHROPIC_EFFORT` (high), max_tokens `ANTHROPIC_MAX_TOKENS` (64000); off ("light"): still adaptive, `display: omitted`, effort `ANTHROPIC_EFFORT_LIGHT` (low), max_tokens 16000. Never `disabled` (`models.anthropic_request_options` / `anthropic_max_tokens`) |
 | `rich_messages` | enabled (true) | answers as Telegram rich messages (native GFM); off = legacy Markdown v1 path; also selects the `<formatting>` prompt section and rich vs plain streaming drafts |
 | `system_prompt` | type ("generall-ai-v2"; also generall-ai-v1, perplexity-deep-research, perplexity-r1) | prompt selection |
 
@@ -428,20 +429,21 @@ judge, tools, semantic, thinking, rich, main. `system_prompt` is special-cased w
 
 **Single source of truth: `app/models.py`.** Every model name is a module constant there with an
 environment override of the same name (read once at import, after `load_dotenv()`), and the request
-options that belong to a model live next to it: `anthropic_request_options(thinking)` returns
-`{"output_config": {"effort": ANTHROPIC_EFFORT}}` plus `thinking` (`{"type": "adaptive", "display":
-"summarized"}` / `{"type": "disabled"}` / omitted for `True` / `False` / `None`), and
+options that belong to a model live next to it: `anthropic_request_options(thinking, effort=None)` returns
+`{"output_config": {"effort": ...}}` plus adaptive `thinking` (`display` `summarized` for `True`, `omitted` for
+`False`, omitted parameter for `None`; effort `ANTHROPIC_EFFORT` vs `ANTHROPIC_EFFORT_LIGHT`), `anthropic_max_tokens(thinking)`
+the matching ceiling, `anthropic_text(message)` the text blocks (the first block may be thinking), and
 `openai_reasoning_options(model)` returns `{"reasoning_effort": OPENAI_REASONING_EFFORT}` for the two
 OpenAI reasoning models and `{}` for anything else. No other file holds a model literal.
 
 | Purpose | Model / API (default; env override) | Request options | Used by |
 |---|---|---|---|
-| Agent loop, judge, final compile | `claude-sonnet-5` via `anthropic.AsyncAnthropic` (`ANTHROPIC_MODEL`) | `output_config.effort` = `high` (`ANTHROPIC_EFFORT`); loop: adaptive thinking when the user's `thinking` setting is on, `disabled` otherwise; judge and forced final call: `disabled` | `agents/main.py` |
-| Document & image description | `claude-sonnet-5` (`ANTHROPIC_MODEL`) | effort `high`, thinking `disabled` (small `max_tokens` budgets) | `bot/media.py` via `bot/clients.py` clients |
+| Agent loop, judge, final compile | `claude-sonnet-5` via `anthropic.AsyncAnthropic` (`ANTHROPIC_MODEL`) | adaptive thinking always; loop and final call: effort `high` + summarized display when the user's `thinking` setting is on, effort `low` + omitted display when off; judge: light mode, max_tokens 2048; the loop and final call always stream | `agents/main.py` |
+| Document & image description | `claude-sonnet-5` (`ANTHROPIC_MODEL`) | light mode (adaptive, effort `low`, display omitted); max_tokens 4096 / 8192 / 16000 leave room for thinking; text read with `anthropic_text` | `bot/media.py` via `bot/clients.py` clients |
 | Topic/summary, complexity classifier, "simple" answers | `claude-haiku-4-5` (`ANTHROPIC_MODEL_FAST`) | none (Haiku rejects `effort`) | `agents/main.py` |
 | Critique | `gpt-5.6-terra` structured output (`beta.chat.completions.parse`) (`OPENAI_MODEL`) | `reasoning_effort` = `high` (`OPENAI_REASONING_EFFORT`); no `temperature`/`max_tokens` | `agents/main.py` |
 | GPT vision on photos (second description after Claude) | `gpt-5.6-terra` (`OPENAI_MODEL`) | `reasoning_effort` `high` | `bot/media.py` |
-| Video frame description | `gpt-5.6-luna` (`VIDEO_FRAMES_MODEL`) | `reasoning_effort` `high`, `max_completion_tokens` 8192 | `bot/media.py` |
+| Video frame description | `gpt-5.6-luna` (`VIDEO_FRAMES_MODEL`) | `reasoning_effort` `high`; no `max_completion_tokens` (it would cap reasoning + answer together) | `bot/media.py` |
 | Transcription | `whisper-1` (`WHISPER_MODEL`) via a second client keyed by `OPENAI_API_KEY_WHISPER` (falls back to `OPENAI_API_KEY`); >24 MB chunked | none | `bot/media.py` `transcribe_audio` |
 | Embeddings | `text-embedding-ada-002` (`EMBEDDING_MODEL`), dim 1536 (`EMBEDDING_DIMENSION`, must match; existing FAISS indexes are not migrated) | none | `agents/embeddings.py` |
 | Image gen/edit | `gemini-3.1-flash-image-preview` (Normal, `GEMINI_IMAGE_MODEL_FLASH`), `gemini-3-pro-image-preview` (Pro, `GEMINI_IMAGE_MODEL_PRO`), `gpt-image-2-2026-04-21` (GPT, `GPT_IMAGE_MODEL`), `dall-e-3` (legacy, `DALLE_MODEL`) | none | `agents/image_tools.py` |
@@ -535,7 +537,7 @@ name; a new temp dir needs its own `.gitignore` line).
 
 - The iteration counter `cicles` counts individual `tool_use` blocks while the `for` loop counts
   API round-trips; hitting either limit drops pending tool calls and may return an incomplete
-  "Let me check..." text. The forced final call has no tools and no thinking.
+  "Let me check..." text. The forced final call has no tools (thinking mode as the loop).
 - `judge_response` treats exceptions as "yes" (accept); `critique_response` treats them as "no rewrite".
 - `perplexity-*` system prompts contain hard-coded 2025 dates and "You are Perplexity" identity text;
   the `generall-ai-*` prompts say "20 previous messages" regardless of `dialog_history.size`.
