@@ -22,8 +22,17 @@ def escape_markdown(text: str) -> str:
     return re.sub(r"([_*`\[])", r"\\\1", text)
 
 
-def _is_not_modified(error: TelegramBadRequest) -> bool:
-    return "message is not modified" in str(error).lower()
+def is_not_modified(error: BaseException) -> bool:
+    """Telegram's "nothing changed" reply, in either of its phrasings.
+
+    Concurrent tool calls finish at once and each refreshes the status, so the same
+    content is often submitted twice; that is a success, not a formatting problem.
+    """
+    text = str(error).lower()
+    return "not modified" in text or "message_not_modified" in text
+
+
+_is_not_modified = is_not_modified  # backwards-compatible alias
 
 
 async def answer_md(message: Message, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> Message:

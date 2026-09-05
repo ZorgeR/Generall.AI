@@ -177,6 +177,18 @@ class ContainerManager:
         with _SANDBOX_SLOTS:
             return self._run_command_in_slot(user_id, command, timeout, network_enabled)
 
+    @staticmethod
+    def _workspace_file(user_dir, prefix, suffix):
+        """A per-call file in the user's workspace: (host path, path inside the container).
+
+        The name carries a uuid because tool calls of one assistant message run
+        CONCURRENTLY (AgentAnthropic.run_tool_batch). A fixed name like
+        ``temp_setup.sh`` was overwritten by whichever call wrote last, so every
+        container then executed that one command and all callers got its output.
+        """
+        name = f"{prefix}_{uuid.uuid4().hex[:8]}{suffix}"
+        return user_dir / name, f"/home/runner/workspace/{name}"
+
     def _run_command_in_slot(self, user_id, command, timeout=60, network_enabled=False):
         # Ensure user directory exists
         user_dir = self.ensure_user_directory(user_id)
@@ -258,8 +270,8 @@ class ContainerManager:
             
             # If we have packages to install, create a script to do that first
             if package_installation_prefix:
-                # Create a temporary script file in the user directory
-                script_path = user_dir / "temp_setup.sh"
+                # Create a temporary script file in the user directory (unique per call)
+                script_path, script_in_container = self._workspace_file(user_dir, "temp_setup", ".sh")
                 with open(script_path, 'w') as f:
                     f.write(package_installation_prefix)
                     f.write(f"\n# Now run the actual command\n{command}\n")
@@ -268,7 +280,7 @@ class ContainerManager:
                 os.chmod(script_path, 0o755)
                 
                 # Update the command to run our script
-                command = "/home/runner/workspace/temp_setup.sh"
+                command = script_in_container
             
             # Get the host path for the user directory to mount into the container
             # user_dir is relative to base_data_path, so we need to construct the host path
@@ -357,14 +369,14 @@ class ContainerManager:
         try:
             # Copy the file to the user directory
             user_dir = self.ensure_user_directory(user_id)
-            target_file = user_dir / "temp_code.py"
+            target_file, file_in_container = self._workspace_file(user_dir, "temp_code", ".py")
             shutil.copy(temp_file_path, target_file)
             
             # Set proper permissions for the file (readable and executable by all)
             os.chmod(target_file, 0o755)
             
             # Run the code in the container
-            command = "python /home/runner/workspace/temp_code.py"
+            command = f"python {file_in_container}"
             result = self.run_command(user_id, command, timeout, network_enabled)
             
             # Clean up the temporary file in the user directory
@@ -508,14 +520,14 @@ print(json.dumps(result))
         try:
             # Copy the file to the user directory
             user_dir = self.ensure_user_directory(user_id)
-            target_file = user_dir / "temp_script.sh"
+            target_file, file_in_container = self._workspace_file(user_dir, "temp_script", ".sh")
             shutil.copy(temp_file_path, target_file)
             
             # Make the script executable
             os.chmod(target_file, 0o755)
             
             # Run the script in the container
-            command = "/bin/bash /home/runner/workspace/temp_script.sh"
+            command = f"/bin/bash {file_in_container}"
             result = self.run_command(user_id, command, timeout, network_enabled)
             
             # Clean up the temporary file in the user directory
