@@ -84,6 +84,9 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
   voice/                    VoiceManager: ElevenLabs voice ids (voices.json) + per-user choice (config.json)
   Dockerfile, requirements.txt   bot image (python:3.12-slim + git, docker.io, ffmpeg)
 tests/                      pytest suite (pytest.ini sets pythonpath=app, asyncio_mode=auto)
+.github/workflows/deploy.yml  manual production deploy (workflow_dispatch, environment PROD), see "Running"
+deploy/                     render_env.py (PROD secrets+vars → .env, runs on the runner) and
+                            remote_deploy.sh (git checkout, .env swap, compose build/up, health check; runs on the server)
 requirements-dev.txt        app requirements + pytest, pytest-asyncio
 docker-compose.yml          services: telegram-bot-api (local Bot API server) + bot
 .env.example                template for .env (WORKSPACE_ROOT comes from docker-compose.yml; BROWSER_SERVICE_URL is unused)
@@ -135,6 +138,12 @@ Deployment facts that are easy to get wrong:
 - Python ≥ 3.12 is required: `agents/main.py` uses nested same-quote f-strings (PEP 701).
 - Polling mode only; `DROP_PENDING_UPDATES=true` (default) discards messages sent while the bot was
   down. The only scheduled work is the reminders loop every 10 s.
+- Production deploys are a manual GitHub Actions run (`.github/workflows/deploy.yml`, Deploy button,
+  `environment: PROD`) plus `deploy/`: `render_env.py` turns **every** PROD secret/variable into the
+  server's `.env` (secrets win; `SERVER_*` are the SSH settings and are excluded), the workflow uploads
+  it as `.env.new` and streams `remote_deploy.sh` over SSH (refuse on dirty tracked files, checkout the
+  ref, swap `.env` keeping `.env.bak`, compose build/up, wait for "is running"). The server's `.env` is
+  therefore generated: change the PROD environment, not the file. Tests: `tests/test_render_env.py`.
 
 ## Startup order and the monkey-patching (read this first)
 
