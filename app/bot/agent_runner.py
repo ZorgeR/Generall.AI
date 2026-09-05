@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -30,6 +31,18 @@ logger = logging.getLogger(__name__)
 
 THINKING = "💭 *Thinking...*"
 TRACE_LINES = 10  # most recent tool calls shown in the status message
+
+
+_ENTITY_UNSAFE = re.compile(r"[_*`\[]")
+
+
+def entity_safe(text: str) -> str:
+    """Text placed INSIDE a legacy-Markdown entity (*bold* / _italic_).
+
+    Legacy Markdown does not allow backslash escapes inside an entity, so the special
+    characters are replaced instead of escaped (``run_command`` -> ``run-command``).
+    """
+    return _ENTITY_UNSAFE.sub("-", str(text))
 
 
 def _fmt_seconds(seconds: float) -> str:
@@ -169,8 +182,8 @@ async def run_turn(
             ctx.set_progress(f"{step}: {details}"[:120])
         text = (
             f"{header}\n- - - - \n{usage_line(user_id, limit)}"
-            f"📝 *Step:* _{str(step).replace('_', '-')}_\n"
-            f"📋 *Details:* _{escape_markdown(str(details))}_\n"
+            f"📝 *Step:* _{entity_safe(step)}_\n"
+            f"📋 *Details:* _{entity_safe(details)}_\n"
             f"🔄 *Iterations:* _{iteration}_\n"
             f"🎯 *Critiques:* _{critique}_"
         )
@@ -180,7 +193,7 @@ async def run_turn(
         usage = usage_text(trace)
         if usage:
             text += "\n" + usage
-        await sender.edit_text(status, text)
+        await sender.edit_text(status, text, fallback="strip")
 
     on_text_chunk = create_streaming_callback(bot, chat_id, thread_id, rich=rich_enabled)
 

@@ -24,7 +24,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramNotFound
 from aiogram.types import BufferedInputFile, FSInputFile, InlineKeyboardMarkup, Message, ReactionTypeEmoji
 
 from bot import rich as rich_render
-from bot.ui import LEGACY_MARKDOWN
+from bot.ui import LEGACY_MARKDOWN, strip_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -119,8 +119,13 @@ class ChatSender:
         # user untouched rather than with its underscores stripped.
         return await self.bot.send_message(text=text, reply_markup=reply_markup, **self._kw())
 
-    async def edit_text(self, message: Message, text: str, *, markdown: bool = True) -> Message | None:
-        """Best-effort edit: never raises (status edits must not break a turn or a cancel)."""
+    async def edit_text(self, message: Message, text: str, *, markdown: bool = True, fallback: str = "raw") -> Message | None:
+        """Best-effort edit: never raises (status edits must not break a turn or a cancel).
+
+        ``fallback`` decides what is shown when Telegram rejects the Markdown: ``"raw"`` keeps
+        the text untouched (LLM output must not lose its underscores), ``"strip"`` removes
+        the Markdown symbols (bot-authored status text, where raw asterisks look broken).
+        """
         text = text if text else "…"
         try:
             if markdown:
@@ -131,6 +136,9 @@ class ChatSender:
                 except TelegramBadRequest as e:
                     if "message is not modified" in str(e).lower():
                         return None
+                    logger.warning("Markdown edit rejected (%s); sending %s text", e, fallback)
+                    if fallback == "strip":
+                        text = strip_markdown(text)
             return await self.bot.edit_message_text(chat_id=self.chat_id, message_id=message.message_id, text=text)
         except TelegramBadRequest as e:
             if "message is not modified" not in str(e).lower():
