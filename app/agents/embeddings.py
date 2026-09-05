@@ -7,6 +7,7 @@ from openai import OpenAI
 import faiss
 from dotenv import load_dotenv
 from datetime import datetime
+from models import EMBEDDING_DIMENSION, EMBEDDING_MODEL
 
 load_dotenv()
 
@@ -18,7 +19,7 @@ class ConversationEmbeddings:
         self.embeddings_dir.mkdir(parents=True, exist_ok=True)
         self.index_path = self.embeddings_dir / "faiss_index.bin"
         self.metadata_path = self.embeddings_dir / "metadata.json"
-        self.dimension = 1536  # OpenAI ada-002 embedding dimension
+        self.dimension = EMBEDDING_DIMENSION  # must match EMBEDDING_MODEL
         
         # Initialize or load FAISS index
         if self.index_path.exists() and self.metadata_path.exists():
@@ -32,7 +33,7 @@ class ConversationEmbeddings:
     def _get_embedding(self, text: str) -> np.ndarray:
         """Get embedding vector for text using OpenAI's API"""
         response = self.openai_client.embeddings.create(
-            model="text-embedding-ada-002",
+            model=EMBEDDING_MODEL,
             input=text
         )
         return np.array(response.data[0].embedding, dtype=np.float32)

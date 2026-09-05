@@ -18,14 +18,16 @@ from pathlib import Path
 
 from PIL import Image
 
-from bot.clients import (
+from bot.clients import anthropic_client, openai_client, whisper_client
+from models import (
     ANTHROPIC_MODEL,
     OPENAI_MODEL,
+    TTS_MODEL,
     VIDEO_FRAMES_MODEL,
     WHISPER_MODEL,
-    anthropic_client,
-    openai_client,
-    whisper_client,
+    anthropic_request_options,
+    anthropic_text,
+    openai_reasoning_options,
 )
 from bot.config import config
 from image_utils import is_jpeg_image, save_image_as_jpeg
@@ -138,7 +140,8 @@ async def describe_image_anthropic(question: str, image_path: str) -> str:
     base64_image = await asyncio.to_thread(encode_image, image_path)
     message = await anthropic_client().messages.create(
         model=ANTHROPIC_MODEL,
-        max_tokens=1024,
+        max_tokens=4096,  # adaptive thinking counts against this
+        **anthropic_request_options(thinking=False),
         messages=[{
             "role": "user",
             "content": [
@@ -147,7 +150,7 @@ async def describe_image_anthropic(question: str, image_path: str) -> str:
             ],
         }],
     )
-    return message.content[0].text
+    return anthropic_text(message)
 
 
 async def describe_image_openai(question: str, image_path: str) -> str:
@@ -155,6 +158,7 @@ async def describe_image_openai(question: str, image_path: str) -> str:
     response = await asyncio.to_thread(
         openai_client().chat.completions.create,
         model=OPENAI_MODEL,
+        **openai_reasoning_options(OPENAI_MODEL),
         messages=[{
             "role": "user",
             "content": [
@@ -169,14 +173,15 @@ async def describe_image_openai(question: str, image_path: str) -> str:
 # ---------------------------------------------------------------------------
 # documents
 # ---------------------------------------------------------------------------
-async def _ask_anthropic(system: str, text: str, max_tokens: int = 4096) -> str:
+async def _ask_anthropic(system: str, text: str, max_tokens: int = 8192) -> str:
     message = await anthropic_client().messages.create(
         model=ANTHROPIC_MODEL,
         messages=[{"role": "user", "content": [{"type": "text", "text": text}]}],
         system=system,
         max_tokens=max_tokens,
+        **anthropic_request_options(thinking=False),
     )
-    return message.content[0].text
+    return anthropic_text(message)
 
 
 async def describe_document_anthropic(question: str, file_path: str, document_type: str, mime_type: str) -> str:
@@ -195,9 +200,10 @@ async def describe_document_anthropic(question: str, file_path: str, document_ty
             ],
         }],
         system="You are a very professional document analyze specialist. Analyze the given document in a detailed way, to answer user's question.",
-        max_tokens=4096,
+        max_tokens=16000,  # adaptive thinking counts against this; still under the non-streaming limit
+        **anthropic_request_options(thinking=False),
     )
-    return message.content[0].text
+    return anthropic_text(message)
 
 
 async def process_large_text(content: str, question: str, content_type: str) -> str:
@@ -435,7 +441,8 @@ async def describe_video_screenshots(screenshot_paths: list[str], transcription:
             openai_client().chat.completions.create,
             model=VIDEO_FRAMES_MODEL,
             messages=[{"role": "user", "content": content}],
-            max_completion_tokens=2048,
+            # no max_completion_tokens: it would cap hidden reasoning + answer together
+            **openai_reasoning_options(VIDEO_FRAMES_MODEL),
         )
         return response.choices[0].message.content or ""
     except Exception as e:  # noqa: BLE001
@@ -447,7 +454,6 @@ async def synthesize_speech(text: str, voice_id: str) -> bytes | None:
     """ElevenLabs TTS in a worker thread; returns MP3 bytes or None on failure."""
     if not config.elevenlabs_api_key:
         return None
-    from bot.clients import TTS_MODEL
 
     def _tts() -> bytes:
         from elevenlabs.client import ElevenLabs

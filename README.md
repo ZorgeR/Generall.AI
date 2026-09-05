@@ -4,7 +4,7 @@
 
 ## 📋 Overview
 
-GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bot communication interface powered by advanced AI models like Claude 4.6 Sonnet and GPT-5.2. It provides a seamless interface for users to interact with AI capabilities through Telegram, supporting text, voice, images, documents, and more.
+GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bot communication interface powered by advanced AI models like Claude Sonnet 5 and GPT-5.6. It provides a seamless interface for users to interact with AI capabilities through Telegram, supporting text, voice, images, documents, and more.
 
 ## 🔎 At a Glance
 
@@ -291,8 +291,8 @@ The bot can:
 ### 🔑 API Keys Required
 
 - Telegram Bot Token
-- Anthropic API Key (for Claude 3.7)
-- OpenAI API Key (for GPT-4o and Whisper)
+- Anthropic API Key (for Claude Sonnet 5 and Haiku 4.5)
+- OpenAI API Key (for GPT-5.6, Whisper and embeddings)
 - ElevenLabs API Key (for voice synthesis)
 - Google API Key (for Gemini image generation/transformation)
 
@@ -381,6 +381,22 @@ The application is configured via environment variables in the `.env` file. Key 
 
 - Tool, critique and judge iteration limits are per-user settings (see `/settings`); the
   `MAX_AGENT_*_ITERATIONS` variables are obsolete and ignored.
+
+### 🧩 Models
+
+Every model name lives in `app/models.py` and can be overridden from `.env` (defaults in
+parentheses; see the commented block in `.env.example`):
+
+- `ANTHROPIC_MODEL` (`claude-sonnet-5`): agent loop, judge, final compile, document and image
+  description. `ANTHROPIC_EFFORT` (`high`) is sent as `output_config.effort` on every call.
+- `ANTHROPIC_MODEL_FAST` (`claude-haiku-4-5`): topic/summary, complexity classifier, quick answers.
+- `OPENAI_MODEL` (`gpt-5.6-terra`): critique and GPT vision on photos. `VIDEO_FRAMES_MODEL`
+  (`gpt-5.6-luna`): video frame description. Both are reasoning models and get
+  `OPENAI_REASONING_EFFORT` (`high`).
+- `WHISPER_MODEL` (`whisper-1`), `EMBEDDING_MODEL` (`text-embedding-ada-002`, with
+  `EMBEDDING_DIMENSION` `1536`), `TTS_MODEL` (`eleven_multilingual_v2`).
+- `GEMINI_IMAGE_MODEL_FLASH`, `GEMINI_IMAGE_MODEL_PRO`, `GPT_IMAGE_MODEL`, `DALLE_MODEL`,
+  `VEO_MODEL`, `PERPLEXITY_MODEL`: image, video and deep-research models.
 
 ### ⚙️ Concurrency
 

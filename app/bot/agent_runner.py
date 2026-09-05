@@ -23,6 +23,7 @@ from bot.queue import JobContext
 from bot.sender import ChatSender
 from bot.settings import UserSettings
 from bot.streaming import create_streaming_callback
+from models import ANTHROPIC_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +123,7 @@ async def run_turn(
         agents = _agents()
         agent = agents.ChainOfThoughtAgent(
             model_type="anthropic",
-            model=agents.anthropic_model,
+            model=ANTHROPIC_MODEL,
             user_id=user_id,
             sender=sender,
             user_settings=user_settings,

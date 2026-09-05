@@ -13,6 +13,7 @@ from google.genai import types
 import PIL.Image
 import PIL.ImageOps
 from image_utils import JPEG_FORMATS
+from models import DALLE_MODEL, GEMINI_IMAGE_MODEL_FLASH, GEMINI_IMAGE_MODEL_PRO, GPT_IMAGE_MODEL
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -22,10 +23,6 @@ openai_client = OpenAI(api_key=openai_api_key)
 google_api_key = os.getenv("GOOGLE_API_KEY")
 genai_client = genai.Client(api_key=google_api_key)
 max_image_resolution_edit = int(os.getenv("MAX_IMAGE_RESOLUTION_EDIT", "4096") or "4096")
-
-GEMINI_FLASH = "gemini-3.1-flash-image-preview"
-GEMINI_PRO = "gemini-3-pro-image-preview"
-GPT_IMAGE = "gpt-image-2-2026-04-21"
 
 class TextPart:
     def __init__(self, text):
@@ -70,7 +67,7 @@ class ImageTools:
                         },
                         "model": {
                             "type": "string",
-                            "description": "Model to use: 'Normal' (faster, standard quality, gemini-3.1-flash-image-preview), 'Pro' (higher quality, more control, gemini-3-pro-image-preview), or 'GPT' (OpenAI GPT Image 2, state-of-the-art quality, excellent text rendering, great for screenshot/UI mockup generation). ALWAYS use 'Normal' unless user specifically requests Pro or GPT mode.",
+                            "description": f"Model to use: 'Normal' (faster, standard quality, {GEMINI_IMAGE_MODEL_FLASH}), 'Pro' (higher quality, more control, {GEMINI_IMAGE_MODEL_PRO}), or 'GPT' (OpenAI GPT Image 2, state-of-the-art quality, excellent text rendering, great for screenshot/UI mockup generation). ALWAYS use 'Normal' unless user specifically requests Pro or GPT mode.",
                             "enum": ["Normal", "Pro", "GPT"],
                             "default": "Normal"
                         },
@@ -177,7 +174,7 @@ class ImageTools:
                         },
                         "model": {
                             "type": "string",
-                            "description": "Model to use: 'Normal' (faster, standard quality, gemini-3.1-flash-image-preview), 'Pro' (higher quality, more control, gemini-3-pro-image-preview), or 'GPT' (OpenAI GPT Image 2, state-of-the-art editing, great for screenshot/UI mockup editing). ALWAYS use 'Normal' unless user specifically requests Pro or GPT mode.",
+                            "description": f"Model to use: 'Normal' (faster, standard quality, {GEMINI_IMAGE_MODEL_FLASH}), 'Pro' (higher quality, more control, {GEMINI_IMAGE_MODEL_PRO}), or 'GPT' (OpenAI GPT Image 2, state-of-the-art editing, great for screenshot/UI mockup editing). ALWAYS use 'Normal' unless user specifically requests Pro or GPT mode.",
                             "enum": ["Normal", "Pro", "GPT"],
                             "default": "Normal"
                         },
@@ -234,7 +231,7 @@ class ImageTools:
                         },
                         "model": {
                             "type": "string",
-                            "description": "Model to use: 'Normal' (faster, standard quality, gemini-3.1-flash-image-preview), 'Pro' (higher quality, more control, gemini-3-pro-image-preview), or 'GPT' (OpenAI GPT Image 2, state-of-the-art composition with up to 10 reference images, great for screenshot/UI mockup composition). ALWAYS use 'Normal' unless user specifically requests Pro or GPT mode.",
+                            "description": f"Model to use: 'Normal' (faster, standard quality, {GEMINI_IMAGE_MODEL_FLASH}), 'Pro' (higher quality, more control, {GEMINI_IMAGE_MODEL_PRO}), or 'GPT' (OpenAI GPT Image 2, state-of-the-art composition with up to 10 reference images, great for screenshot/UI mockup composition). ALWAYS use 'Normal' unless user specifically requests Pro or GPT mode.",
                             "enum": ["Normal", "Pro", "GPT"],
                             "default": "Normal"
                         },
@@ -399,7 +396,7 @@ class ImageTools:
 
     @staticmethod
     def _gemini_model_name(model: str) -> str:
-        return GEMINI_PRO if model.lower() == "pro" else GEMINI_FLASH
+        return GEMINI_IMAGE_MODEL_PRO if model.lower() == "pro" else GEMINI_IMAGE_MODEL_FLASH
 
     async def _deliver_parts(self, parts, prefix: str, text_label: str, all_saved_paths: List[str], variant_caption: str, result_message: str) -> str:
         """Send text parts and inline images from a Gemini response; returns the updated result message."""
@@ -443,7 +440,7 @@ class ImageTools:
         try:
             response = await asyncio.to_thread(
                 openai_client.images.generate,
-                model="dall-e-3",
+                model=DALLE_MODEL,
                 prompt=prompt,
                 size=size,
                 quality=quality,
@@ -464,7 +461,7 @@ class ImageTools:
         try:
             formatted_prompt = f"Generate a story about {prompt} in a {style} style. For each scene, generate an image."
             response = await self._gemini(
-                model=GEMINI_FLASH,
+                model=GEMINI_IMAGE_MODEL_FLASH,
                 contents=formatted_prompt,
                 config=types.GenerateContentConfig(response_modalities=["Text", "Image"]),
             )
@@ -555,7 +552,7 @@ class ImageTools:
             def _edit():
                 files = [open(str(p), "rb") for p in prepared]
                 try:
-                    kwargs = {"model": GPT_IMAGE, "prompt": prompt, "quality": quality, "size": size}
+                    kwargs = {"model": GPT_IMAGE_MODEL, "prompt": prompt, "quality": quality, "size": size}
                     kwargs["image"] = files[0] if len(files) == 1 else files
                     return openai_client.images.edit(**kwargs)
                 finally:
@@ -613,7 +610,7 @@ class ImageTools:
         try:
             result = await asyncio.to_thread(
                 openai_client.images.generate,
-                model=GPT_IMAGE, prompt=prompt, quality=quality, output_format=output_format, size=size, n=n,
+                model=GPT_IMAGE_MODEL, prompt=prompt, quality=quality, output_format=output_format, size=size, n=n,
             )
             ext = "jpg" if output_format == "jpeg" else output_format
             saved_paths = []

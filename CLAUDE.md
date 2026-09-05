@@ -12,7 +12,7 @@ Telegram; the bot turns media into a text prompt, runs a per-message agent loop
 with 35 tools (files, web search, code execution in a Docker sandbox,
 image/video generation, reminders, SMS, S3, TTS), persists multi-layer memory
 per user on disk, and replies in Telegram. Claude drives the tool loop; OpenAI
-(`gpt-5.2`) is only consulted by the optional critique step, which can force a
+(`gpt-5.6-terra`) is only consulted by the optional critique step, which can force a
 rewrite. OpenAI, Google Gemini/Veo, Perplexity, Tavily, ElevenLabs, Twilio and
 Whisper otherwise serve specific side tasks.
 
@@ -20,7 +20,7 @@ Every chat has its own job queue: messages are processed strictly in order per
 user, each as its own turn, and users never wait for each other. See "Queues".
 
 There is a small pytest suite (`tests/`, run with `pytest` from the repo root)
-covering the queue, settings, auth, reminder store and text splitting. There is
+covering the queue, settings, auth, reminder store, text splitting and the model settings module. There is
 no CI, linter, formatter or type checking. Validate changes with the tests and
 the import smoke check at the end of this file.
 
@@ -29,6 +29,8 @@ the import smoke check at the end of this file.
 ```
 app/                        Python package root; the bot runs with cwd=app/ (Dockerfile CMD)
   main_bot.py               Entrypoint (≈60 lines): load .env, validate config, init sandbox, import agents, run bot.app
+  models.py                 THE place for model names + request options (effort / reasoning_effort), each with an
+                            env override; imported as `models` by bot/* and agents/*. No import-time side effects.
   bot/                      Telegram layer (aiogram). No import-time side effects; never imports agents/stats at import.
     app.py                  create_bot (local Bot API support), create_dispatcher, startup/shutdown hooks, run()
     config.py               Config dataclass from env (`config` singleton), validate()
@@ -214,7 +216,7 @@ worker → _run_text → bot.agent_runner.run_turn(bot, user_id, chat_id, prompt
     sender = ChatSender(bot, chat_id, thread_id, reply_to_message_id)
     UserSettings(user_id).save() (persists backfilled defaults) → user_settings dict
     status = sender.send_text("💭 *Thinking...*"); update_status() edits it (usage line, step, iteration)
-    agents.ChainOfThoughtAgent(model="claude-sonnet-4-6", user_id, sender, user_settings, thread_id)
+    agents.ChainOfThoughtAgent(model=models.ANTHROPIC_MODEL, user_id, sender, user_settings, thread_id)
     .generate_response(question, update_status, on_text_chunk)
        ├─ question = "Message received time in UTC+0: <ts>\n\n" + text     (stored everywhere in this form)
        ├─ pick system prompt by settings.system_prompt.type (4 inline prompts; unknown → generall-ai-v2)
@@ -227,12 +229,13 @@ worker → _run_text → bot.agent_runner.run_turn(bot, user_id, chat_id, prompt
        │     + the question                       (all three gated by short_term_memory.enabled too)
        ├─ _classify_complexity (Haiku) → "simple": tool-less Haiku answer; on any error fall back ↓
        ├─ AgentAnthropic.generate_response: for iteration in range(tools.max_iteration):
-       │     messages.create/stream(model, system, tools=get_tools_schema(), thinking?)
+       │     messages.stream (always) (model, system, tools=get_tools_schema(), output_config.effort, adaptive thinking,
+       │        max_tokens 64000 deep / 16000 light; thinking tokens count against it)
        │     stop_reason == tool_use AND tools.enabled AND cicles < max → run each block,
        │        append ONE user msg of tool_results, continue      (cicles counts tool_use BLOCKS)
        │     gate fails → tool_use blocks silently dropped, text goes on to critique/judge/return
-       │     else optional critique (OpenAI gpt-5.2) / judge (Claude yes/no) re-prompts → return
-       │     for-loop exhausted → forced "SYSTEM NOTICE" final call without tools or thinking
+       │     else optional critique (OpenAI gpt-5.6-terra) / judge (Claude yes/no) re-prompts → return
+       │     for-loop exhausted → forced "SYSTEM NOTICE" final call without tools (same thinking mode)
        └─ strip pre-loaded context from thread_messages; persist memory inside try/except
           (a failed Haiku summary is logged, the answer is still returned) → (response, messages)
     stats_tracker.track_message_sent
@@ -255,7 +258,7 @@ Media handlers (`_run_voice`, `_run_video`, `_run_audio`, `_run_images`, `_run_d
   before the agent runs. Albums are buffered per `(chat_id, media_group_id)` and flushed 10 s after
   the last photo into ONE job.
 - Video/video notes: saved to `data/<uid>/videos/`, 4 frames to `data/<uid>/images/video_frame_*.jpg`,
-  frames described by `gpt-5-mini`, audio by Whisper; `speak=True`.
+  frames described by `gpt-5.6-luna`, audio by Whisper; `speak=True`.
 - Documents: saved to `data/<uid>/documents/<lowercased name>`, then `media.describe_document`
   (PDF via Claude document block; txt/json/docx/xlsx extracted; >100k chars map-reduced). Video
   extensions are rerouted to the video job, JPG/JPEG/HEIC/HEIF to the image job, everything else rejected.
@@ -413,7 +416,7 @@ every `set`. `run_turn` saves once per turn so new defaults reach disk. Agent co
 | `judge` | enabled (false), max_iteration (5, 1..300) | Claude yes/no completeness re-prompts |
 | `tools` | enabled (true), max_iteration (20, 1..300) | the agent loop bound (this, not the env var) |
 | `semantic_search` | enabled (true), max_results (3, 1..20) | FAISS hits in system prompt |
-| `thinking` | enabled (true) | extended thinking: max_tokens 20000 / budget 16000, else max_tokens 4096 |
+| `thinking` | enabled (true) | on ("deep"): adaptive thinking, `display: summarized`, effort `ANTHROPIC_EFFORT` (high), max_tokens `ANTHROPIC_MAX_TOKENS` (64000); off ("light"): still adaptive, `display: omitted`, effort `ANTHROPIC_EFFORT_LIGHT` (low), max_tokens 16000. Never `disabled` (`models.anthropic_request_options` / `anthropic_max_tokens`) |
 | `rich_messages` | enabled (true) | answers as Telegram rich messages (native GFM); off = legacy Markdown v1 path; also selects the `<formatting>` prompt section and rich vs plain streaming drafts |
 | `system_prompt` | type ("generall-ai-v2"; also generall-ai-v1, perplexity-deep-research, perplexity-r1) | prompt selection |
 
@@ -424,20 +427,29 @@ judge, tools, semantic, thinking, rich, main. `system_prompt` is special-cased w
 
 ## Models and external services
 
-| Purpose | Model / API | Where set |
-|---|---|---|
-| Agent loop, judge, final compile | `claude-sonnet-4-6` via `anthropic.AsyncAnthropic` | `agents/main.py` `anthropic_model` |
-| Document & image description | `claude-sonnet-4-6` | `bot/clients.py` `ANTHROPIC_MODEL` (used by `bot/media.py`) |
-| Topic/summary, complexity classifier, "simple" answers | `claude-haiku-4-5` | `agents/main.py` `anthropic_model_fast` |
-| Critique | `gpt-5.2` structured output (`beta.chat.completions.parse`) | `agents/main.py` `openai_model` |
-| GPT vision on photos (second description after Claude) | `gpt-5.2` | `bot/clients.py` `OPENAI_MODEL` |
-| Video frame description | `gpt-5-mini` | `bot/clients.py` `VIDEO_FRAMES_MODEL` |
-| Transcription | `whisper-1` via a second client keyed by `OPENAI_API_KEY_WHISPER` (falls back to `OPENAI_API_KEY`); >24 MB chunked | `bot/media.py` `transcribe_audio` |
-| Embeddings | `text-embedding-ada-002`, dim 1536 | `agents/embeddings.py` |
-| Image gen/edit | `gemini-3.1-flash-image-preview` (Normal), `gemini-3-pro-image-preview` (Pro), `gpt-image-2-2026-04-21` (GPT), `dall-e-3` (legacy) | `agents/image_tools.py` constants |
-| Video | `veo-3.1-generate-preview` for all five tools | `agents/video_tools.py` `VEO_MODEL` |
-| Web search / research | Tavily; Perplexity `sonar` (default), `sonar-pro`, `sonar-reasoning-pro` via raw HTTP | `agents/search_tools.py` |
-| TTS | ElevenLabs `eleven_multilingual_v2` (`bot/clients.py` `TTS_MODEL` and `user_interactions.py`), voices in `app/voice/voices.json` | |
+**Single source of truth: `app/models.py`.** Every model name is a module constant there with an
+environment override of the same name (read once at import, after `load_dotenv()`), and the request
+options that belong to a model live next to it: `anthropic_request_options(thinking, effort=None)` returns
+`{"output_config": {"effort": ...}}` plus adaptive `thinking` (`display` `summarized` for `True`, `omitted` for
+`False`, omitted parameter for `None`; effort `ANTHROPIC_EFFORT` vs `ANTHROPIC_EFFORT_LIGHT`), `anthropic_max_tokens(thinking)`
+the matching ceiling, `anthropic_text(message)` the text blocks (the first block may be thinking), and
+`openai_reasoning_options(model)` returns `{"reasoning_effort": OPENAI_REASONING_EFFORT}` for the two
+OpenAI reasoning models and `{}` for anything else. No other file holds a model literal.
+
+| Purpose | Model / API (default; env override) | Request options | Used by |
+|---|---|---|---|
+| Agent loop, judge, final compile | `claude-sonnet-5` via `anthropic.AsyncAnthropic` (`ANTHROPIC_MODEL`) | adaptive thinking always; loop and final call: effort `high` + summarized display when the user's `thinking` setting is on, effort `low` + omitted display when off; judge: light mode, max_tokens 2048; the loop and final call always stream | `agents/main.py` |
+| Document & image description | `claude-sonnet-5` (`ANTHROPIC_MODEL`) | light mode (adaptive, effort `low`, display omitted); max_tokens 4096 / 8192 / 16000 leave room for thinking; text read with `anthropic_text` | `bot/media.py` via `bot/clients.py` clients |
+| Topic/summary, complexity classifier, "simple" answers | `claude-haiku-4-5` (`ANTHROPIC_MODEL_FAST`) | none (Haiku rejects `effort`) | `agents/main.py` |
+| Critique | `gpt-5.6-terra` structured output (`beta.chat.completions.parse`) (`OPENAI_MODEL`) | `reasoning_effort` = `high` (`OPENAI_REASONING_EFFORT`); no `temperature`/`max_tokens` | `agents/main.py` |
+| GPT vision on photos (second description after Claude) | `gpt-5.6-terra` (`OPENAI_MODEL`) | `reasoning_effort` `high` | `bot/media.py` |
+| Video frame description | `gpt-5.6-luna` (`VIDEO_FRAMES_MODEL`) | `reasoning_effort` `high`; no `max_completion_tokens` (it would cap reasoning + answer together) | `bot/media.py` |
+| Transcription | `whisper-1` (`WHISPER_MODEL`) via a second client keyed by `OPENAI_API_KEY_WHISPER` (falls back to `OPENAI_API_KEY`); >24 MB chunked | none | `bot/media.py` `transcribe_audio` |
+| Embeddings | `text-embedding-ada-002` (`EMBEDDING_MODEL`), dim 1536 (`EMBEDDING_DIMENSION`, must match; existing FAISS indexes are not migrated) | none | `agents/embeddings.py` |
+| Image gen/edit | `gemini-3.1-flash-image-preview` (Normal, `GEMINI_IMAGE_MODEL_FLASH`), `gemini-3-pro-image-preview` (Pro, `GEMINI_IMAGE_MODEL_PRO`), `gpt-image-2-2026-04-21` (GPT, `GPT_IMAGE_MODEL`), `dall-e-3` (legacy, `DALLE_MODEL`) | none | `agents/image_tools.py` |
+| Video | `veo-3.1-generate-preview` for all five tools (`VEO_MODEL`) | none | `agents/video_tools.py` |
+| Web search / research | Tavily; Perplexity `sonar` default (`PERPLEXITY_MODEL`), enum `PERPLEXITY_MODELS` = sonar-reasoning-pro / sonar-pro / sonar, via raw HTTP | Perplexity payload keeps its own `temperature`/`max_tokens` | `agents/search_tools.py` |
+| TTS | ElevenLabs `eleven_multilingual_v2` (`TTS_MODEL`), voices in `app/voice/voices.json` | none | `bot/media.py`, `agents/user_interactions.py` |
 | SMS | Twilio | `agents/sms_tools.py` |
 | Object storage | boto3 S3-compatible, presigned URL 1 h | `agents/file_ops.py` |
 
@@ -463,6 +475,7 @@ SearchTools and the embeddings `OpenAI` are per instance; ElevenLabs is per call
 | `THREAD_POOL_SIZE` (32, min 8) | bot/app | size of the default executor used by `asyncio.to_thread` |
 | `WORKSPACE_ROOT` | secure_container | host path of the checkout (see Running); set in compose, not `.env.example` |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENAI_API_KEY_WHISPER`, `GOOGLE_API_KEY`, `TAVILY_API_KEY`, `PERPLEXITY_API_KEY`, `ELEVENLABS_API_KEY` | various | see models table; `OPENAI_API_KEY` and `GOOGLE_API_KEY` needed to import `agents.main` |
+| `ANTHROPIC_MODEL`, `ANTHROPIC_EFFORT`, `ANTHROPIC_MODEL_FAST`, `OPENAI_MODEL`, `VIDEO_FRAMES_MODEL`, `OPENAI_REASONING_EFFORT`, `WHISPER_MODEL`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSION`, `GEMINI_IMAGE_MODEL_FLASH`, `GEMINI_IMAGE_MODEL_PRO`, `GPT_IMAGE_MODEL`, `DALLE_MODEL`, `VEO_MODEL`, `PERPLEXITY_MODEL`, `TTS_MODEL` | `models` | optional overrides of the model defaults (blank = default), read once at import; see "Models and external services" and `.env.example` |
 | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` | sms_tools | optional; tool returns an error string if unset |
 | `S3_HOST`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET_NAME`, `S3_PATH_TO_STORE` | file_ops | optional |
 | `MAX_IMAGE_RESOLUTION_VISION` (1024), `MAX_IMAGE_RESOLUTION_EDIT` (4096) | bot/media, image_tools | downscale before vision / edit |
@@ -513,7 +526,8 @@ name; a new temp dir needs its own `.gitignore` line).
 
 ## README vs code
 
-- README says Claude 3.7 / GPT-4o; code uses `claude-sonnet-4-6`, `claude-haiku-4-5`, `gpt-5.2`, `gpt-5-mini`.
+- README model names (Claude Sonnet 5 / GPT-5.6) now match the defaults in `app/models.py`
+  (`claude-sonnet-5`, `claude-haiku-4-5`, `gpt-5.6-terra`, `gpt-5.6-luna`); if they drift again, `app/models.py` wins.
 - README lists SSH and Shodan tools; neither exists. SSH is only possible via `run_shell_script`
   inside the sandbox (openssh-client is installed there) with `network_enabled`.
 - README lists PNG/GIF/BMP/WEBP as supported images; as documents only JPG/JPEG/HEIC/HEIF are.
@@ -523,7 +537,7 @@ name; a new temp dir needs its own `.gitignore` line).
 
 - The iteration counter `cicles` counts individual `tool_use` blocks while the `for` loop counts
   API round-trips; hitting either limit drops pending tool calls and may return an incomplete
-  "Let me check..." text. The forced final call has no tools and no thinking.
+  "Let me check..." text. The forced final call has no tools (thinking mode as the loop).
 - `judge_response` treats exceptions as "yes" (accept); `critique_response` treats them as "no rewrite".
 - `perplexity-*` system prompts contain hard-coded 2025 dates and "You are Perplexity" identity text;
   the `generall-ai-*` prompts say "20 previous messages" regardless of `dialog_history.size`.
@@ -564,13 +578,17 @@ name; a new temp dir needs its own `.gitignore` line).
   `@router.message(F.<kind>)` handler in `messages.py` that tracks and `submit`s it.
 - **Add a background job**: an `async` loop started from `bot/app.py:on_startup` and appended to
   `runtime.background_tasks`; to run the agent from it, submit a `Job` to `runtime.queue`.
-- **Change models**: `agents/main.py` constants, `bot/clients.py` constants, literals in
-  `image_tools.py`, `video_tools.py`, `embeddings.py`, `search_tools.py` (sonar enum + defaults),
-  and the `eleven_multilingual_v2` literal in `user_interactions.py`.
+- **Change models**: edit the default in `app/models.py` or set the env var of the same name
+  (`ANTHROPIC_MODEL`, `OPENAI_MODEL`, `VIDEO_FRAMES_MODEL`, ...; see `.env.example`). No other file
+  holds a model name. Keep the option helpers honest when the new model's API differs: a
+  non-reasoning OpenAI model rejects `reasoning_effort` (drop it from `OPENAI_REASONING_MODELS`), a
+  pre-4.6 Claude model needs `budget_tokens` instead of adaptive thinking, and Haiku-class models
+  reject `effort` (which is why `ANTHROPIC_MODEL_FAST` calls never get `anthropic_request_options`).
+  Then update the table above and `tests/test_models.py`.
 - **Change sandbox limits/mounts/network**: `ContainerManager._run_command_in_slot`; the slot cap is
   `MAX_SANDBOX_CONTAINERS`.
 - **Run the tests**: `pip install -r requirements-dev.txt && pytest` from the repo root (Python ≥ 3.12).
 - **Smoke-check without Telegram or Docker**: from `app/`, with `OPENAI_API_KEY`, `GOOGLE_API_KEY`,
-  `TAVILY_API_KEY` set to any non-empty value, run `python -c "import bot.app, agents.main"`. It
+  `TAVILY_API_KEY` set to any non-empty value, run `python -c "import bot.app, agents.main, models"`. It
   catches syntax and import errors in the whole bot and tool code. Running `main_bot.py` additionally
   needs Docker and a real token.
