@@ -460,7 +460,7 @@ every `set`. `run_turn` saves once per turn so new defaults reach disk. Agent co
 Edited through `/settings` (`bot/handlers/settings_ui.py`). callback_data is
 `settings_<token>[_<action>[_<value>]]` parsed with a plain `split("_")`, where `<token>` is a short
 name, not the JSON key: summarization, dialog, reasoning, memory (= short_term_memory), critique,
-judge, tools, semantic, thinking, rich, main. `system_prompt` is special-cased with `startswith`.
+judge, tools, semantic, thinking, rich, transcript, trace, main. `system_prompt` is special-cased with `startswith`.
 
 ## Models and external services
 
