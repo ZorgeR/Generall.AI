@@ -93,6 +93,29 @@ def format_stats_text(stats: dict, title: str = "") -> str:
     return text
 
 
+def _fmt_tokens(n: int) -> str:
+    n = int(n or 0)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
+def format_usage_text(usage: dict) -> str:
+    """Token accounting block (legacy Markdown) for the main and per-user stats views."""
+    if not usage or not usage.get("api_calls"):
+        return "🧮 Tokens: _no usage recorded yet_\n"
+    prompt = usage["input_tokens"] + usage["cache_read_tokens"] + usage["cache_write_tokens"]
+    cached = int(round(100 * usage["cache_read_tokens"] / prompt)) if prompt else 0
+    text = (
+        f"🧮 Tokens: in *{_fmt_tokens(prompt)}* ({cached}% cached) · out *{_fmt_tokens(usage['output_tokens'])}*\n"
+        f"│  ├─ API calls: {usage['api_calls']:,} · tool calls: {usage['tool_calls']:,}\n"
+        f"│  └─ Estimated cost: *${usage['cost_usd']:.2f}*\n"
+    )
+    for model, u in list(usage.get("models", {}).items())[:4]:
+        text += f"│     {escape_markdown(model)}: in {_fmt_tokens(u['input_tokens'] + u['cache_read_tokens'] + u['cache_write_tokens'])} · out {_fmt_tokens(u['output_tokens'])} · ${u['cost_usd']:.2f}\n"
+    return text
+
+
 def _build_main_stats() -> tuple[str, InlineKeyboardMarkup]:
     """Text and keyboard of the aggregated stats view (shared by /stats and stats_back_main)."""
     stats_30d = stats_tracker.get_aggregated_stats(days=30)
@@ -103,9 +126,15 @@ def _build_main_stats() -> tuple[str, InlineKeyboardMarkup]:
 
     text += "📅 *Last 30 Days:*\n"
     text += format_stats_text(stats_30d)
+    text += format_usage_text(stats_tracker.get_usage(days=30))
 
     text += "\n📈 *All Time:*\n"
     text += format_stats_text(stats_all)
+    text += format_usage_text(stats_tracker.get_usage(days=None))
+
+    top = stats_tracker.get_users_ranked_by_cost(days=30, limit=5)
+    if top:
+        text += "\n💸 *Top spenders (30d):* " + ", ".join(f"`{uid}` ${cost:.2f}" for uid, cost in top) + "\n"
 
     reply_markup = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="👥 View Users", callback_data="stats_users_page_1")]]
@@ -257,9 +286,11 @@ async def show_user_stats(message: Message, bot: Bot, target_user_id: str) -> No
 
     text += "\n📅 *Last 30 Days:*\n"
     text += format_stats_text(stats_30d)
+    text += format_usage_text(stats_tracker.get_usage(user_id=target_user_id, days=30))
 
     text += "\n📈 *All Time:*\n"
     text += format_stats_text(stats_all)
+    text += format_usage_text(stats_tracker.get_usage(user_id=target_user_id, days=None))
 
     # Build keyboard with block/unblock and set limit buttons
     block_btn = InlineKeyboardButton(

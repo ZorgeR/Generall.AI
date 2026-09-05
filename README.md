@@ -446,7 +446,10 @@ parentheses; see the commented block in `.env.example`):
 7. Use `/settings` → Rich Messages to switch between rich and classic formatting
 8. While the agent works, the "Thinking…" message lists the tool calls as they run (✅ done, ⏳ running,
    ❌ failed, with a short argument preview and duration); tools requested together run in parallel.
-   With rich messages on, a one-line summary of the tool calls stays above the answer.
+   When the answer arrives the status is shortened into a **turn summary** kept above it: expandable
+   tool calls (arguments and results), the model's thinking, tokens used, cached share and estimated
+   cost. `/settings` → Turn Summary turns it off (the status is then deleted).
+9. Admins see token usage and estimated cost per user and in total in `/stats`.
 
 ### ⏳ Queues and isolation
 

@@ -65,6 +65,25 @@ class StatsTracker:
                     action_limit INTEGER NOT NULL
                 )
             """)
+            # Token accounting: one row per model per turn (bot/agent_runner.record_usage)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS usage_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    api_calls INTEGER NOT NULL DEFAULT 0,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                    tool_calls INTEGER NOT NULL DEFAULT 0,
+                    duration_s REAL NOT NULL DEFAULT 0,
+                    cost_usd REAL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_user_ts ON usage_events(user_id, timestamp)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_events(timestamp)")
             conn.commit()
     
     @contextmanager
@@ -88,6 +107,57 @@ class StatsTracker:
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         return cutoff.isoformat()
     
+    # ---- token accounting ---------------------------------------------------
+    def track_usage(self, user_id: str, *, model: str, api_calls: int, input_tokens: int, output_tokens: int,
+                    cache_read_tokens: int = 0, cache_write_tokens: int = 0, tool_calls: int = 0,
+                    duration_s: float = 0.0, cost_usd: Optional[float] = None) -> None:
+        """Record the token usage of one turn for one model (does not count against action limits)."""
+        with self._get_connection() as conn:
+            conn.execute(
+                "INSERT INTO usage_events (user_id, timestamp, model, api_calls, input_tokens, output_tokens, "
+                "cache_read_tokens, cache_write_tokens, tool_calls, duration_s, cost_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(user_id), self._get_timestamp(), model, int(api_calls), int(input_tokens), int(output_tokens),
+                 int(cache_read_tokens), int(cache_write_tokens), int(tool_calls), float(duration_s), cost_usd),
+            )
+            conn.commit()
+
+    def get_usage(self, user_id: Optional[str] = None, days: Optional[int] = None) -> Dict[str, Any]:
+        """Totals (and per-model split) of usage_events for one user or everyone, last N days or all time."""
+        where, params = [], []
+        if user_id is not None:
+            where.append("user_id = ?")
+            params.append(str(user_id))
+        if days is not None:
+            where.append("timestamp >= ?")
+            params.append(self._get_cutoff_timestamp(days))
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT model, COUNT(*) AS turns, SUM(api_calls) AS api_calls, SUM(input_tokens) AS input_tokens, "
+                "SUM(output_tokens) AS output_tokens, SUM(cache_read_tokens) AS cache_read_tokens, "
+                "SUM(cache_write_tokens) AS cache_write_tokens, SUM(tool_calls) AS tool_calls, SUM(cost_usd) AS cost_usd "
+                f"FROM usage_events{clause} GROUP BY model ORDER BY input_tokens DESC",
+                params,
+            ).fetchall()
+        totals = {"turns": 0, "api_calls": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
+                  "cache_write_tokens": 0, "tool_calls": 0, "cost_usd": 0.0, "models": {}}
+        for r in rows:
+            entry = {k: (r[k] or 0) for k in ("turns", "api_calls", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "tool_calls")}
+            entry["cost_usd"] = float(r["cost_usd"] or 0.0)
+            totals["models"][r["model"]] = entry
+            for k in ("api_calls", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "tool_calls", "cost_usd"):
+                totals[k] += entry[k]
+            totals["turns"] = max(totals["turns"], int(entry["turns"]))  # one turn writes one row per model
+        return totals
+
+    def get_users_ranked_by_cost(self, days: int = 30, limit: int = 20) -> List[Tuple[str, float]]:
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT user_id, SUM(cost_usd) AS cost FROM usage_events WHERE timestamp >= ? GROUP BY user_id ORDER BY cost DESC LIMIT ?",
+                (self._get_cutoff_timestamp(days), int(limit)),
+            ).fetchall()
+        return [(r["user_id"], float(r["cost"] or 0.0)) for r in rows]
+
     def track_message_received(self, user_id: str, msg_type: str) -> None:
         """
         Track a received message.

@@ -140,5 +140,8 @@ Messages API conversation, replayed as is.
   system block), token usage in the status line, `agents/subagent.py` (`run_subagent`), the `transcript`
   setting with its `/settings` menu, and the migration seed from `dialog_history.json`.
 - Deferred: server-side compaction (beta) is not used; client-side pruning + Haiku summarization covers it.
-  The expandable tool-call section inside the rich answer and task budgets remain follow-ups.
+  Task budgets remain a follow-up.
+- Shipped after PR B: the status message is a rich message edited in place (`bot/status.py`); at the end it
+  becomes the turn summary with expandable tool calls, thinking and token usage; token accounting per
+  model per turn in `usage_events` with cost estimates in `/stats`.
 - Legacy mode (`transcript.enabled` off) keeps the old context assembly untouched for one release.

@@ -56,8 +56,8 @@ def test_trace_summary_line():
         trace.start(name, {}).done("ok", ok=True)
     trace.start("run_command", {}).done("Error", ok=False)
     text = trace_summary(trace)
-    assert text.startswith("🔧 *4 tool calls in ")
-    assert "· 1 failed" in text
+    assert text.startswith("*🔧 4 tool calls in ")
+    assert "· 1 failed*" in text
     assert text.endswith(": search\\_web ×2, execute\\_python, run\\_command")
     single = ToolTrace()
     single.start("x", {}).done("ok", ok=True)
@@ -76,3 +76,18 @@ def test_rendered_trace_lines_keep_escapes_outside_entities():
     trace.start("run_command", {"command": "for ip in 1.1.1.1 8.8.8.8; do echo \"=== $ip\"; done"}).done("ok", ok=True)
     line = render_trace(trace).splitlines()[1]
     assert line.startswith("✅ `run_command` for ip in 1.1.1.1 8.8.8.8; do echo \"=== $ip\"; done · ")
+
+
+def test_trace_keeps_per_model_usage_and_result_excerpts():
+    trace = ToolTrace()
+    call = trace.start("read_file", {"filename": "a.txt"})
+    call.done("x" * 2000, ok=True)
+    assert len(call.result_excerpt) == 800 and call.result_excerpt.endswith("…")
+    assert '"filename": "a.txt"' in call.args_text
+    trace.add_usage({"input_tokens": 10, "output_tokens": 5}, model="claude-sonnet-5")
+    trace.add_usage({"input_tokens": 20, "output_tokens": 5}, model="claude-haiku-4-5")
+    assert trace.usage_by_model["claude-haiku-4-5"]["input_tokens"] == 20 and trace.input_tokens == 30
+    assert trace.cost_usd is not None and trace.cost_usd > 0
+    trace.add_thinking("  ")
+    trace.add_thinking("plan")
+    assert trace.thinking_text == "plan"
