@@ -118,10 +118,12 @@ async def test_status_falls_back_to_plain_when_rich_edit_is_rejected():
     bot = FakeBot(rich_error=TelegramBadRequest(method=_M, message="Bad Request: message can't be edited"))
     status = StatusMessage(ChatSender(bot, 42), SimpleNamespace(message_id=7), rich=True, header="💭 *Thinking...*")
     trace = make_trace()
-    await status.update(step="s", details="d", iteration=0, critique=0, trace=trace)
-    await status.update(step="s", details="d2", iteration=1, critique=0, trace=trace)
+    for i in range(4):
+        await status.update(step="s", details=f"d{i}", iteration=i, critique=0, trace=trace)
     kinds = bot.kinds()
-    assert kinds[0] == "rich" and kinds[1] == "text" and kinds[2] == "text"  # rich tried once, then plain only
+    # every rejected rich update is followed by the plain one, until rich progress is given up on
+    assert kinds.count("rich") == StatusMessage.MAX_PROGRESS_FAILURES
+    assert kinds[-1] == "text" and kinds.count("text") == 4
     assert bot.calls[1][1]["parse_mode"] == "Markdown" and "*Step:*" in bot.calls[1][1]["text"]
     assert rich.is_available() is True  # a rejected edit is not an unsupported server
 
@@ -140,3 +142,64 @@ async def test_status_with_no_message_is_a_noop():
     await status.update(step="s", details="d", iteration=0, critique=0, trace=ToolTrace())
     await status.finish(ToolTrace(), keep=True)
     await status.set_text("🛑 Stopped.")
+
+
+def test_is_not_modified_matches_both_phrasings():
+    from bot.ui import is_not_modified
+
+    assert is_not_modified(TelegramBadRequest(method=_M, message="Bad Request: message is not modified"))
+    assert is_not_modified(TelegramBadRequest(method=_M, message="Bad Request: MESSAGE_NOT_MODIFIED"))
+    assert not is_not_modified(TelegramBadRequest(method=_M, message="Bad Request: can't parse entities"))
+
+
+async def test_identical_rich_edit_is_success_and_keeps_rich_mode():
+    bot = FakeBot(rich_error=TelegramBadRequest(method=_M, message="Bad Request: MESSAGE_NOT_MODIFIED"))
+    status = StatusMessage(ChatSender(bot, 42), SimpleNamespace(message_id=7), rich=True, header="💭 *Thinking...*")
+    trace = make_trace()
+    await status.update(step="s", details="d", iteration=0, critique=0, trace=trace)
+    await status.update(step="s", details="d", iteration=0, critique=0, trace=trace)
+    assert bot.kinds() == ["rich", "rich"]  # never fell back to text
+    assert status.rich is True and status._progress_failures == 0
+
+
+async def test_rejected_progress_edit_still_gets_a_rich_summary():
+    """A refused progress payload says nothing about the summary, which is different content."""
+    bot = FakeBot(rich_error=TelegramBadRequest(method=_M, message="Bad Request: BLOCK_INVALID"))
+    status = StatusMessage(ChatSender(bot, 42), SimpleNamespace(message_id=7), rich=True, header="💭 *Thinking...*")
+    trace = make_trace()
+    for _ in range(4):
+        await status.update(step="s", details="d", iteration=0, critique=0, trace=trace)
+    kinds = bot.kinds()
+    assert kinds.count("rich") == StatusMessage.MAX_PROGRESS_FAILURES  # stops retrying rich progress
+    assert status.rich is True
+
+    bot.rich_error = None
+    await status.finish(trace, keep=True)
+    assert bot.kinds()[-1] == "rich"
+    assert bot.calls[-1][1]["rich_message"].blocks[0].text[0].text.startswith("🔧 3 tool calls")
+
+
+async def test_concurrent_updates_are_coalesced():
+    """A batch of parallel tools must not fire a burst of edits at the same message."""
+    import asyncio
+
+    class SlowBot(FakeBot):
+        async def edit_message_text(self, **kw):
+            await asyncio.sleep(0.05)
+            return await super().edit_message_text(**kw)
+
+    bot = SlowBot()
+    status = StatusMessage(ChatSender(bot, 42), SimpleNamespace(message_id=7), rich=True, header="h")
+    trace = make_trace()
+    await asyncio.gather(*(status.update(step="s", details=f"d{i}", iteration=i, critique=0, trace=trace) for i in range(7)))
+    assert len(bot.calls) == 1  # one edit in flight, the rest dropped in favour of newer state
+
+
+async def test_summary_falls_back_to_text_when_rich_summary_is_refused():
+    bot = FakeBot(rich_error=TelegramBadRequest(method=_M, message="Bad Request: BLOCK_INVALID"))
+    status = StatusMessage(ChatSender(bot, 42), SimpleNamespace(message_id=7), rich=True, header="h")
+    trace = make_trace()
+    await status.finish(trace, keep=True)
+    assert bot.kinds() == ["rich", "text"]
+    assert bot.calls[1][1]["text"].startswith("*🔧 3 tool calls")
+    assert status.rich is False

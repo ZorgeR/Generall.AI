@@ -10,6 +10,7 @@ old Bot API server or client still gets a readable status.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
@@ -27,7 +28,7 @@ from aiogram.types import (
 )
 
 from bot import rich as rich_render
-from bot.ui import escape_markdown
+from bot.ui import escape_markdown, is_not_modified
 
 logger = logging.getLogger(__name__)
 
@@ -217,56 +218,81 @@ def summary_blocks(trace) -> list:
 
 # ---- the message -------------------------------------------------------------
 class StatusMessage:
-    """Wraps the status message of one turn; rich edits with a plain-text fallback."""
+    """Wraps the status message of one turn; rich edits with a plain-text fallback.
+
+    Progress updates are coalesced: while one edit is in flight the next one is
+    dropped, because the update after it carries newer state anyway. That keeps a
+    batch of parallel tool calls from firing a burst of edits at the same message.
+    """
+
+    MAX_PROGRESS_FAILURES = 2  # stop paying for rejected progress edits; finish() still tries
 
     def __init__(self, sender, message, *, rich: bool, header: str) -> None:
         self.sender = sender
         self.message = message
         self.header = header
         self.rich = bool(rich and message is not None and rich_render.is_available())
+        self._lock = asyncio.Lock()
+        self._progress_failures = 0
 
-    async def _edit_rich(self, blocks: list) -> bool:
+    async def _edit_rich(self, blocks: list, *, progress: bool) -> bool:
+        """True when the message now shows ``blocks``. Never raises."""
         if not self.rich or self.message is None:
             return False
         try:
             await self.sender.bot.edit_message_text(
                 chat_id=self.sender.chat_id, message_id=self.message.message_id, rich_message=InputRichMessage(blocks=blocks)
             )
+            self._progress_failures = 0
             return True
         except TelegramNotFound as e:
+            # The server does not know sendRichMessage/rich edits at all.
             rich_render.mark_unavailable(str(e))
             self.rich = False
         except TelegramBadRequest as e:
-            if "not modified" in str(e).lower():
+            if is_not_modified(e):
                 return True
-            logger.info("Rich status edit rejected (%s); using the plain status from now on", e)
-            self.rich = False
+            if progress:
+                # This particular progress payload was refused; the summary is a
+                # different message, so do not give up on rich for the whole turn.
+                self._progress_failures += 1
+                logger.warning("Rich status update rejected (%s); plain text for this update", e)
+            else:
+                logger.warning("Rich status summary rejected (%s); falling back to text", e)
+                self.rich = False
         except Exception as e:  # noqa: BLE001 - network hiccup: keep rich mode, skip this update
             logger.warning("Rich status edit failed: %s", e)
         return False
 
     async def update(self, *, step, details, iteration, critique, trace, quota: str = "") -> None:
-        if self.message is None:
-            return
-        if self.rich and await self._edit_rich(progress_blocks(self.header, quota, step, details, iteration, critique, trace)):
-            return
-        await self.sender.edit_text(self.message, progress_text(self.header, quota, step, details, iteration, critique, trace), fallback="strip")
+        if self.message is None or self._lock.locked():
+            return  # an edit is already in flight; the next update carries newer state
+        async with self._lock:
+            if self.rich and self._progress_failures < self.MAX_PROGRESS_FAILURES:
+                if await self._edit_rich(progress_blocks(self.header, quota, step, details, iteration, critique, trace), progress=True):
+                    return
+            await self.sender.edit_text(
+                self.message, progress_text(self.header, quota, step, details, iteration, critique, trace), fallback="strip"
+            )
 
     async def finish(self, trace, *, keep: bool) -> None:
         """End of a successful turn: shorten into the summary, or delete."""
         if self.message is None:
             return
-        if not keep:
-            await self.sender.delete([self.message])
-            return
-        if self.rich and await self._edit_rich(summary_blocks(trace)):
-            return
-        await self.sender.edit_text(self.message, trace_summary(trace), fallback="strip")
+        async with self._lock:
+            if not keep:
+                await self.sender.delete([self.message])
+                return
+            # Always worth one rich attempt: the summary differs from every progress payload.
+            if self.rich and await self._edit_rich(summary_blocks(trace), progress=False):
+                return
+            await self.sender.edit_text(self.message, trace_summary(trace), fallback="strip")
 
     async def set_text(self, text: str) -> None:
         """Stopped / error notices."""
         if self.message is None:
             return
-        if self.rich and await self._edit_rich([InputRichBlockParagraph(text=text)]):
-            return
-        await self.sender.edit_text(self.message, text, markdown=False)
+        async with self._lock:
+            if self.rich and await self._edit_rich([InputRichBlockParagraph(text=text)], progress=False):
+                return
+            await self.sender.edit_text(self.message, text, markdown=False)

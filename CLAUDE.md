@@ -353,8 +353,10 @@ writes it, but the model can create the file with `create_file` and it will then
   `entrypoint.sh` does `exec "$@"`. Pipes, `&&`, redirects, `cd`, globs need `bash -c '...'` or
   `run_shell_script`. Exception: when a persisted package list exists the command is embedded in a
   bash prelude script, so shell syntax suddenly works.
-- Python code is written to `data/<uid>/temp_code.py`, shell scripts to `temp_script.sh`, and a
-  package-install prelude to `temp_setup.sh`; all are deleted after the run.
+- Python code is written to `data/<uid>/temp_code_<hex>.py`, shell scripts to `temp_script_<hex>.sh`,
+  and a package-install prelude to `temp_setup_<hex>.sh`; all are deleted after the run. The name is
+  unique per call (`ContainerManager._workspace_file`) because a batch of tool calls runs concurrently:
+  fixed names were overwritten by whichever call wrote last, so every container ran that one command.
 - Persistence across runs is by re-installing: `installed_packages.txt` (apt, via `sudo apt-get`)
   and `installed_python_packages.txt` (`pip install --user`) are replayed before **every** sandboxed
   call (including `delete_file`/`create_directory`/`memory_search`) when present, which forces
@@ -399,7 +401,8 @@ data/
     videos/                         video_<uuid>.mp4 (uploads), veo3_*.mp4
     audio/, documents/              uploads under their ORIGINAL file names (documents lowercased) → re-uploads overwrite
     downloads/                      download_file / download_webpage(save_to_file) / create_zip_archive outputs
-    installed_packages.txt, installed_python_packages.txt, temp_code.py, temp_script.sh, temp_setup.sh
+    installed_packages.txt, installed_python_packages.txt, temp_code_<hex>.py, temp_script_<hex>.sh,
+  temp_setup_<hex>.sh (unique per call: tool calls of one message run concurrently)
 temp_audio/ temp_photos/ temp_docs/   transient, cwd-relative, deleted in finally
 app/voice/config.json               MUTATED at runtime by /voice (per-user voice id). Lives inside the image, not data/.
 ```
@@ -597,6 +600,11 @@ name; a new temp dir needs its own `.gitignore` line).
 - `agents/main.py` appends `RICH_FORMATTING_GUIDE` / `LEGACY_FORMATTING_GUIDE` to every system
   prompt after selection; the `generall-ai-*` prompts still say nothing about formatting themselves.
 - Roadmap and design notes for transcript / prompt caching / subagents: `docs/agent-roadmap.md`.
+- Status edits are coalesced: while one edit is in flight further progress updates are dropped (the
+  next one carries newer state), so a batch of parallel tool calls cannot storm the message. A rejected
+  rich *progress* payload only disables rich progress after `MAX_PROGRESS_FAILURES`; `finish()` always
+  tries the rich summary once, because it is different content. "not modified" (either phrasing, see
+  `bot.ui.is_not_modified`) counts as success.
 - The status message starts as a plain legacy-Markdown message (handlers create it before the settings are
   read) and becomes rich on its first `editMessageText(rich_message=...)`; if that edit is rejected the
   status stays plain for the turn (`StatusMessage.rich = False`). Headers like `💭 *Thinking...*` are

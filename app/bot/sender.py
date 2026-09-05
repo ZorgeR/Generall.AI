@@ -24,7 +24,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramNotFound
 from aiogram.types import BufferedInputFile, FSInputFile, InlineKeyboardMarkup, Message, ReactionTypeEmoji
 
 from bot import rich as rich_render
-from bot.ui import LEGACY_MARKDOWN, strip_markdown
+from bot.ui import LEGACY_MARKDOWN, is_not_modified, strip_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -134,14 +134,14 @@ class ChatSender:
                         chat_id=self.chat_id, message_id=message.message_id, text=text, parse_mode=LEGACY_MARKDOWN
                     )
                 except TelegramBadRequest as e:
-                    if "message is not modified" in str(e).lower():
+                    if is_not_modified(e):
                         return None
                     logger.warning("Markdown edit rejected (%s); sending %s text", e, fallback)
                     if fallback == "strip":
                         text = strip_markdown(text)
             return await self.bot.edit_message_text(chat_id=self.chat_id, message_id=message.message_id, text=text)
         except TelegramBadRequest as e:
-            if "message is not modified" not in str(e).lower():
+            if not is_not_modified(e):
                 logger.warning("edit_text failed: %s", e)
             return None
         except Exception as e:  # noqa: BLE001
