@@ -23,11 +23,49 @@ from bot.queue import JobContext
 from bot.sender import ChatSender
 from bot.settings import UserSettings
 from bot.streaming import create_streaming_callback
+from bot.ui import escape_markdown
 from models import ANTHROPIC_MODEL
 
 logger = logging.getLogger(__name__)
 
 THINKING = "💭 *Thinking...*"
+TRACE_LINES = 10  # most recent tool calls shown in the status message
+
+
+def _fmt_seconds(seconds: float) -> str:
+    return f"{seconds:.1f}s" if seconds < 10 else f"{int(round(seconds))}s"
+
+
+def render_trace(trace, limit: int = TRACE_LINES) -> str:
+    """The tool-call list shown under the status header (legacy Markdown)."""
+    from agents.trace import describe_args
+
+    if not trace or not trace.calls:
+        return ""
+    lines = [f"🔧 *Tools* ({trace.total}, {_fmt_seconds(trace.elapsed)})"]
+    calls = trace.calls[-limit:]
+    if len(trace.calls) > limit:
+        lines.append(f"… {len(trace.calls) - limit} earlier")
+    for call in calls:
+        icon = "⏳" if call.running else ("✅" if call.ok else "❌")
+        indent = "  " * call.depth
+        args = describe_args(call.args)
+        line = f"{indent}{icon} `{call.name}`"
+        if args:
+            line += f" {escape_markdown(args)}"
+        if not call.running:
+            line += f" · {_fmt_seconds(call.duration)}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def trace_summary(trace) -> str:
+    """One line kept above the answer once the turn is over."""
+    parts = ", ".join(f"{name} ×{n}" if n > 1 else name for name, n in trace.counts_by_name())
+    text = f"🔧 *{trace.total} tool call{'s' if trace.total != 1 else ''} in {_fmt_seconds(trace.elapsed)}*"
+    if trace.errors:
+        text += f" · {trace.errors} failed"
+    return f"{text}: {escape_markdown(parts)}"
 
 
 @dataclass
@@ -103,6 +141,10 @@ async def run_turn(
     if status is None:
         status = await sender.send_text(header)
 
+    from agents.trace import ToolTrace
+
+    trace = ToolTrace()
+
     async def update_status(step: str, details: str, iteration: Any, critique: Any) -> None:
         if step == "saving":
             iteration, critique = "final", "end"
@@ -111,10 +153,13 @@ async def run_turn(
         text = (
             f"{header}\n- - - - \n{usage_line(user_id, limit)}"
             f"📝 *Step:* _{str(step).replace('_', '-')}_\n"
-            f"📋 *Details:* _{str(details).replace('_', '-')}_\n"
+            f"📋 *Details:* _{escape_markdown(str(details))}_\n"
             f"🔄 *Iterations:* _{iteration}_\n"
             f"🎯 *Critiques:* _{critique}_"
         )
+        trace_text = render_trace(trace)
+        if trace_text:
+            text += "\n\n" + trace_text
         await sender.edit_text(status, text)
 
     on_text_chunk = create_streaming_callback(bot, chat_id, thread_id, rich=rich_enabled)
@@ -129,7 +174,7 @@ async def run_turn(
             user_settings=user_settings,
             message_thread_id=thread_id,
         )
-        response, messages = await agent.generate_response(prompt, update_status, on_text_chunk=on_text_chunk)
+        response, messages = await agent.generate_response(prompt, update_status, on_text_chunk=on_text_chunk, trace=trace)
         stats_tracker.track_message_sent(user_id)
 
         if speak and response:
@@ -144,7 +189,13 @@ async def run_turn(
                 except Exception as e:  # noqa: BLE001
                     logger.error("Error sending voice reply: %s", e)
 
-        await sender.send_markdown(response, edit=status)
+        if rich_enabled and trace.calls:
+            # Keep the status message as a compact record of the tool calls above the answer
+            # (a rich answer cannot replace it anyway); without tool calls it is deleted as before.
+            await sender.send_markdown(response)
+            await sender.edit_text(status, trace_summary(trace))
+        else:
+            await sender.send_markdown(response, edit=status)
         await send_reasoning_file(sender, messages, settings, caption=reasoning_caption)
         return TurnResult(response=response, messages=messages)
     except asyncio.CancelledError:

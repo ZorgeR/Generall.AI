@@ -276,7 +276,39 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         else:
             return f"Unknown tool: {tool_name}"
 
-    async def generate_response(self, messages: list = [], prompt: str = "", system_role: str = "", question: str = "", update_status=None, dialog_history: list = [], user_settings: dict = None, on_text_chunk=None) -> str:
+    async def run_tool_batch(self, tool_blocks: list, trace=None, refresh=None) -> list:
+        """Run every tool_use block of one assistant message concurrently.
+
+        Returns the tool_result blocks in the same order as ``tool_blocks`` (the API wants
+        all results of a message back in ONE user message). A tool that raises becomes a
+        tool_result with ``is_error`` instead of aborting the turn. ``trace`` (agents.trace
+        .ToolTrace) records each call; ``refresh(details)`` re-renders the status message
+        as calls finish.
+        """
+
+        async def run_one(block):
+            call = trace.start(block.name, block.input) if trace is not None else None
+            try:
+                text = str(await self.execute_tool(block.name, block.input))
+                is_error = False
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - one broken tool must not kill the turn
+                text, is_error = f"Error executing {block.name}: {e}", True
+            if call is not None:
+                # tools report their own failures as "Error ..." text; show those as failed too
+                call.done(text, ok=not is_error and not text.lstrip().lower().startswith("error"))
+            print(f"Tool name: {block.name}\nTool result: {text}")
+            if refresh is not None:
+                await refresh(f"{block.name} finished")
+            result = {"type": "tool_result", "tool_use_id": block.id, "content": text}
+            if is_error:
+                result["is_error"] = True
+            return result
+
+        return list(await asyncio.gather(*(run_one(block) for block in tool_blocks)))
+
+    async def generate_response(self, messages: list = [], prompt: str = "", system_role: str = "", question: str = "", update_status=None, dialog_history: list = [], user_settings: dict = None, on_text_chunk=None, trace=None) -> str:
         processed_messages = []
         system = system_role
         
@@ -397,25 +429,20 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                     "content": cleaned_content
                 })
                 
-                # Execute tools and build proper tool_result blocks
-                tool_result_blocks = []
-                for content_block in response.content:
-                    if content_block.type == 'tool_use':
-                        cicles += 1
-                        print(f"\nExecuting tool: {content_block.name}")
-                        if update_status:
-                            last_step_category = "executing-tools"
-                            await update_status(step=last_step_category, details="Tool name: " + content_block.name, iteration=cicles, critique=critique)
-                        last_tool_name = content_block.name
-                        result = await self.execute_tool(content_block.name, content_block.input)
-                        print(f"Tool name: {content_block.name}\nTool result: {result}")
-                        
-                        tool_result_blocks.append({
-                            "type": "tool_result",
-                            "tool_use_id": content_block.id,
-                            "content": str(result)
-                        })
-                
+                # Execute every requested tool concurrently and build proper tool_result blocks
+                tool_blocks = [b for b in response.content if b.type == 'tool_use']
+                cicles += len(tool_blocks)
+                last_tool_name = tool_blocks[-1].name if tool_blocks else last_tool_name
+                last_step_category = "executing-tools"
+                print(f"\nExecuting {len(tool_blocks)} tool(s): {', '.join(b.name for b in tool_blocks)}")
+
+                async def refresh(details: str) -> None:
+                    if update_status:
+                        await update_status(step=last_step_category, details=details, iteration=cicles, critique=critique)
+
+                await refresh("Running: " + ", ".join(b.name for b in tool_blocks))
+                tool_result_blocks = await self.run_tool_batch(tool_blocks, trace=trace, refresh=refresh)
+
                 # Send tool results back as proper tool_result message
                 processed_messages.append({
                     "role": "user",
@@ -753,7 +780,7 @@ User message: {question}"""
             pass
         return None
 
-    async def generate_response(self, question: str, update_status=None, on_text_chunk=None) -> str:
+    async def generate_response(self, question: str, update_status=None, on_text_chunk=None, trace=None) -> str:
         print(f"\n=== Starting Chain of Thought for Question: {question} ===")
         print(f"Thread ID: {self.thread_id or 'None (no topic)'}")
         question = f"Message received time in UTC+0: {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}\n\n{question}"
@@ -1206,7 +1233,8 @@ You have been asked to answer a query given sources. Consider the following when
                 update_status=update_status,
                 dialog_history=dialog_history,
                 user_settings=self.user_settings,
-                on_text_chunk=on_text_chunk
+                on_text_chunk=on_text_chunk,
+                trace=trace,
             )
             # remove first 2 messages from thread_messages array
             thread_messages = thread_messages[2:]

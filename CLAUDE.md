@@ -74,6 +74,7 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
     embeddings.py           ConversationEmbeddings: OpenAI ada-002 + FAISS per user
     system_tools.py         SystemTools: apt/pip/service/network tools — NOT wired into the agent
     paths.py                resolve_under(): safe resolution of model-supplied paths inside data/<uid>
+    trace.py                ToolTrace/ToolCall: per-turn record of tool calls (rendered by bot/agent_runner)
     __init__.py             imports SystemTools; the package object is what the patcher needs
   secure_container/
     main.py                 initialize_secure_containers() / cleanup_containers()
@@ -215,7 +216,8 @@ messages.on_text (bot/handlers/messages.py)      [AuthMiddleware(check_limits=Tr
 worker → _run_text → bot.agent_runner.run_turn(bot, user_id, chat_id, prompt, thread_id, reply_to, ctx, limit)
     sender = ChatSender(bot, chat_id, thread_id, reply_to_message_id)
     UserSettings(user_id).save() (persists backfilled defaults) → user_settings dict
-    status = sender.send_text("💭 *Thinking...*"); update_status() edits it (usage line, step, iteration)
+    status = sender.send_text("💭 *Thinking...*"); update_status() edits it (usage line, step, iteration,
+    then the tool trace: last 10 calls with ⏳/✅/❌, args preview, duration)
     agents.ChainOfThoughtAgent(model=models.ANTHROPIC_MODEL, user_id, sender, user_settings, thread_id)
     .generate_response(question, update_status, on_text_chunk)
        ├─ question = "Message received time in UTC+0: <ts>\n\n" + text     (stored everywhere in this form)
@@ -231,8 +233,9 @@ worker → _run_text → bot.agent_runner.run_turn(bot, user_id, chat_id, prompt
        ├─ AgentAnthropic.generate_response: for iteration in range(tools.max_iteration):
        │     messages.stream (always) (model, system, tools=get_tools_schema(), output_config.effort, adaptive thinking,
        │        max_tokens 64000 deep / 16000 light; thinking tokens count against it)
-       │     stop_reason == tool_use AND tools.enabled AND cicles < max → run each block,
-       │        append ONE user msg of tool_results, continue      (cicles counts tool_use BLOCKS)
+       │     stop_reason == tool_use AND tools.enabled AND cicles < max → run ALL blocks concurrently
+       │        (run_tool_batch: asyncio.gather, is_error on exceptions, trace + status refresh per call),
+       │        append ONE user msg of tool_results in block order, continue (cicles counts tool_use BLOCKS)
        │     gate fails → tool_use blocks silently dropped, text goes on to critique/judge/return
        │     else optional critique (OpenAI gpt-5.6-terra) / judge (Claude yes/no) re-prompts → return
        │     for-loop exhausted → forced "SYSTEM NOTICE" final call without tools (same thinking mode)
@@ -240,7 +243,8 @@ worker → _run_text → bot.agent_runner.run_turn(bot, user_id, chat_id, prompt
           (a failed Haiku summary is logged, the answer is still returned) → (response, messages)
     stats_tracker.track_message_sent
     speak? → ElevenLabs TTS (to_thread) → sender.send_voice
-    sender.send_markdown(response, edit=status)
+    sender.send_markdown(response, edit=status)   (rich mode with tool calls: send without edit, then
+       the status is edited into the one-line trace summary and kept above the answer)
        rich (default): split ≤32 KB → sendRichMessage(markdown) → on parse error rich HTML
        (telegramify-markdown) → on 404 sticky MarkdownV2 → legacy Markdown → raw; status deleted after
        legacy (rich_messages off): ≤4000 edit status in place; else new chunks + notice
@@ -296,7 +300,10 @@ Wiring is entirely manual in `agents/main.py` and there is no registry:
 
 Tool results are `str(result)` into a single `tool_result` block; return strings. Every call is
 recorded via `stats_tracker.track_tool_used` (and counts against the user's action limit). Tool
-schemas are sent to the API even when `tools.enabled` is false.
+schemas are sent to the API even when `tools.enabled` is false. All `tool_use` blocks of one
+assistant message run **concurrently** (`AgentAnthropic.run_tool_batch`), so a provider must be safe
+to call from several tasks at once; an exception becomes a `tool_result` with `is_error: true`,
+a returned string starting with "Error" is passed through as content (shown ❌ in the trace).
 
 Effective tool list as the model sees it (after patching):
 
@@ -535,8 +542,9 @@ name; a new temp dir needs its own `.gitignore` line).
 
 ## Known pitfalls (do not "fix" casually without checking callers)
 
-- The iteration counter `cicles` counts individual `tool_use` blocks while the `for` loop counts
-  API round-trips; hitting either limit drops pending tool calls and may return an incomplete
+- The iteration counter `cicles` counts individual `tool_use` blocks (a whole batch is added at once,
+  so it can overshoot the limit by one batch) while the `for` loop counts API round-trips; hitting
+  either limit drops pending tool calls and may return an incomplete
   "Let me check..." text. The forced final call has no tools (thinking mode as the loop).
 - `judge_response` treats exceptions as "yes" (accept); `critique_response` treats them as "no rewrite".
 - `perplexity-*` system prompts contain hard-coded 2025 dates and "You are Perplexity" identity text;
@@ -557,6 +565,7 @@ name; a new temp dir needs its own `.gitignore` line).
   `TelegramBadRequest` on a rich send is treated as "this text", not "this server".
 - `agents/main.py` appends `RICH_FORMATTING_GUIDE` / `LEGACY_FORMATTING_GUIDE` to every system
   prompt after selection; the `generall-ai-*` prompts still say nothing about formatting themselves.
+- Roadmap for the transcript / prompt caching / subagents work: `docs/agent-roadmap.md`.
 
 ## How to make common changes
 
