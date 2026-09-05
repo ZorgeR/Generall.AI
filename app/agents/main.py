@@ -47,13 +47,14 @@ Your reply is delivered as a rich Telegram message rendered from GitHub-flavored
 - tables in pipe syntax with a header row (up to 20 columns) for comparisons, options, schedules and any tabular data
 - fenced code blocks with a language tag for code, commands and program output
 - > block quotes, horizontal rules (---) and LaTeX math ($...$ inline, $$...$$ display)
+- pictures inline: ![caption](images/generated_x.jpg) shows the image at that spot. Works for any image or video file in your workspace (images you generated, photos the user sent, downloads; use the path a tool or the message gave you) and for https image URLs. Images a tool already delivered as a file need not be repeated; embed a picture when it belongs next to the text (a report, a comparison, before/after).
 Keep short conversational replies plain: no headings or tables unless they genuinely help. Do not write raw HTML.
 </formatting>
 """
 
 LEGACY_FORMATTING_GUIDE = """
 <formatting>
-Your reply is delivered as a plain Telegram message where only *bold*, _italic_ and `code` render. Headings, tables and nested lists do not render, so present tabular data as short lists.
+Your reply is delivered as a plain Telegram message where only *bold*, _italic_ and `code` render. Headings, tables and nested lists do not render, so present tabular data as short lists. An image referenced as ![caption](images/x.jpg) (a file in your workspace) is sent as a separate photo after the text.
 </formatting>
 """
 

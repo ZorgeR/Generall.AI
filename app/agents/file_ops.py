@@ -27,9 +27,22 @@ class FileOperations:
         # Create downloads directory
         self.downloads_path = self.base_path / "downloads"
         self.downloads_path.mkdir(parents=True, exist_ok=True)
-        
         # Initialize S3 client
         self.s3_client = self._init_s3_client()
+
+    def _path(self, user_path: str, *, must_exist: bool = False, fallback_dirs=()) -> Path:
+        """Resolve a model-supplied path inside the user's workspace or raise ValueError.
+
+        Accepts workspace-relative paths, the sandbox spelling (/home/runner/workspace/...)
+        and the host spelling (data/<uid>/...); ``..`` and absolute paths elsewhere are refused.
+        """
+        from agents.paths import resolve_under
+
+        resolved = resolve_under(self.base_path, user_path, must_exist=must_exist, fallback_dirs=fallback_dirs)
+        if resolved is None:
+            what = "does not exist or is outside your workspace" if must_exist else "is outside your workspace"
+            raise ValueError(f"Path '{user_path}' {what}")
+        return resolved
 
     def _init_s3_client(self):
         """Initialize S3 client with environment variables"""
@@ -289,13 +302,13 @@ class FileOperations:
         """List files in the user's data directory with pagination"""
         MAX_FILES = 200
         try:
-            target = self.base_path / path if path != "." else self.base_path
+            target = self._path(path, must_exist=True) if path != "." else self.base_path.resolve()
             if not target.exists():
                 return f"Directory not found: {path}"
             
             all_items = []
             for item in sorted(target.iterdir(), key=lambda x: (x.is_file(), x.name)):
-                rel = str(item.relative_to(self.base_path))
+                rel = str(item.relative_to(self.base_path.resolve()))
                 if item.is_file():
                     all_items.append(f"{rel} ({item.stat().st_size} bytes)")
                 elif item.is_dir():
@@ -323,7 +336,7 @@ class FileOperations:
     def create_text_file(self, filename: str, content: str) -> str:
         """Create a text file with given content"""
         try:
-            file_path = self.base_path / filename
+            file_path = self._path(filename)
             # Ensure the parent directories exist
             file_path.parent.mkdir(parents=True, exist_ok=True)
             
@@ -339,10 +352,7 @@ class FileOperations:
     def read_text_file(self, filename: str) -> str:
         """Read content from a text file"""
         try:
-            file_path = self.base_path / filename
-            if not file_path.exists():
-                return f"File {filename} does not exist"
-            
+            file_path = self._path(filename, must_exist=True, fallback_dirs=("downloads", "documents"))
             with open(file_path, 'r', encoding='utf-8') as f:
                 return f.read()
         except Exception as e:
@@ -381,6 +391,9 @@ class FileOperations:
                 if not filename:
                     return "Could not determine filename from URL"
 
+            filename = Path(filename).name  # no directories: everything lands in downloads/
+            if not filename:
+                return "Could not determine filename from URL"
             file_path = self.downloads_path / filename
             
             # Download the file
@@ -454,9 +467,7 @@ class FileOperations:
                 return "S3 client not initialized. Check your S3 credentials in environment variables."
 
             # Get the full local file path
-            local_file_path = self.base_path / file_path
-            if not local_file_path.exists():
-                return f"File {file_path} does not exist"
+            local_file_path = self._path(file_path, must_exist=True, fallback_dirs=("downloads",))
             
             if not local_file_path.is_file():
                 return f"{file_path} is not a file"
@@ -510,9 +521,7 @@ class FileOperations:
             # Check if all files exist first
             files_to_zip = []
             for file_path in files:
-                full_path = self.base_path / file_path
-                if not full_path.exists():
-                    return f"File {file_path} does not exist"
+                full_path = self._path(file_path, must_exist=True, fallback_dirs=("downloads",))
                 if not full_path.is_file():
                     return f"{file_path} is not a file"
                 files_to_zip.append((full_path, file_path))  # Store both full path and relative path
@@ -545,13 +554,9 @@ Files included:
         """Send a file to a user via Telegram"""
         try:
 
-            if Path(self.base_path / file_path).exists():
-                full_path = str(Path(self.base_path / file_path))
-            elif Path(self.downloads_path / file_path).exists():
-                full_path = str(Path(self.downloads_path / file_path))
-            elif Path(file_path).exists():
-                full_path = str(Path(file_path))
-            else:
+            try:
+                full_path = str(self._path(file_path, must_exist=True, fallback_dirs=("downloads", "images", "videos", "documents")))
+            except ValueError:
                 return f"File {file_path} not found"
 
             print(f"Sending file to user {self.user_id}: {full_path}")

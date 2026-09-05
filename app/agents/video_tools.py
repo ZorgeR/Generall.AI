@@ -236,14 +236,11 @@ class VideoTools:
     # helpers (every Veo call runs in a worker thread; polling is async)
     # ------------------------------------------------------------------
     def _resolve_path(self, path: str) -> Path:
-        """Resolve a model-supplied path: raw, then relative to the user dir, then by basename in images/videos."""
-        p = Path(path)
-        if p.exists():
-            return p
-        for candidate in (self.base_path / path, self.base_path / "images" / p.name, self.base_path / "videos" / p.name):
-            if candidate.exists():
-                return candidate
-        return p
+        """Resolve a model-supplied path inside the user's workspace: relative, sandbox or host spelling, or a bare name in images/videos/downloads."""
+        from agents.paths import resolve_under
+
+        resolved = resolve_under(self.base_path, path, fallback_dirs=("images", "videos", "downloads"))
+        return resolved if resolved is not None else self.videos_path / Path(path).name
 
     async def _notify(self, text: str) -> None:
         try:

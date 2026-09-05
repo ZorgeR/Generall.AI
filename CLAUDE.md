@@ -36,7 +36,8 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
     queue.py                QueueManager / Job / JobContext: per-user FIFO workers, deadline, /cancel, global cap
     sender.py               ChatSender: the one object handlers AND tools use to send text/media/reactions;
                             send_markdown renders LLM answers as rich messages with tiered fallback
-    rich.py                 rich-message helpers: split/convert (telegramify-markdown), sticky "unsupported" flag
+    rich.py                 rich-message helpers: split/convert (telegramify-markdown), inline media extraction,
+                            sticky "unsupported" flag
     agent_runner.py         run_turn(): builds ChainOfThoughtAgent, status edits, streaming, voice reply, answer, reasoning file
     media.py                Whisper transcription, Claude/GPT image+document description, video frames, TTS, ffmpeg setup
     streaming.py            throttled draft streaming (rich drafts + <tg-thinking> block, plain draft fallback)
@@ -70,6 +71,7 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
                             schedule_reminder, send file from content
     embeddings.py           ConversationEmbeddings: OpenAI ada-002 + FAISS per user
     system_tools.py         SystemTools: apt/pip/service/network tools — NOT wired into the agent
+    paths.py                resolve_under(): safe resolution of model-supplied paths inside data/<uid>
     __init__.py             imports SystemTools; the package object is what the patcher needs
   secure_container/
     main.py                 initialize_secure_containers() / cleanup_containers()
@@ -297,7 +299,7 @@ Effective tool list as the model sees it (after patching):
 
 | Provider | Tools | Runs where |
 |---|---|---|
-| FileOperations | `list_files`, `create_file`, `read_file`, `download_file`, `download_webpage`, `upload_to_s3`, `create_zip_archive`, `send_file_path_to_user_via_telegram` | bot process, `data/<uid>/ / <arg>` via pathlib (an absolute arg escapes the base; no traversal check) |
+| FileOperations | `list_files`, `create_file`, `read_file`, `download_file`, `download_webpage`, `upload_to_s3`, `create_zip_archive`, `send_file_path_to_user_via_telegram` | bot process, paths resolved under `data/<uid>/` by `agents/paths.resolve_under` (escapes refused) |
 | FileOperations | `create_directory`, `delete_file` | sandbox container (a fresh `docker run` per call), paths relative to `data/<uid>` |
 | SearchTools | `search_web` (Tavily), `deep_research` (Perplexity `sonar*`) | bot process, worker thread |
 | SearchTools | `memory_search` | sandbox; `*.txt` only |
@@ -489,7 +491,11 @@ name; a new temp dir needs its own `.gitignore` line).
   rich mode (`ChatSender(rich=True)`, set by `run_turn` from `rich_messages.enabled`) sends
   `InputRichMessage(markdown=...)`; a plain message cannot be edited into a rich one, so the status
   message is deleted instead of edited. `bot/rich.py` owns the tiers and the process-wide
-  "server has no rich support" flag (`rich.reset()` in tests). Escape
+  "server has no rich support" flag (`rich.reset()` in tests). Markdown images in an answer
+  (`![alt](images/x.jpg)` or an https URL) are resolved by `rich.extract_media` against the sender's
+  `media_root` (`data/<uid>`): in the rich tier they are uploaded with the message as `tg://photo?id=`
+  media, in every other tier the caption stays in the text and the file is sent as a photo/video after
+  it. Unresolvable images (missing, outside the workspace, too big) are replaced by their caption. Escape
   user/LLM text embedded in Markdown with `bot.ui.escape_markdown`. Invite/admin replies use HTML.
 - Keyboards: `InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=..., callback_data=...)]])`
   (keyword arguments are mandatory in aiogram).
@@ -521,11 +527,12 @@ name; a new temp dir needs its own `.gitignore` line).
 - `judge_response` treats exceptions as "yes" (accept); `critique_response` treats them as "no rewrite".
 - `perplexity-*` system prompts contain hard-coded 2025 dates and "You are Perplexity" identity text;
   the `generall-ai-*` prompts say "20 previous messages" regardless of `dialog_history.size`.
-- File tools join under `data/<uid>/` with pathlib, so an absolute path escapes the base;
-  `send_file_path_to_user_via_telegram`, `_resolve_image_path` and the video tools' `_resolve_path`
-  accept any existing path on the bot filesystem.
-- `check_reminders` scans every directory under `data/` each tick regardless of authorization; a
-  blocked user's pending agent reminder still runs.
+- Model-supplied paths go through `agents/paths.py:resolve_under` (file, image and video tools): it
+  refuses anything outside `data/<uid>/` (`..`, absolute paths, symlinks out), understands the sandbox
+  spelling `/home/runner/workspace/...` and the host spelling `data/<uid>/...`, and falls back to a bare
+  file name in images/videos/downloads. Sandbox-patched tools rely on the container mount instead.
+- `check_reminders` skips users `auth.is_authorized` rejects (blocked or removed); their reminders
+  stay `pending` and fire once they are authorized again.
 - Cancellation cannot interrupt a tool call already inside a worker thread; the turn only ends when
   that call returns (sandbox containers run to their own timeout).
 - `stats_ui.py` imports `stats` at module level, so importing `bot.handlers` creates `data/stats.db`

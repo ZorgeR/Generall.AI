@@ -375,7 +375,8 @@ async def _run_images(
         )
         prompt = (
             f"{caption}\n\nUser attached {len(descriptions)} image(s) to this message. "
-            f"Here are the details about each image from Anthropic and OpenAI:\n\n{details}"
+            f"Here are the details about each image from Anthropic and OpenAI:\n\n{details}\n\n"
+            "The images are saved in your workspace; to show one inline in your answer, write ![caption](images/<file name>)."
         )
         await sender.edit_text(status, "🤖 *Processing...*")
         result = await run_turn(
