@@ -436,6 +436,9 @@ parentheses; see the commented block in `.env.example`):
 5. Use `/reminders` to manage your reminders
 6. Use `/cancel` to stop the task that is running and clear your queue
 7. Use `/settings` → Rich Messages to switch between rich and classic formatting
+8. While the agent works, the "Thinking…" message lists the tool calls as they run (✅ done, ⏳ running,
+   ❌ failed, with a short argument preview and duration); tools requested together run in parallel.
+   With rich messages on, a one-line summary of the tool calls stays above the answer.
 
 ### ⏳ Queues and isolation
 
