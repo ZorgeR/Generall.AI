@@ -277,19 +277,32 @@ class ImageTools:
     # helpers
     # ------------------------------------------------------------------
     def _resolve_image_path(self, image_path: str) -> Path:
-        """Resolve an image path, trying multiple base directories as fallback."""
-        p = Path(image_path)
-        if p.exists():
-            return p
-        # Try relative to the user's base data directory
-        relative_to_base = self.base_path / image_path
-        if relative_to_base.exists():
-            return relative_to_base
-        # Try relative to the user's images directory (bare filename)
-        relative_to_images = self.images_path / Path(image_path).name
-        if relative_to_images.exists():
-            return relative_to_images
-        return p  # Return original so the caller can report the correct path
+        """Resolve a model-supplied path inside the user's workspace (never outside it).
+
+        Accepts a path relative to the workspace, the sandbox spelling
+        (/home/runner/workspace/...), the host spelling (data/<uid>/...) or a bare
+        file name looked up in images/, downloads/ and documents/. Returns a
+        non-existent path under images/ when nothing matches, so callers report
+        "does not exist" instead of touching a file elsewhere on the host.
+        """
+        from agents.paths import resolve_under
+
+        resolved = resolve_under(self.base_path, image_path, fallback_dirs=("images", "downloads", "documents"))
+        return resolved if resolved is not None else self.images_path / Path(image_path).name
+
+    def _inline_hint(self, paths) -> str:
+        """Tell the model how to show the saved image(s) inline in its answer."""
+        rels: list[str] = []
+        base = self.base_path.resolve()
+        for raw in paths:
+            try:
+                rels.append(Path(raw).resolve().relative_to(base).as_posix())
+            except ValueError:
+                rels.append(f"images/{Path(raw).name}")
+        if not rels:
+            return ""
+        examples = ", ".join(f"![caption]({r})" for r in rels[:3])
+        return f"The user already received the file(s). To also show an image inline in your answer, write {examples}\n"
 
     def _prepare_image_for_edit(self, image_path: Path, temp_paths: List[Path]) -> Path:
         """Create a temporary JPEG for resized or non-JPEG edit inputs."""
@@ -441,7 +454,7 @@ class ImageTools:
             with open(image_path, "wb") as f:
                 f.write(base64.b64decode(response.data[0].b64_json))
             await self._send_image(image_path, caption)
-            return f"Image generated and sent to user via telegram successfully.\n\nFile also saved to: {image_path}\n\n"
+            return f"Image generated and sent to user via telegram successfully.\n\nFile also saved to: {image_path}\n\n" + self._inline_hint([image_path])
         except Exception as e:
             return f"Error generating image: {str(e)}"
 
@@ -521,7 +534,7 @@ class ImageTools:
 
             if all_saved_paths:
                 paths_str = "\n".join(f"  - {p}" for p in all_saved_paths)
-                result_message += f"Edited {len(all_saved_paths)} image(s) and sent to user.\nSaved to:\n{paths_str}\nImage transformation completed successfully.\n"
+                result_message += f"Edited {len(all_saved_paths)} image(s) and sent to user.\nSaved to:\n{paths_str}\nImage transformation completed successfully.\n" + self._inline_hint(all_saved_paths)
             else:
                 result_message += "Warning: No transformed image was generated. The model only provided text response.\n"
             return result_message
@@ -558,7 +571,7 @@ class ImageTools:
             with open(image_path, "wb") as f:
                 f.write(base64.b64decode(result.data[0].b64_json))
             await self._send_image(image_path, caption)
-            return f"Image edited with GPT Image 2 and saved to: {image_path} and sent to user.\nImage editing completed successfully.\n"
+            return f"Image edited with GPT Image 2 and saved to: {image_path} and sent to user.\nImage editing completed successfully.\n" + self._inline_hint([image_path])
         except Exception as e:
             return f"Error editing image with GPT Image 2: {str(e)}"
 
@@ -587,7 +600,7 @@ class ImageTools:
 
             if all_saved_paths:
                 paths_str = "\n".join(f"  - {p}" for p in all_saved_paths)
-                result_message += f"Generated {len(all_saved_paths)} image(s) and sent to user.\nSaved to:\n{paths_str}\nImage generation completed successfully.\n"
+                result_message += f"Generated {len(all_saved_paths)} image(s) and sent to user.\nSaved to:\n{paths_str}\nImage generation completed successfully.\n" + self._inline_hint(all_saved_paths)
             else:
                 result_message += "Warning: No image was generated. The model only provided text response.\n"
             return result_message
@@ -611,7 +624,7 @@ class ImageTools:
                 await self._send_image(image_path, f"{caption} (variant {idx + 1}/{n})" if n > 1 else caption)
                 saved_paths.append(str(image_path))
             paths_str = "\n".join(f"  - {p}" for p in saved_paths)
-            return f"Generated {len(saved_paths)} image(s) with GPT Image 2 and sent to user.\nSaved to:\n{paths_str}\nImage generation completed successfully.\n"
+            return f"Generated {len(saved_paths)} image(s) with GPT Image 2 and sent to user.\nSaved to:\n{paths_str}\nImage generation completed successfully.\n" + self._inline_hint(saved_paths)
         except Exception as e:
             return f"Error generating image with GPT Image 2: {str(e)}"
 
@@ -661,7 +674,7 @@ class ImageTools:
 
             if all_saved_paths:
                 paths_str = "\n".join(f"  - {p}" for p in all_saved_paths)
-                result_message += f"Composed {len(all_saved_paths)} image(s) and sent to user.\nSaved to:\n{paths_str}\nImage composition completed successfully.\n"
+                result_message += f"Composed {len(all_saved_paths)} image(s) and sent to user.\nSaved to:\n{paths_str}\nImage composition completed successfully.\n" + self._inline_hint(all_saved_paths)
             else:
                 result_message += "Warning: No composed image was generated. The model only provided text response.\n"
             return result_message

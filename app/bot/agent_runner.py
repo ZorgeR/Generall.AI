@@ -18,7 +18,7 @@ from aiogram import Bot
 from aiogram.types import Message
 
 from bot.limits import usage_line
-from bot.media import synthesize_speech
+from bot.media import synthesize_speech, user_dir
 from bot.queue import JobContext
 from bot.sender import ChatSender
 from bot.settings import UserSettings
@@ -96,7 +96,7 @@ async def run_turn(
     settings.save()  # persist any defaults added since the file was written
     user_settings: dict[str, Any] = settings.as_dict()
     rich_enabled = bool(settings.get("rich_messages", "enabled"))
-    sender = ChatSender(bot, chat_id, thread_id, reply_to_message_id, rich=rich_enabled)
+    sender = ChatSender(bot, chat_id, thread_id, reply_to_message_id, rich=rich_enabled, media_root=user_dir(user_id))
 
     await sender.typing()
     if status is None:

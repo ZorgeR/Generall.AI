@@ -27,8 +27,11 @@ import html as _html
 import logging
 import re
 
+from dataclasses import dataclass, field
+from pathlib import Path
+
 from aiogram.exceptions import TelegramAPIError, TelegramNotFound
-from aiogram.types import InputRichMessage
+from aiogram.types import FSInputFile, InputMediaPhoto, InputMediaVideo, InputRichMessage, InputRichMessageMedia
 
 logger = logging.getLogger(__name__)
 
@@ -139,9 +142,9 @@ def halve_markdown(text: str) -> list[str]:
     return [p for p in (left, right) if p] or [text]
 
 
-def markdown_message(text: str) -> InputRichMessage:
-    """Tier 1 payload: Telegram parses the Markdown itself."""
-    return InputRichMessage(markdown=text)
+def markdown_message(text: str, media: list[InputRichMessageMedia] | None = None) -> InputRichMessage:
+    """Tier 1 payload: Telegram parses the Markdown itself; ``media`` backs its tg:// links."""
+    return InputRichMessage(markdown=text, media=media)
 
 
 def html_message(text: str) -> InputRichMessage | None:
@@ -205,3 +208,109 @@ _MDV2_ESCAPE = re.compile(r"\\([_*\[\]()~`>#+\-=|{}.!\\])")
 
 def unescape_markdown_v2(text: str) -> str:
     return _MDV2_ESCAPE.sub(r"\1", text)
+
+
+# ---- inline media -----------------------------------------------------------
+# The model embeds pictures with normal Markdown image syntax: ``![caption](images/x.jpg)``
+# for a file in the user's workspace or an https URL. In a rich message the file is
+# uploaded with the message and referenced as ``tg://photo?id=…`` so it renders inline;
+# the other tiers strip the image from the text and send it as a separate photo.
+PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v"}
+MEDIA_FALLBACK_DIRS = ("images", "videos", "downloads", "documents")
+MAX_INLINE_MEDIA = 10
+MAX_PHOTO_BYTES = 10 * 1024 * 1024
+MAX_VIDEO_BYTES = 50 * 1024 * 1024
+
+_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(\s*<?([^\s()<>]+)>?(?:\s+(?:\"[^\"]*\"|'[^']*'))?\s*\)")
+
+
+@dataclass
+class MediaItem:
+    id: str
+    kind: str  # "photo" | "video"
+    source: str | Path  # https URL or local file
+    alt: str = ""
+
+    def input_media(self) -> InputMediaPhoto | InputMediaVideo:
+        media = self.source if isinstance(self.source, str) else FSInputFile(str(self.source))
+        return InputMediaPhoto(media=media) if self.kind == "photo" else InputMediaVideo(media=media)
+
+
+@dataclass
+class MediaExtraction:
+    rich_text: str  # image links rewritten to tg://photo?id=… / tg://video?id=…
+    plain_text: str  # image syntax replaced by its caption (for non-rich tiers)
+    items: list[MediaItem] = field(default_factory=list)
+
+    def input_media(self) -> list[InputRichMessageMedia] | None:
+        if not self.items:
+            return None
+        return [InputRichMessageMedia(id=item.id, media=item.input_media()) for item in self.items]
+
+
+def _media_kind(name: str) -> str | None:
+    ext = Path(name.split("?", 1)[0]).suffix.lower()
+    if ext in PHOTO_EXTENSIONS:
+        return "photo"
+    if ext in VIDEO_EXTENSIONS:
+        return "video"
+    return None
+
+
+def _resolve_local(target: str, media_root: Path | None) -> tuple[str, Path] | None:
+    if media_root is None:
+        return None
+    kind = _media_kind(target)
+    if kind is None:
+        return None
+    from agents.paths import resolve_under
+
+    path = resolve_under(media_root, target, fallback_dirs=MEDIA_FALLBACK_DIRS)
+    if path is None or not path.is_file():
+        return None
+    limit = MAX_PHOTO_BYTES if kind == "photo" else MAX_VIDEO_BYTES
+    if path.stat().st_size > limit:
+        return None
+    return kind, path
+
+
+def extract_media(text: str, media_root: Path | None) -> MediaExtraction:
+    """Find Markdown images in ``text`` and turn the ones we can send into media items.
+
+    Unresolvable images (missing file, outside the workspace, unsupported type,
+    too big) are replaced by their caption so Telegram never sees a broken link.
+    """
+    items: list[MediaItem] = []
+    rich_parts: list[str] = []
+    plain_parts: list[str] = []
+    pos = 0
+    for m in _IMAGE_RE.finditer(text):
+        alt, target = m.group(1).strip(), m.group(2).strip()
+        rich_parts.append(text[pos:m.start()])
+        plain_parts.append(text[pos:m.start()])
+        pos = m.end()
+        resolved: tuple[str, str | Path] | None = None
+        if target.startswith(("http://", "https://")):
+            kind = _media_kind(target)
+            if kind:
+                resolved = (kind, target)
+        elif target.startswith("tg://"):
+            rich_parts.append(m.group(0))  # already a Telegram media link: leave it alone
+            plain_parts.append(alt)
+            continue
+        else:
+            resolved = _resolve_local(target, media_root)
+        if resolved is None or len(items) >= MAX_INLINE_MEDIA:
+            fallback = alt or (target if target.startswith("http") else Path(target).name)
+            rich_parts.append(fallback)
+            plain_parts.append(fallback)
+            continue
+        kind, source = resolved
+        item = MediaItem(id=f"m{len(items) + 1}", kind=kind, source=source, alt=alt)
+        items.append(item)
+        rich_parts.append(f"![{alt}](tg://{kind}?id={item.id})")
+        plain_parts.append(alt)
+    rich_parts.append(text[pos:])
+    plain_parts.append(text[pos:])
+    return MediaExtraction(rich_text="".join(rich_parts), plain_text="".join(plain_parts), items=items)

@@ -14,6 +14,7 @@ from functools import partial
 from aiogram import Bot
 
 from bot.agent_runner import run_turn
+from bot.auth import auth
 from bot.config import config
 from bot.limits import check_user_limits
 from bot.queue import Job, JobContext, QueueManager
@@ -70,6 +71,8 @@ async def check_reminders(bot: Bot, queue: QueueManager) -> None:
             chat_id = int(user_id)
         except ValueError:
             continue  # not a chat directory
+        if not auth.is_authorized(user_id):
+            continue  # blocked or no longer authorized: their reminders stay pending
         due_user: list[dict] = []
         due_agent: list[dict] = []
 

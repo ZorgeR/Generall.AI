@@ -205,6 +205,10 @@ headings, tables, task lists, fenced code blocks, block quotes and LaTeX math, r
 the Telegram app. While the answer is being generated (with `STREAMING_ENABLED=true`) the draft
 streams with live formatting and the model's thinking shows in Telegram's "Thinking…" block.
 
+Pictures can appear inside the answer: the agent writes `![caption](images/photo.jpg)` for an image
+it generated, a photo you sent or a downloaded file (or an https image URL) and it renders inline at
+that spot; with rich messages off the picture is sent as a separate photo after the text.
+
 Rich messages are on by default and can be switched per chat in `/settings` → **Rich Messages**.
 Turn them off if your Telegram app is too old and shows "unsupported message"; the bot then uses
 classic Markdown formatting. If the Bot API server (the `telegram-bot-api` sidecar) is older than

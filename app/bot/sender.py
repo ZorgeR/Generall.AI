@@ -84,12 +84,16 @@ class ChatSender:
         thread_id: int | None = None,
         reply_to_message_id: int | None = None,
         rich: bool = False,
+        media_root: str | Path | None = None,
     ) -> None:
         self.bot = bot
         self.chat_id = int(chat_id)
         self.thread_id = thread_id
         self.reply_to_message_id = reply_to_message_id
         self.rich = rich  # render LLM answers as rich messages (per-user setting)
+        # The user's workspace (data/<uid>): Markdown images in an answer that point to a
+        # file inside it are sent along (inline in rich mode, as photos otherwise).
+        self.media_root = Path(media_root) if media_root else None
 
     def _kw(self) -> dict:
         kw: dict = {"chat_id": self.chat_id}
@@ -150,7 +154,10 @@ class ChatSender:
         if not text or not text.strip():
             text = "🤖 *No response from the AI.*"
         if not (self.rich and rich_render.is_available()):
-            return await self._send_legacy(text, edit)
+            extraction = rich_render.extract_media(text, self.media_root)
+            sent = await self._send_legacy(extraction.plain_text, edit)
+            sent.extend(await self._send_media_items(extraction.items))
+            return sent
         sent: list[Message] = []
         for chunk in rich_render.split_markdown(text):
             sent.extend(await self._send_formatted(chunk))
@@ -159,33 +166,40 @@ class ChatSender:
         return sent
 
     async def _send_formatted(self, chunk: str, depth: int = 0) -> list[Message]:
-        """Send one ≤32 KB piece with the best tier this server and text allow."""
+        """Send one ≤32 KB piece with the best tier this server and text allow.
+
+        Inline images ride along only in the rich-Markdown tier; every other tier
+        sends the caption in the text and the pictures as separate photos after it.
+        """
+        extraction = rich_render.extract_media(chunk, self.media_root)
         if rich_render.is_available():
             try:
-                return [await self.bot.send_rich_message(rich_message=rich_render.markdown_message(chunk), **self._kw())]
+                payload = rich_render.markdown_message(extraction.rich_text, extraction.input_media())
+                return [await self.bot.send_rich_message(rich_message=payload, **self._kw())]
             except (TelegramBadRequest, TelegramNotFound) as e:
                 if rich_render.is_unsupported_error(e):
                     rich_render.mark_unavailable(str(e))
                 else:
                     logger.info("Rich Markdown rejected (%s); retrying as rich HTML", e)
-                    sent = await self._send_rich_html(chunk, depth)
+                    sent = await self._send_rich_html(chunk, extraction, depth)
                     if sent:
                         return sent
-        sent = await self._send_markdown_v2(chunk)
-        if sent:
-            return sent
-        return [await self.send_text(piece) for piece in split_text_intelligently(chunk)]
+        sent = await self._send_markdown_v2(extraction.plain_text)
+        if not sent:
+            sent = [await self.send_text(piece) for piece in split_text_intelligently(extraction.plain_text)]
+        sent.extend(await self._send_media_items(extraction.items))
+        return sent
 
-    async def _send_rich_html(self, chunk: str, depth: int) -> list[Message]:
+    async def _send_rich_html(self, chunk: str, extraction, depth: int) -> list[Message]:
         try:
-            payload = rich_render.html_message(chunk)
+            payload = rich_render.html_message(extraction.plain_text)
         except Exception as e:  # noqa: BLE001 - optional dependency / parser failure
             logger.debug("Rich HTML conversion failed: %s", e)
             return []
         if payload is None:
             # Too big for one HTML message: retry the halves separately (each may
             # still pass as plain rich Markdown), bounded so a pathological text ends.
-            halves = rich_render.halve_markdown(chunk)
+            halves = rich_render.halve_markdown(chunk)  # the original text keeps its image syntax
             if len(halves) < 2 or depth >= 6:
                 return []
             sent: list[Message] = []
@@ -193,13 +207,30 @@ class ChatSender:
                 sent.extend(await self._send_formatted(half, depth + 1))
             return sent
         try:
-            return [await self.bot.send_rich_message(rich_message=payload, **self._kw())]
+            sent = [await self.bot.send_rich_message(rich_message=payload, **self._kw())]
         except (TelegramBadRequest, TelegramNotFound) as e:
             if rich_render.is_unsupported_error(e):
                 rich_render.mark_unavailable(str(e))
             else:
                 logger.warning("Rich HTML rejected too (%s); falling back to MarkdownV2", e)
             return []
+        sent.extend(await self._send_media_items(extraction.items))
+        return sent
+
+    async def _send_media_items(self, items) -> list[Message]:
+        """Deliver inline media as ordinary photos/videos (non-rich tiers). Never raises."""
+        sent: list[Message] = []
+        for item in items:
+            source = item.source if isinstance(item.source, str) else FSInputFile(str(item.source))
+            caption = _caption(item.alt) or None
+            try:
+                if item.kind == "video":
+                    sent.append(await self.bot.send_video(video=source, caption=caption, **self._kw()))
+                else:
+                    sent.append(await self.bot.send_photo(photo=source, caption=caption, **self._kw()))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Could not send inline media %s: %s", item.source, e)
+        return sent
 
     async def _send_markdown_v2(self, chunk: str) -> list[Message]:
         try:
