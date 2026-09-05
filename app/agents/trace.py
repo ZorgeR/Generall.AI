@@ -64,9 +64,46 @@ class ToolCall:
 
 
 @dataclass
+class TurnBudget:
+    """Tool-call allowance of one turn, shared by the main agent and its subagents."""
+
+    limit: int
+    used: int = 0
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.limit - self.used)
+
+    def take(self, n: int = 1) -> None:
+        self.used += n
+
+
+@dataclass
 class ToolTrace:
     calls: list[ToolCall] = field(default_factory=list)
     started: float = field(default_factory=time.monotonic)
+    api_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+
+    def add_usage(self, usage) -> None:
+        """Accumulate a Messages API ``usage`` object (attributes or dict)."""
+        if usage is None:
+            return
+        get = usage.get if isinstance(usage, dict) else (lambda k, d=None: getattr(usage, k, d))
+        self.api_calls += 1
+        self.input_tokens += int(get("input_tokens") or 0)
+        self.output_tokens += int(get("output_tokens") or 0)
+        self.cache_read_tokens += int(get("cache_read_input_tokens") or 0)
+        self.cache_write_tokens += int(get("cache_creation_input_tokens") or 0)
+
+    @property
+    def cache_hit_ratio(self) -> float:
+        """Share of prompt tokens served from cache (0..1)."""
+        total = self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
+        return self.cache_read_tokens / total if total else 0.0
 
     def start(self, name: str, args: dict | None = None, depth: int = 0) -> ToolCall:
         call = ToolCall(name=name, args=dict(args or {}), depth=depth)

@@ -52,14 +52,22 @@ GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bo
 
 ## ⚙️ How memory work
 
-![schema](static/schema/genai_tg_schema_v2.png)
-
-- Control all memory aspect
-- Long term memory
-- Short term memory
-- Previous conversation full thinking context
-- RAG automated memory
-- Summarization memory
+- **Transcript (short-term)**: every chat (or forum topic) has one real conversation transcript, including the
+  tool calls the agent made, what they returned and its reasoning. It is replayed as is on every turn, so the
+  agent remembers what it looked up and did. Large tool results are capped, results older than a few turns
+  are cleared, and when the transcript grows past the configured context size the oldest part is summarized.
+  A new forum topic starts with an empty transcript. Settings: `/settings` → Transcript.
+- **Long-term memory**: after each turn a short summary and an embedding of the exchange are stored. On the next
+  question the most recent summaries and the semantically closest earlier conversations are injected as a
+  memory block, so the agent can recall things from weeks ago even after the transcript was pruned.
+- **Files**: everything the agent downloads, generates or writes lives in the user's workspace on disk and
+  persists between sessions (`data/<chat id>/`).
+- **Subagents**: for large research or independent sub-tasks the agent can delegate to subagents with a fresh
+  context (`run_subagent`), several in parallel, and merge their reports; their tool calls appear indented in
+  the status message and count against the turn's tool budget.
+- **Prompt caching**: the static prompt and the transcript prefix are cached on the API side, so long
+  conversations and tool-heavy turns cost a fraction of the uncached price; the status message shows the
+  cached share per turn.
 
 ## 🚀 Example Scenarios
 

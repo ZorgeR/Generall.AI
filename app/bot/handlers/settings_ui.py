@@ -6,7 +6,7 @@ the UI behaves the same; authorization is handled by ``AuthMiddleware``.
 
 callback_data scheme: ``settings_<token>[_<action>[_<value>]]`` where
 ``<token>`` is a short name (summarization, dialog, reasoning, memory,
-critique, judge, tools, semantic, thinking, rich, main), parsed with a plain
+critique, judge, tools, semantic, thinking, rich, transcript, main), parsed with a plain
 ``split("_")``. ``settings_system_prompt`` and
 ``settings_system_prompt_set_<type>`` are special-cased because of the
 underscore in their token.
@@ -31,6 +31,8 @@ SYSTEM_PROMPT_SET_PREFIX = "settings_system_prompt_set_"
 SIZE_CHOICES = (1, 5, 10, 20, 30, 50)
 ITERATION_CHOICES = (1, 2, 3, 5, 7, 10, 20, 30, 50, 70, 80, 100, 150, 200, 300)
 SEMANTIC_MAX_RESULTS_CHOICES = (1, 3, 5, 7, 10, 15, 20)
+CONTEXT_TOKEN_CHOICES = (50000, 100000, 120000, 150000, 200000, 300000)
+KEEP_TOOL_RESULTS_CHOICES = (1, 2, 3, 5, 10)
 
 SYSTEM_PROMPT_DESCRIPTIONS: dict[str, str] = {
     "generall-ai-v2": "Generall.AI v2 system prompt.",
@@ -116,6 +118,9 @@ def _overview(user_settings: UserSettings) -> tuple[str, InlineKeyboardMarkup]:
         f"{_mark(s.get('thinking', 'enabled'))}\n"
         "✨ *Rich Messages*: "
         f"{_mark(s.get('rich_messages', 'enabled'))}\n"
+        "🧵 *Transcript*: "
+        f"{_mark(s.get('transcript', 'enabled'))} | "
+        f"Context: {int(s.get('transcript', 'max_context_tokens') or 0) // 1000}k\n"
         "🧩 *System Prompt*: "
         f"{s.get('system_prompt', 'type')}\n\n"
         "Select a setting to configure:"
@@ -145,6 +150,7 @@ def _overview(user_settings: UserSettings) -> tuple[str, InlineKeyboardMarkup]:
             ],
             [
                 InlineKeyboardButton(text="✨ Rich Messages", callback_data="settings_rich"),
+                InlineKeyboardButton(text="🧵 Transcript", callback_data="settings_transcript"),
             ],
         ]
     )
@@ -320,6 +326,28 @@ async def settings_button(callback: CallbackQuery) -> None:
             current = user_settings.get("rich_messages", "enabled")
             user_settings.set("rich_messages", not current, "enabled")
         await show_rich_menu(message, user_settings)
+
+    elif category == "transcript":
+        if action == "toggle":
+            current = user_settings.get("transcript", "enabled")
+            user_settings.set("transcript", not current, "enabled")
+            await show_transcript_menu(message, user_settings)
+        elif action == "ctx":
+            number = _to_int(value)
+            if number is not None:
+                user_settings.set("transcript", user_settings.validate_context_tokens(number), "max_context_tokens")
+                await show_transcript_menu(message, user_settings)
+            else:
+                await show_transcript_choice_menu(message, "ctx")
+        elif action == "keep":
+            number = _to_int(value)
+            if number is not None:
+                user_settings.set("transcript", max(0, min(50, number)), "keep_tool_results_turns")
+                await show_transcript_menu(message, user_settings)
+            else:
+                await show_transcript_choice_menu(message, "keep")
+        else:
+            await show_transcript_menu(message, user_settings)
 
     else:
         logger.debug("Ignoring unknown settings callback: %s", data)
@@ -560,6 +588,45 @@ async def show_rich_menu(message: Message, user_settings: UserSettings) -> None:
         "classic Markdown formatting.",
         keyboard,
     )
+
+
+async def show_transcript_menu(message: Message, user_settings: UserSettings) -> None:
+    """Show transcript (conversation memory) settings menu."""
+    enabled = user_settings.get("transcript", "enabled")
+    ctx = int(user_settings.get("transcript", "max_context_tokens") or 0)
+    keep = user_settings.get("transcript", "keep_tool_results_turns")
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [_toggle_button(enabled, "settings_transcript_toggle")],
+            [InlineKeyboardButton(text=f"🧮 Max context: {ctx // 1000}k tokens", callback_data="settings_transcript_ctx")],
+            [InlineKeyboardButton(text=f"🧹 Keep tool results: {keep} turns", callback_data="settings_transcript_keep")],
+            [_back_button()],
+        ]
+    )
+    await edit_md(
+        message,
+        "*Transcript Settings*\n\n"
+        f"Status: {_status(enabled)}\n\n"
+        "The bot keeps one real conversation transcript per chat\n"
+        "(or forum topic), including tool calls and their results,\n"
+        "so it remembers what it looked up and did. Older tool results\n"
+        "are cleared and the oldest turns summarized when the transcript\n"
+        "grows past the max context. With Transcript off the classic\n"
+        "dialog history / reasoning context memory is used instead.",
+        keyboard,
+    )
+
+
+async def show_transcript_choice_menu(message: Message, kind: str) -> None:
+    if kind == "ctx":
+        rows = [[InlineKeyboardButton(text=f"{v // 1000}k", callback_data=f"settings_transcript_ctx_{v}") for v in CONTEXT_TOKEN_CHOICES[:3]],
+                [InlineKeyboardButton(text=f"{v // 1000}k", callback_data=f"settings_transcript_ctx_{v}") for v in CONTEXT_TOKEN_CHOICES[3:]]]
+        title = "*Max context (tokens)*\n\nHow large the transcript may grow before it is pruned:"
+    else:
+        rows = _choice_rows(KEEP_TOOL_RESULTS_CHOICES, "settings_transcript_keep_")
+        title = "*Keep tool results*\n\nTool results of the last N turns are kept in full;\nolder ones are cleared to save context:"
+    rows.append([_back_button("settings_transcript")])
+    await edit_md(message, title, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 async def show_system_prompt_menu(message: Message, user_settings: UserSettings) -> None:

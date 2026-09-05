@@ -1,6 +1,6 @@
 # Agent architecture roadmap
 
-Status: PR A in progress, PR B planned. Written 2026-09-05 after the aiogram port (#4),
+Status: PR A shipped (#8); PR B implemented (transcript, caching, subagents), see the notes at the end. Written 2026-09-05 after the aiogram port (#4),
 rich messages (#5, #6) and the model consolidation (#7).
 
 ## Why
@@ -131,3 +131,14 @@ Messages API conversation, replayed as is.
 - Tool results can be huge (web pages, command output); the per-result cap in the transcript is
   mandatory.
 - Server-side compaction is a beta; the client-side fallback must be tested independently.
+
+## Implementation notes (PR B)
+
+- Shipped: `agents/transcript.py` (store, cap/clear/summarize pruning, seeding), transcript mode in
+  `ChainOfThoughtAgent._generate_with_transcript`, the cache-friendly request layout in
+  `AgentAnthropic` (`_request_messages`, top-level automatic `cache_control`, explicit breakpoint on the
+  system block), token usage in the status line, `agents/subagent.py` (`run_subagent`), the `transcript`
+  setting with its `/settings` menu, and the migration seed from `dialog_history.json`.
+- Deferred: server-side compaction (beta) is not used; client-side pruning + Haiku summarization covers it.
+  The expandable tool-call section inside the rich answer and task budgets remain follow-ups.
+- Legacy mode (`transcript.enabled` off) keeps the old context assembly untouched for one release.

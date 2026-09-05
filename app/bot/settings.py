@@ -23,11 +23,15 @@ DEFAULT_SETTINGS: dict[str, dict[str, Any]] = {
     "thinking": {"enabled": True},
     "system_prompt": {"type": "generall-ai-v2"},
     "rich_messages": {"enabled": True},
+    # One real conversation transcript per chat/topic (tool calls and results included).
+    # When on, dialog_history and reasoning_context are ignored; summaries still feed the memory block.
+    "transcript": {"enabled": True, "max_context_tokens": 120000, "keep_tool_results_turns": 3, "max_tool_result_chars": 20000},
 }
 
 SYSTEM_PROMPT_TYPES = ("generall-ai-v2", "generall-ai-v1", "perplexity-deep-research", "perplexity-r1")
 
 SIZE_MIN, SIZE_MAX = 1, 50
+CONTEXT_TOKENS_MIN, CONTEXT_TOKENS_MAX = 20000, 400000
 ITERATION_MIN, ITERATION_MAX = 1, 300
 SEMANTIC_MIN, SEMANTIC_MAX = 1, 20
 
@@ -97,3 +101,7 @@ class UserSettings:
     @staticmethod
     def validate_semantic_max_results(max_results: int) -> int:
         return max(SEMANTIC_MIN, min(SEMANTIC_MAX, int(max_results)))
+
+    @staticmethod
+    def validate_context_tokens(tokens: int) -> int:
+        return max(CONTEXT_TOKENS_MIN, min(CONTEXT_TOKENS_MAX, int(tokens)))

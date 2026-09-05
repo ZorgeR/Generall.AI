@@ -36,6 +36,21 @@ def _fmt_seconds(seconds: float) -> str:
     return f"{seconds:.1f}s" if seconds < 10 else f"{int(round(seconds))}s"
 
 
+def _fmt_tokens(n: int) -> str:
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
+def usage_text(trace) -> str:
+    """Token usage of the turn so far, with the share served from the prompt cache."""
+    if not trace or not trace.api_calls:
+        return ""
+    prompt = trace.input_tokens + trace.cache_read_tokens + trace.cache_write_tokens
+    text = f"🧮 {trace.api_calls} call{'s' if trace.api_calls != 1 else ''} · in {_fmt_tokens(prompt)}"
+    if trace.cache_read_tokens:
+        text += f" ({int(round(trace.cache_hit_ratio * 100))}% cached)"
+    return text + f" · out {_fmt_tokens(trace.output_tokens)}"
+
+
 def render_trace(trace, limit: int = TRACE_LINES) -> str:
     """The tool-call list shown under the status header (legacy Markdown)."""
     from agents.trace import describe_args
@@ -65,7 +80,9 @@ def trace_summary(trace) -> str:
     text = f"🔧 *{trace.total} tool call{'s' if trace.total != 1 else ''} in {_fmt_seconds(trace.elapsed)}*"
     if trace.errors:
         text += f" · {trace.errors} failed"
-    return f"{text}: {escape_markdown(parts)}"
+    text = f"{text}: {escape_markdown(parts)}"
+    usage = usage_text(trace)
+    return f"{text}\n{usage}" if usage else text
 
 
 @dataclass
@@ -160,6 +177,9 @@ async def run_turn(
         trace_text = render_trace(trace)
         if trace_text:
             text += "\n\n" + trace_text
+        usage = usage_text(trace)
+        if usage:
+            text += "\n" + usage
         await sender.edit_text(status, text)
 
     on_text_chunk = create_streaming_callback(bot, chat_id, thread_id, rich=rich_enabled)
