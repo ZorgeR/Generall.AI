@@ -8,18 +8,19 @@ from botocore.client import Config
 from dotenv import load_dotenv
 import zipfile
 from datetime import datetime
-import telegram
 import asyncio
 
 load_dotenv()
 
-# Initialize Telegram bot
-telegram_bot = telegram.Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
-
 class FileOperations:
-    def __init__(self, user_id: str, telegram_update: telegram.Update):
+    def __init__(self, user_id: str, sender=None):
+        """
+        Args:
+            user_id: chat id of the user as a string
+            sender: bot.sender.ChatSender bound to the user's chat (used to send files)
+        """
         self.user_id = user_id
-        self.telegram_update = telegram_update
+        self.sender = sender
         self.base_path = Path("./data") / str(user_id)
         # Create base directory if it doesn't exist
         self.base_path.mkdir(parents=True, exist_ok=True)
@@ -234,36 +235,45 @@ class FileOperations:
         ]
 
     async def execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
-        """Execute a tool by name with given arguments"""
+        """Execute a tool by name with given arguments.
+
+        Every file/network operation below is synchronous (and create_directory/delete_file
+        are patched at startup to run a Docker container), so they are executed in a worker
+        thread to keep the bot's event loop free for other users.
+        """
         if tool_name == "list_files":
-            return self.list_directory(
+            return await asyncio.to_thread(
+                self.list_directory,
                 tool_args.get("path", "."),
                 tool_args.get("page", 1)
             )
         elif tool_name == "create_file":
-            return self.create_text_file(tool_args["filename"], tool_args["content"])
+            return await asyncio.to_thread(self.create_text_file, tool_args["filename"], tool_args["content"])
         elif tool_name == "read_file":
-            return self.read_text_file(tool_args["filename"])
+            return await asyncio.to_thread(self.read_text_file, tool_args["filename"])
         elif tool_name == "create_directory":
-            return self.create_directory(tool_args["dirname"])
+            return await asyncio.to_thread(self.create_directory, tool_args["dirname"])
         elif tool_name == "delete_file":
-            return self.delete_file(tool_args["filename"])
+            return await asyncio.to_thread(self.delete_file, tool_args["filename"])
         elif tool_name == "download_file":
-            return self.download_file(tool_args["url"], tool_args.get("filename"))
+            return await asyncio.to_thread(self.download_file, tool_args["url"], tool_args.get("filename"))
         elif tool_name == "download_webpage":
-            return self.download_webpage(
+            return await asyncio.to_thread(
+                self.download_webpage,
                 tool_args["url"],
                 tool_args.get("save_to_file", False),
                 tool_args.get("filename"),
                 tool_args.get("max_chars", 5000)
             )
         elif tool_name == "upload_to_s3":
-            return self.upload_to_s3(
+            return await asyncio.to_thread(
+                self.upload_to_s3,
                 tool_args["file_path"],
                 tool_args.get("s3_path")
             )
         elif tool_name == "create_zip_archive":
-            return self.create_zip_archive(
+            return await asyncio.to_thread(
+                self.create_zip_archive,
                 tool_args["files"],
                 tool_args.get("archive_name")
             )
@@ -374,7 +384,7 @@ class FileOperations:
             file_path = self.downloads_path / filename
             
             # Download the file
-            response = requests.get(url, stream=True)
+            response = requests.get(url, stream=True, timeout=(10, 120))
             response.raise_for_status()  # Raise an error for bad status codes
             
             # Save the file
@@ -395,7 +405,7 @@ class FileOperations:
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
             }
-            response = requests.get(url, headers=headers)
+            response = requests.get(url, headers=headers, timeout=(10, 60))
             response.raise_for_status()
 
             # Parse with BeautifulSoup
@@ -548,12 +558,10 @@ Files included:
 
             if not Path(full_path).exists():
                 return f"Error: File {file_path} does not exist"
-            
-            with open(full_path, 'rb') as file:
-                await self.telegram_update.message.reply_document(
-                    document=file,
-                    caption=caption
-                )
+
+            if self.sender is None:
+                return "Error: no chat sender available in this context"
+            await self.sender.send_document(full_path, caption=caption or "Here is your file")
 
             return f"Successfully sent file {file_path} to chat ID {self.user_id}.\n"
             

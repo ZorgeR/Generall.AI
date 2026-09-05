@@ -1,3 +1,5 @@
+import asyncio
+import logging
 from openai import OpenAI
 import os
 from typing import Dict, Any, List
@@ -6,7 +8,6 @@ from pathlib import Path
 import math
 import uuid
 import base64
-import telegram
 from google import genai
 from google.genai import types
 import PIL.Image
@@ -14,11 +15,17 @@ import PIL.ImageOps
 from image_utils import JPEG_FORMATS
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 openai_api_key = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=openai_api_key)
 google_api_key = os.getenv("GOOGLE_API_KEY")
 genai_client = genai.Client(api_key=google_api_key)
 max_image_resolution_edit = int(os.getenv("MAX_IMAGE_RESOLUTION_EDIT", "4096") or "4096")
+
+GEMINI_FLASH = "gemini-3.1-flash-image-preview"
+GEMINI_PRO = "gemini-3-pro-image-preview"
+GPT_IMAGE = "gpt-image-2-2026-04-21"
 
 class TextPart:
     def __init__(self, text):
@@ -30,9 +37,14 @@ class InlineDataPart:
         self.data = bytes(data)
 
 class ImageTools:
-    def __init__(self, user_id: str, telegram_update: telegram.Update):
+    def __init__(self, user_id: str, sender):
+        """
+        Args:
+            user_id: chat id of the user as a string
+            sender: bot.sender.ChatSender bound to the user's chat
+        """
         self.user_id = user_id
-        self.telegram_update = telegram_update
+        self.sender = sender
         self.base_path = Path("./data") / str(user_id)
         # Create base directory if it doesn't exist
         self.base_path.mkdir(parents=True, exist_ok=True)
@@ -261,6 +273,9 @@ class ImageTools:
             }
         ]
 
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
     def _resolve_image_path(self, image_path: str) -> Path:
         """Resolve an image path, trying multiple base directories as fallback."""
         p = Path(image_path)
@@ -301,7 +316,7 @@ class ImageTools:
                     img.save(temp_path, format="JPEG", quality=90, optimize=True)
                     return temp_path
         except Exception as e:
-            print(f"Failed to prepare image for edit, using original file: {e}")
+            logger.warning("Failed to prepare image for edit, using original file: %s", e)
 
         return image_path
 
@@ -311,11 +326,11 @@ class ImageTools:
                 if temp_path.exists():
                     temp_path.unlink()
             except Exception as e:
-                print(f"Failed to remove temporary image {temp_path}: {e}")
+                logger.warning("Failed to remove temporary image %s: %s", temp_path, e)
 
     def _resolve_gpt_size(self, resolution: str, aspect_ratio: str) -> str:
         """Translate resolution + aspect_ratio into a GPT Image 2 pixel size string.
-        
+
         GPT Image 2 constraints: edges multiples of 16, max edge 3840,
         ratio ≤ 3:1, total pixels 655,360..8,294,400.
         """
@@ -346,6 +361,53 @@ class ImageTools:
         h = max(min(h, 3840), 16)
         return f"{w}x{h}"
 
+    async def _send_text(self, text: str) -> None:
+        """Send model-generated text (Markdown, split and with fallback handled by the sender)."""
+        await self.sender.send_markdown(text)
+
+    async def _send_image(self, path: Path, caption: str) -> None:
+        await self.sender.send_document(str(path), caption=caption)
+
+    async def _gemini(self, **kwargs):
+        """generate_content in a worker thread so image generation never blocks the event loop."""
+        return await asyncio.to_thread(genai_client.models.generate_content, **kwargs)
+
+    @staticmethod
+    def _gemini_config(model: str, aspect_ratio: str, resolution: str, with_text: bool = True):
+        modalities = ["Text", "Image"] if with_text else None
+        if model == "Pro":
+            return types.GenerateContentConfig(
+                response_modalities=modalities,
+                image_config=types.ImageConfig(aspect_ratio=aspect_ratio, image_size=resolution)
+            ) if with_text else types.GenerateContentConfig(
+                image_config=types.ImageConfig(aspect_ratio=aspect_ratio, image_size=resolution)
+            )
+        return types.GenerateContentConfig(response_modalities=modalities) if with_text else None
+
+    @staticmethod
+    def _gemini_model_name(model: str) -> str:
+        return GEMINI_PRO if model.lower() == "pro" else GEMINI_FLASH
+
+    async def _deliver_parts(self, parts, prefix: str, text_label: str, all_saved_paths: List[str], variant_caption: str, result_message: str) -> str:
+        """Send text parts and inline images from a Gemini response; returns the updated result message."""
+        for part in parts:
+            if 'text' in part.model_fields_set and part.text:
+                await self._send_text(f"{text_label}\n\n{part.text}" if text_label else part.text)
+                result_message += f"{text_label or 'Generated text:'} \n\n{part.text}\n\n"
+            elif 'inline_data' in part.model_fields_set:
+                extension = part.inline_data.mime_type.split('/')[-1]
+                if extension == 'jpeg':
+                    extension = 'jpg'
+                image_path = self.images_path / f"{prefix}_{uuid.uuid4()}.{extension}"
+                with open(image_path, "wb") as f:
+                    f.write(part.inline_data.data)
+                await self._send_image(image_path, variant_caption)
+                all_saved_paths.append(str(image_path))
+        return result_message
+
+    # ------------------------------------------------------------------
+    # dispatch
+    # ------------------------------------------------------------------
     async def execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
         if tool_name == "image_generator":
             return await self._image_generator(**tool_args)
@@ -359,11 +421,15 @@ class ImageTools:
             return await self._image_composition(**tool_args)
         return f"Unknown tool: {tool_name}"
 
+    # ------------------------------------------------------------------
+    # tools
+    # ------------------------------------------------------------------
     async def _generate_image_dall_e(self, prompt: str, size: str = "1024x1024", quality: str = "standard", caption: str = "Here is your image") -> str:
         """Generate an image using DALL-E 3 and return the URL"""
-        print(f"Generating image with DALL-E 3 - Prompt: {prompt}, Size: {size}, Quality: {quality}")
+        logger.info("Generating image with DALL-E 3 - prompt=%r size=%s quality=%s", prompt, size, quality)
         try:
-            response = openai_client.images.generate(
+            response = await asyncio.to_thread(
+                openai_client.images.generate,
                 model="dall-e-3",
                 prompt=prompt,
                 size=size,
@@ -371,100 +437,64 @@ class ImageTools:
                 response_format="b64_json",
                 n=1,
             )
-            image_in_base64_string = response.data[0].b64_json
             image_path = self.images_path / f"image_{uuid.uuid4()}.jpg"
             with open(image_path, "wb") as f:
-                f.write(base64.b64decode(image_in_base64_string))
-            
-            with open(image_path, 'rb') as file:
-                await self.telegram_update.message.reply_document(
-                    document=file,
-                    caption=caption
-                )
-
+                f.write(base64.b64decode(response.data[0].b64_json))
+            await self._send_image(image_path, caption)
             return f"Image generated and sent to user via telegram successfully.\n\nFile also saved to: {image_path}\n\n"
         except Exception as e:
             return f"Error generating image: {str(e)}"
-            
+
     async def _generate_multimodal_image_and_text(self, prompt: str, style: str = "3d digital art") -> str:
         """Generate a story with images using Google's Gemini model"""
-        print(f"Generating multimodal story with Gemini - Prompt: {prompt}, Style: {style}, Model: gemini-3.1-flash-image-preview")
+        logger.info("Generating multimodal story with Gemini - prompt=%r style=%s", prompt, style)
         try:
-            # Format the prompt to include style information
             formatted_prompt = f"Generate a story about {prompt} in a {style} style. For each scene, generate an image."
-            
-            response = genai_client.models.generate_content(
-                model="gemini-3.1-flash-image-preview",
+            response = await self._gemini(
+                model=GEMINI_FLASH,
                 contents=formatted_prompt,
-                config=types.GenerateContentConfig(
-                    response_modalities=["Text", "Image"],
-                    # media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH
-                ),
+                config=types.GenerateContentConfig(response_modalities=["Text", "Image"]),
             )
-            
-            # Wait all parts to be generated. WA where not all candidates are generated yet. Need to research how to do it better.
-            # await asyncio.sleep(10)
-
             contents = response.candidates[0].content.parts
-            
+
             all_parts = []
             for content in contents:
                 if 'text' in content.model_fields_set:
                     all_parts.append(TextPart(content.text))
                 elif 'inline_data' in content.model_fields_set:
-                    all_parts.append(InlineDataPart(
-                        content.inline_data.mime_type,
-                        content.inline_data.data
-                    ))
-            
+                    all_parts.append(InlineDataPart(content.inline_data.mime_type, content.inline_data.data))
+
             result_message = "Text and images were generated and successfully sent to user as telegram messages:\n\n"
             image_count = 0
             part_count = 0
             for part in all_parts:
                 part_count += 1
                 if isinstance(part, TextPart):
-                    try: # as markdown
-                        await self.telegram_update.message.reply_text(f"Part {part_count}:\n\n{part.text}", parse_mode="markdown")
-                    except Exception:
-                        # check length of text and split to chunks of 3000 characters
-                        text_chunks = [part.text[i:i+3000] for i in range(0, len(part.text), 3000)]
-                        sub_part_count = 0
-                        for chunk in text_chunks:
-                            sub_part_count += 1
-                            try:
-                                await self.telegram_update.message.reply_text(f"Part {part_count} subpart {sub_part_count}:\n\n{chunk}", parse_mode="markdown")
-                            except Exception:
-                                await self.telegram_update.message.reply_text(f"Part {part_count} subpart {sub_part_count}:\n\n{chunk}")
+                    await self._send_text(f"Part {part_count}:\n\n{part.text}")
                     result_message += f"Part {part_count}:\n\n{part.text}\n\n"
                 elif isinstance(part, InlineDataPart):
                     image_count += 1
                     image_path = self.images_path / f"story_image_{uuid.uuid4()}.jpg"
                     with open(image_path, "wb") as f:
                         f.write(part.data)
-                    
-                    with open(image_path, 'rb') as file:
-                        await self.telegram_update.message.reply_document(
-                            document=file,
-                            caption=f"Image {image_count}."
-                        )
-                    
+                    await self._send_image(image_path, f"Image {image_count}.")
                     result_message += f"Image for part {image_count}: {image_path}.\n\n"
 
             result_message += "\n\nEnd of messages.\nWrite answer to user using this text, remove under the hood details about styling info, formatting, or something like that, and translate it to user language if needed."
             return result_message
         except Exception as e:
             return f"Error generating multimodal story: {str(e)}"
-            
+
     async def _image_editing(self, prompt: str, image_path: str, model: str = "Normal", aspect_ratio: str = "16:9", resolution: str = "2K", gpt_quality: str = "auto", variants: int = 1, caption: str = "Here is your edited image") -> str:
         """Edit an existing image using Gemini or GPT Image 2"""
-        print(f"Editing image - Prompt: {prompt}, Image: {image_path}, Model: {model}, Aspect Ratio: {aspect_ratio}, Resolution: {resolution}, GPT Quality: {gpt_quality}, Variants: {variants}")
+        logger.info("Editing image - prompt=%r image=%s model=%s variants=%s", prompt, image_path, model, variants)
         temp_paths: List[Path] = []
         source_image = None
         try:
             image_path_obj = self._resolve_image_path(image_path)
             if not image_path_obj.exists():
                 return f"Error: The image at path {image_path} does not exist."
-            
+
             if model.lower() == "gpt":
                 gpt_size = self._resolve_gpt_size(resolution, aspect_ratio)
                 all_results = []
@@ -476,72 +506,24 @@ class ImageTools:
                     all_results.append(r)
                 return "\n".join(all_results)
 
-            source_image_path = self._prepare_image_for_edit(image_path_obj, temp_paths)
+            source_image_path = await asyncio.to_thread(self._prepare_image_for_edit, image_path_obj, temp_paths)
             source_image = PIL.Image.open(source_image_path)
-            
-            model_name = "gemini-3-pro-image-preview" if model.lower() == "pro" else "gemini-3.1-flash-image-preview"
-            
-            if model == "Pro":
-                config = types.GenerateContentConfig(
-                    response_modalities=["Text", "Image"],
-                    image_config=types.ImageConfig(
-                        aspect_ratio=aspect_ratio,
-                        image_size=resolution
-                    )
-                )
-            else:
-                config = types.GenerateContentConfig(
-                    response_modalities=["Text", "Image"]
-                )
-            
-            all_saved_paths = []
+            config = self._gemini_config(model, aspect_ratio, resolution)
+
+            all_saved_paths: List[str] = []
             result_message = "Image transformation results:\n\n"
-            
             for variant_idx in range(variants):
-                response = genai_client.models.generate_content(
-                    model=model_name,
-                    contents=(
-                        prompt,
-                        source_image
-                    ),
-                    config=config,
+                response = await self._gemini(model=self._gemini_model_name(model), contents=(prompt, source_image), config=config)
+                variant_caption = f"{caption} (variant {variant_idx + 1}/{variants})" if variants > 1 else caption
+                result_message = await self._deliver_parts(
+                    response.candidates[0].content.parts, "transformed", "Text explanation:", all_saved_paths, variant_caption, result_message
                 )
-                
-                contents = response.candidates[0].content.parts
-
-                for content in contents:
-                    if 'text' in content.model_fields_set:
-                        try:
-                            await self.telegram_update.message.reply_text(f"Text explanation:\n\n{content.text}", parse_mode="markdown")
-                        except Exception:
-                            text_chunks = [content.text[i:i+3000] for i in range(0, len(content.text), 3000)]
-                            for sub_idx, chunk in enumerate(text_chunks):
-                                try:
-                                    await self.telegram_update.message.reply_text(f"Text explanation subpart {sub_idx + 1}:\n\n{chunk}", parse_mode="markdown")
-                                except Exception:
-                                    await self.telegram_update.message.reply_text(f"Text explanation subpart {sub_idx + 1}:\n\n{chunk}")
-                        result_message += f"Text explanation sent to user: \n\n{content.text}\n\n"
-                    elif 'inline_data' in content.model_fields_set:
-                        extension = content.inline_data.mime_type.split('/')[-1]
-                        transformed_image_path = self.images_path / f"transformed_{uuid.uuid4()}.{extension}"
-                        with open(transformed_image_path, "wb") as f:
-                            f.write(content.inline_data.data)
-                        
-                        variant_caption = f"{caption} (variant {variant_idx + 1}/{variants})" if variants > 1 else caption
-                        with open(transformed_image_path, 'rb') as file:
-                            await self.telegram_update.message.reply_document(
-                                document=file,
-                                caption=variant_caption
-                            )
-
-                        all_saved_paths.append(str(transformed_image_path))
 
             if all_saved_paths:
                 paths_str = "\n".join(f"  - {p}" for p in all_saved_paths)
                 result_message += f"Edited {len(all_saved_paths)} image(s) and sent to user.\nSaved to:\n{paths_str}\nImage transformation completed successfully.\n"
             else:
                 result_message += "Warning: No transformed image was generated. The model only provided text response.\n"
-
             return result_message
         except Exception as e:
             return f"Error editing image: {str(e)}"
@@ -552,164 +534,90 @@ class ImageTools:
 
     async def _gpt_image_edit(self, prompt: str, image_paths: List[Path], size: str = "2048x1152", quality: str = "auto", caption: str = "Here is your edited image") -> str:
         """Edit one or more images using OpenAI GPT Image 2"""
-        print(f"Editing image(s) with GPT Image 2 - Prompt: {prompt}, Images: {image_paths}, Size: {size}, Quality: {quality}")
+        logger.info("Editing image(s) with GPT Image 2 - prompt=%r images=%s size=%s", prompt, image_paths, size)
         temp_paths: List[Path] = []
         try:
-            image_files = [
-                open(str(self._prepare_image_for_edit(p, temp_paths)), "rb")
-                for p in image_paths
-            ]
-            
-            kwargs = {
-                "model": "gpt-image-2-2026-04-21",
-                "prompt": prompt,
-                "quality": quality,
-                "size": size,
-            }
-            
-            if len(image_files) == 1:
-                kwargs["image"] = image_files[0]
-            else:
-                kwargs["image"] = image_files
+            prepared = [await asyncio.to_thread(self._prepare_image_for_edit, p, temp_paths) for p in image_paths]
+
+            def _edit():
+                files = [open(str(p), "rb") for p in prepared]
+                try:
+                    kwargs = {"model": GPT_IMAGE, "prompt": prompt, "quality": quality, "size": size}
+                    kwargs["image"] = files[0] if len(files) == 1 else files
+                    return openai_client.images.edit(**kwargs)
+                finally:
+                    for f in files:
+                        f.close()
 
             try:
-                result = openai_client.images.edit(**kwargs)
+                result = await asyncio.to_thread(_edit)
             finally:
-                for f in image_files:
-                    f.close()
                 self._cleanup_temp_images(temp_paths)
 
-            image_base64 = result.data[0].b64_json
-            image_bytes = base64.b64decode(image_base64)
-            
             image_path = self.images_path / f"gpt_edited_{uuid.uuid4()}.png"
             with open(image_path, "wb") as f:
-                f.write(image_bytes)
-            
-            with open(image_path, 'rb') as file:
-                await self.telegram_update.message.reply_document(
-                    document=file,
-                    caption=caption
-                )
-            
+                f.write(base64.b64decode(result.data[0].b64_json))
+            await self._send_image(image_path, caption)
             return f"Image edited with GPT Image 2 and saved to: {image_path} and sent to user.\nImage editing completed successfully.\n"
         except Exception as e:
             return f"Error editing image with GPT Image 2: {str(e)}"
-    
+
     async def _image_generator(self, prompt: str, style: str = "photorealistic", model: str = "Normal", aspect_ratio: str = "16:9", resolution: str = "2K", gpt_quality: str = "auto", gpt_output_format: str = "png", variants: int = 1, caption: str = "Here is your generated image") -> str:
         """Generate a high-quality image from text using Gemini or GPT Image 2"""
-        print(f"Generating image - Prompt: {prompt}, Style: {style}, Model: {model}, Aspect Ratio: {aspect_ratio}, Resolution: {resolution}, GPT Quality: {gpt_quality}, Output Format: {gpt_output_format}, Variants: {variants}")
+        logger.info("Generating image - prompt=%r model=%s variants=%s", prompt, model, variants)
         try:
             if model.lower() == "gpt":
                 gpt_size = self._resolve_gpt_size(resolution, aspect_ratio)
                 return await self._gpt_image_generate(prompt, gpt_size, gpt_quality, gpt_output_format, caption, n=variants)
-            
-            if style and style != "photorealistic":
-                formatted_prompt = f"Create a {style} style image: {prompt}"
-            else:
-                formatted_prompt = prompt
-            
-            model_name = "gemini-3-pro-image-preview" if model.lower() == "pro" else "gemini-3.1-flash-image-preview"
-            
-            all_saved_paths = []
+
+            formatted_prompt = f"Create a {style} style image: {prompt}" if style and style != "photorealistic" else prompt
+            config = self._gemini_config(model, aspect_ratio, resolution, with_text=False)
+
+            all_saved_paths: List[str] = []
             result_message = ""
-            
             for variant_idx in range(variants):
-                if model == "Pro":
-                    config = types.GenerateContentConfig(
-                        image_config=types.ImageConfig(
-                            aspect_ratio=aspect_ratio,
-                            image_size=resolution
-                        )
-                    )
-                    response = genai_client.models.generate_content(
-                        model=model_name,
-                        contents=[formatted_prompt],
-                        config=config
-                    )
-                else:
-                    response = genai_client.models.generate_content(
-                        model=model_name,
-                        contents=[formatted_prompt],
-                    )
-                
-                contents = response.candidates[0].content.parts
-                
-                for part in contents:
-                    if 'text' in part.model_fields_set and part.text:
-                        try:
-                            await self.telegram_update.message.reply_text(part.text, parse_mode="markdown")
-                        except Exception:
-                            await self.telegram_update.message.reply_text(part.text)
-                        result_message += f"Generated text: {part.text}\n\n"
-                        
-                    elif 'inline_data' in part.model_fields_set:
-                        extension = part.inline_data.mime_type.split('/')[-1]
-                        if extension == 'jpeg':
-                            extension = 'jpg'
-                        image_path = self.images_path / f"generated_{uuid.uuid4()}.{extension}"
-                        
-                        with open(image_path, "wb") as f:
-                            f.write(part.inline_data.data)
-                        
-                        variant_caption = f"{caption} (variant {variant_idx + 1}/{variants})" if variants > 1 else caption
-                        with open(image_path, 'rb') as file:
-                            await self.telegram_update.message.reply_document(
-                                document=file,
-                                caption=variant_caption
-                            )
-                        
-                        all_saved_paths.append(str(image_path))
-            
+                kwargs = {"model": self._gemini_model_name(model), "contents": [formatted_prompt]}
+                if config is not None:
+                    kwargs["config"] = config
+                response = await self._gemini(**kwargs)
+                variant_caption = f"{caption} (variant {variant_idx + 1}/{variants})" if variants > 1 else caption
+                result_message = await self._deliver_parts(
+                    response.candidates[0].content.parts, "generated", "", all_saved_paths, variant_caption, result_message
+                )
+
             if all_saved_paths:
                 paths_str = "\n".join(f"  - {p}" for p in all_saved_paths)
                 result_message += f"Generated {len(all_saved_paths)} image(s) and sent to user.\nSaved to:\n{paths_str}\nImage generation completed successfully.\n"
             else:
                 result_message += "Warning: No image was generated. The model only provided text response.\n"
-                
             return result_message
         except Exception as e:
             return f"Error generating image: {str(e)}"
 
     async def _gpt_image_generate(self, prompt: str, size: str = "2048x1152", quality: str = "auto", output_format: str = "jpeg", caption: str = "Here is your generated image", n: int = 1) -> str:
         """Generate one or more images using OpenAI GPT Image 2"""
-        print(f"Generating image with GPT Image 2 - Prompt: {prompt}, Size: {size}, Quality: {quality}, N: {n}, Output Format: {output_format}")
+        logger.info("Generating image with GPT Image 2 - prompt=%r size=%s n=%s", prompt, size, n)
         try:
-            kwargs = {
-                "model": "gpt-image-2-2026-04-21",
-                "prompt": prompt,
-                "quality": quality,
-                "output_format": output_format,
-                "size": size,
-                "n": n,
-            }
-
-            result = openai_client.images.generate(**kwargs)
-
+            result = await asyncio.to_thread(
+                openai_client.images.generate,
+                model=GPT_IMAGE, prompt=prompt, quality=quality, output_format=output_format, size=size, n=n,
+            )
             ext = "jpg" if output_format == "jpeg" else output_format
             saved_paths = []
             for idx, item in enumerate(result.data):
-                image_bytes = base64.b64decode(item.b64_json)
                 image_path = self.images_path / f"gpt_generated_{uuid.uuid4()}.{ext}"
                 with open(image_path, "wb") as f:
-                    f.write(image_bytes)
-                
-                variant_caption = f"{caption} (variant {idx + 1}/{n})" if n > 1 else caption
-                with open(image_path, 'rb') as file:
-                    await self.telegram_update.message.reply_document(
-                        document=file,
-                        caption=variant_caption
-                    )
+                    f.write(base64.b64decode(item.b64_json))
+                await self._send_image(image_path, f"{caption} (variant {idx + 1}/{n})" if n > 1 else caption)
                 saved_paths.append(str(image_path))
-            
             paths_str = "\n".join(f"  - {p}" for p in saved_paths)
             return f"Generated {len(saved_paths)} image(s) with GPT Image 2 and sent to user.\nSaved to:\n{paths_str}\nImage generation completed successfully.\n"
         except Exception as e:
             return f"Error generating image with GPT Image 2: {str(e)}"
-    
+
     async def _image_composition(self, prompt: str, image_paths: List[str], model: str = "Normal", aspect_ratio: str = "16:9", resolution: str = "2K", gpt_quality: str = "auto", variants: int = 1, caption: str = "Here is your composed image") -> str:
         """Compose a new image from multiple input images using Gemini or GPT Image 2"""
-        print(f"Composing image - Prompt: {prompt}, Images: {image_paths}, Model: {model}, Aspect Ratio: {aspect_ratio}, Resolution: {resolution}, GPT Quality: {gpt_quality}, Variants: {variants}")
+        logger.info("Composing image - prompt=%r images=%s model=%s variants=%s", prompt, image_paths, model, variants)
         temp_paths: List[Path] = []
         images: List[PIL.Image.Image] = []
         try:
@@ -719,10 +627,10 @@ class ImageTools:
                 if not image_path_obj.exists():
                     return f"Error: The image at path {image_path} does not exist."
                 resolved_paths.append(image_path_obj)
-            
+
             if len(resolved_paths) < 2:
                 return "Error: At least 2 images are required for composition."
-            
+
             if model.lower() == "gpt":
                 gpt_size = self._resolve_gpt_size(resolution, aspect_ratio)
                 all_results = []
@@ -733,85 +641,29 @@ class ImageTools:
                     )
                     all_results.append(r)
                 return "\n".join(all_results)
-            
+
             if len(resolved_paths) > 3:
                 return "Error: Maximum 3 images are supported for composition with Normal/Pro mode. Use GPT mode for more images."
-            
-            prepared_paths = [
-                self._prepare_image_for_edit(p, temp_paths)
-                for p in resolved_paths
-            ]
-            images = [PIL.Image.open(p) for p in prepared_paths]
-            
-            input_contents = []
-            for image in images:
-                input_contents.append(image)
-            input_contents.append(prompt)
-            
-            model_name = "gemini-3-pro-image-preview" if model.lower() == "pro" else "gemini-3.1-flash-image-preview"
-            
-            if model == "Pro":
-                config = types.GenerateContentConfig(
-                    response_modalities=["Text", "Image"],
-                    image_config=types.ImageConfig(
-                        aspect_ratio=aspect_ratio,
-                        image_size=resolution
-                    )
-                )
-            else:
-                config = types.GenerateContentConfig(
-                    response_modalities=["Text", "Image"]
-                )
-            
-            all_saved_paths = []
-            result_message = "Image composition results:\n\n"
-            
-            for variant_idx in range(variants):
-                response = genai_client.models.generate_content(
-                    model=model_name,
-                    contents=input_contents,
-                    config=config,
-                )
-                
-                response_parts = response.candidates[0].content.parts
 
-                for part in response_parts:
-                    if 'text' in part.model_fields_set and part.text:
-                        try:
-                            await self.telegram_update.message.reply_text(f"Composition details:\n\n{part.text}", parse_mode="markdown")
-                        except Exception:
-                            text_chunks = [part.text[i:i+3000] for i in range(0, len(part.text), 3000)]
-                            for i, chunk in enumerate(text_chunks):
-                                try:
-                                    await self.telegram_update.message.reply_text(f"Composition details (part {i+1}):\n\n{chunk}", parse_mode="markdown")
-                                except Exception:
-                                    await self.telegram_update.message.reply_text(f"Composition details (part {i+1}):\n\n{chunk}")
-                        result_message += f"Composition explanation sent to user: \n\n{part.text}\n\n"
-                        
-                    elif 'inline_data' in part.model_fields_set:
-                        extension = part.inline_data.mime_type.split('/')[-1]
-                        if extension == 'jpeg':
-                            extension = 'jpg'
-                        composed_image_path = self.images_path / f"composed_{uuid.uuid4()}.{extension}"
-                        
-                        with open(composed_image_path, "wb") as f:
-                            f.write(part.inline_data.data)
-                        
-                        variant_caption = f"{caption} (variant {variant_idx + 1}/{variants})" if variants > 1 else caption
-                        with open(composed_image_path, 'rb') as file:
-                            await self.telegram_update.message.reply_document(
-                                document=file,
-                                caption=variant_caption
-                            )
-                        
-                        all_saved_paths.append(str(composed_image_path))
-            
+            prepared_paths = [await asyncio.to_thread(self._prepare_image_for_edit, p, temp_paths) for p in resolved_paths]
+            images = [PIL.Image.open(p) for p in prepared_paths]
+            input_contents = [*images, prompt]
+            config = self._gemini_config(model, aspect_ratio, resolution)
+
+            all_saved_paths: List[str] = []
+            result_message = "Image composition results:\n\n"
+            for variant_idx in range(variants):
+                response = await self._gemini(model=self._gemini_model_name(model), contents=input_contents, config=config)
+                variant_caption = f"{caption} (variant {variant_idx + 1}/{variants})" if variants > 1 else caption
+                result_message = await self._deliver_parts(
+                    response.candidates[0].content.parts, "composed", "Composition details:", all_saved_paths, variant_caption, result_message
+                )
+
             if all_saved_paths:
                 paths_str = "\n".join(f"  - {p}" for p in all_saved_paths)
                 result_message += f"Composed {len(all_saved_paths)} image(s) and sent to user.\nSaved to:\n{paths_str}\nImage composition completed successfully.\n"
             else:
                 result_message += "Warning: No composed image was generated. The model only provided text response.\n"
-
             return result_message
         except Exception as e:
             return f"Error composing image: {str(e)}"

@@ -1,15 +1,14 @@
 from typing import List, Dict, Any
 import subprocess
 import os
-import telegram
 from dotenv import load_dotenv
 
 load_dotenv()
 
 class TerminalTools:
-    def __init__(self, user_id: str, telegram_update: telegram.Update):
+    def __init__(self, user_id: str, sender=None):
         self.user_id = user_id
-        self.telegram_update = telegram_update
+        self.sender = sender
 
     @property
     def tools_schema(self) -> List[Dict[str, Any]]:

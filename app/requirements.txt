@@ -1,5 +1,5 @@
-python-telegram-bot>=22.6
 python-dotenv>=1.0.0
+aiogram>=3.31.0
 anthropic>=0.47.0
 openai>=1.59.0
 tavily-python>=0.5.0
@@ -13,7 +13,6 @@ ffmpeg-downloader # ffdl install --add-path
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 pytz>=2024.1
-python-telegram-bot[job-queue]>=22.6
 faiss-cpu>=1.7.4
 numpy>=1.24.0
 docker>=6.1.3
