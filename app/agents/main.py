@@ -36,6 +36,27 @@ anthropic_client = anthropic.AsyncAnthropic(api_key=anthropic_api_key)
 streaming_enabled = os.getenv("STREAMING_ENABLED", "false").lower() == "true"
 print(f"Agent streaming_enabled: {streaming_enabled} (env: {os.getenv('STREAMING_ENABLED', 'not set')})")
 
+# Appended to every system prompt so the model knows how its answer is rendered
+# (bot/rich.py). Rich messages are Telegram's native GitHub-flavored Markdown.
+RICH_FORMATTING_GUIDE = """
+<formatting>
+Your reply is delivered as a rich Telegram message rendered from GitHub-flavored Markdown, so use real Markdown:
+- headings (#, ##, ###) to structure long answers
+- **bold**, *italic*, ~~strikethrough~~, `inline code`, [links](https://example.com)
+- bullet lists, numbered lists and task lists (- [ ] todo, - [x] done)
+- tables in pipe syntax with a header row (up to 20 columns) for comparisons, options, schedules and any tabular data
+- fenced code blocks with a language tag for code, commands and program output
+- > block quotes, horizontal rules (---) and LaTeX math ($...$ inline, $$...$$ display)
+Keep short conversational replies plain: no headings or tables unless they genuinely help. Do not write raw HTML.
+</formatting>
+"""
+
+LEGACY_FORMATTING_GUIDE = """
+<formatting>
+Your reply is delivered as a plain Telegram message where only *bold*, _italic_ and `code` render. Headings, tables and nested lists do not render, so present tabular data as short lists.
+</formatting>
+"""
+
 # OpenAI config
 openai_api_key = os.getenv("OPENAI_API_KEY")
 openai_model = "gpt-5.2"
@@ -1018,6 +1039,12 @@ You have been asked to answer a query given sources. Consider the following when
             system_context = system_context_perplexity_r1
         else:
             system_context = system_context_generall_ai_v2
+
+        # Tell the model how its answer will be rendered (rich messages are on by default).
+        if (self.user_settings or {}).get("rich_messages", {}).get("enabled", True):
+            system_context += RICH_FORMATTING_GUIDE
+        else:
+            system_context += LEGACY_FORMATTING_GUIDE
 
         # Search for relevant past conversations
         if self.user_settings.get("semantic_search").get("enabled"):

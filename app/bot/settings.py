@@ -22,6 +22,7 @@ DEFAULT_SETTINGS: dict[str, dict[str, Any]] = {
     "semantic_search": {"enabled": True, "max_results": 3},
     "thinking": {"enabled": True},
     "system_prompt": {"type": "generall-ai-v2"},
+    "rich_messages": {"enabled": True},
 }
 
 SYSTEM_PROMPT_TYPES = ("generall-ai-v2", "generall-ai-v1", "perplexity-deep-research", "perplexity-r1")

@@ -34,10 +34,12 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
     config.py               Config dataclass from env (`config` singleton), validate()
     runtime.py              process-wide QueueManager instance + background task list
     queue.py                QueueManager / Job / JobContext: per-user FIFO workers, deadline, /cancel, global cap
-    sender.py               ChatSender: the one object handlers AND tools use to send text/media/reactions
+    sender.py               ChatSender: the one object handlers AND tools use to send text/media/reactions;
+                            send_markdown renders LLM answers as rich messages with tiered fallback
+    rich.py                 rich-message helpers: split/convert (telegramify-markdown), sticky "unsupported" flag
     agent_runner.py         run_turn(): builds ChainOfThoughtAgent, status edits, streaming, voice reply, answer, reasoning file
     media.py                Whisper transcription, Claude/GPT image+document description, video frames, TTS, ffmpeg setup
-    streaming.py            throttled draft-message streaming callback (trailing flush)
+    streaming.py            throttled draft streaming (rich drafts + <tg-thinking> block, plain draft fallback)
     auth.py                 AuthStore (`auth` singleton): allow/block lists + invite codes in data/userlist.json
     limits.py               check_user_limits() (rolling 30-day action quota via stats.db)
     settings.py             DEFAULT_SETTINGS + UserSettings (single source of truth)
@@ -114,6 +116,11 @@ Deployment facts that are easy to get wrong:
   Cloning elsewhere without changing it makes every sandboxed tool fail or mount an empty dir.
 - `.env.example` ships `TELEGRAM_USE_LOCAL_API=true`. For a plain local run without the
   `telegram-bot-api` sidecar set it to `false`, or the bot will point aiogram at `localhost:8081`.
+- Rich messages (`sendRichMessage`, Bot API 10.1) need a Bot API server that knows the method. The
+  compose sidecar is `aiogram/telegram-bot-api:latest`, so run `docker compose pull telegram-bot-api`
+  on an old checkout; against an older server the bot logs one warning and falls back to MarkdownV2
+  for the rest of the process (`bot/rich.py` flag). Old Telegram clients show rich messages as
+  "unsupported message"; users turn them off per chat in `/settings` → Rich Messages.
 - The `bot` service runs `privileged: true` with `network_mode: host`. Host networking is what lets it
   reach the `telegram-bot-api` sidecar at `localhost:8081`; the shared `telegram-bot-api-data` volume
   is mounted in both containers because local-mode `get_file` returns server-side absolute paths
@@ -219,7 +226,10 @@ worker → _run_text → bot.agent_runner.run_turn(bot, user_id, chat_id, prompt
           (a failed Haiku summary is logged, the answer is still returned) → (response, messages)
     stats_tracker.track_message_sent
     speak? → ElevenLabs TTS (to_thread) → sender.send_voice
-    sender.send_markdown(response, edit=status)   (≤4000: edit status in place; else new chunks + notice)
+    sender.send_markdown(response, edit=status)
+       rich (default): split ≤32 KB → sendRichMessage(markdown) → on parse error rich HTML
+       (telegramify-markdown) → on 404 sticky MarkdownV2 → legacy Markdown → raw; status deleted after
+       legacy (rich_messages off): ≤4000 edit status in place; else new chunks + notice
     send_reasoning_file (if reasoning_context.enabled; document from bytes)
     errors → status edited to "❌ An error occurred. Trace ID: …", returns None; CancelledError → "🛑 Stopped."
 ```
@@ -393,12 +403,13 @@ every `set`. `run_turn` saves once per turn so new defaults reach disk. Agent co
 | `tools` | enabled (true), max_iteration (20, 1..300) | the agent loop bound (this, not the env var) |
 | `semantic_search` | enabled (true), max_results (3, 1..20) | FAISS hits in system prompt |
 | `thinking` | enabled (true) | extended thinking: max_tokens 20000 / budget 16000, else max_tokens 4096 |
+| `rich_messages` | enabled (true) | answers as Telegram rich messages (native GFM); off = legacy Markdown v1 path; also selects the `<formatting>` prompt section and rich vs plain streaming drafts |
 | `system_prompt` | type ("generall-ai-v2"; also generall-ai-v1, perplexity-deep-research, perplexity-r1) | prompt selection |
 
 Edited through `/settings` (`bot/handlers/settings_ui.py`). callback_data is
 `settings_<token>[_<action>[_<value>]]` parsed with a plain `split("_")`, where `<token>` is a short
 name, not the JSON key: summarization, dialog, reasoning, memory (= short_term_memory), critique,
-judge, tools, semantic, thinking, main. `system_prompt` is special-cased with `startswith`.
+judge, tools, semantic, thinking, rich, main. `system_prompt` is special-cased with `startswith`.
 
 ## Models and external services
 
@@ -435,7 +446,7 @@ SearchTools and the embeddings `OpenAI` are per instance; ElevenLabs is per call
 | `INVITE_LIMIT` | commands | default 3 (`.env.example` says 5) |
 | `TELEGRAM_USE_LOCAL_API`, `TELEGRAM_LOCAL_API_URL` | bot/app | local Bot API server (compose sidecar); default URL `http://localhost:8081` |
 | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | compose only | for the `telegram-bot-api` sidecar |
-| `STREAMING_ENABLED` | bot/config AND agents/main (read independently, both after dotenv) | draft-message streaming via `send_message_draft`, errors swallowed |
+| `STREAMING_ENABLED` | bot/config AND agents/main (read independently, both after dotenv) | draft streaming: `send_rich_message_draft` in rich mode (thinking as `<tg-thinking>`), else `send_message_draft`; errors swallowed |
 | `MAX_CONCURRENT_TURNS` (8), `TURN_TIMEOUT_SECONDS` (1800), `DROP_PENDING_UPDATES` (true) | bot/config | queue caps, see "Queues" |
 | `MAX_SANDBOX_CONTAINERS` (4) | secure_container/container_manager | concurrent sandbox containers |
 | `THREAD_POOL_SIZE` (32, min 8) | bot/app | size of the default executor used by `asyncio.to_thread` |
@@ -465,7 +476,11 @@ name; a new temp dir needs its own `.gitignore` line).
   handler on the router with the right middleware. Read the chat from `callback.message.chat.id`
   and guard `isinstance(callback.message, Message)`.
 - Static UI text goes through `bot.ui.answer_md` / `edit_md` (legacy Markdown, plain fallback,
-  "message is not modified" swallowed). LLM text goes through `ChatSender.send_markdown`. Escape
+  "message is not modified" swallowed). LLM text goes through `ChatSender.send_markdown`, which in
+  rich mode (`ChatSender(rich=True)`, set by `run_turn` from `rich_messages.enabled`) sends
+  `InputRichMessage(markdown=...)`; a plain message cannot be edited into a rich one, so the status
+  message is deleted instead of edited. `bot/rich.py` owns the tiers and the process-wide
+  "server has no rich support" flag (`rich.reset()` in tests). Escape
   user/LLM text embedded in Markdown with `bot.ui.escape_markdown`. Invite/admin replies use HTML.
 - Keyboards: `InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=..., callback_data=...)]])`
   (keyword arguments are mandatory in aiogram).
@@ -507,6 +522,11 @@ name; a new temp dir needs its own `.gitignore` line).
 - `stats_ui.py` imports `stats` at module level, so importing `bot.handlers` creates `data/stats.db`
   in the cwd (the other modules import it lazily).
 - Dead code: `JudgeResponse`, `tavily_client` in `agents/main.py`, `describe_document_openai` was removed.
+- `bot.rich` marks rich messages unsupported for the whole process on the first 404 from
+  `sendRichMessage`/`sendRichMessageDraft`; a wrong verdict (e.g. a transient 404) needs a restart.
+  `TelegramBadRequest` on a rich send is treated as "this text", not "this server".
+- `agents/main.py` appends `RICH_FORMATTING_GUIDE` / `LEGACY_FORMATTING_GUIDE` to every system
+  prompt after selection; the `generall-ai-*` prompts still say nothing about formatting themselves.
 
 ## How to make common changes
 

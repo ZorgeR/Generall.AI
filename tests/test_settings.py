@@ -48,3 +48,13 @@ def test_validation_clamps():
     assert UserSettings.validate_iteration(0, "tools") == 1
     assert UserSettings.validate_iteration(1000, "unknown-type") == 300
     assert UserSettings.validate_semantic_max_results(50) == 20
+
+
+def test_rich_messages_default_on_and_backfilled_for_old_files(tmp_path):
+    user_dir = tmp_path / "9"
+    user_dir.mkdir()
+    (user_dir / "settings.json").write_text(json.dumps({"thinking": {"enabled": False}}))
+    s = UserSettings("9", base_dir=str(tmp_path))
+    assert s.get("rich_messages", "enabled") is True
+    s.set("rich_messages", False, "enabled")
+    assert UserSettings("9", base_dir=str(tmp_path)).get("rich_messages", "enabled") is False

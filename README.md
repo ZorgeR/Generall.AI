@@ -198,6 +198,18 @@ Bot to Admin: "🔔 New user joined!
 
 ## 🔄 Advanced Features
 
+### ✨ Rich Messages
+
+Answers are sent as **rich Telegram messages** (Bot API 10.1): real GitHub-flavored Markdown with
+headings, tables, task lists, fenced code blocks, block quotes and LaTeX math, rendered natively by
+the Telegram app. While the answer is being generated (with `STREAMING_ENABLED=true`) the draft
+streams with live formatting and the model's thinking shows in Telegram's "Thinking…" block.
+
+Rich messages are on by default and can be switched per chat in `/settings` → **Rich Messages**.
+Turn them off if your Telegram app is too old and shows "unsupported message"; the bot then uses
+classic Markdown formatting. If the Bot API server (the `telegram-bot-api` sidecar) is older than
+10.1 the bot detects it once and falls back to MarkdownV2 formatting (tables as monospace blocks).
+
 ### 🎤 Voice Settings
 Customize voice parameters including voice model selection, stability, clarity, and style. The bot can both listen to your voice messages and respond with generated voice using ElevenLabs.
 
@@ -335,6 +347,7 @@ The bot can:
 - **💻 Operating Systems**: Linux (recommended for production), macOS, Windows
 - **🚀 Deployment**: Docker-based deployment supported across all major platforms
 - **🐍 Python Version**: 3.12+ required
+- **📱 Telegram clients**: rich message rendering needs a Telegram app released after Bot API 10.1 (older apps show "unsupported message"; switch Rich Messages off in `/settings`)
 - **🖥️ Hardware Requirements**: 
   - Minimum: 4GB RAM, 2 CPU cores
   - Recommended: 8GB+ RAM, 4+ CPU cores (especially for handling multiple conversations)
@@ -402,6 +415,7 @@ The application is configured via environment variables in the `.env` file. Key 
 4. Use `/settings` to customize the bot's behavior
 5. Use `/reminders` to manage your reminders
 6. Use `/cancel` to stop the task that is running and clear your queue
+7. Use `/settings` → Rich Messages to switch between rich and classic formatting
 
 ### ⏳ Queues and isolation
 
@@ -417,6 +431,9 @@ as video generation or a sandboxed command, never delays other users. `MAX_CONCU
 - **🎤 Voice features not working**: Ensure FFmpeg is properly installed
 - **🐳 Container issues**: Verify Docker is running and the user has appropriate permissions
 - **🔑 API errors**: Check your API keys and network connection
+- **✨ Answers arrive as "unsupported message"**: update the Telegram app, or turn Rich Messages off in `/settings`
+- **✨ Answers have no headings/tables and the log says rich messages are not supported**: the
+  `telegram-bot-api` sidecar is older than Bot API 10.1; run `docker compose pull telegram-bot-api && docker compose up -d`
 
 ## 📄 License
 

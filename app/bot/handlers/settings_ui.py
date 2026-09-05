@@ -6,7 +6,7 @@ the UI behaves the same; authorization is handled by ``AuthMiddleware``.
 
 callback_data scheme: ``settings_<token>[_<action>[_<value>]]`` where
 ``<token>`` is a short name (summarization, dialog, reasoning, memory,
-critique, judge, tools, semantic, thinking, main), parsed with a plain
+critique, judge, tools, semantic, thinking, rich, main), parsed with a plain
 ``split("_")``. ``settings_system_prompt`` and
 ``settings_system_prompt_set_<type>`` are special-cased because of the
 underscore in their token.
@@ -114,6 +114,8 @@ def _overview(user_settings: UserSettings) -> tuple[str, InlineKeyboardMarkup]:
         f"Max Results: {s.get('semantic_search', 'max_results')}\n"
         "🤔 *Thinking Status*: "
         f"{_mark(s.get('thinking', 'enabled'))}\n"
+        "✨ *Rich Messages*: "
+        f"{_mark(s.get('rich_messages', 'enabled'))}\n"
         "🧩 *System Prompt*: "
         f"{s.get('system_prompt', 'type')}\n\n"
         "Select a setting to configure:"
@@ -140,6 +142,9 @@ def _overview(user_settings: UserSettings) -> tuple[str, InlineKeyboardMarkup]:
             [
                 InlineKeyboardButton(text="🤔 Thinking", callback_data="settings_thinking"),
                 InlineKeyboardButton(text="🧩 System Prompt", callback_data="settings_system_prompt"),
+            ],
+            [
+                InlineKeyboardButton(text="✨ Rich Messages", callback_data="settings_rich"),
             ],
         ]
     )
@@ -309,6 +314,12 @@ async def settings_button(callback: CallbackQuery) -> None:
             current = user_settings.get("thinking", "enabled")
             user_settings.set("thinking", not current, "enabled")
         await show_thinking_menu(message, user_settings)
+
+    elif category == "rich":
+        if action == "toggle":
+            current = user_settings.get("rich_messages", "enabled")
+            user_settings.set("rich_messages", not current, "enabled")
+        await show_rich_menu(message, user_settings)
 
     else:
         logger.debug("Ignoring unknown settings callback: %s", data)
@@ -525,6 +536,28 @@ async def show_thinking_menu(message: Message, user_settings: UserSettings) -> N
         f"Status: {_status(enabled)}\n\n"
         "This setting controls whether the bot shows detailed\n"
         "thinking steps during processing.",
+        keyboard,
+    )
+
+
+async def show_rich_menu(message: Message, user_settings: UserSettings) -> None:
+    """Show rich messages settings menu."""
+    enabled = user_settings.get("rich_messages", "enabled")
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [_toggle_button(enabled, "settings_rich_toggle")],
+            [_back_button()],
+        ]
+    )
+    await edit_md(
+        message,
+        "*Rich Messages Settings*\n\n"
+        f"Status: {_status(enabled)}\n\n"
+        "Answers are sent as rich Telegram messages with real\n"
+        "Markdown: headings, tables, code blocks, task lists and math.\n"
+        "Turn this off if your Telegram app shows them as\n"
+        "\"unsupported message\" (old client); answers then use\n"
+        "classic Markdown formatting.",
         keyboard,
     )
 
