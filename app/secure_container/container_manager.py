@@ -5,10 +5,16 @@ import logging
 import tempfile
 import json
 import shutil
+import threading
 from pathlib import Path
 import docker
 from docker.errors import DockerException, ImageNotFound, ContainerError
 import time
+
+# Cap on sandbox containers running at the same time across all users. Each container is
+# limited to 512 MB / one CPU; without a cap a burst of users could exhaust the host.
+MAX_SANDBOX_CONTAINERS = max(1, int(os.getenv("MAX_SANDBOX_CONTAINERS", "4") or "4"))
+_SANDBOX_SLOTS = threading.BoundedSemaphore(MAX_SANDBOX_CONTAINERS)
 
 # Set up logging
 logging.basicConfig(
@@ -155,16 +161,23 @@ class ContainerManager:
     def run_command(self, user_id, command, timeout=60, network_enabled=False):
         """
         Run a command in a secure container for the specified user.
-        
+
+        Blocks until a sandbox slot is free (see MAX_SANDBOX_CONTAINERS); callers run
+        this in a worker thread, so waiting here never blocks the bot's event loop.
+
         Args:
             user_id: User ID
             command: Command to run
             timeout: Timeout in seconds
             network_enabled: Whether to enable network access for the container
-            
+
         Returns:
             Command output
         """
+        with _SANDBOX_SLOTS:
+            return self._run_command_in_slot(user_id, command, timeout, network_enabled)
+
+    def _run_command_in_slot(self, user_id, command, timeout=60, network_enabled=False):
         # Ensure user directory exists
         user_dir = self.ensure_user_directory(user_id)
         

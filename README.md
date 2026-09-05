@@ -362,8 +362,16 @@ The application is configured via environment variables in the `.env` file. Key 
 
 ### 🧠 Agent Configuration
 
-- `MAX_AGENT_TOOLS_ITERATIONS`: Maximum number of tool use iterations (default: 65)
-- `MAX_AGENT_CRITIQUE_ITERATIONS`: Maximum number of critique iterations (default: 0)
+- Tool, critique and judge iteration limits are per-user settings (see `/settings`); the
+  `MAX_AGENT_*_ITERATIONS` variables are obsolete and ignored.
+
+### ⚙️ Concurrency
+
+- `MAX_CONCURRENT_TURNS`: agent turns running at the same time across all users (default: 8)
+- `MAX_SANDBOX_CONTAINERS`: sandbox containers running at the same time (default: 4)
+- `THREAD_POOL_SIZE`: worker threads for blocking work such as Docker waits and HTTP SDK calls (default: 32)
+- `TURN_TIMEOUT_SECONDS`: hard limit for one message or scheduled task (default: 1800)
+- `DROP_PENDING_UPDATES`: discard messages that arrived while the bot was down (default: true)
 
 ### ☁️ S3 Storage Configuration
 
@@ -393,6 +401,15 @@ The application is configured via environment variables in the `.env` file. Key 
 3. The bot will process your input and respond accordingly
 4. Use `/settings` to customize the bot's behavior
 5. Use `/reminders` to manage your reminders
+6. Use `/cancel` to stop the task that is running and clear your queue
+
+### ⏳ Queues and isolation
+
+Every chat has its own queue. Messages you send while the bot is still working on a previous one
+are answered immediately with a short "still working on…" notice (with a Stop button) and are then
+processed in order, each as its own turn. Queues are fully isolated: a long task for one user, such
+as video generation or a sandboxed command, never delays other users. `MAX_CONCURRENT_TURNS`,
+`MAX_SANDBOX_CONTAINERS` and `TURN_TIMEOUT_SECONDS` in `.env` bound the whole process.
 
 ## ❓ Troubleshooting
 
@@ -413,9 +430,16 @@ GenerALL.AI is released under a custom license with the following terms:
 
 See the [LICENSE](./LICENSE) file for complete details.
 
+## 🧪 Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
 ## 👏 Acknowledgments
 
-- Built with [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot)
+- Built with [aiogram](https://github.com/aiogram/aiogram)
 - Uses AI models from Anthropic and OpenAI
 - Voice synthesis powered by ElevenLabs 
 

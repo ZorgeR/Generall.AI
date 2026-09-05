@@ -1,23 +1,36 @@
+import asyncio
+import logging
 import os
 import time
 from typing import Dict, Any
 from dotenv import load_dotenv
 from pathlib import Path
 import uuid
-import telegram
 from google import genai
 from google.genai import types
 from google.genai.types import Image, VideoGenerationReferenceImage
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 google_api_key = os.getenv("GOOGLE_API_KEY")
 genai_client = genai.Client(api_key=google_api_key)
 
+VEO_MODEL = "veo-3.1-generate-preview"
+MAX_WAIT_SECONDS = 300  # 5 minutes max
+POLL_INTERVAL_SECONDS = 20
+
+
 class VideoTools:
-    def __init__(self, user_id: str, telegram_update: telegram.Update):
+    def __init__(self, user_id: str, sender):
+        """
+        Args:
+            user_id: chat id of the user as a string
+            sender: bot.sender.ChatSender bound to the user's chat
+        """
         self.user_id = user_id
-        self.telegram_update = telegram_update
+        self.sender = sender
         self.base_path = Path("./data") / str(user_id)
         # Create base directory if it doesn't exist
         self.base_path.mkdir(parents=True, exist_ok=True)
@@ -28,7 +41,7 @@ class VideoTools:
         self.tools_schema = [
             {
                 "name": "video_generator",
-                "description": "Generate high-quality videos from text descriptions using Google Veo 3.0 (state-of-the-art text-to-video generation with cinematic quality), save to videos directory, and send to user via Telegram. Supports detailed scene descriptions with camera movements, lighting, and actions.",
+                "description": "Generate high-quality videos from text descriptions using Google Veo 3.1 (state-of-the-art text-to-video generation with cinematic quality), save to videos directory, and send to user via Telegram. Supports detailed scene descriptions with camera movements, lighting, and actions.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -64,7 +77,7 @@ class VideoTools:
             },
             {
                 "name": "image_to_video_generator",
-                "description": "Generate high-quality videos from an existing image using Google Veo 3.0. Takes a starting image and animates it based on the prompt description. Perfect for bringing static images to life with motion, camera movements, and scene evolution.",
+                "description": "Generate high-quality videos from an existing image using Google Veo 3.1. Takes a starting image and animates it based on the prompt description. Perfect for bringing static images to life with motion, camera movements, and scene evolution.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -219,464 +232,201 @@ class VideoTools:
             return await self._video_extension_generator(**tool_args)
         return f"Unknown tool: {tool_name}"
 
-    async def _video_generator(self, prompt: str, orientation: str = "horizontal", quality: str = "720p", negative_prompt: str = "", caption: str = "Here is your generated video") -> str:
-        """Generate a high-quality video from text using Google's Veo 3.0 model"""
-        print(f"Generating video with Veo 3.1 - Prompt: {prompt}, Orientation: {orientation}, Quality: {quality}, Negative prompt: {negative_prompt}")
+    # ------------------------------------------------------------------
+    # helpers (every Veo call runs in a worker thread; polling is async)
+    # ------------------------------------------------------------------
+    def _resolve_path(self, path: str) -> Path:
+        """Resolve a model-supplied path: raw, then relative to the user dir, then by basename in images/videos."""
+        p = Path(path)
+        if p.exists():
+            return p
+        for candidate in (self.base_path / path, self.base_path / "images" / p.name, self.base_path / "videos" / p.name):
+            if candidate.exists():
+                return candidate
+        return p
+
+    async def _notify(self, text: str) -> None:
         try:
-            # Convert orientation to aspect ratio
-            aspect_ratio = "16:9" if orientation == "horizontal" else "9:16"
-            
-            # Notify user that video generation started (it can take some time)
-            await self.telegram_update.message.reply_text(
-                f"🎬 Video generation started ({aspect_ratio}, {quality})... This may take 1-2 minutes. Please wait.",
-                parse_mode="markdown"
-            )
-            
-            # Configure video generation
-            config = types.GenerateVideosConfig(
-                aspect_ratio=aspect_ratio, resolution=quality
-            )
-            if negative_prompt:
-                config.negative_prompt = negative_prompt
-            
-            # Start video generation operation
-            operation = genai_client.models.generate_videos(
-                model="veo-3.1-generate-preview",
-                prompt=prompt,
-                config=config,
-            )
-            
-            # Poll for completion
-            max_wait_time = 300  # 5 minutes max
-            start_time = time.time()
-            poll_interval = 20  # Check every 20 seconds
-            
-            while not operation.done:
-                if time.time() - start_time > max_wait_time:
-                    return "Error: Video generation timed out after 5 minutes. Please try again with a simpler prompt."
-                
-                time.sleep(poll_interval)
-                operation = genai_client.operations.get(operation)
-            
-            # Get the generated video
-            if not operation.result or not operation.result.generated_videos:
-                return "Error: No video was generated. Please try again with a different prompt."
-            
-            generated_video = operation.result.generated_videos[0]
-            
-            # Generate unique filename
-            video_filename = f"veo3_video_{uuid.uuid4()}.mp4"
-            video_path = self.videos_path / video_filename
-            
-            # Download the video file
+            await self.sender.send_text(text)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not send video notice: %s", e)
+
+    async def _generate_and_wait(self, **kwargs):
+        """Start a generate_videos operation and poll it without blocking the event loop."""
+        operation = await asyncio.to_thread(genai_client.models.generate_videos, model=VEO_MODEL, **kwargs)
+        start = time.monotonic()
+        while not operation.done:
+            if time.monotonic() - start > MAX_WAIT_SECONDS:
+                return None
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+            operation = await asyncio.to_thread(genai_client.operations.get, operation)
+        if not operation.result or not operation.result.generated_videos:
+            return False
+        return operation.result.generated_videos[0]
+
+    async def _save_and_send(self, generated_video, filename: str, caption: str) -> Path:
+        video_path = self.videos_path / filename
+
+        def _download() -> None:
             genai_client.files.download(file=generated_video.video)
             generated_video.video.save(str(video_path))
-            
-            # Send video to user via Telegram
-            with open(video_path, 'rb') as video_file:
-                await self.telegram_update.message.reply_video(
-                    video=video_file,
-                    caption=caption,
-                    supports_streaming=True
-                )
-            
-            result_message = "✅ Video generated successfully!\n\n"
-            result_message += f"Aspect Ratio: {aspect_ratio}\n"
-            result_message += f"Resolution: {quality}\n"
-            result_message += f"File saved to: {video_path}\n"
-            result_message += "Video has been sent to user via Telegram.\n"
-            
-            return result_message
-            
+
+        await asyncio.to_thread(_download)
+        await self.sender.send_video(str(video_path), caption=caption)
+        return video_path
+
+    async def _fail(self, user_text: str, error_message: str) -> str:
+        logger.error(error_message)
+        await self._notify(user_text)
+        return error_message
+
+    # ------------------------------------------------------------------
+    # tools
+    # ------------------------------------------------------------------
+    async def _video_generator(self, prompt: str, orientation: str = "horizontal", quality: str = "720p", negative_prompt: str = "", caption: str = "Here is your generated video") -> str:
+        """Generate a high-quality video from text using Google's Veo model"""
+        logger.info("Generating video - prompt=%r orientation=%s quality=%s", prompt, orientation, quality)
+        try:
+            aspect_ratio = "16:9" if orientation == "horizontal" else "9:16"
+            await self._notify(f"🎬 Video generation started ({aspect_ratio}, {quality})... This may take 1-2 minutes. Please wait.")
+            config = types.GenerateVideosConfig(aspect_ratio=aspect_ratio, resolution=quality)
+            if negative_prompt:
+                config.negative_prompt = negative_prompt
+
+            video = await self._generate_and_wait(prompt=prompt, config=config)
+            if video is None:
+                return "Error: Video generation timed out after 5 minutes. Please try again with a simpler prompt."
+            if video is False:
+                return "Error: No video was generated. Please try again with a different prompt."
+
+            video_path = await self._save_and_send(video, f"veo3_video_{uuid.uuid4()}.mp4", caption)
+            return (
+                "✅ Video generated successfully!\n\n"
+                f"Aspect Ratio: {aspect_ratio}\nResolution: {quality}\nFile saved to: {video_path}\n"
+                "Video has been sent to user via Telegram.\n"
+            )
         except Exception as e:
-            error_message = f"Error generating video: {str(e)}"
-            print(error_message)
-            try:
-                await self.telegram_update.message.reply_text(
-                    "❌ Sorry, video generation failed. Please try again.",
-                    parse_mode="markdown"
-                )
-            except Exception:
-                pass
-            return error_message
+            return await self._fail("❌ Sorry, video generation failed. Please try again.", f"Error generating video: {str(e)}")
 
     async def _image_to_video_generator(self, prompt: str, image_path: str, orientation: str = "horizontal", quality: str = "720p", negative_prompt: str = "", caption: str = "Here is your generated video from the image") -> str:
-        """Generate a high-quality video from an image using Google's Veo 3.0 model"""
-        print(f"Generating video from image with Veo 3.1 - Prompt: {prompt}, Image: {image_path}, Orientation: {orientation}, Quality: {quality}, Negative prompt: {negative_prompt}")
+        """Generate a high-quality video from an image using Google's Veo model"""
+        logger.info("Generating video from image - prompt=%r image=%s", prompt, image_path)
         try:
-            # Verify the image path exists
-            image_path_obj = Path(image_path)
+            image_path_obj = self._resolve_path(image_path)
             if not image_path_obj.exists():
                 return f"Error: The image at path {image_path} does not exist."
-            
-            # Convert orientation to aspect ratio
             aspect_ratio = "16:9" if orientation == "horizontal" else "9:16"
-            
-            # Load image using the from_file method (handles bytes and mime_type automatically)
-            source_image = Image.from_file(location=str(image_path_obj))
-            
-            # Notify user that video generation started (it can take some time)
-            await self.telegram_update.message.reply_text(
-                f"🎬 Video generation from image started ({aspect_ratio}, {quality})... This may take 1-2 minutes. Please wait.",
-                parse_mode="markdown"
-            )
-            
-            # Configure video generation
-            config = types.GenerateVideosConfig(
-                aspect_ratio=aspect_ratio, resolution=quality
-            )
-
+            source_image = await asyncio.to_thread(Image.from_file, location=str(image_path_obj))
+            await self._notify(f"🎬 Video generation from image started ({aspect_ratio}, {quality})... This may take 1-2 minutes. Please wait.")
+            config = types.GenerateVideosConfig(aspect_ratio=aspect_ratio, resolution=quality)
             if negative_prompt:
                 config.negative_prompt = negative_prompt
-            
-            # Start video generation operation with image
-            operation = genai_client.models.generate_videos(
-                model="veo-3.1-generate-preview",
-                prompt=prompt,
-                image=source_image,
-                config=config,
-            )
-            
-            # Poll for completion
-            max_wait_time = 300  # 5 minutes max
-            start_time = time.time()
-            poll_interval = 20  # Check every 20 seconds
-            
-            while not operation.done:
-                if time.time() - start_time > max_wait_time:
-                    return "Error: Video generation timed out after 5 minutes. Please try again with a simpler prompt."
-                
-                time.sleep(poll_interval)
-                operation = genai_client.operations.get(operation)
-            
-            # Get the generated video
-            if not operation.result or not operation.result.generated_videos:
+
+            video = await self._generate_and_wait(prompt=prompt, image=source_image, config=config)
+            if video is None:
+                return "Error: Video generation timed out after 5 minutes. Please try again with a simpler prompt."
+            if video is False:
                 return "Error: No video was generated. Please try again with a different prompt or image."
-            
-            generated_video = operation.result.generated_videos[0]
-            
-            # Generate unique filename
-            video_filename = f"veo3_from_image_{uuid.uuid4()}.mp4"
-            video_path = self.videos_path / video_filename
-            
-            # Download the video file
-            genai_client.files.download(file=generated_video.video)
-            generated_video.video.save(str(video_path))
-            
-            # Send video to user via Telegram
-            with open(video_path, 'rb') as video_file:
-                await self.telegram_update.message.reply_video(
-                    video=video_file,
-                    caption=caption,
-                    supports_streaming=True
-                )
-            
-            result_message = "✅ Video generated from image successfully!\n\n"
-            result_message += f"Source image: {image_path}\n"
-            result_message += f"Aspect Ratio: {aspect_ratio}\n"
-            result_message += f"Resolution: {quality}\n"
-            result_message += f"Video saved to: {video_path}\n"
-            result_message += "Video has been sent to user via Telegram.\n"
-            
-            return result_message
-            
+
+            video_path = await self._save_and_send(video, f"veo3_from_image_{uuid.uuid4()}.mp4", caption)
+            return (
+                "✅ Video generated from image successfully!\n\n"
+                f"Source image: {image_path}\nAspect Ratio: {aspect_ratio}\nResolution: {quality}\nVideo saved to: {video_path}\n"
+                "Video has been sent to user via Telegram.\n"
+            )
         except Exception as e:
-            error_message = f"Error generating video from image: {str(e)}"
-            print(error_message)
-            try:
-                await self.telegram_update.message.reply_text(
-                    "❌ Sorry, video generation from image failed. Please try again.",
-                    parse_mode="markdown"
-                )
-            except Exception:
-                pass
-            return error_message
+            return await self._fail("❌ Sorry, video generation from image failed. Please try again.", f"Error generating video from image: {str(e)}")
 
     async def _video_from_reference_images(self, prompt: str, reference_image_paths: list, quality: str = "720p", negative_prompt: str = "", caption: str = "Here is your generated video with reference images") -> str:
-        """Generate a high-quality video using reference images with Google's Veo 3.1 model"""
-        print(f"Generating video with reference images - Prompt: {prompt}, Reference images: {reference_image_paths}, Quality: {quality}")
+        """Generate a high-quality video using reference images with Google's Veo model"""
+        logger.info("Generating video with reference images - prompt=%r images=%s", prompt, reference_image_paths)
         try:
-            # Verify all reference image paths exist
             reference_images = []
             for image_path in reference_image_paths:
-                image_path_obj = Path(image_path)
+                image_path_obj = self._resolve_path(image_path)
                 if not image_path_obj.exists():
                     return f"Error: The reference image at path {image_path} does not exist."
-                
-                # Load each reference image and create VideoGenerationReferenceImage
-                image = Image.from_file(location=str(image_path_obj))
-                ref_image = VideoGenerationReferenceImage(
-                    image=image,
-                    reference_type="asset"
-                )
-                reference_images.append(ref_image)
-            
-            # Currently only supports horizontal 16:9
-            aspect_ratio = "16:9"
-            
-            # Notify user that video generation started
-            await self.telegram_update.message.reply_text(
-                f"🎬 Video generation with {len(reference_images)} reference image(s) started ({aspect_ratio}, {quality})... This may take 1-2 minutes. Please wait.",
-                parse_mode="markdown"
-            )
-            
-            # Configure video generation
-            config = types.GenerateVideosConfig(
-                aspect_ratio=aspect_ratio,
-                resolution=quality,
-                reference_images=reference_images
-            )
+                image = await asyncio.to_thread(Image.from_file, location=str(image_path_obj))
+                reference_images.append(VideoGenerationReferenceImage(image=image, reference_type="asset"))
+
+            aspect_ratio = "16:9"  # Currently only supports horizontal 16:9
+            await self._notify(f"🎬 Video generation with {len(reference_images)} reference image(s) started ({aspect_ratio}, {quality})... This may take 1-2 minutes. Please wait.")
+            config = types.GenerateVideosConfig(aspect_ratio=aspect_ratio, resolution=quality, reference_images=reference_images)
             if negative_prompt:
                 config.negative_prompt = negative_prompt
-            
-            # Start video generation operation
-            operation = genai_client.models.generate_videos(
-                model="veo-3.1-generate-preview",
-                prompt=prompt,
-                config=config,
-            )
-            
-            # Poll for completion
-            max_wait_time = 300  # 5 minutes max
-            start_time = time.time()
-            poll_interval = 20  # Check every 20 seconds
-            
-            while not operation.done:
-                if time.time() - start_time > max_wait_time:
-                    return "Error: Video generation timed out after 5 minutes. Please try again with a simpler prompt."
-                
-                time.sleep(poll_interval)
-                operation = genai_client.operations.get(operation)
-            
-            # Get the generated video
-            if not operation.result or not operation.result.generated_videos:
+
+            video = await self._generate_and_wait(prompt=prompt, config=config)
+            if video is None:
+                return "Error: Video generation timed out after 5 minutes. Please try again with a simpler prompt."
+            if video is False:
                 return "Error: No video was generated. Please try again with a different prompt or reference images."
-            
-            generated_video = operation.result.generated_videos[0]
-            
-            # Generate unique filename
-            video_filename = f"veo3_reference_{uuid.uuid4()}.mp4"
-            video_path = self.videos_path / video_filename
-            
-            # Download the video file
-            genai_client.files.download(file=generated_video.video)
-            generated_video.video.save(str(video_path))
-            
-            # Send video to user via Telegram
-            with open(video_path, 'rb') as video_file:
-                await self.telegram_update.message.reply_video(
-                    video=video_file,
-                    caption=caption,
-                    supports_streaming=True
-                )
-            
-            result_message = "✅ Video with reference images generated successfully!\n\n"
-            result_message += f"Reference images: {len(reference_images)}\n"
-            result_message += f"Aspect Ratio: {aspect_ratio}\n"
-            result_message += f"Resolution: {quality}\n"
-            result_message += f"File saved to: {video_path}\n"
-            result_message += "Video has been sent to user via Telegram.\n"
-            
-            return result_message
-            
+
+            video_path = await self._save_and_send(video, f"veo3_reference_{uuid.uuid4()}.mp4", caption)
+            return (
+                "✅ Video with reference images generated successfully!\n\n"
+                f"Reference images: {len(reference_images)}\nAspect Ratio: {aspect_ratio}\nResolution: {quality}\nFile saved to: {video_path}\n"
+                "Video has been sent to user via Telegram.\n"
+            )
         except Exception as e:
-            error_message = f"Error generating video with reference images: {str(e)}"
-            print(error_message)
-            try:
-                await self.telegram_update.message.reply_text(
-                    "❌ Sorry, video generation with reference images failed. Please try again.",
-                    parse_mode="markdown"
-                )
-            except Exception:
-                pass
-            return error_message
+            return await self._fail("❌ Sorry, video generation with reference images failed. Please try again.", f"Error generating video with reference images: {str(e)}")
 
     async def _video_interpolation_generator(self, prompt: str, first_frame_path: str, last_frame_path: str, orientation: str = "horizontal", quality: str = "720p", negative_prompt: str = "", caption: str = "Here is your interpolated video") -> str:
-        """Generate a high-quality video with specified first and last frames using Google's Veo 3.1 model"""
-        print(f"Generating interpolated video - Prompt: {prompt}, First frame: {first_frame_path}, Last frame: {last_frame_path}, Orientation: {orientation}, Quality: {quality}")
+        """Generate a high-quality video with specified first and last frames using Google's Veo model"""
+        logger.info("Generating interpolated video - prompt=%r first=%s last=%s", prompt, first_frame_path, last_frame_path)
         try:
-            # Verify both frame paths exist
-            first_frame_obj = Path(first_frame_path)
-            last_frame_obj = Path(last_frame_path)
-            
+            first_frame_obj = self._resolve_path(first_frame_path)
+            last_frame_obj = self._resolve_path(last_frame_path)
             if not first_frame_obj.exists():
                 return f"Error: The first frame at path {first_frame_path} does not exist."
             if not last_frame_obj.exists():
                 return f"Error: The last frame at path {last_frame_path} does not exist."
-            
-            # Load both frames
-            first_image = Image.from_file(location=str(first_frame_obj))
-            last_image = Image.from_file(location=str(last_frame_obj))
-            
-            # Convert orientation to aspect ratio
+            first_image = await asyncio.to_thread(Image.from_file, location=str(first_frame_obj))
+            last_image = await asyncio.to_thread(Image.from_file, location=str(last_frame_obj))
             aspect_ratio = "16:9" if orientation == "horizontal" else "9:16"
-            
-            # Notify user that video generation started
-            await self.telegram_update.message.reply_text(
-                f"🎬 Video interpolation started ({aspect_ratio}, {quality})... This may take 1-2 minutes. Please wait.",
-                parse_mode="markdown"
-            )
-            
-            # Configure video generation with last frame
-            config = types.GenerateVideosConfig(
-                aspect_ratio=aspect_ratio,
-                resolution=quality,
-                last_frame=last_image
-            )
+            await self._notify(f"🎬 Video interpolation started ({aspect_ratio}, {quality})... This may take 1-2 minutes. Please wait.")
+            config = types.GenerateVideosConfig(aspect_ratio=aspect_ratio, resolution=quality, last_frame=last_image)
             if negative_prompt:
                 config.negative_prompt = negative_prompt
-            
-            # Start video generation operation with first frame as image parameter
-            operation = genai_client.models.generate_videos(
-                model="veo-3.1-generate-preview",
-                prompt=prompt,
-                image=first_image,
-                config=config,
-            )
-            
-            # Poll for completion
-            max_wait_time = 300  # 5 minutes max
-            start_time = time.time()
-            poll_interval = 20  # Check every 20 seconds
-            
-            while not operation.done:
-                if time.time() - start_time > max_wait_time:
-                    return "Error: Video generation timed out after 5 minutes. Please try again with a simpler prompt."
-                
-                time.sleep(poll_interval)
-                operation = genai_client.operations.get(operation)
-            
-            # Get the generated video
-            if not operation.result or not operation.result.generated_videos:
+
+            video = await self._generate_and_wait(prompt=prompt, image=first_image, config=config)
+            if video is None:
+                return "Error: Video generation timed out after 5 minutes. Please try again with a simpler prompt."
+            if video is False:
                 return "Error: No video was generated. Please try again with different frames or prompt."
-            
-            generated_video = operation.result.generated_videos[0]
-            
-            # Generate unique filename
-            video_filename = f"veo3_interpolated_{uuid.uuid4()}.mp4"
-            video_path = self.videos_path / video_filename
-            
-            # Download the video file
-            genai_client.files.download(file=generated_video.video)
-            generated_video.video.save(str(video_path))
-            
-            # Send video to user via Telegram
-            with open(video_path, 'rb') as video_file:
-                await self.telegram_update.message.reply_video(
-                    video=video_file,
-                    caption=caption,
-                    supports_streaming=True
-                )
-            
-            result_message = "✅ Interpolated video generated successfully!\n\n"
-            result_message += f"First frame: {first_frame_path}\n"
-            result_message += f"Last frame: {last_frame_path}\n"
-            result_message += f"Aspect Ratio: {aspect_ratio}\n"
-            result_message += f"Resolution: {quality}\n"
-            result_message += f"Video saved to: {video_path}\n"
-            result_message += "Video has been sent to user via Telegram.\n"
-            
-            return result_message
-            
+
+            video_path = await self._save_and_send(video, f"veo3_interpolated_{uuid.uuid4()}.mp4", caption)
+            return (
+                "✅ Interpolated video generated successfully!\n\n"
+                f"First frame: {first_frame_path}\nLast frame: {last_frame_path}\nAspect Ratio: {aspect_ratio}\nResolution: {quality}\nVideo saved to: {video_path}\n"
+                "Video has been sent to user via Telegram.\n"
+            )
         except Exception as e:
-            error_message = f"Error generating interpolated video: {str(e)}"
-            print(error_message)
-            try:
-                await self.telegram_update.message.reply_text(
-                    "❌ Sorry, interpolated video generation failed. Please try again.",
-                    parse_mode="markdown"
-                )
-            except Exception:
-                pass
-            return error_message
+            return await self._fail("❌ Sorry, interpolated video generation failed. Please try again.", f"Error generating interpolated video: {str(e)}")
 
     async def _video_extension_generator(self, prompt: str, source_video_path: str, caption: str = "Here is your extended video") -> str:
-        """Extend an existing video using Google's Veo 3.1 model"""
-        print(f"Extending video - Prompt: {prompt}, Source video: {source_video_path}")
+        """Extend an existing video using Google's Veo model"""
+        logger.info("Extending video - prompt=%r source=%s", prompt, source_video_path)
         try:
-            # Verify the source video path exists
-            video_path_obj = Path(source_video_path)
+            video_path_obj = self._resolve_path(source_video_path)
             if not video_path_obj.exists():
                 return f"Error: The source video at path {source_video_path} does not exist."
-            
-            # Upload the source video to Google's servers first
             # The genai client requires videos to be uploaded before use
-            uploaded_video = genai_client.files.upload(file=str(video_path_obj))
-            source_video = uploaded_video
-            
-            # Currently only supports 720p for extension
-            quality = "720p"
-            
-            # Notify user that video extension started
-            await self.telegram_update.message.reply_text(
-                f"🎬 Video extension started ({quality})... This may take 1-2 minutes. Please wait.",
-                parse_mode="markdown"
-            )
-            
-            # Configure video generation
-            config = types.GenerateVideosConfig(
-                number_of_videos=1,
-                resolution=quality
-            )
-            
-            # Start video extension operation
-            operation = genai_client.models.generate_videos(
-                model="veo-3.1-generate-preview",
-                video=source_video,
-                prompt=prompt,
-                config=config,
-            )
-            
-            # Poll for completion
-            max_wait_time = 300  # 5 minutes max
-            start_time = time.time()
-            poll_interval = 20  # Check every 20 seconds
-            
-            while not operation.done:
-                if time.time() - start_time > max_wait_time:
-                    return "Error: Video extension timed out after 5 minutes. Please try again with a simpler prompt."
-                
-                time.sleep(poll_interval)
-                operation = genai_client.operations.get(operation)
-            
-            # Get the generated video
-            if not operation.result or not operation.result.generated_videos:
+            source_video = await asyncio.to_thread(genai_client.files.upload, file=str(video_path_obj))
+            quality = "720p"  # Currently only supports 720p for extension
+            await self._notify(f"🎬 Video extension started ({quality})... This may take 1-2 minutes. Please wait.")
+            config = types.GenerateVideosConfig(number_of_videos=1, resolution=quality)
+
+            video = await self._generate_and_wait(video=source_video, prompt=prompt, config=config)
+            if video is None:
+                return "Error: Video extension timed out after 5 minutes. Please try again with a simpler prompt."
+            if video is False:
                 return "Error: No extended video was generated. Please try again with a different prompt."
-            
-            generated_video = operation.result.generated_videos[0]
-            
-            # Generate unique filename
-            video_filename = f"veo3_extended_{uuid.uuid4()}.mp4"
-            video_path = self.videos_path / video_filename
-            
-            # Download the video file
-            genai_client.files.download(file=generated_video.video)
-            generated_video.video.save(str(video_path))
-            
-            # Send video to user via Telegram
-            with open(video_path, 'rb') as video_file:
-                await self.telegram_update.message.reply_video(
-                    video=video_file,
-                    caption=caption,
-                    supports_streaming=True
-                )
-            
-            result_message = "✅ Video extended successfully!\n\n"
-            result_message += f"Source video: {source_video_path}\n"
-            result_message += f"Resolution: {quality}\n"
-            result_message += f"Extended video saved to: {video_path}\n"
-            result_message += "Video has been sent to user via Telegram.\n"
-            
-            return result_message
-            
+
+            video_path = await self._save_and_send(video, f"veo3_extended_{uuid.uuid4()}.mp4", caption)
+            return (
+                "✅ Video extended successfully!\n\n"
+                f"Source video: {source_video_path}\nResolution: {quality}\nExtended video saved to: {video_path}\n"
+                "Video has been sent to user via Telegram.\n"
+            )
         except Exception as e:
-            error_message = f"Error extending video: {str(e)}"
-            print(error_message)
-            try:
-                await self.telegram_update.message.reply_text(
-                    "❌ Sorry, video extension failed. Please try again.",
-                    parse_mode="markdown"
-                )
-            except Exception:
-                pass
-            return error_message
+            return await self._fail("❌ Sorry, video extension failed. Please try again.", f"Error extending video: {str(e)}")

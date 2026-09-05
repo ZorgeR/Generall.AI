@@ -20,7 +20,6 @@ import json
 from datetime import datetime
 from pathlib import Path
 from pydantic import BaseModel
-import telegram
 
 load_dotenv()
 
@@ -224,14 +223,16 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         if self.user_id:
             stats_tracker.track_tool_used(self.user_id, tool_name)
         
+        # Async providers are awaited; synchronous providers (network / Docker calls) run in a
+        # worker thread so one user's tool call never stalls the event loop for everyone else.
         if self.file_ops and tool_name in [t["name"] for t in self.file_ops.tools_schema]:
             return await self.file_ops.execute_tool(tool_name, tool_args)
         elif self.search_tools and tool_name in [t["name"] for t in self.search_tools.tools_schema]:
-            return self.search_tools.execute_tool(tool_name, tool_args)
+            return await asyncio.to_thread(self.search_tools.execute_tool, tool_name, tool_args)
         elif self.code_tools and tool_name in [t["name"] for t in self.code_tools.tools_schema]:
-            return self.code_tools.execute_tool(tool_name, tool_args)
+            return await asyncio.to_thread(self.code_tools.execute_tool, tool_name, tool_args)
         elif self.terminal_tools and tool_name in [t["name"] for t in self.terminal_tools.tools_schema]:
-            return self.terminal_tools.execute_tool(tool_name, tool_args)
+            return await asyncio.to_thread(self.terminal_tools.execute_tool, tool_name, tool_args)
         elif self.time_tools and tool_name in [t["name"] for t in self.time_tools.tools_schema]:
             return self.time_tools.execute_tool(tool_name, tool_args)
         elif self.image_tools and tool_name in [t["name"] for t in self.image_tools.tools_schema]:
@@ -239,7 +240,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         elif self.video_tools and tool_name in [t["name"] for t in self.video_tools.tools_schema]:
             return await self.video_tools.execute_tool(tool_name, tool_args)
         elif self.sms_tools and tool_name in [t["name"] for t in self.sms_tools.tools_schema]:
-            return self.sms_tools.execute_tool(tool_name, tool_args)
+            return await asyncio.to_thread(self.sms_tools.execute_tool, tool_name, tool_args)
         elif self.user_interactions and tool_name in [t["name"] for t in self.user_interactions.tools_schema]:
             return await self.user_interactions.execute_tool(tool_name, tool_args)
         else:
@@ -488,21 +489,27 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
 
 
 class ChainOfThoughtAgent:
-    def __init__(self, model_type: str = "anthropic", model: str = anthropic_model, user_id: str = "default", telegram_update: telegram.Update = None, user_settings: dict = None, message_thread_id: int = None):
+    def __init__(self, model_type: str = "anthropic", model: str = anthropic_model, user_id: str = "default", sender=None, user_settings: dict = None, message_thread_id: int = None):
+        """
+        Args:
+            sender: bot.sender.ChatSender bound to the user's chat; tools use it to send
+                    messages, files and reactions. Never depends on an incoming update.
+        """
         self.model_type = model_type
         self.thread_id = message_thread_id
-        
+        self.sender = sender
+
         # Initialize tools
         self.user_id = user_id
-        self.file_ops = FileOperations(user_id, telegram_update)
+        self.file_ops = FileOperations(user_id, sender)
         self.search_tools = SearchTools(user_id)
         self.code_tools = CodeTools(user_id)
-        self.terminal_tools = TerminalTools(user_id, telegram_update)
+        self.terminal_tools = TerminalTools(user_id, sender)
         self.time_tools = TimeTools()
-        self.image_tools = ImageTools(user_id, telegram_update)
-        self.video_tools = VideoTools(user_id, telegram_update)
+        self.image_tools = ImageTools(user_id, sender)
+        self.video_tools = VideoTools(user_id, sender)
         self.sms_tools = SMSTools()
-        self.user_interactions = UserInteractions(user_id, telegram_update)
+        self.user_interactions = UserInteractions(user_id, sender)
         self.user_settings = user_settings
         
         # Initialize embeddings
@@ -1014,10 +1021,16 @@ You have been asked to answer a query given sources. Consider the following when
 
         # Search for relevant past conversations
         if self.user_settings.get("semantic_search").get("enabled"):
-            relevant_conversations = self.conversation_embeddings.search_conversations(
-                query=question,
-                k=int(self.user_settings.get("semantic_search").get("max_results", 5))
-            )
+            try:
+                # Embedding lookup is a blocking HTTP call: keep it off the event loop.
+                relevant_conversations = await asyncio.to_thread(
+                    self.conversation_embeddings.search_conversations,
+                    query=question,
+                    k=int(self.user_settings.get("semantic_search").get("max_results", 5))
+                )
+            except Exception as e:
+                print(f"Semantic search failed, continuing without it: {e}")
+                relevant_conversations = []
             print(f"\nRelevant past conversations found: {relevant_conversations}")
             if relevant_conversations:
                 system_context += "\n\nRelevant past conversations:\n"
@@ -1193,24 +1206,30 @@ You have been asked to answer a query given sources. Consider the following when
                 if message in thread_messages:
                     thread_messages.remove(message)
 
-        # Save conversation history
-        summary = await self._save_conversation(question, response, thread_messages)
-        print(f"\nConversation saved. Summary: {summary}")
-        
-        # Save short term memory
-        reasoning_save_filename = self._get_memory_filename("short_term_memory.json")
-        print(f"Saving reasoning context to: {self.short_term_memory_path / reasoning_save_filename}")
-        self._save_short_term_memory(thread_messages)
+        # Persist memory. The answer is already generated (and paid for), so a failure here
+        # must never turn into an error for the user: log it and still return the response.
+        try:
+            summary = await self._save_conversation(question, response, thread_messages)
+            print(f"\nConversation saved. Summary: {summary}")
+        except Exception as e:
+            print(f"WARNING: failed to save long-term conversation memory: {e}")
 
-        dialog = [{"role": "user", "content": question}, {"role": "assistant", "content": response}]
-        dialog_history.extend(dialog)
+        try:
+            reasoning_save_filename = self._get_memory_filename("short_term_memory.json")
+            print(f"Saving reasoning context to: {self.short_term_memory_path / reasoning_save_filename}")
+            self._save_short_term_memory(thread_messages)
 
-        # Save question and response in json array
-        dialog_history_filename = self._get_memory_filename("dialog_history.json")
-        print(f"Saving dialog history to: {self.short_term_memory_path / dialog_history_filename}")
-        with open(self.short_term_memory_path / dialog_history_filename, "w", encoding="utf-8") as f:
-            size_of_dialog_history = settings_dialog_history_size * 2
-            dialog_history = dialog_history[-size_of_dialog_history:]
-            json.dump(dialog_history, f, indent=2, ensure_ascii=False)
+            dialog = [{"role": "user", "content": question}, {"role": "assistant", "content": response}]
+            dialog_history.extend(dialog)
+
+            # Save question and response in json array
+            dialog_history_filename = self._get_memory_filename("dialog_history.json")
+            print(f"Saving dialog history to: {self.short_term_memory_path / dialog_history_filename}")
+            with open(self.short_term_memory_path / dialog_history_filename, "w", encoding="utf-8") as f:
+                size_of_dialog_history = settings_dialog_history_size * 2
+                dialog_history = dialog_history[-size_of_dialog_history:]
+                json.dump(dialog_history, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"WARNING: failed to save short-term memory: {e}")
 
         return response, thread_messages
