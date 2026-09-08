@@ -9,7 +9,7 @@ OVERRIDE_VARS = [
     "ANTHROPIC_MODEL", "ANTHROPIC_EFFORT", "ANTHROPIC_EFFORT_LIGHT", "ANTHROPIC_MAX_TOKENS", "ANTHROPIC_MAX_TOKENS_LIGHT", "ANTHROPIC_MODEL_FAST",
     "OPENAI_MODEL", "VIDEO_FRAMES_MODEL", "OPENAI_REASONING_EFFORT",
     "WHISPER_MODEL", "EMBEDDING_MODEL", "EMBEDDING_DIMENSION",
-    "GEMINI_IMAGE_MODEL_FLASH", "GEMINI_IMAGE_MODEL_PRO", "GPT_IMAGE_MODEL", "DALLE_MODEL",
+    "GEMINI_IMAGE_MODEL_FLASH", "GEMINI_IMAGE_MODEL_PRO", "GPT_IMAGE_MODEL", "GPT_IMAGE_MODEL_FAST",
     "VEO_MODEL", "PERPLEXITY_MODEL", "TTS_MODEL",
 ]
 
@@ -40,8 +40,8 @@ def test_defaults(clean_models):
     assert m.EMBEDDING_DIMENSION == 1536
     assert m.GEMINI_IMAGE_MODEL_FLASH == "gemini-3.1-flash-image-preview"
     assert m.GEMINI_IMAGE_MODEL_PRO == "gemini-3-pro-image-preview"
-    assert m.GPT_IMAGE_MODEL == "gpt-image-2-2026-04-21"
-    assert m.DALLE_MODEL == "dall-e-3"
+    assert m.GPT_IMAGE_MODEL == "gpt-image-2.5-sunburst"
+    assert m.GPT_IMAGE_MODEL_FAST == "gpt-image-2.5-flare"
     assert m.VEO_MODEL == "veo-3.1-generate-preview"
     assert m.PERPLEXITY_MODEL == "sonar"
     assert m.PERPLEXITY_MODELS == ("sonar-reasoning-pro", "sonar-pro", "sonar")
@@ -114,7 +114,6 @@ def test_openai_reasoning_options(clean_models):
     assert m.openai_reasoning_options(m.WHISPER_MODEL) == {}
     assert m.openai_reasoning_options(m.EMBEDDING_MODEL) == {}
     assert m.openai_reasoning_options(m.GPT_IMAGE_MODEL) == {}
-    assert m.openai_reasoning_options(m.DALLE_MODEL) == {}
 
 
 def test_estimate_cost(clean_models):

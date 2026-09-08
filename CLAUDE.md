@@ -9,7 +9,7 @@ wins and the discrepancy is listed under "README vs code".
 A single-process Python Telegram bot (aiogram 3, asyncio) that wraps a Claude
 tool-use agent. Users send text / voice / photos / video / audio / documents in
 Telegram; the bot turns media into a text prompt, runs a per-message agent loop
-with 35 tools (files, web search, code execution in a Docker sandbox,
+with 31 tools (files, web search, code execution in a Docker sandbox,
 image/video generation, reminders, SMS, S3, TTS), persists multi-layer memory
 per user on disk, and replies in Telegram. Claude drives the tool loop; OpenAI
 (`gpt-5.6-terra`) is only consulted by the optional critique step, which can force a
@@ -70,7 +70,8 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
     terminal_tools.py       TerminalTools: run_command (patched; gains run_shell_script/install_package)
     time_tools.py           TimeTools: timezone helpers
     sms_tools.py            SMSTools: Twilio send_sms
-    image_tools.py          ImageTools: Gemini / GPT Image 2 / DALL-E generation, editing, composition
+    image_tools.py          ImageTools: one generate_image tool (generate/edit/compose) over the
+                            models.IMAGE_BACKENDS table, plus generate_story_images
     video_tools.py          VideoTools: Google Veo 3.1 text→video, image→video, extend, interpolate
     user_interactions.py    UserInteractions: mid-run Telegram messages, TTS voice, reactions,
                             schedule_reminder, send file from content
@@ -327,7 +328,7 @@ Effective tool list as the model sees it (after patching):
 | CodeTools | `execute_python` (+`network_enabled`) | sandbox |
 | TerminalTools | `run_command` (no network option), `run_shell_script` (+`network_enabled`), `install_package` (apt, persisted, network on) | sandbox |
 | TimeTools | `get_time_in_timezone`, `list_timezones` | bot process |
-| ImageTools | `image_generator`, `image_editing`, `image_composition` (Gemini or GPT Image 2), `generate_multimodal_image_and_text` (Gemini), `generate_image_dall_e` (obsolete) | bot process (SDK calls in worker threads), sends results itself as documents |
+| ImageTools | `generate_image` (no `images` → generate, one → edit, several → compose; engine `auto`/`best`/`fast`/`story`), `generate_story_images` | bot process (SDK calls in worker threads), delivers each result itself as a document, once |
 | VideoTools | `video_generator`, `image_to_video_generator`, `video_from_reference_images`, `video_interpolation_generator`, `video_extension_generator` | bot process (Veo in worker threads, async polling up to 5 min) |
 | SMSTools | `send_sms` | bot process, worker thread |
 | UserInteractions | `send_user_telegram_message`, `send_voice_message`, `set_message_reaction`, `schedule_reminder`, `send_file_content_to_user_via_telegram` | bot process |
@@ -456,6 +457,7 @@ every `set`. `run_turn` saves once per turn so new defaults reach disk. Agent co
 | `semantic_search` | enabled (true), max_results (3, 1..20) | FAISS hits in system prompt |
 | `thinking` | enabled (true) | on ("deep"): adaptive thinking, `display: summarized`, effort `ANTHROPIC_EFFORT` (high), max_tokens `ANTHROPIC_MAX_TOKENS` (64000); off ("light"): still adaptive, `display: omitted`, effort `ANTHROPIC_EFFORT_LIGHT` (low), max_tokens 16000. Never `disabled` (`models.anthropic_request_options` / `anthropic_max_tokens`) |
 | `rich_messages` | enabled (true) | answers as Telegram rich messages (native GFM); off = legacy Markdown v1 path; also selects the `<formatting>` prompt section and rich vs plain streaming drafts |
+| `image` | engine (`auto`), quality (`auto`), size (`2K`), max_variants (4), metadata (true) | defaults for `generate_image`; the agent may override engine/quality from the request, `max_variants` is a hard cap, `metadata` puts model/quality/size in the delivered file's caption |
 | `trace` | keep_summary (true) | end of turn: status shortened into the rich summary above the answer (expandable tool calls, thinking, tokens); off = deleted |
 | `transcript` | enabled (true), max_context_tokens (120000, 20k..400k), keep_tool_results_turns (3), max_tool_result_chars (20000) | transcript mode (real conversation replayed as is); when on, `dialog_history`/`reasoning_context` are ignored for the prompt (dialog_history.json is still kept current) and `summarization_history.size` = recent summaries in the `<memory>` block |
 | `system_prompt` | type ("generall-ai-v2"; also generall-ai-v1, perplexity-deep-research, perplexity-r1) | prompt selection |
@@ -463,7 +465,7 @@ every `set`. `run_turn` saves once per turn so new defaults reach disk. Agent co
 Edited through `/settings` (`bot/handlers/settings_ui.py`). callback_data is
 `settings_<token>[_<action>[_<value>]]` parsed with a plain `split("_")`, where `<token>` is a short
 name, not the JSON key: summarization, dialog, reasoning, memory (= short_term_memory), critique,
-judge, tools, semantic, thinking, rich, transcript, trace, main. `system_prompt` is special-cased with `startswith`.
+judge, tools, semantic, thinking, rich, transcript, trace, image, main. `system_prompt` is special-cased with `startswith`.
 
 ## Models and external services
 
@@ -486,7 +488,7 @@ OpenAI reasoning models and `{}` for anything else. No other file holds a model 
 | Video frame description | `gpt-5.6-luna` (`VIDEO_FRAMES_MODEL`) | `reasoning_effort` `high`; no `max_completion_tokens` (it would cap reasoning + answer together) | `bot/media.py` |
 | Transcription | `whisper-1` (`WHISPER_MODEL`) via a second client keyed by `OPENAI_API_KEY_WHISPER` (falls back to `OPENAI_API_KEY`); >24 MB chunked | none | `bot/media.py` `transcribe_audio` |
 | Embeddings | `text-embedding-ada-002` (`EMBEDDING_MODEL`), dim 1536 (`EMBEDDING_DIMENSION`, must match; existing FAISS indexes are not migrated) | none | `agents/embeddings.py` |
-| Image gen/edit | `gemini-3.1-flash-image-preview` (Normal, `GEMINI_IMAGE_MODEL_FLASH`), `gemini-3-pro-image-preview` (Pro, `GEMINI_IMAGE_MODEL_PRO`), `gpt-image-2-2026-04-21` (GPT, `GPT_IMAGE_MODEL`), `dall-e-3` (legacy, `DALLE_MODEL`) | none | `agents/image_tools.py` |
+| Image gen/edit/compose | engine → model via `models.IMAGE_BACKENDS`: `auto`/`best` → `gpt-image-2.5-sunburst` (`GPT_IMAGE_MODEL`), `fast` → `gpt-image-2.5-flare` (`GPT_IMAGE_MODEL_FAST`, same price, lower quality), `story` → `gemini-3.1-flash-image-preview` (`GEMINI_IMAGE_MODEL_FLASH`), escalating to `gemini-3-pro-image-preview` (`GEMINI_IMAGE_MODEL_PRO`) at quality xhigh/max | OpenAI: `quality` from the `auto…max` ladder, pixel `size` from ratio+tier, `n=variants`, `output_format`. Gemini: `ImageConfig(aspect_ratio, image_size)`, no quality knob | `agents/image_tools.py` |
 | Video | `veo-3.1-generate-preview` for all five tools (`VEO_MODEL`) | none | `agents/video_tools.py` |
 | Web search / research | Tavily; Perplexity `sonar` default (`PERPLEXITY_MODEL`), enum `PERPLEXITY_MODELS` = sonar-reasoning-pro / sonar-pro / sonar, via raw HTTP | Perplexity payload keeps its own `temperature`/`max_tokens` | `agents/search_tools.py` |
 | TTS | ElevenLabs `eleven_multilingual_v2` (`TTS_MODEL`), voices in `app/voice/voices.json` | none | `bot/media.py`, `agents/user_interactions.py` |
@@ -515,7 +517,7 @@ SearchTools and the embeddings `OpenAI` are per instance; ElevenLabs is per call
 | `THREAD_POOL_SIZE` (32, min 8) | bot/app | size of the default executor used by `asyncio.to_thread` |
 | `WORKSPACE_ROOT` | secure_container | host path of the checkout (see Running); set in compose, not `.env.example` |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENAI_API_KEY_WHISPER`, `GOOGLE_API_KEY`, `TAVILY_API_KEY`, `PERPLEXITY_API_KEY`, `ELEVENLABS_API_KEY` | various | see models table; `OPENAI_API_KEY` and `GOOGLE_API_KEY` needed to import `agents.main` |
-| `ANTHROPIC_MODEL`, `ANTHROPIC_EFFORT`, `ANTHROPIC_MODEL_FAST`, `OPENAI_MODEL`, `VIDEO_FRAMES_MODEL`, `OPENAI_REASONING_EFFORT`, `WHISPER_MODEL`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSION`, `GEMINI_IMAGE_MODEL_FLASH`, `GEMINI_IMAGE_MODEL_PRO`, `GPT_IMAGE_MODEL`, `DALLE_MODEL`, `VEO_MODEL`, `PERPLEXITY_MODEL`, `TTS_MODEL` | `models` | optional overrides of the model defaults (blank = default), read once at import; see "Models and external services" and `.env.example` |
+| `ANTHROPIC_MODEL`, `ANTHROPIC_EFFORT`, `ANTHROPIC_MODEL_FAST`, `OPENAI_MODEL`, `VIDEO_FRAMES_MODEL`, `OPENAI_REASONING_EFFORT`, `WHISPER_MODEL`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSION`, `GEMINI_IMAGE_MODEL_FLASH`, `GEMINI_IMAGE_MODEL_PRO`, `GPT_IMAGE_MODEL`, `GPT_IMAGE_MODEL_FAST`, `VEO_MODEL`, `PERPLEXITY_MODEL`, `TTS_MODEL` | `models` | optional overrides of the model defaults (blank = default), read once at import; see "Models and external services" and `.env.example` |
 | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` | sms_tools | optional; tool returns an error string if unset |
 | `S3_HOST`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET_NAME`, `S3_PATH_TO_STORE` | file_ops | optional |
 | `MAX_IMAGE_RESOLUTION_VISION` (1024), `MAX_IMAGE_RESOLUTION_EDIT` (4096) | bot/media, image_tools | downscale before vision / edit |
@@ -597,6 +599,11 @@ name; a new temp dir needs its own `.gitignore` line).
 - `bot.rich` marks rich messages unsupported for the whole process on the first 404 from
   `sendRichMessage`/`sendRichMessageDraft`/a rich `editMessageText`; a wrong verdict (e.g. a transient 404) needs a restart.
   `TelegramBadRequest` on a rich send is treated as "this text", not "this server".
+- Image tools: `generate_image` resolves engine/quality/size as tool call → user's `image` settings → default,
+  so the agent can override a preference from the request. `xhigh`/`max` are in no published SDK type for images
+  and are sent as given, with a single retry at `IMAGE_QUALITY_FALLBACK` when the provider refuses them. File
+  extensions are derived from the returned bytes, never asserted, and the inline-embed hint is only offered for
+  formats `bot/rich.py` can actually inline.
 - `agents/main.py` appends `RICH_FORMATTING_GUIDE` / `LEGACY_FORMATTING_GUIDE` to every system
   prompt after selection; the `generall-ai-*` prompts still say nothing about formatting themselves.
 - Roadmap and design notes for transcript / prompt caching / subagents: `docs/agent-roadmap.md`.
@@ -639,6 +646,9 @@ name; a new temp dir needs its own `.gitignore` line).
   `@router.message(F.<kind>)` handler in `messages.py` that tracks and `submit`s it.
 - **Add a background job**: an `async` loop started from `bot/app.py:on_startup` and appended to
   `runtime.background_tasks`; to run the agent from it, submit a `Job` to `runtime.queue`.
+- **Add an image engine**: a row in `models.IMAGE_BACKENDS` (model id, provider, which operations and knobs it
+  supports, variant strategy, file prefix) and, if it is a new provider, one `_<provider>_images` method in
+  `agents/image_tools.py`. Nothing else dispatches on the engine name.
 - **Change models**: edit the default in `app/models.py` or set the env var of the same name
   (`ANTHROPIC_MODEL`, `OPENAI_MODEL`, `VIDEO_FRAMES_MODEL`, ...; see `.env.example`). No other file
   holds a model name. Keep the option helpers honest when the new model's API differs: a

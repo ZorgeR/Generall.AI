@@ -1,8 +1,9 @@
 # Image generation, editing and composition — current state
 
-Status: descriptive. This is what `app/agents/image_tools.py` does at HEAD, written as the basis for
-consolidating DALL-E, GPT Image 2 and Gemini into one image tool. No proposals; where the tool schema
-and the code disagree, both are recorded and the disagreement is called out.
+Status: **historical**. This describes `app/agents/image_tools.py` *before* the consolidation and is
+kept as the record of what was replaced and why. The current tool is described in
+`docs/image-consolidation-design.md`. No proposals; where the old tool schema and code disagreed,
+both are recorded and the disagreement is called out.
 
 ## 1. Overview
 

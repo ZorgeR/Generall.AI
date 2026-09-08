@@ -1,7 +1,7 @@
 # Consolidating the image tools — design
 
-Status: proposed, not implemented. Companion to `docs/image-pipeline.md`, which describes the
-current state; quirk numbers below refer to its §9. Decisions in §1 were made by the repo owner.
+Status: **implemented**. Companion to `docs/image-pipeline.md`, which describes the state this
+replaced; quirk numbers below refer to its §9. Decisions in §1 were made by the repo owner.
 
 ## 1. Decisions
 
@@ -48,8 +48,8 @@ One table, in `app/models.py`, is the only place that knows a provider's dialect
 
 | Engine | Model id (env override) | Generate | Edit | Compose | Size control | Quality | Variants |
 |---|---|---|---|---|---|---|---|
-| `auto`, `best` | `gpt-image-2.5-sunburst` (`GPT_IMAGE_MODEL`) | yes | yes | yes (`images.edit`, many files) | pixel `WxH` derived from ratio + tier | ladder, passed through | `n=` in one call |
-| `fast` | `gpt-image-2.5-flare` (`GPT_IMAGE_MODEL_FAST`) | yes | yes | yes | same | ladder | `n=` |
+| `auto`, `best` | `gpt-image-2.5-sunburst` (`GPT_IMAGE_MODEL`) — most capable, generation and editing | yes | yes | yes (`images.edit`, many files) | pixel `WxH` derived from ratio + tier | ladder, passed through | `n=` in one call |
+| `fast` | `gpt-image-2.5-flare` (`GPT_IMAGE_MODEL_FAST`) — fast everyday generation, lower quality | yes | yes | yes | same | ladder | `n=` |
 | `story` | `gemini-3.1-flash-image-preview` (`GEMINI_IMAGE_MODEL_FLASH`) | yes | yes | yes (≤3) | ratio + `1K/2K/4K` | none | sequential calls |
 | `story` (pro) | `gemini-3-pro-image-preview` (`GEMINI_IMAGE_MODEL_PRO`) | yes | yes | yes (≤3) | ratio + tier | none | sequential calls |
 
@@ -150,9 +150,14 @@ bytes; partial-success and error result shapes; the inline hint appearing only f
 formats. The provider SDKs are faked, so the module must import without API keys — which requires
 making the two module-level clients lazy, as `bot/clients.py` already does.
 
-## 8. Open question
+## 8. Sunburst vs Flare
 
-**Which of Sunburst and Flare is the premium engine?** The naming does not say, and the docs are
-unreachable from this environment. The table above assumes Sunburst is the balanced default (as
-specified) and puts Flare on `fast`. If Flare is in fact the higher-tier model, the mapping is one
-line in `models.py` — but the tool description's guidance to the agent depends on getting it right.
+Confirmed by the repo owner: **Sunburst is the most capable model** for generation and editing;
+**Flare is the fast everyday one** with lower quality. **The two cost the same** — Flare buys latency,
+not money.
+
+That price parity decides the guidance the agent reads. Because choosing `fast` saves no money, the
+default stays on Sunburst and the tool description frames Flare narrowly: *"`fast` (Flare) trades
+quality for speed at the same price — choose it only when the user is waiting on a quick draft or
+iterating, never for a final image."* Spend is controlled by `variants` and the quality ladder, not
+by engine choice, so `max_variants` in settings is the cost lever.
