@@ -161,3 +161,35 @@ default stays on Sunburst and the tool description frames Flare narrowly: *"`fas
 quality for speed at the same price — choose it only when the user is waiting on a quick draft or
 iterating, never for a final image."* Spend is controlled by `variants` and the quality ladder, not
 by engine choice, so `max_variants` in settings is the cost lever.
+
+## 9. Postscript: the hook that was not dead
+
+§7 listed "deleting the dead sandbox hook (quirk 36)" as deliberately out of scope. That judgement was
+wrong, and it cost the first production run of this tool.
+
+`ToolIntegrator.patch_image_tools` guarded on `hasattr(image_tools_class, "_generate_image")`. The old
+code had no such method, so the hook was inert — and the rewrite named its handler `_generate_image`.
+At startup the patcher therefore replaced it with
+
+```python
+async def secure_generate_image(self, prompt, size="1024x1024", quality="standard", caption="Here is your image")
+```
+
+which forwards **positionally** into a signature whose second parameter is now `images`. Two things
+followed, both visible in the transcript that reported this:
+
+- every edit and composition died with `secure_generate_image() got an unexpected keyword argument
+  'images'`, and the model, seeing a tool that refuses input images, retried without them — so the user
+  got confident, well-made pictures of the wrong subject;
+- every generation that *did* run had its arguments replaced: `images="1024x1024"`, `engine="standard"`,
+  `quality="Here is your image"`. All three fell back to defaults, which is why each result reported
+  `quality auto, 2K` no matter what the model asked for.
+
+The tests did not catch it because they exercise `ImageTools` directly, while the patch is applied by
+`main_bot.py` at startup — the seam between them was never covered. The fix is to delete the hook (image
+generation needs API access and was never sandboxed), and the guard is a test asserting that
+`tool_integrator.py` does not mention the image tools at all, so re-adding a wrapper has to be deliberate.
+
+The general lesson, now in CLAUDE.md: **a monkey-patch is part of a method's contract.** Adding a method
+to a tool class whose name any `patch_*` function targets silently replaces it, and the replacement's
+signature wins.

@@ -9,6 +9,7 @@ here, so every entry point behaves the same.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from dataclasses import dataclass
@@ -44,21 +45,64 @@ def _agents():
     return agents
 
 
+ARGS_CHARS = 2000  # per tool call, in the reasoning file
+RESULT_CHARS = 2000  # per tool result
+THINKING_CHARS = 4000  # per thinking block
+
+
+def _clip(text: str, limit: int) -> str:
+    text = str(text)
+    return text if len(text) <= limit else f"{text[:limit]}… ({len(text)} chars total)"
+
+
+def _result_text(content: Any) -> str:
+    """A tool result is a string or a list of content blocks."""
+    if isinstance(content, list):
+        return "\n".join(str(b.get("text", "")) if isinstance(b, dict) else str(b) for b in content)
+    return str(content)
+
+
 def reasoning_text(messages: list) -> str:
+    """The turn as a readable transcript: prompts, thinking, tool calls WITH their arguments, results.
+
+    Every block of every message is rendered, not just the first one: with thinking on, an
+    assistant message starts with a ``thinking`` block and its tool calls follow it, so reading
+    only ``content[0]`` hid the calls and the parameters they were made with.
+    """
+    names: dict[str, str] = {}  # tool_use_id -> tool name, so results can name their call
+    for msg in messages:
+        for block in msg.get("content", []) if isinstance(msg.get("content"), list) else []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                names[str(block.get("id"))] = str(block.get("name", "unknown"))
+
     out: list[str] = []
     for msg in messages:
         try:
+            role = str(msg.get("role", "")).capitalize() or "Message"
             content = msg.get("content", [])
             if isinstance(content, str):
-                out.append(content)
-            elif isinstance(content, list) and content:
-                first = content[0]
-                if isinstance(first, dict) and first.get("type") == "text":
-                    out.append(first.get("text", ""))
-                elif isinstance(first, dict) and first.get("type") == "tool_use":
-                    out.append(f"[Tool: {first.get('name', 'unknown')}]")
-                elif isinstance(first, dict) and first.get("type") == "tool_result":
-                    out.append(f"[Tool Result: {str(first.get('content', ''))[:200]}]")
+                out.append(f"[{role}]\n{content}" if role else content)
+                continue
+            for block in content if isinstance(content, list) else []:
+                if not isinstance(block, dict):
+                    continue
+                kind = block.get("type")
+                if kind == "text" and str(block.get("text", "")).strip():
+                    out.append(f"[{role}]\n{block['text']}")
+                elif kind == "thinking" and str(block.get("thinking", "")).strip():
+                    out.append(f"[{role} thinking]\n{_clip(block['thinking'], THINKING_CHARS)}")
+                elif kind == "tool_use":
+                    args = block.get("input")
+                    try:
+                        rendered = json.dumps(args, ensure_ascii=False, indent=2)
+                    except (TypeError, ValueError):
+                        rendered = str(args)
+                    out.append(f"[Tool call: {block.get('name', 'unknown')}]\n{_clip(rendered, ARGS_CHARS)}")
+                elif kind == "tool_result":
+                    name = names.get(str(block.get("tool_use_id")), "unknown")
+                    status = " — error" if block.get("is_error") else ""
+                    body = _clip(_result_text(block.get("content", "")), RESULT_CHARS)
+                    out.append(f"[Tool result: {name}{status}]\n{body}")
         except (KeyError, IndexError, TypeError, AttributeError):
             continue
     return "\n\n========\n\n".join(out) + "\n\n========\n\n" if out else ""

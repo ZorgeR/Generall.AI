@@ -35,7 +35,6 @@ import PIL.ImageOps
 from google import genai
 from google.genai import types
 
-from image_utils import JPEG_FORMATS
 from models import (
     DEFAULT_IMAGE_ENGINE,
     IMAGE_ASPECT_RATIOS,
@@ -54,6 +53,11 @@ logger = logging.getLogger(__name__)
 # for embedding, so the model is never told to write a link that degrades to alt text.
 INLINEABLE = ("png", "jpg", "jpeg", "webp")
 OUTPUT_FORMATS = ("png", "jpeg", "webp")
+# Formats the image APIs accept as input: anything else is converted before upload.
+UPLOADABLE_FORMATS = {"PNG", "JPEG", "JPG", "WEBP"}
+# Editing is judged by how much of the original survives, so ask for the faithful mode.
+INPUT_FIDELITY = "high"
+INPUT_FIDELITY_PARAM = "input_fidelity"
 DEFAULT_ASPECT_RATIO = "1:1"
 DEFAULT_SIZE = "2K"
 # OpenAI image constraints: edges multiples of 16, max edge 3840, total pixels in this window.
@@ -143,9 +147,27 @@ def _one_of(value, allowed: Iterable[str], default: str) -> str:
     return default
 
 
+def is_parameter_rejection(error: BaseException, parameter: str) -> bool:
+    """Did the provider refuse this one parameter rather than the request as a whole?"""
+    return parameter.lower() in str(error).lower()
+
+
 def is_quality_rejection(error: BaseException) -> bool:
     """Did the provider refuse the quality value rather than the request as a whole?"""
-    return "quality" in str(error).lower()
+    return is_parameter_rejection(error, "quality")
+
+
+# Knobs a model turned out not to know, remembered for the life of the process so the
+# discovery costs one round trip in total rather than one per image.
+_UNSUPPORTED: Dict[str, set] = {}
+
+
+def knob_allowed(model: str, parameter: str) -> bool:
+    return parameter not in _UNSUPPORTED.get(model, set())
+
+
+def remember_unsupported(model: str, parameter: str) -> None:
+    _UNSUPPORTED.setdefault(model, set()).add(parameter)
 
 
 class ImageTools:
@@ -276,22 +298,27 @@ class ImageTools:
         return resolved if resolved is not None and resolved.is_file() else None
 
     def _prepare_input(self, image_path: Path, temp_paths: List[Path]) -> Path:
-        """Downscale/convert an oversized or non-JPEG input; returns the file to upload."""
+        """The file to upload: the original when the provider takes it, a converted copy otherwise.
+
+        An edit is judged on how much of the input survives, so a picture that is already an
+        accepted format and size is sent untouched instead of being re-encoded, and one that
+        does need converting keeps its transparency as PNG rather than being flattened.
+        """
         limit = _env_int("MAX_IMAGE_RESOLUTION_EDIT", 4096)
         try:
             with PIL.Image.open(image_path) as img:
                 needs_resize = limit > 0 and max(img.size) > limit
-                needs_convert = (img.format or "").upper() not in JPEG_FORMATS
+                needs_convert = (img.format or "").upper() not in UPLOADABLE_FORMATS
                 if not (needs_resize or needs_convert):
                     return image_path
                 img = PIL.ImageOps.exif_transpose(img)
                 if needs_resize:
                     img.thumbnail((limit, limit), getattr(PIL.Image, "Resampling", PIL.Image).LANCZOS)
-                if img.mode != "RGB":
-                    img = img.convert("RGB")
-                temp_path = self.images_path / f"edit_input_{uuid.uuid4().hex[:8]}.jpg"
+                keeps_alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
+                suffix, fmt, options = ("png", "PNG", {}) if keeps_alpha else ("jpg", "JPEG", {"quality": 95})
+                temp_path = self.images_path / f"edit_input_{uuid.uuid4().hex[:8]}.{suffix}"
                 temp_paths.append(temp_path)
-                img.save(temp_path, format="JPEG", quality=90, optimize=True)
+                img.convert("RGBA" if keeps_alpha else "RGB").save(temp_path, format=fmt, optimize=True, **options)
                 return temp_path
         except Exception as e:  # noqa: BLE001 - an unreadable input is the provider's problem to report
             logger.warning("Could not prepare %s for editing, sending the original: %s", image_path, e)
@@ -424,14 +451,18 @@ class ImageTools:
         """One call for every variant: images.generate, or images.edit when inputs are given."""
         pixel_size = resolve_pixel_size(size, aspect_ratio)
         prepared = [await asyncio.to_thread(self._prepare_input, p, temp_paths) for p in inputs]
+        # Only edits have an input to stay faithful to, and only while this model accepts the knob.
+        fidelity = INPUT_FIDELITY if prepared and knob_allowed(backend.model, INPUT_FIDELITY_PARAM) else None
 
-        def _call(effective_quality: str):
+        def _call(effective_quality: str, effective_fidelity: str | None):
             kwargs: Dict[str, Any] = {
                 "model": backend.model, "prompt": prompt, "size": pixel_size,
                 "n": variants, "quality": effective_quality, "output_format": fmt,
             }
             if not prepared:
                 return openai_client().images.generate(**kwargs)
+            if effective_fidelity:
+                kwargs[INPUT_FIDELITY_PARAM] = effective_fidelity
             handles = [open(p, "rb") for p in prepared]
             try:
                 kwargs["image"] = handles[0] if len(handles) == 1 else handles
@@ -440,19 +471,32 @@ class ImageTools:
                 for handle in handles:
                     handle.close()
 
+        # These model ids are newer than any published SDK, so a knob it does not know is a
+        # possibility rather than a bug: drop the knob and try again instead of failing the turn.
         note = ""
         used_quality = quality
-        try:
-            result = await asyncio.to_thread(_call, quality)
-        except Exception as e:  # noqa: BLE001
-            # xhigh/max are unverified against this provider; fall back once rather than fail.
-            if quality in ("xhigh", "max") and is_quality_rejection(e):
-                logger.warning("Quality %r refused by %s, retrying at %s: %s", quality, backend.model, IMAGE_QUALITY_FALLBACK, e)
-                used_quality = IMAGE_QUALITY_FALLBACK
-                note = f"Quality '{quality}' is not supported by {backend.model}; used '{used_quality}' instead."
-                result = await asyncio.to_thread(_call, used_quality)
-            else:
+        result = None
+        failure: BaseException | None = None
+        for _ in range(3):
+            try:
+                result = await asyncio.to_thread(_call, used_quality, fidelity)
+                failure = None
+                break
+            except Exception as e:  # noqa: BLE001
+                failure = e
+                if fidelity and is_parameter_rejection(e, INPUT_FIDELITY_PARAM):
+                    logger.warning("%s does not accept %s, retrying without it: %s", backend.model, INPUT_FIDELITY_PARAM, e)
+                    remember_unsupported(backend.model, INPUT_FIDELITY_PARAM)
+                    fidelity = None
+                    continue
+                if used_quality in ("xhigh", "max") and is_quality_rejection(e):
+                    logger.warning("Quality %r refused by %s, retrying at %s: %s", used_quality, backend.model, IMAGE_QUALITY_FALLBACK, e)
+                    note = f"Quality '{quality}' is not supported by {backend.model}; used '{IMAGE_QUALITY_FALLBACK}' instead."
+                    used_quality = IMAGE_QUALITY_FALLBACK
+                    continue
                 raise
+        if failure is not None:
+            raise failure
 
         saved: List[Path] = []
         items = list(getattr(result, "data", None) or [])

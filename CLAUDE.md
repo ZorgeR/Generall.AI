@@ -173,7 +173,10 @@ Deployment facts that are easy to get wrong:
      run on the host (i.e. inside the bot container) unsandboxed.
    - `SearchTools.memory_search` → sandbox version that only greps `**/*.txt` and prints a JSON list
      of `{file, context, position}`. The host implementation in `search_tools.py` is dead once patched.
-   - `ImageTools`: patch targets `_generate_image`, which no longer exists → no-op.
+   - `ImageTools`: **not patched at all** (it needs API access, not a sandbox). The patcher used to
+     wrap `_generate_image` with a fixed `(prompt, size, quality, caption)` signature; when the
+     consolidated tool happened to reuse that method name, every edit died on `unexpected keyword
+     argument 'images'` and every other parameter was silently replaced. Do not add it back.
    - `ConversationEmbeddings`: wrapped with logging only.
    - `SystemTools`: fully patched, but the class is never given to the agent, so unreachable.
    `ContainerManager` is instantiated twice here (once kept for cleanup, once inside the wrapper).
@@ -259,7 +262,8 @@ worker → _run_text → bot.agent_runner.run_turn(bot, user_id, chat_id, prompt
        rich (default): split ≤32 KB → sendRichMessage(markdown) → on parse error rich HTML
        (telegramify-markdown) → on 404 sticky MarkdownV2 → legacy Markdown → raw; status deleted after
        legacy (rich_messages off): ≤4000 edit status in place; else new chunks + notice
-    send_reasoning_file (if reasoning_context.enabled; document from bytes)
+    send_reasoning_file (if reasoning_context.enabled; document from bytes): every block of the turn —
+       prompts, thinking, tool calls WITH their arguments, results and their errors
     errors → status edited to "❌ An error occurred. Trace ID: …", returns None; CancelledError → "🛑 Stopped."
 ```
 
@@ -328,7 +332,7 @@ Effective tool list as the model sees it (after patching):
 | CodeTools | `execute_python` (+`network_enabled`) | sandbox |
 | TerminalTools | `run_command` (no network option), `run_shell_script` (+`network_enabled`), `install_package` (apt, persisted, network on) | sandbox |
 | TimeTools | `get_time_in_timezone`, `list_timezones` | bot process |
-| ImageTools | `generate_image` (no `images` → generate, one → edit, several → compose; engine `auto`/`best`/`fast`/`story`), `generate_story_images` | bot process (SDK calls in worker threads), delivers each result itself as a document, once |
+| ImageTools | `generate_image` (no `images` → generate, one → edit, several → compose; engine `auto`/`best`/`fast`/`story`), `generate_story_images` | bot process (SDK calls in worker threads), never sandboxed, delivers each result itself as a document, once |
 | VideoTools | `video_generator`, `image_to_video_generator`, `video_from_reference_images`, `video_interpolation_generator`, `video_extension_generator` | bot process (Veo in worker threads, async polling up to 5 min) |
 | SMSTools | `send_sms` | bot process, worker thread |
 | UserInteractions | `send_user_telegram_message`, `send_voice_message`, `set_message_reaction`, `schedule_reminder`, `send_file_content_to_user_via_telegram` | bot process |
@@ -488,7 +492,7 @@ OpenAI reasoning models and `{}` for anything else. No other file holds a model 
 | Video frame description | `gpt-5.6-luna` (`VIDEO_FRAMES_MODEL`) | `reasoning_effort` `high`; no `max_completion_tokens` (it would cap reasoning + answer together) | `bot/media.py` |
 | Transcription | `whisper-1` (`WHISPER_MODEL`) via a second client keyed by `OPENAI_API_KEY_WHISPER` (falls back to `OPENAI_API_KEY`); >24 MB chunked | none | `bot/media.py` `transcribe_audio` |
 | Embeddings | `text-embedding-ada-002` (`EMBEDDING_MODEL`), dim 1536 (`EMBEDDING_DIMENSION`, must match; existing FAISS indexes are not migrated) | none | `agents/embeddings.py` |
-| Image gen/edit/compose | engine → model via `models.IMAGE_BACKENDS`: `auto`/`best` → `gpt-image-2.5-sunburst` (`GPT_IMAGE_MODEL`), `fast` → `gpt-image-2.5-flare` (`GPT_IMAGE_MODEL_FAST`, same price, lower quality), `story` → `gemini-3.1-flash-image-preview` (`GEMINI_IMAGE_MODEL_FLASH`), escalating to `gemini-3-pro-image-preview` (`GEMINI_IMAGE_MODEL_PRO`) at quality xhigh/max | OpenAI: `quality` from the `auto…max` ladder, pixel `size` from ratio+tier, `n=variants`, `output_format`. Gemini: `ImageConfig(aspect_ratio, image_size)`, no quality knob | `agents/image_tools.py` |
+| Image gen/edit/compose | engine → model via `models.IMAGE_BACKENDS`: `auto`/`best` → `gpt-image-2.5-sunburst` (`GPT_IMAGE_MODEL`), `fast` → `gpt-image-2.5-flare` (`GPT_IMAGE_MODEL_FAST`, same price, lower quality), `story` → `gemini-3.1-flash-image-preview` (`GEMINI_IMAGE_MODEL_FLASH`), escalating to `gemini-3-pro-image-preview` (`GEMINI_IMAGE_MODEL_PRO`) at quality xhigh/max | OpenAI: `quality` from the `auto…max` ladder, pixel `size` from ratio+tier, `n=variants`, `output_format`, and `input_fidelity=high` on edits so the original survives (any knob the model refuses is dropped and remembered for the process). Gemini: `ImageConfig(aspect_ratio, image_size)`, no quality knob | `agents/image_tools.py` |
 | Video | `veo-3.1-generate-preview` for all five tools (`VEO_MODEL`) | none | `agents/video_tools.py` |
 | Web search / research | Tavily; Perplexity `sonar` default (`PERPLEXITY_MODEL`), enum `PERPLEXITY_MODELS` = sonar-reasoning-pro / sonar-pro / sonar, via raw HTTP | Perplexity payload keeps its own `temperature`/`max_tokens` | `agents/search_tools.py` |
 | TTS | ElevenLabs `eleven_multilingual_v2` (`TTS_MODEL`), voices in `app/voice/voices.json` | none | `bot/media.py`, `agents/user_interactions.py` |
@@ -599,6 +603,9 @@ name; a new temp dir needs its own `.gitignore` line).
 - `bot.rich` marks rich messages unsupported for the whole process on the first 404 from
   `sendRichMessage`/`sendRichMessageDraft`/a rich `editMessageText`; a wrong verdict (e.g. a transient 404) needs a restart.
   `TelegramBadRequest` on a rich send is treated as "this text", not "this server".
+- Anything the patcher rebinds imposes **its own signature** on the method. Adding a method to a tool
+  class whose name a `patch_*` function targets silently replaces it; that is how image editing broke.
+  `tests/test_image_tools.py` guards the image tools by asserting `tool_integrator.py` never names them.
 - Image tools: `generate_image` resolves engine/quality/size as tool call → user's `image` settings → default,
   so the agent can override a preference from the request. `xhigh`/`max` are in no published SDK type for images
   and are sent as given, with a single retry at `IMAGE_QUALITY_FALLBACK` when the provider refuses them. File
