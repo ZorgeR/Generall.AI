@@ -206,6 +206,19 @@ Bot to Admin: "🔔 New user joined!
 
 ## 🔄 Advanced Features
 
+### 🎨 Image Generation
+
+One tool covers everything: describe a picture to create it, name an existing image to edit it, or
+several to compose them into one. Engines are chosen by purpose — `best` for the most capable model,
+`fast` for a quicker draft at the same price and lower quality, `story` for an illustrated narrative
+— and quality runs from `auto` through `max`. `/settings` → 🎨 Images sets your preferred engine,
+quality, size, a cap on how many variants one request may produce, and whether the model, quality and
+size appear in the caption of each delivered image. The assistant follows your preference but may
+pick a better engine when you ask for the best result.
+
+Images are delivered once, as files, and the assistant embeds one inside its answer only if you ask
+to see it there.
+
 ### ✨ Rich Messages
 
 Answers are sent as **rich Telegram messages** (Bot API 10.1): real GitHub-flavored Markdown with

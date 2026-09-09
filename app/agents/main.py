@@ -623,7 +623,7 @@ class ChainOfThoughtAgent:
         self.code_tools = CodeTools(user_id)
         self.terminal_tools = TerminalTools(user_id, sender)
         self.time_tools = TimeTools()
-        self.image_tools = ImageTools(user_id, sender)
+        self.image_tools = ImageTools(user_id, sender, (user_settings or {}).get("image"))
         self.video_tools = VideoTools(user_id, sender)
         self.sms_tools = SMSTools()
         self.user_interactions = UserInteractions(user_id, sender)

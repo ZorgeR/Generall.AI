@@ -29,6 +29,9 @@ DEFAULT_SETTINGS: dict[str, dict[str, Any]] = {
     # After a turn the status message is shortened into a summary (tool calls, thinking, tokens)
     # kept above the answer; off = delete it as before.
     "trace": {"keep_summary": True},
+    # Image generation defaults. The agent may override engine/quality from the request
+    # (e.g. the user asks for the best result while preferring "fast"); max_variants is a hard cap.
+    "image": {"engine": "auto", "quality": "auto", "size": "2K", "max_variants": 4, "metadata": True},
 }
 
 SYSTEM_PROMPT_TYPES = ("generall-ai-v2", "generall-ai-v1", "perplexity-deep-research", "perplexity-r1")

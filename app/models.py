@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import os
 
+from dataclasses import dataclass, replace
+
 from dotenv import load_dotenv
 
 load_dotenv()  # harmless when main_bot.py already did it; makes overrides work for bare imports
@@ -84,11 +86,59 @@ EMBEDDING_DIMENSION = int(_env("EMBEDDING_DIMENSION", "1536"))
 
 # ---------------------------------------------------------------------------
 # Image generation / editing / composition (agents/image_tools.py)
+#
+# The tool speaks purpose words ("auto", "fast", "best", "story"); the table
+# below is the only place that knows which model each maps to and which knobs
+# that provider actually takes. Add a backend here, not in the tool.
 # ---------------------------------------------------------------------------
-GEMINI_IMAGE_MODEL_FLASH = _env("GEMINI_IMAGE_MODEL_FLASH", "gemini-3.1-flash-image-preview")  # "Normal" mode
-GEMINI_IMAGE_MODEL_PRO = _env("GEMINI_IMAGE_MODEL_PRO", "gemini-3-pro-image-preview")  # "Pro" mode
-GPT_IMAGE_MODEL = _env("GPT_IMAGE_MODEL", "gpt-image-2-2026-04-21")  # "GPT" mode
-DALLE_MODEL = _env("DALLE_MODEL", "dall-e-3")  # legacy generate_image_dall_e tool
+GPT_IMAGE_MODEL = _env("GPT_IMAGE_MODEL", "gpt-image-2.5-sunburst")  # most capable: generation + editing
+GPT_IMAGE_MODEL_FAST = _env("GPT_IMAGE_MODEL_FAST", "gpt-image-2.5-flare")  # faster, lower quality, same price
+GEMINI_IMAGE_MODEL_FLASH = _env("GEMINI_IMAGE_MODEL_FLASH", "gemini-3.1-flash-image-preview")
+GEMINI_IMAGE_MODEL_PRO = _env("GEMINI_IMAGE_MODEL_PRO", "gemini-3-pro-image-preview")
+
+IMAGE_QUALITIES = ("auto", "low", "medium", "high", "xhigh", "max")
+# "xhigh"/"max" appear in no published SDK type for images (they exist there only as
+# ReasoningEffort for text models), so they are sent as given and the call is retried
+# once at this value if the provider refuses them. See agents/image_tools.py.
+IMAGE_QUALITY_FALLBACK = "high"
+IMAGE_ASPECT_RATIOS = ("1:1", "3:2", "2:3", "16:9", "9:16", "4:3", "3:4", "21:9", "5:4", "4:5")
+IMAGE_SIZES = ("1K", "2K", "4K")
+IMAGE_MAX_VARIANTS = 4
+
+
+@dataclass(frozen=True)
+class ImageBackend:
+    """One image engine as the tool sees it."""
+
+    engine: str  # the purpose word the model passes
+    provider: str  # "openai" | "gemini"
+    model: str
+    prefix: str  # file-name prefix, so provenance survives in the path
+    supports_quality: bool
+    max_input_images: int  # 0 = text-to-image only
+    batch_variants: bool  # True: one call with n=; False: one call per variant
+    interleaved_text: bool = False  # returns prose between images (story mode)
+
+
+IMAGE_BACKENDS: dict[str, ImageBackend] = {
+    "auto": ImageBackend("auto", "openai", GPT_IMAGE_MODEL, "sunburst", True, 16, True),
+    "best": ImageBackend("best", "openai", GPT_IMAGE_MODEL, "sunburst", True, 16, True),
+    "fast": ImageBackend("fast", "openai", GPT_IMAGE_MODEL_FAST, "flare", True, 16, True),
+    "story": ImageBackend("story", "gemini", GEMINI_IMAGE_MODEL_FLASH, "story", False, 3, False, interleaved_text=True),
+}
+DEFAULT_IMAGE_ENGINE = "auto"
+
+
+def resolve_image_backend(engine: str | None, quality: str | None = None) -> ImageBackend:
+    """The backend for a purpose word. Unknown words fall back to the default engine.
+
+    Gemini has no quality parameter, so a request above "high" selects the Pro model
+    instead — the only way to spend more effort on that provider.
+    """
+    backend = IMAGE_BACKENDS.get((engine or "").strip().lower()) or IMAGE_BACKENDS[DEFAULT_IMAGE_ENGINE]
+    if backend.provider == "gemini" and (quality or "").lower() in ("xhigh", "max"):
+        backend = replace(backend, model=GEMINI_IMAGE_MODEL_PRO, prefix=f"{backend.prefix}_pro")
+    return backend
 
 # ---------------------------------------------------------------------------
 # Video generation (agents/video_tools.py) - Google Veo, all five tools

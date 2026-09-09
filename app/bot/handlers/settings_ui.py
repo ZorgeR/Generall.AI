@@ -6,7 +6,7 @@ the UI behaves the same; authorization is handled by ``AuthMiddleware``.
 
 callback_data scheme: ``settings_<token>[_<action>[_<value>]]`` where
 ``<token>`` is a short name (summarization, dialog, reasoning, memory,
-critique, judge, tools, semantic, thinking, rich, transcript, trace, main), parsed with a plain
+critique, judge, tools, semantic, thinking, rich, transcript, trace, image, main), parsed with a plain
 ``split("_")``. ``settings_system_prompt`` and
 ``settings_system_prompt_set_<type>`` are special-cased because of the
 underscore in their token.
@@ -20,6 +20,7 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot.settings import SYSTEM_PROMPT_TYPES, UserSettings
+from models import IMAGE_BACKENDS, IMAGE_MAX_VARIANTS, IMAGE_QUALITIES, IMAGE_SIZES
 from bot.ui import answer_md, edit_md
 
 logger = logging.getLogger(__name__)
@@ -123,6 +124,10 @@ def _overview(user_settings: UserSettings) -> tuple[str, InlineKeyboardMarkup]:
         f"Context: {int(s.get('transcript', 'max_context_tokens') or 0) // 1000}k\n"
         "🧾 *Turn Summary*: "
         f"{_mark(s.get('trace', 'keep_summary'))}\n"
+        "🎨 *Images*: "
+        f"{s.get('image', 'engine')} | "
+        f"Quality: {s.get('image', 'quality')} | "
+        f"{s.get('image', 'size')}\n"
         "🧩 *System Prompt*: "
         f"{s.get('system_prompt', 'type')}\n\n"
         "Select a setting to configure:"
@@ -156,6 +161,7 @@ def _overview(user_settings: UserSettings) -> tuple[str, InlineKeyboardMarkup]:
             ],
             [
                 InlineKeyboardButton(text="🧾 Turn Summary", callback_data="settings_trace"),
+                InlineKeyboardButton(text="🎨 Images", callback_data="settings_image"),
             ],
         ]
     )
@@ -331,6 +337,31 @@ async def settings_button(callback: CallbackQuery) -> None:
             current = user_settings.get("rich_messages", "enabled")
             user_settings.set("rich_messages", not current, "enabled")
         await show_rich_menu(message, user_settings)
+
+    elif category == "image":
+        if action in ("engine", "quality", "size") and value:
+            allowed = {
+                "engine": sorted(IMAGE_BACKENDS),
+                "quality": list(IMAGE_QUALITIES),
+                "size": list(IMAGE_SIZES),
+            }[action]
+            if value in allowed:
+                user_settings.set("image", value, action)
+            await show_image_menu(message, user_settings)
+        elif action == "variants":
+            number = _to_int(value)
+            if number is not None:
+                user_settings.set("image", max(1, min(IMAGE_MAX_VARIANTS, number)), "max_variants")
+                await show_image_menu(message, user_settings)
+            else:
+                await show_image_choice_menu(message, "variants")
+        elif action == "metadata":
+            user_settings.set("image", not user_settings.get("image", "metadata"), "metadata")
+            await show_image_menu(message, user_settings)
+        elif action in ("engine", "quality", "size"):
+            await show_image_choice_menu(message, action)
+        else:
+            await show_image_menu(message, user_settings)
 
     elif category == "trace":
         if action == "toggle":
@@ -599,6 +630,50 @@ async def show_rich_menu(message: Message, user_settings: UserSettings) -> None:
         "classic Markdown formatting.",
         keyboard,
     )
+
+
+async def show_image_menu(message: Message, user_settings: UserSettings) -> None:
+    """Show image generation settings menu."""
+    s = user_settings
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"🖌 Engine: {s.get('image', 'engine')}", callback_data="settings_image_engine")],
+            [InlineKeyboardButton(text=f"✨ Quality: {s.get('image', 'quality')}", callback_data="settings_image_quality")],
+            [InlineKeyboardButton(text=f"📐 Size: {s.get('image', 'size')}", callback_data="settings_image_size")],
+            [InlineKeyboardButton(text=f"🔢 Max variants: {s.get('image', 'max_variants')}", callback_data="settings_image_variants")],
+            [_toggle_button(s.get("image", "metadata"), "settings_image_metadata")],
+            [_back_button()],
+        ]
+    )
+    await edit_md(
+        message,
+        "*Image Settings*\n\n"
+        "Your preferred engine and quality for generated images. The\n"
+        "assistant follows them, but may pick a better engine when you\n"
+        "ask for the best result, or a faster one for a quick draft.\n\n"
+        "`auto`/`best` use the most capable model, `fast` is quicker at\n"
+        "the same price with lower quality, `story` illustrates a\n"
+        "narrative. The toggle adds the model, quality and size to the\n"
+        "caption of every delivered image.",
+        keyboard,
+    )
+
+
+async def show_image_choice_menu(message: Message, kind: str) -> None:
+    """Choice list for one image setting."""
+    if kind == "variants":
+        rows = _choice_rows(tuple(range(1, IMAGE_MAX_VARIANTS + 1)), "settings_image_variants_")
+        title = "*Max variants*\n\nUpper limit on how many alternatives one request may produce:"
+    else:
+        values = {"engine": sorted(IMAGE_BACKENDS), "quality": list(IMAGE_QUALITIES), "size": list(IMAGE_SIZES)}[kind]
+        rows = [[InlineKeyboardButton(text=v, callback_data=f"settings_image_{kind}_{v}")] for v in values]
+        title = {
+            "engine": "*Engine*\n\nauto and best use the most capable model; fast is quicker\nat the same price with lower quality; story illustrates a narrative:",
+            "quality": "*Quality*\n\nHow much effort to spend. auto lets the provider decide\nfrom the prompt:",
+            "size": "*Size*\n\nResolution tier; 4K is slower and is clamped to the\nprovider's limits:",
+        }[kind]
+    rows.append([_back_button("settings_image")])
+    await edit_md(message, title, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 async def show_trace_menu(message: Message, user_settings: UserSettings) -> None:
