@@ -24,7 +24,6 @@ class SecureToolWrapper:
         "terminal_tools",  # Terminal commands
         "code_tools",      # Code execution
         "file_ops",        # File operations
-        "image_tools",     # Image generation and manipulation
         "search_tools",    # Web search and file search operations
         "embeddings",      # Vector embeddings operations
         "system_tools"     # System administration tools

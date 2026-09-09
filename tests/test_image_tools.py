@@ -52,6 +52,16 @@ class FakeImages:
         return self._result()
 
 
+@pytest.fixture(autouse=True)
+def forget_unsupported_knobs():
+    """The "this model refuses that knob" memo is process-wide; no test may leak into the next."""
+    from agents import image_tools
+
+    image_tools._UNSUPPORTED.clear()
+    yield
+    image_tools._UNSUPPORTED.clear()
+
+
 @pytest.fixture
 def workspace(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
@@ -268,3 +278,90 @@ async def test_metadata_can_be_switched_off(workspace, monkeypatch):
     tools, sender = make_tools(monkeypatch, images, {"metadata": False})
     await tools.execute_tool("generate_image", {"prompt": "x", "caption": "My picture"})
     assert sender.documents[0][1] == "My picture"
+
+
+def test_the_sandbox_patcher_does_not_rebind_image_tool_methods():
+    """Image tools need API access, so they run in the bot process and must not be monkey-patched.
+
+    A patcher that replaced a method here would silently impose its own signature: that is how
+    ``_generate_image`` once lost its ``images`` argument and every edit became a fresh generation.
+    """
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "app" / "secure_container" / "tool_integrator.py").read_text()
+    assert "ImageTools" not in source and "image_tools" not in source, (
+        "tool_integrator.py touches the image tools again; a patched method must keep the real signature"
+    )
+
+
+# ---- input fidelity ----------------------------------------------------------
+async def test_edits_ask_the_provider_to_stay_faithful_to_the_input(workspace, monkeypatch):
+    images = FakeImages()
+    tools, _ = make_tools(monkeypatch, images)
+
+    await tools.execute_tool("generate_image", {"prompt": "add a hat", "images": ["images/cat.png"]})
+    assert images.edit_calls[0]["input_fidelity"] == "high"
+
+    # there is nothing to be faithful to when generating from scratch
+    await tools.execute_tool("generate_image", {"prompt": "a hat"})
+    assert "input_fidelity" not in images.generate_calls[0]
+
+
+async def test_a_model_that_refuses_input_fidelity_is_retried_and_remembered(workspace, monkeypatch):
+    class Picky(FakeImages):
+        def edit(self, **kw):
+            super().edit(**kw)
+            if "input_fidelity" in kw:
+                raise ValueError("Unknown parameter: 'input_fidelity'")
+            return self._result()
+
+    images = Picky()
+    tools, sender = make_tools(monkeypatch, images)
+
+    result = await tools.execute_tool("generate_image", {"prompt": "x", "images": ["images/cat.png"]})
+    assert [("input_fidelity" in c) for c in images.edit_calls] == [True, False]
+    assert "Edited 1 image(s)" in result and len(sender.documents) == 1
+
+    # the discovery costs one round trip in total, not one per image
+    images.edit_calls.clear()
+    await tools.execute_tool("generate_image", {"prompt": "y", "images": ["images/cat.png"]})
+    assert [("input_fidelity" in c) for c in images.edit_calls] == [False]
+
+
+# ---- preparing the input -----------------------------------------------------
+def _write(path, mode, size, fmt):
+    import PIL.Image
+
+    PIL.Image.new(mode, size, (255, 0, 0, 128) if mode == "RGBA" else (255, 0, 0)).save(path, format=fmt)
+    return path
+
+
+def test_an_acceptable_input_is_uploaded_untouched(workspace, monkeypatch):
+    monkeypatch.setenv("MAX_IMAGE_RESOLUTION_EDIT", "256")
+    tools = ImageTools("7", FakeSender())
+    temp = []
+    for name, mode, fmt in (("real.png", "RGB", "PNG"), ("real.jpg", "RGB", "JPEG"), ("real.webp", "RGB", "WEBP")):
+        source = _write(workspace / "data" / "7" / "images" / name, mode, (64, 64), fmt)
+        assert tools._prepare_input(source, temp) == source  # no re-encode, no quality lost
+    assert temp == []
+
+
+def test_an_oversized_input_is_downscaled_and_transparency_survives_conversion(workspace, monkeypatch):
+    import PIL.Image
+
+    monkeypatch.setenv("MAX_IMAGE_RESOLUTION_EDIT", "64")
+    tools = ImageTools("7", FakeSender())
+
+    temp = []
+    big = _write(workspace / "data" / "7" / "images" / "big.jpg", "RGB", (200, 100), "JPEG")
+    prepared = tools._prepare_input(big, temp)
+    assert prepared != big and temp == [prepared] and prepared.suffix == ".jpg"
+    with PIL.Image.open(prepared) as img:
+        assert max(img.size) <= 64
+
+    temp = []
+    logo = _write(workspace / "data" / "7" / "images" / "logo.tiff", "RGBA", (32, 32), "TIFF")
+    prepared = tools._prepare_input(logo, temp)
+    assert prepared.suffix == ".png"  # flattening a logo onto white would ruin a composition
+    with PIL.Image.open(prepared) as img:
+        assert img.mode == "RGBA"

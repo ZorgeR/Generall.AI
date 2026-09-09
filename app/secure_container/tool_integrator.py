@@ -305,29 +305,6 @@ class ToolIntegrator:
             
             logger.info("Search tools patched to use secure container")
     
-    def patch_image_tools(self, image_tools_class):
-        """
-        Patch the image tools class to handle image operations securely.
-        
-        Args:
-            image_tools_class: The image tools class to patch
-        """
-        # For image generation, we need API access, so we don't run it in the container
-        # But we can still log the operations for security monitoring
-        if hasattr(image_tools_class, "_generate_image"):
-            original_generate_image = image_tools_class._generate_image
-            
-            async def secure_generate_image(self, prompt, size="1024x1024", quality="standard", caption="Here is your image"):
-                """Secure version of _generate_image that logs the operation"""
-                logger.info(f"Intercepted image generation for user {self.user_id}: {prompt}")
-                # We don't run this in a container as it needs API access
-                return await original_generate_image(self, prompt, size, quality, caption)
-            
-            # Replace the original method with the secure version
-            image_tools_class._generate_image = secure_generate_image
-            
-            logger.info("Image tools patched for security monitoring")
-    
     def patch_embeddings(self, embeddings_class):
         """
         Patch the embeddings class to handle embedding operations securely.
@@ -700,7 +677,6 @@ echo "Python package {package_name} removed from installed packages list."
                 "code_tools": False,
                 "file_ops": False,
                 "search_tools": False,
-                "image_tools": False,
                 "embeddings": False,
                 "system_tools": False
             }
@@ -747,16 +723,6 @@ echo "Python package {package_name} removed from installed packages list."
                 patched_tools["search_tools"] = True
             except (AttributeError, ImportError) as e:
                 logger.warning(f"Could not patch search tools: {str(e)}")
-            
-            # Get the image tools class
-            try:
-                image_tools_module = import_module(".image_tools", agent_module.__name__)
-                image_tools_class = image_tools_module.ImageTools
-                logger.info(f"Found ImageTools class: {image_tools_class}")
-                self.patch_image_tools(image_tools_class)
-                patched_tools["image_tools"] = True
-            except (AttributeError, ImportError) as e:
-                logger.warning(f"Could not patch image tools: {str(e)}")
             
             # Get the embeddings class
             try:
