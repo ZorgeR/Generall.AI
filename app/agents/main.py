@@ -1044,6 +1044,8 @@ User message: {question}"""
         return response, new_messages
 
     async def generate_response(self, question: str, update_status=None, on_text_chunk=None, trace=None) -> str:
+        if self.image_tools is not None:
+            self.image_tools.trace = trace  # image calls add their tokens and cost to the turn
         print(f"\n=== Starting Chain of Thought for Question: {question} ===")
         print(f"Thread ID: {self.thread_id or 'None (no topic)'}")
         question = f"Message received time in UTC+0: {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}\n\n{question}"

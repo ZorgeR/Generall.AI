@@ -441,8 +441,11 @@ Memory semantics worth knowing before touching `ChainOfThoughtAgent.generate_res
   `agent_runner.record_usage` stores one `usage_events` row per model; `/stats` (admin) shows tokens, cost
   and top spenders. The OpenAI critique call is added to the turn's trace; the GPT photo and video-frame
   descriptions (`bot/media.py`) each write their own `usage_events` row (OpenAI usage has no cache split: all
-  prompt tokens are priced as input). Haiku side calls (topic/summary/classifier), the judge, Claude
-  image/document descriptions, Whisper, embeddings and image/video generation are not counted.
+  prompt tokens are priced as input). OpenAI image calls are added to the turn's trace too
+  (`ImageTools.trace`, set per turn by `ChainOfThoughtAgent.generate_response`), priced by modality with
+  `models.estimate_image_cost` / `IMAGE_TOKEN_PRICES` and stored as the bucket's `cost_usd`, which
+  `ToolTrace.model_cost` prefers over `MODEL_PRICES`. Haiku side calls (topic/summary/classifier), the judge,
+  Claude image/document descriptions, Whisper, embeddings, Gemini images and Veo video are not counted.
   Legacy mode still has no caching (its system prompt embeds the time).
 
 ## User settings (`data/<uid>/settings.json`)
@@ -658,7 +661,8 @@ name; a new temp dir needs its own `.gitignore` line).
   `runtime.background_tasks`; to run the agent from it, submit a `Job` to `runtime.queue`.
 - **Add an image engine**: a row in `models.IMAGE_BACKENDS` (model id, provider, which operations and knobs it
   supports, variant strategy, file prefix) and, if it is a new provider, one `_<provider>_images` method in
-  `agents/image_tools.py`. Nothing else dispatches on the engine name.
+  `agents/image_tools.py`. Nothing else dispatches on the engine name. For cost tracking add the model's
+  per-modality rates to `models.IMAGE_TOKEN_PRICES` (OpenAI only; Gemini usage is not recorded).
 - **Change models**: edit the default in `app/models.py` or set the env var of the same name
   (`ANTHROPIC_MODEL`, `OPENAI_MODEL`, `VIDEO_FRAMES_MODEL`, ...; see `.env.example`). No other file
   holds a model name. Keep the option helpers honest when the new model's API differs: a

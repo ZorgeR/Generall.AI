@@ -111,8 +111,6 @@ def reasoning_text(messages: list) -> str:
 def record_usage(stats_tracker, user_id: str, trace) -> None:
     """Token accounting: one usage row per model used in this turn (never raises)."""
     try:
-        from models import estimate_cost
-
         for model, u in (trace.usage_by_model or {}).items():
             stats_tracker.track_usage(
                 user_id,
@@ -124,7 +122,7 @@ def record_usage(stats_tracker, user_id: str, trace) -> None:
                 cache_write_tokens=u["cache_write_tokens"],
                 tool_calls=trace.total,
                 duration_s=trace.elapsed,
-                cost_usd=estimate_cost(model, u["input_tokens"], u["output_tokens"], u["cache_read_tokens"], u["cache_write_tokens"]),
+                cost_usd=trace.model_cost(model),
             )
     except Exception as e:  # noqa: BLE001
         logger.warning("Could not record token usage for %s: %s", user_id, e)

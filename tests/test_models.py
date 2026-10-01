@@ -125,3 +125,11 @@ def test_estimate_cost(clean_models):
     # OpenAI rates per 1M tokens: gpt-6.1-sol $2 / $10, gpt-6-luna $0.1 / $0.5
     assert m.estimate_cost(m.OPENAI_MODEL, 1_000_000, 1_000_000) == 2.0 + 10.0
     assert m.estimate_cost(m.VIDEO_FRAMES_MODEL, 1_000_000, 1_000_000) == 0.1 + 0.5
+
+
+def test_estimate_image_cost(clean_models):
+    m = clean_models
+    # per 1M tokens: text input $5, image input $8, image output $30 (both GPT Image 2.5 models)
+    for model in (m.GPT_IMAGE_MODEL, m.GPT_IMAGE_MODEL_FAST):
+        assert m.estimate_image_cost(model, 1_000_000, 1_000_000, 1_000_000) == 5.0 + 8.0 + 30.0
+    assert m.estimate_image_cost(m.GEMINI_IMAGE_MODEL_FLASH, 1000, 0, 1000) is None

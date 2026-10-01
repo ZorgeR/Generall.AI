@@ -281,3 +281,21 @@ def estimate_cost(model: str, input_tokens: int = 0, output_tokens: int = 0, cac
         + cache_write_tokens * price_in * CACHE_WRITE_MULTIPLIER
         + output_tokens * price_out
     ) / 1_000_000
+
+
+# OpenAI image models bill tokens by modality (USD per million tokens): text input,
+# image input, image output. Text output is not billed. The cached-input rates
+# ($1.25 text / $2 image) are not applied: the images API reports no cached share.
+IMAGE_TOKEN_PRICES: dict[str, tuple[float, float, float]] = {
+    "gpt-image-2.5-sunburst": (5.0, 8.0, 30.0),
+    "gpt-image-2.5-flare": (5.0, 8.0, 30.0),
+}
+
+
+def estimate_image_cost(model: str, text_input_tokens: int = 0, image_input_tokens: int = 0, image_output_tokens: int = 0) -> float | None:
+    """USD estimate for one images API call, or None when the model is not in IMAGE_TOKEN_PRICES."""
+    prices = IMAGE_TOKEN_PRICES.get(model)
+    if prices is None:
+        return None
+    text_in, image_in, image_out = prices
+    return (text_input_tokens * text_in + image_input_tokens * image_in + image_output_tokens * image_out) / 1_000_000
