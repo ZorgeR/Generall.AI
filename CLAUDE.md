@@ -12,7 +12,7 @@ Telegram; the bot turns media into a text prompt, runs a per-message agent loop
 with 31 tools (files, web search, code execution in a Docker sandbox,
 image/video generation, reminders, SMS, S3, TTS), persists multi-layer memory
 per user on disk, and replies in Telegram. Claude drives the tool loop; OpenAI
-(`gpt-5.6-terra`) is only consulted by the optional critique step, which can force a
+(`gpt-6.1-sol`) is only consulted by the optional critique step, which can force a
 rewrite. OpenAI, Google Gemini/Veo, Perplexity, Tavily, ElevenLabs, Twilio and
 Whisper otherwise serve specific side tasks.
 
@@ -248,7 +248,7 @@ worker → _run_text → bot.agent_runner.run_turn(bot, user_id, chat_id, prompt
        │        (run_tool_batch: asyncio.gather, is_error on exceptions, trace + status refresh per call),
        │        append ONE user msg of tool_results in block order, continue (cicles counts tool_use BLOCKS)
        │     gate fails → tool_use blocks silently dropped, text goes on to critique/judge/return
-       │     else optional critique (OpenAI gpt-5.6-terra) / judge (Claude yes/no) re-prompts → return
+       │     else optional critique (OpenAI gpt-6.1-sol) / judge (Claude yes/no) re-prompts → return
        │     for-loop exhausted → forced "SYSTEM NOTICE" final call without tools (same thinking mode)
        └─ strip pre-loaded context from thread_messages; persist memory inside try/except
           (a failed Haiku summary is logged, the answer is still returned) → (response, messages)
@@ -277,7 +277,7 @@ Media handlers (`_run_voice`, `_run_video`, `_run_audio`, `_run_images`, `_run_d
   before the agent runs. Albums are buffered per `(chat_id, media_group_id)` and flushed 10 s after
   the last photo into ONE job.
 - Video/video notes: saved to `data/<uid>/videos/`, 4 frames to `data/<uid>/images/video_frame_*.jpg`,
-  frames described by `gpt-5.6-luna`, audio by Whisper; `speak=True`.
+  frames described by `gpt-6-luna`, audio by Whisper; `speak=True`.
 - Documents: saved to `data/<uid>/documents/<lowercased name>`, then `media.describe_document`
   (PDF via Claude document block; txt/json/docx/xlsx extracted; >100k chars map-reduced). Video
   extensions are rerouted to the video job, JPG/JPEG/HEIC/HEIF to the image job, everything else rejected.
@@ -439,7 +439,16 @@ Memory semantics worth knowing before touching `ChainOfThoughtAgent.generate_res
   `ToolTrace.add_usage(usage, model)` accumulates `usage` per turn and per model; the status line shows the
   cached share and an estimated cost (`models.MODEL_PRICES`, cache reads ×0.1, writes ×1.25), and
   `agent_runner.record_usage` stores one `usage_events` row per model; `/stats` (admin) shows tokens, cost
-  and top spenders. Haiku side calls (topic/summary/classifier) are not counted.
+  and top spenders. The OpenAI critique call is added to the turn's trace; the GPT photo and video-frame
+  descriptions (`bot/media.py`) each write their own `usage_events` row (OpenAI usage has no cache split: all
+  prompt tokens are priced as input). Image and video calls are added to the turn's trace too
+  (`ImageTools.trace` / `VideoTools.trace`, set per turn by `ChainOfThoughtAgent.generate_response`): OpenAI and
+  Gemini images priced by modality with `models.estimate_image_cost` / `IMAGE_TOKEN_PRICES`, Veo per generated
+  second with `estimate_video_cost` / `VIDEO_PRICES_PER_SECOND` (the tools leave `duration_seconds` unset, so
+  `VEO_DEFAULT_SECONDS` / `VEO_EXTENSION_SECONDS` are assumed). That cost is stored as the bucket's `cost_usd`,
+  which `ToolTrace.model_cost` prefers over `MODEL_PRICES`. Haiku side calls (topic/summary/classifier), the
+  judge, Claude image/document descriptions, Whisper, embeddings and the Gemini Pro image model (no price) are
+  not counted.
   Legacy mode still has no caching (its system prompt embeds the time).
 
 ## User settings (`data/<uid>/settings.json`)
@@ -484,12 +493,12 @@ OpenAI reasoning models and `{}` for anything else. No other file holds a model 
 
 | Purpose | Model / API (default; env override) | Request options | Used by |
 |---|---|---|---|
-| Agent loop, judge, final compile | `claude-sonnet-5` via `anthropic.AsyncAnthropic` (`ANTHROPIC_MODEL`) | adaptive thinking always; loop and final call: effort `high` + summarized display when the user's `thinking` setting is on, effort `low` + omitted display when off; judge: light mode, max_tokens 2048; the loop and final call always stream | `agents/main.py` |
-| Document & image description | `claude-sonnet-5` (`ANTHROPIC_MODEL`) | light mode (adaptive, effort `low`, display omitted); max_tokens 4096 / 8192 / 16000 leave room for thinking; text read with `anthropic_text` | `bot/media.py` via `bot/clients.py` clients |
+| Agent loop, judge, final compile | `claude-sonnet-5-5` via `anthropic.AsyncAnthropic` (`ANTHROPIC_MODEL`) | adaptive thinking always; loop and final call: effort `high` + summarized display when the user's `thinking` setting is on, effort `low` + omitted display when off; judge: light mode, max_tokens 2048; the loop and final call always stream | `agents/main.py` |
+| Document & image description | `claude-sonnet-5-5` (`ANTHROPIC_MODEL`) | light mode (adaptive, effort `low`, display omitted); max_tokens 4096 / 8192 / 16000 leave room for thinking; text read with `anthropic_text` | `bot/media.py` via `bot/clients.py` clients |
 | Topic/summary, complexity classifier, "simple" answers | `claude-haiku-4-5` (`ANTHROPIC_MODEL_FAST`) | none (Haiku rejects `effort`) | `agents/main.py` |
-| Critique | `gpt-5.6-terra` structured output (`beta.chat.completions.parse`) (`OPENAI_MODEL`) | `reasoning_effort` = `high` (`OPENAI_REASONING_EFFORT`); no `temperature`/`max_tokens` | `agents/main.py` |
-| GPT vision on photos (second description after Claude) | `gpt-5.6-terra` (`OPENAI_MODEL`) | `reasoning_effort` `high` | `bot/media.py` |
-| Video frame description | `gpt-5.6-luna` (`VIDEO_FRAMES_MODEL`) | `reasoning_effort` `high`; no `max_completion_tokens` (it would cap reasoning + answer together) | `bot/media.py` |
+| Critique | `gpt-6.1-sol` structured output (`beta.chat.completions.parse`) (`OPENAI_MODEL`) | `reasoning_effort` = `high` (`OPENAI_REASONING_EFFORT`); no `temperature`/`max_tokens` | `agents/main.py` |
+| GPT vision on photos (second description after Claude) | `gpt-6.1-sol` (`OPENAI_MODEL`) | `reasoning_effort` `high` | `bot/media.py` |
+| Video frame description | `gpt-6-luna` (`VIDEO_FRAMES_MODEL`) | `reasoning_effort` `high`; no `max_completion_tokens` (it would cap reasoning + answer together) | `bot/media.py` |
 | Transcription | `whisper-1` (`WHISPER_MODEL`) via a second client keyed by `OPENAI_API_KEY_WHISPER` (falls back to `OPENAI_API_KEY`); >24 MB chunked | none | `bot/media.py` `transcribe_audio` |
 | Embeddings | `text-embedding-ada-002` (`EMBEDDING_MODEL`), dim 1536 (`EMBEDDING_DIMENSION`, must match; existing FAISS indexes are not migrated) | none | `agents/embeddings.py` |
 | Image gen/edit/compose | engine → model via `models.IMAGE_BACKENDS`: `auto`/`best` → `gpt-image-2.5-sunburst` (`GPT_IMAGE_MODEL`), `fast` → `gpt-image-2.5-flare` (`GPT_IMAGE_MODEL_FAST`, same price, lower quality), `story` → `gemini-3.1-flash-image-preview` (`GEMINI_IMAGE_MODEL_FLASH`), escalating to `gemini-3-pro-image-preview` (`GEMINI_IMAGE_MODEL_PRO`) at quality xhigh/max | OpenAI: `quality` from the `auto…max` ladder, pixel `size` from ratio+tier, `n=variants`, `output_format`, and `input_fidelity=high` on edits so the original survives (any knob the model refuses is dropped and remembered for the process). Gemini: `ImageConfig(aspect_ratio, image_size)`, no quality knob | `agents/image_tools.py` |
@@ -573,8 +582,8 @@ name; a new temp dir needs its own `.gitignore` line).
 
 ## README vs code
 
-- README model names (Claude Sonnet 5 / GPT-5.6) now match the defaults in `app/models.py`
-  (`claude-sonnet-5`, `claude-haiku-4-5`, `gpt-5.6-terra`, `gpt-5.6-luna`); if they drift again, `app/models.py` wins.
+- README model names (Claude Sonnet 5.5 / GPT-6.1 / GPT-6) now match the defaults in `app/models.py`
+  (`claude-sonnet-5-5`, `claude-haiku-4-5`, `gpt-6.1-sol`, `gpt-6-luna`); if they drift again, `app/models.py` wins.
 - README lists SSH and Shodan tools; neither exists. SSH is only possible via `run_shell_script`
   inside the sandbox (openssh-client is installed there) with `network_enabled`.
 - README lists PNG/GIF/BMP/WEBP as supported images; as documents only JPG/JPEG/HEIC/HEIF are.
@@ -655,7 +664,8 @@ name; a new temp dir needs its own `.gitignore` line).
   `runtime.background_tasks`; to run the agent from it, submit a `Job` to `runtime.queue`.
 - **Add an image engine**: a row in `models.IMAGE_BACKENDS` (model id, provider, which operations and knobs it
   supports, variant strategy, file prefix) and, if it is a new provider, one `_<provider>_images` method in
-  `agents/image_tools.py`. Nothing else dispatches on the engine name.
+  `agents/image_tools.py`. Nothing else dispatches on the engine name. For cost tracking add the model's
+  per-modality rates to `models.IMAGE_TOKEN_PRICES`.
 - **Change models**: edit the default in `app/models.py` or set the env var of the same name
   (`ANTHROPIC_MODEL`, `OPENAI_MODEL`, `VIDEO_FRAMES_MODEL`, ...; see `.env.example`). No other file
   holds a model name. Keep the option helpers honest when the new model's API differs: a

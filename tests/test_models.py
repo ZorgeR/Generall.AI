@@ -26,15 +26,15 @@ def clean_models(monkeypatch):
 
 def test_defaults(clean_models):
     m = clean_models
-    assert m.ANTHROPIC_MODEL == "claude-sonnet-5"
+    assert m.ANTHROPIC_MODEL == "claude-sonnet-5-5"
     assert m.ANTHROPIC_EFFORT == "high"
     assert m.ANTHROPIC_EFFORT_LIGHT == "low"
     assert (m.ANTHROPIC_MAX_TOKENS, m.ANTHROPIC_MAX_TOKENS_LIGHT) == (64000, 16000)
     assert m.ANTHROPIC_MODEL_FAST == "claude-haiku-4-5"
-    assert m.OPENAI_MODEL == "gpt-5.6-terra"
-    assert m.VIDEO_FRAMES_MODEL == "gpt-5.6-luna"
+    assert m.OPENAI_MODEL == "gpt-6.1-sol"
+    assert m.VIDEO_FRAMES_MODEL == "gpt-6-luna"
     assert m.OPENAI_REASONING_EFFORT == "high"
-    assert m.OPENAI_REASONING_MODELS == {"gpt-5.6-terra", "gpt-5.6-luna"}
+    assert m.OPENAI_REASONING_MODELS == {"gpt-6.1-sol", "gpt-6-luna"}
     assert m.WHISPER_MODEL == "whisper-1"
     assert m.EMBEDDING_MODEL == "text-embedding-ada-002"
     assert m.EMBEDDING_DIMENSION == 1536
@@ -62,7 +62,7 @@ def test_env_override_is_honoured(clean_models, monkeypatch):
     assert m.anthropic_request_options() == {"output_config": {"effort": "xhigh"}}
     assert m.OPENAI_MODEL == "gpt-5.6-nova"
     assert m.openai_reasoning_options("gpt-5.6-nova") == {"reasoning_effort": "low"}
-    assert m.openai_reasoning_options("gpt-5.6-terra") == {}  # no longer a configured model
+    assert m.openai_reasoning_options("gpt-6.1-sol") == {}  # no longer a configured model
     assert m.EMBEDDING_DIMENSION == 3072
     assert m.VEO_MODEL == "veo-3.1-generate-preview"
     assert m.ANTHROPIC_MODEL_FAST == "claude-haiku-4-5"  # untouched
@@ -119,6 +119,25 @@ def test_openai_reasoning_options(clean_models):
 def test_estimate_cost(clean_models):
     m = clean_models
     # 1M input at $2 + 1M cache reads at 10% + 1M cache writes at 125% + 1M output at $10
-    assert m.estimate_cost("claude-sonnet-5", 1_000_000, 1_000_000, 1_000_000, 1_000_000) == 2.0 + 0.2 + 2.5 + 10.0
+    assert m.estimate_cost("claude-sonnet-5-5", 1_000_000, 1_000_000, 1_000_000, 1_000_000) == 2.0 + 0.2 + 2.5 + 10.0
     assert m.estimate_cost("claude-haiku-4-5", 1000, 0) == 0.001
     assert m.estimate_cost("some-unknown-model", 1000, 1000) is None
+    # OpenAI rates per 1M tokens: gpt-6.1-sol $2 / $10, gpt-6-luna $0.1 / $0.5
+    assert m.estimate_cost(m.OPENAI_MODEL, 1_000_000, 1_000_000) == 2.0 + 10.0
+    assert m.estimate_cost(m.VIDEO_FRAMES_MODEL, 1_000_000, 1_000_000) == 0.1 + 0.5
+
+
+def test_estimate_image_cost(clean_models):
+    m = clean_models
+    # per 1M tokens: text input $5, image input $8, image output $30 (both GPT Image 2.5 models)
+    for model in (m.GPT_IMAGE_MODEL, m.GPT_IMAGE_MODEL_FAST):
+        assert m.estimate_image_cost(model, 1_000_000, 1_000_000, 1_000_000) == 5.0 + 8.0 + 30.0
+    # Gemini Flash Image: $0.50 input (text and images), $60 output per 1M
+    assert m.estimate_image_cost(m.GEMINI_IMAGE_MODEL_FLASH, 1_000_000, 0, 1_000_000) == 0.5 + 60.0
+    assert m.estimate_image_cost(m.GEMINI_IMAGE_MODEL_PRO, 1000, 0, 1000) is None
+
+
+def test_estimate_video_cost(clean_models):
+    m = clean_models
+    assert m.estimate_video_cost(m.VEO_MODEL, m.VEO_DEFAULT_SECONDS) == 8 * 0.40
+    assert m.estimate_video_cost("some-unknown-video-model", 8) is None

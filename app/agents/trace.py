@@ -108,15 +108,22 @@ class ToolTrace:
     usage_by_model: dict = field(default_factory=dict)  # model -> the same five counters
     thinking: list[str] = field(default_factory=list)  # summarized thinking of the turn, in order
 
-    def add_usage(self, usage, model: str | None = None) -> None:
-        """Accumulate a Messages API ``usage`` object (attributes or dict), per model too."""
+    def add_usage(self, usage, model: str | None = None, cost_usd: float | None = None) -> None:
+        """Accumulate a Messages API ``usage`` object (attributes or dict), per model too.
+
+        An OpenAI chat-completions ``usage`` (prompt_tokens / completion_tokens) is
+        accepted as well; its cached prompt share is not split out. ``cost_usd`` is a
+        cost the caller priced itself (image models bill by modality, which the token
+        counts here do not keep); it replaces the MODEL_PRICES estimate for that model.
+        """
         if usage is None:
             return
         get = usage.get if isinstance(usage, dict) else (lambda k, d=None: getattr(usage, k, d))
+        openai = get("input_tokens") is None and get("prompt_tokens") is not None
         counts = {
             "api_calls": 1,
-            "input_tokens": int(get("input_tokens") or 0),
-            "output_tokens": int(get("output_tokens") or 0),
+            "input_tokens": int(get("prompt_tokens" if openai else "input_tokens") or 0),
+            "output_tokens": int(get("completion_tokens" if openai else "output_tokens") or 0),
             "cache_read_tokens": int(get("cache_read_input_tokens") or 0),
             "cache_write_tokens": int(get("cache_creation_input_tokens") or 0),
         }
@@ -125,6 +132,8 @@ class ToolTrace:
         bucket = self.usage_by_model.setdefault(model or "unknown", {k: 0 for k in counts})
         for key, value in counts.items():
             bucket[key] += value
+        if cost_usd is not None:
+            bucket["cost_usd"] = bucket.get("cost_usd", 0.0) + cost_usd
 
     def add_thinking(self, text: str) -> None:
         text = (text or "").strip()
@@ -136,14 +145,23 @@ class ToolTrace:
         text = "\n\n".join(self.thinking)
         return text if len(text) <= THINKING_CHARS else text[: THINKING_CHARS - 1] + "…"
 
+    def model_cost(self, model: str) -> float | None:
+        """Estimated cost of one model's usage this turn: the cost recorded with it, else MODEL_PRICES."""
+        from models import estimate_cost
+
+        u = self.usage_by_model.get(model)
+        if not u:
+            return None
+        if "cost_usd" in u:
+            return u["cost_usd"]
+        return estimate_cost(model, u["input_tokens"], u["output_tokens"], u["cache_read_tokens"], u["cache_write_tokens"])
+
     @property
     def cost_usd(self) -> float | None:
         """Estimated cost of the turn (models with a known price only), None when nothing is known."""
-        from models import estimate_cost
-
         total, known = 0.0, False
-        for model, u in self.usage_by_model.items():
-            cost = estimate_cost(model, u["input_tokens"], u["output_tokens"], u["cache_read_tokens"], u["cache_write_tokens"])
+        for model in self.usage_by_model:
+            cost = self.model_cost(model)
             if cost is not None:
                 total += cost
                 known = True

@@ -109,7 +109,7 @@ class AgentAnthropic:
         self.budget = None             # agents.trace.TurnBudget shared with subagents
         self.thinking = False
 
-    async def critique_response(self, question: str, answer: str, dialog_history: list = []) -> str:
+    async def critique_response(self, question: str, answer: str, dialog_history: list = [], trace=None) -> str:
         """
         Use OpenAI to critique the response for potential issues.
         Returns critique text if issues found, otherwise returns empty string.
@@ -171,7 +171,9 @@ You can suggest assistant to use a tools, if you think that it's necessary, the 
                 response_format=CritiqueResponse,
                 **openai_reasoning_options(OPENAI_MODEL),
             )
-            
+            if trace is not None:
+                trace.add_usage(getattr(critique_response, "usage", None), model=OPENAI_MODEL)
+
             critique = critique_response.choices[0].message.content.strip()
             
             # Parse into model CritiqueResponse
@@ -510,7 +512,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 last_step_category = "critique"
                 if update_status:
                     await update_status(step=last_step_category, details="Starting critique session", iteration=cicles, critique=critique)
-                critique_answer = await self.critique_response(question=question, answer=current_text, dialog_history=dialog_history)
+                critique_answer = await self.critique_response(question=question, answer=current_text, dialog_history=dialog_history, trace=trace)
                 print(f"\nCritique: {critique_answer}")
                 if critique_answer:
                     need_rewrite_answer = critique_answer.need_rewrite_answer
@@ -1042,6 +1044,11 @@ User message: {question}"""
         return response, new_messages
 
     async def generate_response(self, question: str, update_status=None, on_text_chunk=None, trace=None) -> str:
+        # image and video calls add their tokens and cost to the turn
+        if self.image_tools is not None:
+            self.image_tools.trace = trace
+        if self.video_tools is not None:
+            self.video_tools.trace = trace
         print(f"\n=== Starting Chain of Thought for Question: {question} ===")
         print(f"Thread ID: {self.thread_id or 'None (no topic)'}")
         question = f"Message received time in UTC+0: {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}\n\n{question}"

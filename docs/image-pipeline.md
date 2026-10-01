@@ -369,7 +369,7 @@ per-user `tools.max_iteration` (default 20, `:384-386`).
 (`api_kwargs["tools"] = self.get_tools_schema()`, `agents/main.py:424`) inside the cached prefix
 (`cache_control` ephemeral at `:429-430`), even when `tools.enabled` is false. They have a second
 consumer: the OpenAI critique prompt interpolates `{self.get_tools_schema()}` as text
-(`agents/main.py:148`), so all five image definitions ship to `gpt-5.6-terra` on every critique
+(`agents/main.py:148`), so all five image definitions ship to `gpt-6.1-sol` on every critique
 iteration. Because three descriptions are f-strings over `GEMINI_IMAGE_MODEL_FLASH/PRO`
 (`image_tools.py:70`, `:177`, `:234`), changing either env var invalidates the cached prefix.
 

@@ -365,3 +365,59 @@ def test_an_oversized_input_is_downscaled_and_transparency_survives_conversion(w
     assert prepared.suffix == ".png"  # flattening a logo onto white would ruin a composition
     with PIL.Image.open(prepared) as img:
         assert img.mode == "RGBA"
+
+
+async def test_image_usage_and_cost_reach_the_turn_trace(workspace, monkeypatch):
+    from agents.trace import ToolTrace
+
+    class PricedImages(FakeImages):
+        def _result(self):
+            result = super()._result()
+            result.usage = SimpleNamespace(
+                input_tokens=1_000_100, output_tokens=1_000_000,
+                input_tokens_details=SimpleNamespace(text_tokens=100, image_tokens=1_000_000),
+                output_tokens_details=SimpleNamespace(image_tokens=1_000_000, text_tokens=0),
+            )
+            return result
+
+    tools, _ = make_tools(monkeypatch, PricedImages())
+    tools.trace = ToolTrace()
+    await tools.execute_tool("generate_image", {"prompt": "a cat"})
+
+    bucket = tools.trace.usage_by_model[models.GPT_IMAGE_MODEL]
+    assert bucket["api_calls"] == 1 and bucket["input_tokens"] == 1_000_100 and bucket["output_tokens"] == 1_000_000
+    # 100 text tokens at $5, 1M image input at $8, 1M image output at $30 per 1M
+    expected = (100 * 5 + 1_000_000 * 8 + 1_000_000 * 30) / 1_000_000
+    assert abs(tools.trace.model_cost(models.GPT_IMAGE_MODEL) - expected) < 1e-9
+    assert abs(tools.trace.cost_usd - expected) < 1e-9
+
+
+async def test_no_trace_or_no_usage_is_not_an_error(workspace, monkeypatch):
+    tools, sender = make_tools(monkeypatch, FakeImages())
+    assert tools.trace is None
+    await tools.execute_tool("generate_image", {"prompt": "a cat"})
+    assert len(sender.documents) == 1
+
+
+async def test_gemini_usage_and_cost_reach_the_turn_trace(workspace, monkeypatch):
+    from agents.trace import ToolTrace
+
+    response = SimpleNamespace(
+        candidates=[SimpleNamespace(content=SimpleNamespace(parts=[SimpleNamespace(inline_data=SimpleNamespace(data=PNG, mime_type="image/png"), text=None)]))],
+        usage_metadata=SimpleNamespace(prompt_token_count=1_000_000, candidates_token_count=900_000, thoughts_token_count=100_000),
+    )
+    calls = []
+
+    def generate_content(**kw):
+        calls.append(kw)
+        return response
+
+    tools, _ = make_tools(monkeypatch, FakeImages())
+    monkeypatch.setattr("agents.image_tools.genai_client", lambda: SimpleNamespace(models=SimpleNamespace(generate_content=generate_content)))
+    tools.trace = ToolTrace()
+    await tools.execute_tool("generate_image", {"prompt": "a dragon", "engine": "story", "variants": 2})
+
+    bucket = tools.trace.usage_by_model[models.GEMINI_IMAGE_MODEL_FLASH]
+    assert len(calls) == 2 and bucket["api_calls"] == 2
+    assert bucket["input_tokens"] == 2_000_000 and bucket["output_tokens"] == 2_000_000  # thinking counted as output
+    assert abs(tools.trace.model_cost(models.GEMINI_IMAGE_MODEL_FLASH) - 2 * (0.5 + 60.0)) < 1e-9

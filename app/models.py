@@ -33,18 +33,18 @@ def _env(name: str, default: str) -> str:
 # Anthropic - agent loop, judge, final compile (agents/main.py); document and
 # image description (bot/media.py)
 # ---------------------------------------------------------------------------
-ANTHROPIC_MODEL = _env("ANTHROPIC_MODEL", "claude-sonnet-5")
+ANTHROPIC_MODEL = _env("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 # Passed as ``output_config={"effort": ...}`` on every call to ANTHROPIC_MODEL.
-# Sonnet 5 accepts low | medium | high | xhigh | max. ANTHROPIC_EFFORT is the
+# Sonnet 5.5 accepts low | medium | high | xhigh | max. ANTHROPIC_EFFORT is the
 # level for the user's "thinking on" mode; ANTHROPIC_EFFORT_LIGHT for "thinking
 # off" and for internal calls (judge, image/document descriptions). Thinking is
-# adaptive in both cases: Anthropic's guidance for Sonnet 5 is to lower effort
-# rather than disable thinking (disabled thinking can leak tool calls into text).
+# adaptive in both cases: Sonnet 5.5 rejects ``thinking: disabled`` (400), and
+# Anthropic's guidance is to lower effort rather than turn thinking off.
 ANTHROPIC_EFFORT = _env("ANTHROPIC_EFFORT", "high")
 ANTHROPIC_EFFORT_LIGHT = _env("ANTHROPIC_EFFORT_LIGHT", "low")
 # max_tokens ceilings. There is no separate thinking budget any more: thinking
 # tokens count against max_tokens, so the ceiling must leave room for the
-# reasoning AND the answer (Sonnet 5 allows up to 128k). The agent loop always
+# reasoning AND the answer (Sonnet 5.5 allows up to 128k). The agent loop always
 # streams, which is what makes the large value safe: the SDK refuses roughly
 # > 21k tokens on non-streaming calls because they could exceed its 10-minute
 # request timeout.
@@ -61,8 +61,8 @@ ANTHROPIC_MODEL_FAST = _env("ANTHROPIC_MODEL_FAST", "claude-haiku-4-5")
 # OpenAI reasoning models - critique (agents/main.py) and GPT vision on photos
 # (bot/media.py); video frame description (bot/media.py)
 # ---------------------------------------------------------------------------
-OPENAI_MODEL = _env("OPENAI_MODEL", "gpt-5.6-terra")
-VIDEO_FRAMES_MODEL = _env("VIDEO_FRAMES_MODEL", "gpt-5.6-luna")
+OPENAI_MODEL = _env("OPENAI_MODEL", "gpt-6.1-sol")
+VIDEO_FRAMES_MODEL = _env("VIDEO_FRAMES_MODEL", "gpt-6-luna")
 # ``reasoning_effort`` for both models above (low | medium | high). Reasoning
 # models reject ``temperature`` / ``top_p`` and take ``max_completion_tokens``
 # instead of ``max_tokens``; that cap covers the hidden reasoning AND the
@@ -165,9 +165,10 @@ TTS_MODEL = _env("TTS_MODEL", "eleven_multilingual_v2")
 def anthropic_request_options(thinking: bool | None = None, *, effort: str | None = None) -> dict:
     """kwargs for ``messages.create`` / ``messages.stream`` on ANTHROPIC_MODEL.
 
-    Adaptive thinking is the only thinking mode on Sonnet 5 (a fixed
-    ``budget_tokens`` is rejected) and it runs whether the parameter is present
-    or omitted, so the user's thinking switch selects *how much*:
+    Adaptive thinking is the thinking mode used on Sonnet 5.5 (a fixed
+    ``budget_tokens`` and ``disabled`` are rejected) and it runs whether the
+    parameter is present or omitted, so the user's thinking switch selects
+    *how much*:
 
     * ``True``  -> effort ANTHROPIC_EFFORT, ``display: "summarized"`` (feeds the
       streaming thinking block and the reasoning file)
@@ -249,14 +250,20 @@ def openai_reasoning_options(model: str) -> dict:
 # in the status summary and the admin /stats view. Cache reads cost 10% of the
 # input price, cache writes 125% (5-minute entries; the hourly system block is
 # written rarely). Unknown models get no cost estimate, only token counts.
+# OpenAI usage is recorded without a cache split (no cached-input rate is
+# configured), so its prompt tokens are all priced as input; reasoning tokens
+# are part of completion_tokens and priced as output.
 # ---------------------------------------------------------------------------
 MODEL_PRICES: dict[str, tuple[float, float]] = {
+    "claude-sonnet-5-5": (2.0, 10.0),
     "claude-sonnet-5": (2.0, 10.0),
     "claude-sonnet-4-6": (3.0, 15.0),
     "claude-haiku-4-5": (1.0, 5.0),
     "claude-opus-5": (5.0, 25.0),
     "claude-opus-4-8": (5.0, 25.0),
     "claude-opus-4-7": (5.0, 25.0),
+    "gpt-6.1-sol": (2.0, 10.0),
+    "gpt-6-luna": (0.1, 0.5),
 }
 CACHE_READ_MULTIPLIER = 0.1
 CACHE_WRITE_MULTIPLIER = 1.25
@@ -274,3 +281,42 @@ def estimate_cost(model: str, input_tokens: int = 0, output_tokens: int = 0, cac
         + cache_write_tokens * price_in * CACHE_WRITE_MULTIPLIER
         + output_tokens * price_out
     ) / 1_000_000
+
+
+# Image models bill tokens by modality (USD per million tokens): text input, image
+# input, image output. GPT Image 2.5: text output is not billed, and the cached-input
+# rates ($1.25 text / $2 image) are not applied because the images API reports no
+# cached share. Gemini Flash Image: one input rate for text and images and one
+# output rate, applied to every output token (story prose and thinking included).
+# Models missing here (the Gemini Pro image model) get token counts but no cost.
+IMAGE_TOKEN_PRICES: dict[str, tuple[float, float, float]] = {
+    "gpt-image-2.5-sunburst": (5.0, 8.0, 30.0),
+    "gpt-image-2.5-flare": (5.0, 8.0, 30.0),
+    "gemini-3.1-flash-image-preview": (0.5, 0.5, 60.0),
+}
+
+
+def estimate_image_cost(model: str, text_input_tokens: int = 0, image_input_tokens: int = 0, image_output_tokens: int = 0) -> float | None:
+    """USD estimate for one images API call, or None when the model is not in IMAGE_TOKEN_PRICES."""
+    prices = IMAGE_TOKEN_PRICES.get(model)
+    if prices is None:
+        return None
+    text_in, image_in, image_out = prices
+    return (text_input_tokens * text_in + image_input_tokens * image_in + image_output_tokens * image_out) / 1_000_000
+
+
+# Video generation (USD per generated second). Veo 3.1 starts at $0.40/s; higher
+# resolutions may cost more, so the estimate is a floor. The video tools never set
+# duration_seconds, so Veo's default length is what gets billed: 8 s for a new
+# video, 7 s for an extension.
+VIDEO_PRICES_PER_SECOND: dict[str, float] = {
+    "veo-3.1-generate-preview": 0.40,
+}
+VEO_DEFAULT_SECONDS = 8
+VEO_EXTENSION_SECONDS = 7
+
+
+def estimate_video_cost(model: str, seconds: float) -> float | None:
+    """USD estimate for ``seconds`` of generated video, or None when the model has no price."""
+    price = VIDEO_PRICES_PER_SECOND.get(model)
+    return None if price is None else seconds * price

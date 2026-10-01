@@ -221,7 +221,7 @@ async def _run_video(bot: Bot, message: Message, user_id: str, limit: int | None
                 saved_frames.append(dest)
             await sender.edit_text(status, "🖼️ *Analyzing video frames...*")
             ctx.set_progress("describing frames")
-            visual = await media.describe_video_screenshots(screenshots, transcription=(transcription or "") if is_video_note else "", caption=caption)
+            visual = await media.describe_video_screenshots(screenshots, transcription=(transcription or "") if is_video_note else "", caption=caption, user_id=user_id)
 
         if not (transcription or visual or saved_frames):
             await sender.edit_text(status, "❌ Could not extract any content from video")
@@ -360,7 +360,7 @@ async def _run_images(
                 anthropic_desc = await media.describe_image_anthropic(question, jpeg)
                 _stats().track_describe_used(user_id, "image_anthropic")
                 await sender.edit_text(status, f"🤖 *Getting OpenAI description{suffix}...*")
-                openai_desc = await media.describe_image_openai(question, jpeg)
+                openai_desc = await media.describe_image_openai(question, jpeg, user_id=user_id)
                 _stats().track_describe_used(user_id, "image_openai")
                 descriptions.append({"anthropic": anthropic_desc, "openai": openai_desc, "path": permanent})
             except asyncio.CancelledError:
