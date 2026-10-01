@@ -439,7 +439,10 @@ Memory semantics worth knowing before touching `ChainOfThoughtAgent.generate_res
   `ToolTrace.add_usage(usage, model)` accumulates `usage` per turn and per model; the status line shows the
   cached share and an estimated cost (`models.MODEL_PRICES`, cache reads ×0.1, writes ×1.25), and
   `agent_runner.record_usage` stores one `usage_events` row per model; `/stats` (admin) shows tokens, cost
-  and top spenders. Haiku side calls (topic/summary/classifier) are not counted.
+  and top spenders. The OpenAI critique call is added to the turn's trace; the GPT photo and video-frame
+  descriptions (`bot/media.py`) each write their own `usage_events` row (OpenAI usage has no cache split: all
+  prompt tokens are priced as input). Haiku side calls (topic/summary/classifier), the judge, Claude
+  image/document descriptions, Whisper, embeddings and image/video generation are not counted.
   Legacy mode still has no caching (its system prompt embeds the time).
 
 ## User settings (`data/<uid>/settings.json`)

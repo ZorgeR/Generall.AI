@@ -250,6 +250,9 @@ def openai_reasoning_options(model: str) -> dict:
 # in the status summary and the admin /stats view. Cache reads cost 10% of the
 # input price, cache writes 125% (5-minute entries; the hourly system block is
 # written rarely). Unknown models get no cost estimate, only token counts.
+# OpenAI usage is recorded without a cache split (no cached-input rate is
+# configured), so its prompt tokens are all priced as input; reasoning tokens
+# are part of completion_tokens and priced as output.
 # ---------------------------------------------------------------------------
 MODEL_PRICES: dict[str, tuple[float, float]] = {
     "claude-sonnet-5-5": (2.0, 10.0),
@@ -259,6 +262,8 @@ MODEL_PRICES: dict[str, tuple[float, float]] = {
     "claude-opus-5": (5.0, 25.0),
     "claude-opus-4-8": (5.0, 25.0),
     "claude-opus-4-7": (5.0, 25.0),
+    "gpt-6.1-sol": (2.0, 10.0),
+    "gpt-6-luna": (0.1, 0.5),
 }
 CACHE_READ_MULTIPLIER = 0.1
 CACHE_WRITE_MULTIPLIER = 1.25

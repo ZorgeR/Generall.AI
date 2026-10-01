@@ -122,3 +122,6 @@ def test_estimate_cost(clean_models):
     assert m.estimate_cost("claude-sonnet-5-5", 1_000_000, 1_000_000, 1_000_000, 1_000_000) == 2.0 + 0.2 + 2.5 + 10.0
     assert m.estimate_cost("claude-haiku-4-5", 1000, 0) == 0.001
     assert m.estimate_cost("some-unknown-model", 1000, 1000) is None
+    # OpenAI rates per 1M tokens: gpt-6.1-sol $2 / $10, gpt-6-luna $0.1 / $0.5
+    assert m.estimate_cost(m.OPENAI_MODEL, 1_000_000, 1_000_000) == 2.0 + 10.0
+    assert m.estimate_cost(m.VIDEO_FRAMES_MODEL, 1_000_000, 1_000_000) == 0.1 + 0.5

@@ -27,6 +27,7 @@ from models import (
     WHISPER_MODEL,
     anthropic_request_options,
     anthropic_text,
+    estimate_cost,
     openai_reasoning_options,
 )
 from bot.config import config
@@ -153,7 +154,33 @@ async def describe_image_anthropic(question: str, image_path: str) -> str:
     return anthropic_text(message)
 
 
-async def describe_image_openai(question: str, image_path: str) -> str:
+def _record_openai_usage(user_id: str | None, model: str, response) -> None:
+    """One usage_events row for an OpenAI call made outside an agent turn (never raises).
+
+    The prompt tokens (cached share included) are priced as input, completion tokens
+    (reasoning included) as output; see models.MODEL_PRICES.
+    """
+    usage = getattr(response, "usage", None)
+    if not user_id or usage is None:
+        return
+    try:
+        from stats import stats_tracker
+
+        input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        stats_tracker.track_usage(
+            user_id,
+            model=model,
+            api_calls=1,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=estimate_cost(model, input_tokens, output_tokens),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Could not record token usage for %s: %s", user_id, e)
+
+
+async def describe_image_openai(question: str, image_path: str, user_id: str | None = None) -> str:
     base64_image = await asyncio.to_thread(encode_image, image_path)
     response = await asyncio.to_thread(
         openai_client().chat.completions.create,
@@ -167,6 +194,7 @@ async def describe_image_openai(question: str, image_path: str) -> str:
             ],
         }],
     )
+    _record_openai_usage(user_id, OPENAI_MODEL, response)
     return response.choices[0].message.content
 
 
@@ -414,7 +442,7 @@ async def extract_video_screenshots(video_path: str) -> list[str]:
 FRAME_LABELS = ["10%", "40%", "60%", "85%"]
 
 
-async def describe_video_screenshots(screenshot_paths: list[str], transcription: str = "", caption: str = "") -> str:
+async def describe_video_screenshots(screenshot_paths: list[str], transcription: str = "", caption: str = "", user_id: str | None = None) -> str:
     if not screenshot_paths:
         return ""
     prompt = (
@@ -444,6 +472,7 @@ async def describe_video_screenshots(screenshot_paths: list[str], transcription:
             # no max_completion_tokens: it would cap hidden reasoning + answer together
             **openai_reasoning_options(VIDEO_FRAMES_MODEL),
         )
+        _record_openai_usage(user_id, VIDEO_FRAMES_MODEL, response)
         return response.choices[0].message.content or ""
     except Exception as e:  # noqa: BLE001
         logger.error("Error describing video screenshots: %s", e)

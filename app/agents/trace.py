@@ -109,14 +109,19 @@ class ToolTrace:
     thinking: list[str] = field(default_factory=list)  # summarized thinking of the turn, in order
 
     def add_usage(self, usage, model: str | None = None) -> None:
-        """Accumulate a Messages API ``usage`` object (attributes or dict), per model too."""
+        """Accumulate a Messages API ``usage`` object (attributes or dict), per model too.
+
+        An OpenAI chat-completions ``usage`` (prompt_tokens / completion_tokens) is
+        accepted as well; its cached prompt share is not split out.
+        """
         if usage is None:
             return
         get = usage.get if isinstance(usage, dict) else (lambda k, d=None: getattr(usage, k, d))
+        openai = get("input_tokens") is None and get("prompt_tokens") is not None
         counts = {
             "api_calls": 1,
-            "input_tokens": int(get("input_tokens") or 0),
-            "output_tokens": int(get("output_tokens") or 0),
+            "input_tokens": int(get("prompt_tokens" if openai else "input_tokens") or 0),
+            "output_tokens": int(get("completion_tokens" if openai else "output_tokens") or 0),
             "cache_read_tokens": int(get("cache_read_input_tokens") or 0),
             "cache_write_tokens": int(get("cache_creation_input_tokens") or 0),
         }

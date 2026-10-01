@@ -91,3 +91,16 @@ def test_trace_keeps_per_model_usage_and_result_excerpts():
     trace.add_thinking("  ")
     trace.add_thinking("plan")
     assert trace.thinking_text == "plan"
+
+
+def test_trace_counts_openai_chat_usage():
+    from types import SimpleNamespace
+
+    trace = ToolTrace()
+    # chat.completions usage: prompt/completion, no input_tokens/output_tokens attributes
+    trace.add_usage(SimpleNamespace(prompt_tokens=1_000_000, completion_tokens=100_000), model="gpt-6.1-sol")
+    trace.add_usage({"input_tokens": 10, "output_tokens": 5}, model="claude-sonnet-5-5")
+    gpt = trace.usage_by_model["gpt-6.1-sol"]
+    assert gpt["input_tokens"] == 1_000_000 and gpt["output_tokens"] == 100_000 and gpt["api_calls"] == 1
+    assert trace.input_tokens == 1_000_010
+    assert abs(trace.cost_usd - (2.0 + 1.0 + (10 * 2 + 5 * 10) / 1_000_000)) < 1e-9
