@@ -62,15 +62,25 @@ Messages API conversation, replayed as is.
   (`text`, `tool_use`, `tool_result`, `thinking` with signature, server `compaction` blocks).
   Written atomically under the per-user lock; one file per chat or topic, so a new topic starts
   empty.
-- **Turn**: load → append the user message → run the loop, appending assistant content and tool
-  results exactly as sent → append the final assistant text → save. Judge/critique injections are
-  tagged and dropped before saving; they are not user turns.
-- **Size control**, in this order: (1) cap each `tool_result` stored in the transcript (large
-  outputs are truncated with a note, the model already saw the full text this turn); (2) clear the
-  content of tool results older than the last N turns ("[result cleared]"); (3) server-side
-  compaction (`compact-2026-01-12` beta, supported on Sonnet 5.5): pass `response.content` back
-  including compaction blocks; (4) client-side fallback when compaction is unavailable: summarize
-  the oldest half with the fast model into one labelled block.
+- **Turn**: load → append the user message (context block first) → run the loop, appending
+  assistant content and tool results exactly as sent → append the final assistant text → save.
+  Judge/critique injections are kept: they were sent, and dropping them would invalidate the
+  thinking blocks after them.
+- **Size control**: tool results are capped when the tool returns, before the model sees them.
+  Only above `max_context_tokens` (a compaction boundary, down to 70% of the budget): (1) clear the
+  content of tool results older than the last N turns; (2) summarize the oldest half with the fast
+  model into one labelled block; then strip every thinking block, since they were bound to the old
+  history. Later option: server-side compaction (`compact-2026-01-12` beta, supported on Sonnet 5.5),
+  which does not count as an edit; pass `response.content` back including compaction blocks.
+
+### B1a. Preserved thinking (Sonnet 5.5)
+
+Thinking blocks are bound to the model, system prompt, tools and every earlier message; a changed
+prefix is a 400 for accounts created on or after 2026-08-31. The transcript is therefore
+append-only, with two explicit boundaries that strip all thinking (compaction above, and a change
+of the model/system/tools fingerprint after a settings change or deploy). Safety net:
+`block_binding.prefix_mismatch_behavior: "drop_block"` with the `thinking-binding-controls-2026-08-01`
+beta (`THINKING_PREFIX_MISMATCH`), and `input_transformations` logged when the API drops a block.
 - **Long-term memory stays**: conversation summaries + FAISS are still written per turn and used
   for retrieval, but injected as one labelled `<memory>` block in the newest user message, never
   as fake dialogue.
@@ -90,7 +100,8 @@ Messages API conversation, replayed as is.
   prompt first and one explicit `cache_control` breakpoint on it (1-hour TTL) → `messages` = the
   transcript, with top-level automatic caching for the growing tail.
 - Volatile content (current time, memory hits, formatting flags) moves out of the system prompt
-  into a `<context>` block at the start of the **newest** user message, after the cached prefix.
+  into a `<context>` block at the start of each user turn. It is stored with the turn (append-only,
+  see B1a), so the previous turn stays a cache read; only memory lines not shown yet are added.
 - Every response logs `usage.cache_read_input_tokens` / `cache_creation_input_tokens`; the status
   usage line can show the cache hit rate.
 - Expected effect: within a turn every loop iteration reuses the prefix; across turns the

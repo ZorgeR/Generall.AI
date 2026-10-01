@@ -96,7 +96,6 @@ def test_parent_tool_schema_includes_run_subagent_and_request_builder(agents_mai
         {"role": "assistant", "content": [{"type": "text", "text": "a"}]},
         {"role": "user", "content": "follow-up"},
     ]
-    out = agents_main.AgentAnthropic._request_messages(msgs, context_index=2, request_context="<context>now</context>")
+    out = agents_main.AgentAnthropic._request_messages(msgs)
     assert "_ephemeral" not in out[0] and msgs[0]["_ephemeral"] is True  # original untouched
-    assert out[2]["content"] == [{"type": "text", "text": "<context>now</context>"}, {"type": "text", "text": "follow-up"}]
-    assert agents_main.AgentAnthropic._request_messages(msgs)[2]["content"] == "follow-up"
+    assert out[1:] == msgs[1:]  # nothing else changes: the transcript stores what is sent

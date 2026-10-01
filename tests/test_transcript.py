@@ -36,10 +36,11 @@ def test_message_classification_and_text_view():
     assert T.text_only_view([assistant("orphan"), user("q")]) == [{"role": "user", "content": "q"}]
 
 
-def test_cap_and_clear_tool_results():
+def test_cap_text_and_clear_tool_results():
+    capped = T.cap_text("r" * 5000, 1000)
+    assert capped.startswith("r" * 1000) and capped.endswith("[truncated 4000 characters]")
+    assert T.cap_text("short", 1000) == "short" and T.cap_text("x" * 50, None) == "x" * 50
     msgs = turn(1, 5000) + turn(2, 5000) + turn(3, 5000) + turn(4, 5000)
-    assert T.cap_tool_results(msgs, 1000) == 4
-    assert all(len(m["content"][0]["content"]) < 1100 for m in msgs if T.is_tool_result_message(m))
     assert T.clear_old_tool_results(msgs, keep_turns=2) == 2
     results = [m["content"][0]["content"] for m in msgs if T.is_tool_result_message(m)]
     assert results[0] == T.CLEARED_MARKER and results[1] == T.CLEARED_MARKER
@@ -59,8 +60,11 @@ async def test_prune_summarizes_oldest_half_when_still_too_big():
         calls.append(len(old))
         return "summary of the beginning"
 
-    stats = await T.prune(msgs, max_context_tokens=900, keep_tool_results_turns=1, max_tool_result_chars=2000, summarize=summarize)
-    assert stats["truncated"] == 8 and stats["cleared"] == 7 and stats["summarized"] > 0
+    stats = await T.prune(msgs, max_context_tokens=900, keep_tool_results_turns=1, summarize=summarize)
+    assert stats["cleared"] == 7 and stats["summarized"] > 0
+    # an edited history cannot keep its thinking blocks: they were bound to the old one
+    assert stats["thinking_stripped"] > 0
+    assert not any(b.get("type") == "thinking" for m in msgs for b in m["content"])
     assert msgs[0]["role"] == "user" and T.SUMMARY_TAG in msgs[0]["content"][0]["text"]
     assert msgs[1]["role"] == "user"  # consecutive user turns are fine: the API merges them
     assert calls and all(n > 0 for n in calls)
@@ -70,14 +74,14 @@ async def test_prune_summarizes_oldest_half_when_still_too_big():
 async def test_prune_leaves_small_transcripts_alone_and_survives_summarizer_failure():
     msgs = turn(1) + turn(2)
     before = json.dumps(msgs)
-    stats = await T.prune(msgs, max_context_tokens=100000, keep_tool_results_turns=1, max_tool_result_chars=20000, summarize=None)
-    assert stats == {"truncated": 0, "cleared": 0, "summarized": 0} and json.dumps(msgs) == before
+    stats = await T.prune(msgs, max_context_tokens=100000, keep_tool_results_turns=1, summarize=None)
+    assert stats == {"cleared": 0, "summarized": 0, "thinking_stripped": 0} and json.dumps(msgs) == before
 
     async def boom(old):
         raise RuntimeError("no model")
 
     big = [m for i in range(6) for m in turn(i, 3000)]
-    stats = await T.prune(big, max_context_tokens=1000, keep_tool_results_turns=0, max_tool_result_chars=100, summarize=boom)
+    stats = await T.prune(big, max_context_tokens=1000, keep_tool_results_turns=0, summarize=boom)
     assert stats["summarized"] == 0 and len(big) == 24  # nothing lost
 
 
@@ -123,3 +127,42 @@ def test_sanitize_turn_repairs_incomplete_turns():
     assert [m["role"] for m in led] == ["user", "assistant"] and T.message_text(led[1]) == "y"
     complete = turn(1)
     assert T.sanitize_turn(list(complete), "answer 1") == complete
+
+
+def test_context_blocks_are_stored_but_not_part_of_the_text():
+    context = {"type": "text", "text": T.CONTEXT_OPEN + "Current time\n<memory>\n• [d1] a\n• [d2] b\n</memory>\n</context>"}
+    msgs = [{"role": "user", "content": [context, {"type": "text", "text": "question"}]}, assistant("answer")]
+    assert T.is_context_block(context) and not T.is_context_block(msgs[0]["content"][1])
+    assert T.message_text(msgs[0]) == "question"
+    assert T.text_only_view(msgs)[0] == {"role": "user", "content": "question"}
+    assert T.shown_memory_lines(msgs) == {"• [d1] a", "• [d2] b"}
+    assert T.shown_memory_lines(turn(1)) == set()
+
+
+def test_strip_thinking_keeps_everything_else():
+    msgs = turn(1) + [
+        {"role": "assistant", "content": [{"type": "redacted_thinking", "data": "xx"}]},
+        user("next"),
+    ]
+    assert T.strip_thinking(msgs) == 3  # two thinking blocks from turn(1), one redacted
+    assert not any(b.get("type") in T.THINKING_TYPES for m in msgs for b in m["content"])
+    assert [m["role"] for m in msgs] == ["user", "assistant", "user", "assistant", "user"]  # the empty one is gone
+    assert msgs[1]["content"][-1]["type"] == "tool_use"
+    assert T.strip_thinking(msgs) == 0
+
+
+def test_prefix_fingerprint():
+    tools = [{"name": "b", "description": "x"}, {"name": "a", "description": "y"}]
+    fp = T.prefix_fingerprint("m", "system", tools)
+    assert fp == T.prefix_fingerprint("m", "system", list(reversed(tools)))  # bound as a set
+    assert fp != T.prefix_fingerprint("m2", "system", tools)
+    assert fp != T.prefix_fingerprint("m", "system!", tools)
+    assert fp != T.prefix_fingerprint("m", "system", [{"name": "b", "description": "x"}, {"name": "a", "description": "z"}])
+
+
+def test_fingerprint_round_trips(tmp_path):
+    store = T.TranscriptStore(tmp_path)
+    t = store.load("7", None)
+    t.messages, t.fingerprint = turn(1), "abc"
+    store.save(t)
+    assert store.load("7", None).fingerprint == "abc"

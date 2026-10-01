@@ -6,15 +6,25 @@ blocks of every turn (``text``, ``tool_use``, ``tool_result``, ``thinking`` with
 its signature), so the next turn sees what tools returned and what the model
 thought, and the request prefix stays byte-stable for prompt caching.
 
-Size control, applied after every turn (see ``prune``):
+Append-only. A thinking block is bound to the conversation that produced it: the
+API rejects (or, with the drop policy, drops) a block whose system prompt, tools
+or earlier messages changed since. So every turn stores exactly what was sent,
+the per-turn ``<context>`` block included, and the stored history is never
+edited in place, with two deliberate exceptions, both of which strip every
+thinking block (``strip_thinking``) because the old blocks no longer match:
 
-1. every stored ``tool_result`` is capped at ``max_tool_result_chars`` (the model
-   already saw the full text during the turn);
-2. tool results older than the last ``keep_tool_results_turns`` user turns are
-   cleared to a short marker (the tool_use/tool_result pairing stays intact);
-3. when the estimated size still exceeds ``max_context_tokens`` the oldest half
-   is summarized by the caller-supplied ``summarize`` coroutine into one user
-   message that replaces it.
+* a compaction boundary (``prune``): only when the estimated size exceeds
+  ``max_context_tokens``, tool results older than the last
+  ``keep_tool_results_turns`` user turns are cleared to a short marker and, if
+  still above the target, the oldest half is summarized by the caller-supplied
+  ``summarize`` coroutine into one user message, until the transcript is below
+  ``PRUNE_TARGET_RATIO`` of the budget (so the next boundary is many turns away);
+* a prefix change (``prefix_fingerprint``): the model, the system prompt or the
+  tool definitions differ from the ones the transcript was built with (a settings
+  change or a deploy).
+
+Tool results are capped at ``max_tool_result_chars`` when the tool returns
+(``cap_text`` in the agent loop), before the model sees them.
 
 Files: ``data/<uid>/transcripts/[topic_<thread>_]transcript.json`` written
 atomically (tmp + rename). Per-user turns never overlap (per-user queue), so no
@@ -23,6 +33,7 @@ lock is needed here.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -35,7 +46,11 @@ logger = logging.getLogger(__name__)
 TRANSCRIPT_VERSION = 1
 CLEARED_MARKER = "[tool result cleared to save context; call the tool again if you need it]"
 SUMMARY_TAG = "earlier_conversation_summary"
+CONTEXT_OPEN = "<context>\n"  # the per-turn context block stored first in each user turn
+MEMORY_BULLET = "• "  # one memory line (summary or semantic hit) inside a context block
 CHARS_PER_TOKEN = 3.2  # conservative for the Sonnet 5.x tokenizer and non-Latin scripts
+PRUNE_TARGET_RATIO = 0.7  # a compaction brings the transcript down to this share of the budget
+THINKING_TYPES = ("thinking", "redacted_thinking")
 
 
 @dataclass
@@ -47,6 +62,7 @@ class Transcript:
     updated: str = ""
     model: str = ""
     seeded_from: str | None = None
+    fingerprint: str = ""  # prefix_fingerprint of the model/system/tools the stored blocks were made with
 
     def to_json(self) -> dict:
         return {
@@ -57,6 +73,7 @@ class Transcript:
             "updated": self.updated,
             "model": self.model,
             "seeded_from": self.seeded_from,
+            "fingerprint": self.fingerprint,
             "messages": self.messages,
         }
 
@@ -71,6 +88,7 @@ class Transcript:
             updated=data.get("updated", ""),
             model=data.get("model", ""),
             seeded_from=data.get("seeded_from"),
+            fingerprint=data.get("fingerprint") or "",
         )
 
 
@@ -90,13 +108,65 @@ def is_user_turn(message: dict) -> bool:
     return message.get("role") == "user" and not is_tool_result_message(message)
 
 
+def is_context_block(block) -> bool:
+    """The per-turn ``<context>`` block (time and memory) stored at the start of a user turn."""
+    return isinstance(block, dict) and block.get("type") == "text" and str(block.get("text", "")).startswith(CONTEXT_OPEN)
+
+
 def message_text(message: dict) -> str:
+    """The message's own text: text blocks without the per-turn context block."""
     content = message.get("content")
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+        return "\n".join(
+            b.get("text", "") for b in content
+            if isinstance(b, dict) and b.get("type") == "text" and not is_context_block(b)
+        )
     return ""
+
+
+def shown_memory_lines(messages: list[dict]) -> set[str]:
+    """Memory lines already shown in this transcript's context blocks. A new turn repeats
+    none of them: the earlier context blocks stay in the history, so the model still has
+    them, and the transcript does not grow by the same summaries every turn."""
+    shown: set[str] = set()
+    for m in messages:
+        content = m.get("content")
+        if m.get("role") != "user" or not isinstance(content, list):
+            continue
+        for block in content:
+            if is_context_block(block):
+                shown.update(line for line in block["text"].splitlines() if line.startswith(MEMORY_BULLET))
+    return shown
+
+
+def strip_thinking(messages: list[dict]) -> int:
+    """Remove every thinking / redacted_thinking block in place (for a history that was
+    edited, where they would no longer match). An assistant message left empty is
+    dropped. Returns the number of blocks removed."""
+    removed = 0
+    kept: list[dict] = []
+    for m in messages:
+        content = m.get("content")
+        if m.get("role") == "assistant" and isinstance(content, list):
+            rest = [b for b in content if not (isinstance(b, dict) and b.get("type") in THINKING_TYPES)]
+            removed += len(content) - len(rest)
+            if not rest:
+                continue
+            if len(rest) != len(content):
+                m = {**m, "content": rest}
+        kept.append(m)
+    messages[:] = kept
+    return removed
+
+
+def prefix_fingerprint(model: str, system: str, tools: list[dict]) -> str:
+    """Hash of what a thinking block is bound to besides the messages: the model, the
+    system prompt and the tool definitions (as a name-sorted set)."""
+    ordered = sorted(tools or [], key=lambda t: str(t.get("name", "")))
+    payload = json.dumps({"model": model, "system": system, "tools": ordered}, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def text_only_view(messages: list[dict]) -> list[dict]:
@@ -164,18 +234,11 @@ def strip_private_keys(messages: list[dict]) -> list[dict]:
 
 
 # ---- size control ------------------------------------------------------------
-def cap_tool_results(messages: list[dict], max_chars: int) -> int:
-    """Truncate oversized tool results in place. Returns the number truncated."""
-    truncated = 0
-    for m in messages:
-        if not is_tool_result_message(m):
-            continue
-        for block in m["content"]:
-            content = block.get("content")
-            if isinstance(content, str) and len(content) > max_chars:
-                block["content"] = content[:max_chars] + f"\n…[truncated {len(content) - max_chars} characters]"
-                truncated += 1
-    return truncated
+def cap_text(text: str, max_chars: int | None) -> str:
+    """A tool result cut to ``max_chars`` (with a note), applied before the model sees it."""
+    if not max_chars or len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"\n…[truncated {len(text) - max_chars} characters]"
 
 
 def clear_old_tool_results(messages: list[dict], keep_turns: int) -> int:
@@ -219,29 +282,33 @@ async def prune(
     *,
     max_context_tokens: int,
     keep_tool_results_turns: int,
-    max_tool_result_chars: int,
     summarize: Callable[[list[dict]], Awaitable[str]] | None = None,
 ) -> dict:
-    """Apply the three size-control steps in place. Returns counters for logging."""
-    stats = {"truncated": cap_tool_results(messages, max_tool_result_chars), "cleared": 0, "summarized": 0}
+    """Compaction boundary, in place. Below ``max_context_tokens`` nothing changes (the
+    history stays append-only). Above it: clear old tool results, then summarize the
+    oldest half until under ``PRUNE_TARGET_RATIO`` of the budget; if anything was edited,
+    strip every thinking block. Returns counters for logging."""
+    stats = {"cleared": 0, "summarized": 0, "thinking_stripped": 0}
     if estimate_tokens(messages) <= max_context_tokens:
         return stats
+    target = int(max_context_tokens * PRUNE_TARGET_RATIO)
     stats["cleared"] = clear_old_tool_results(messages, keep_tool_results_turns)
-    if estimate_tokens(messages) <= max_context_tokens or summarize is None:
-        return stats
-    for _ in range(4):  # a few rounds at most; each halves the transcript
-        old, rest = split_for_summary(messages)
-        if not old:
-            break
-        try:
-            summary = await summarize(old)
-        except Exception as e:  # noqa: BLE001 - keep the transcript rather than lose it
-            logger.error("Transcript summarization failed, keeping full history: %s", e)
-            break
-        messages[:] = [summary_message(summary)] + rest
-        stats["summarized"] += len(old)
-        if estimate_tokens(messages) <= max_context_tokens:
-            break
+    if estimate_tokens(messages) > target and summarize is not None:
+        for _ in range(4):  # a few rounds at most; each halves the transcript
+            old, rest = split_for_summary(messages)
+            if not old:
+                break
+            try:
+                summary = await summarize(old)
+            except Exception as e:  # noqa: BLE001 - keep the transcript rather than lose it
+                logger.error("Transcript summarization failed, keeping full history: %s", e)
+                break
+            messages[:] = [summary_message(summary)] + rest
+            stats["summarized"] += len(old)
+            if estimate_tokens(messages) <= target:
+                break
+    if stats["cleared"] or stats["summarized"]:
+        stats["thinking_stripped"] = strip_thinking(messages)
     return stats
 
 
