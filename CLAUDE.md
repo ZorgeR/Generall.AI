@@ -20,7 +20,7 @@ Every chat has its own job queue: messages are processed strictly in order per
 user, each as its own turn, and users never wait for each other. See "Queues".
 
 There is a small pytest suite (`tests/`, run with `pytest` from the repo root)
-covering the queue, settings, auth, reminder store, text splitting and the model settings module. There is
+covering the queue, settings, auth, reminder store, text splitting, the model settings module and the /stats views. There is
 no CI, linter, formatter or type checking. Validate changes with the tests and
 the import smoke check at the end of this file.
 
@@ -52,6 +52,11 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
     ui.py                   answer_md/edit_md helpers: legacy Markdown with plain-text fallback
     jobs.py                 reminders scheduler loop (10 s): sends user reminders, queues agent reminders
     clients.py              lazily built OpenAI/Whisper/Anthropic clients + model name constants
+    stats_report.py         /stats data: collect() → StatsReport (stats_tracker queries; blocking, run in to_thread)
+                            and the legacy-Markdown text views (Unicode bars, daily sparkline, deltas vs previous 30 days,
+                            monospace lines ≤ LINE_WIDTH so phones don't wrap them)
+    stats_chart.py          /stats PNG dashboard from the same report: matplotlib object API only (Figure + Agg, never
+                            pyplot, so worker-thread renders share no state), imported lazily; render in to_thread
     handlers/
       __init__.py           build_root_router(): public → admin → ui → chat, middleware per router
       middleware.py         AuthMiddleware(require_admin, check_limits) injects user_id / limit kwargs
@@ -59,7 +64,8 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
       commands.py           /start, /invite, /listusers, /voice
       settings_ui.py        /settings inline keyboards
       reminders_ui.py       /reminders inline keyboards
-      stats_ui.py           admin /stats
+      stats_ui.py           admin /stats: dashboard photo + text view, users page, per-user view, limits, block;
+                            display names cached 1 h (successful lookups only)
   reminders_store.py        RemindersStore (`reminders_store` singleton): per-user locked JSON read/modify/write
   agents/
     main.py                 Agent core: AgentAnthropic (tool loop) + ChainOfThoughtAgent
@@ -441,7 +447,7 @@ Memory semantics worth knowing before touching `ChainOfThoughtAgent.generate_res
   `ToolTrace.add_usage(usage, model)` accumulates `usage` per turn and per model; the status line shows the
   cached share and an estimated cost (`models.MODEL_PRICES`, cache reads ×0.1, writes ×1.25), and
   `agent_runner.record_usage` stores one `usage_events` row per model; `/stats` (admin) shows tokens, cost
-  and top spenders. The OpenAI critique call is added to the turn's trace; the GPT photo and video-frame
+  and top spenders, per day too (`get_daily_series`, the dashboard's cost chart). The OpenAI critique call is added to the turn's trace; the GPT photo and video-frame
   descriptions (`bot/media.py`) each write their own `usage_events` row (OpenAI usage has no cache split: all
   prompt tokens are priced as input). Image and video calls are added to the turn's trace too
   (`ImageTools.trace` / `VideoTools.trace`, set per turn by `ChainOfThoughtAgent.generate_response`): OpenAI and
