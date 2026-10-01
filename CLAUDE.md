@@ -394,7 +394,8 @@ data/
                                     block-structured messages of (mostly) the last turn ("reasoning context")
     transcripts/[topic_<thread>_]transcript.json
                                     transcript mode: {version, user_id, thread_id, created, updated, model, seeded_from,
-                                    messages:[exact API messages]}; pruned per settings; atomic write
+                                    fingerprint, messages:[exact API messages, as sent]}; append-only, pruned only above
+                                    max_context_tokens; atomic write
     embeddings/faiss_index.bin, metadata.json
                                     IndexFlatL2(1536) over "Question: ..\nAnswer: .." with text-embedding-ada-002
     reminders/reminders.json        list of {id (8 hex), user_id, text, time (ISO UTC), type: user|agent,
@@ -434,8 +435,9 @@ Memory semantics worth knowing before touching `ChainOfThoughtAgent.generate_res
 - Prompt caching (transcript mode): the static system prompt is one `text` block with an explicit
   `cache_control` breakpoint (`SYSTEM_CACHE_TTL`), covering the tool schemas before it; every request also
   passes the top-level `cache_control={"type": "ephemeral"}` so the API places an automatic breakpoint on
-  the conversation tail. Everything volatile (time, memory hits) goes into the `<context>` block prepended to
-  the newest user message at request time by `AgentAnthropic._request_messages`; it is never stored.
+  the conversation tail. Everything volatile (time, memory hits) goes into the `<context>` block, the first
+  block of each user turn; it is stored with the turn (see "Preserved thinking" in Known pitfalls), and only
+  memory lines the transcript has not shown yet are included, so the previous turn is a cache read.
   `ToolTrace.add_usage(usage, model)` accumulates `usage` per turn and per model; the status line shows the
   cached share and an estimated cost (`models.MODEL_PRICES`, cache reads ×0.1, writes ×1.25), and
   `agent_runner.record_usage` stores one `usage_events` row per model; `/stats` (admin) shows tokens, cost
@@ -472,7 +474,7 @@ every `set`. `run_turn` saves once per turn so new defaults reach disk. Agent co
 | `rich_messages` | enabled (true) | answers as Telegram rich messages (native GFM); off = legacy Markdown v1 path; also selects the `<formatting>` prompt section and rich vs plain streaming drafts |
 | `image` | engine (`auto`), quality (`auto`), size (`2K`), max_variants (4), metadata (true) | defaults for `generate_image`; the agent may override engine/quality from the request, `max_variants` is a hard cap, `metadata` puts model/quality/size in the delivered file's caption |
 | `trace` | keep_summary (true) | end of turn: status shortened into the rich summary above the answer (expandable tool calls, thinking, tokens); off = deleted |
-| `transcript` | enabled (true), max_context_tokens (120000, 20k..400k), keep_tool_results_turns (3), max_tool_result_chars (20000) | transcript mode (real conversation replayed as is); when on, `dialog_history`/`reasoning_context` are ignored for the prompt (dialog_history.json is still kept current) and `summarization_history.size` = recent summaries in the `<memory>` block |
+| `transcript` | enabled (true), max_context_tokens (120000, 20k..400k), keep_tool_results_turns (3), max_tool_result_chars (20000, applied when the tool returns, before the model sees it) | transcript mode (real conversation replayed as is); when on, `dialog_history`/`reasoning_context` are ignored for the prompt (dialog_history.json is still kept current) and `summarization_history.size` = recent summaries in the `<memory>` block |
 | `system_prompt` | type ("generall-ai-v2"; also generall-ai-v1, perplexity-deep-research, perplexity-r1) | prompt selection |
 
 Edited through `/settings` (`bot/handlers/settings_ui.py`). callback_data is
@@ -537,6 +539,7 @@ SearchTools and the embeddings `OpenAI` are per instance; ElevenLabs is per call
 | `FFMPEG_DIR` | bot/media (Windows only) | directory holding ffmpeg.exe when not on PATH |
 | `MAX_AGENT_TOOLS_ITERATIONS`, `MAX_AGENT_CRITIQUE_ITERATIONS` | read, never used | obsolete; per-user settings replaced them |
 | `BROWSER_SERVICE_URL` | nobody | listed in `.env.example`, unused |
+| `THINKING_PREFIX_MISMATCH` (drop_block) | `models` | preserved-thinking safety net sent with the `thinking-binding-controls-2026-08-01` beta: `drop_block` drops a stale thinking block instead of failing, `error` fails (finds history edits while testing), `off` sends neither |
 | `PROMPT_CACHING` (true), `SYSTEM_CACHE_TTL` (1h), `ANTHROPIC_MAX_TOKENS_FAST` (16000) | `models` | explicit breakpoint on the static system block + top-level automatic caching of the conversation tail (`cache_control` kwarg); max_tokens for fast-model subagents |
 
 Never commit `.env`, `data/`, `temp_photos/`, `temp_docs/`, `temp_audio/` (git-ignored by exact
@@ -633,10 +636,22 @@ name; a new temp dir needs its own `.gitignore` line).
   status stays plain for the turn (`StatusMessage.rich = False`). Headers like `💭 *Thinking...*` are
   legacy Markdown; `status.plain_header` strips the marks for rich blocks.
 - Transcript mode: `AgentAnthropic.generate_response` returns ALL messages (incoming + appended); the transcript
-  path slices `[base_len:]` and drops `_ephemeral` ones, so never insert or drop messages in the request path.
-  `_request_messages` strips every key starting with `_` before sending. Old tool results are replaced by
-  `CLEARED_MARKER` (pairing kept); the oldest half becomes one `<earlier_conversation_summary>` user message
-  (consecutive user messages are merged by the API). Server-side compaction is not used yet (beta).
+  path slices `[base_len:]` and keeps every one of them, judge/critique/SYSTEM NOTICE (`_ephemeral`) included,
+  so never insert or drop messages in the request path. `_request_messages` only strips keys starting with `_`.
+- **Preserved thinking (Sonnet 5.5): the transcript is append-only.** The API binds each thinking block to the
+  model, system prompt, tools and every message before it; a changed one is a 400 for accounts created on or
+  after 2026-08-31 (older accounts are not enforced). So the stored transcript is exactly what was sent: the
+  `<context>` block is stored with its turn, tool results are cut (`transcript.cap_text`) before the model sees
+  them, empty text blocks are dropped when the assistant message is appended, and redacted_thinking blocks go
+  back unchanged. The final answer is stored text-only; that is safe because no later block depends on it.
+  The only edits are boundaries that strip every thinking block (`transcript.strip_thinking`): `prune` above
+  `max_context_tokens` (clear old tool results to `CLEARED_MARKER`, then summarize the oldest half into one
+  `<earlier_conversation_summary>` user message, down to `PRUNE_TARGET_RATIO` of the budget), and a change of
+  `transcript.prefix_fingerprint` (model, static system prompt or tool definitions, e.g. a new image preference,
+  prompt type, rich-messages toggle or a deploy). Any new code that edits stored history must strip thinking
+  the same way. Safety net: `models.thinking_binding` adds `block_binding.prefix_mismatch_behavior`
+  (`THINKING_PREFIX_MISMATCH`) on the beta client; `log_input_transformations` prints any block the API
+  dropped (that means something still edits history), and a refused beta is switched off for the process.
 - Subagents share the parent's `TurnBudget`: the child gets `min(max_tool_calls, remaining)` and its used calls
   are charged to the parent afterwards; a child never persists a transcript and runs with judge/critique off.
 
@@ -649,8 +664,9 @@ name; a new temp dir needs its own `.gitignore` line).
 - **Add a user setting**: add the category to `DEFAULT_SETTINGS` in `bot/settings.py`, render it in
   `settings_ui.py` (overview text, keyboard, `show_<cat>_menu`, `elif category ==` branch with the
   short token), then read it in `agents/main.py` via the `user_settings` dict.
-- **Add a memory source to the prompt**: extend `ChainOfThoughtAgent._request_context` (transcript mode); never
-  put per-turn text into the static system prompt, it breaks the cache.
+- **Add a memory source to the prompt**: extend `ChainOfThoughtAgent._request_context` (transcript mode); start
+  each line with `transcript.MEMORY_BULLET` so a line already shown in this transcript is not repeated. Never
+  put per-turn text into the static system prompt (it breaks the cache and strips every stored thinking block).
 - **Add a system prompt**: define `system_context_<name>` inside
   `ChainOfThoughtAgent.generate_response`, add the selection `elif`, the display-name branch, add the
   name to `SYSTEM_PROMPT_TYPES` in `bot/settings.py` (the menu is generated from it).
@@ -682,9 +698,10 @@ name; a new temp dir needs its own `.gitignore` line).
   needs Docker and a real token.
        ├─ TRANSCRIPT MODE (default, transcript.enabled): _generate_with_transcript → load
        │     data/<uid>/transcripts/[topic_<id>_]transcript.json (seeded from dialog_history.json on first use);
-       │     static prompt (time stripped) as ONE cached system block (ttl SYSTEM_CACHE_TTL); <context> = time +
-       │     <memory> (recent summaries + FAISS hits) prepended to the newest user message AT REQUEST TIME only;
-       │     Haiku complexity check on the text view; tool loop on the real transcript; then append the turn
-       │     (judge/critique/SYSTEM NOTICE messages carry _ephemeral and are dropped), prune (cap tool results,
-       │     clear results older than keep_tool_results_turns, summarize oldest half with Haiku when above
-       │     max_context_tokens), save; summaries/FAISS/dialog_history.json still written. LEGACY MODE below:
+       │     static prompt (time stripped) as ONE cached system block (ttl SYSTEM_CACHE_TTL); fingerprint of
+       │     model + static prompt + tools changed → strip stored thinking; <context> = time + <memory> (recent
+       │     summaries + FAISS hits not shown before) stored as the first block of the new user turn; Haiku
+       │     complexity check on the text view (context blocks excluded); tool loop on the real transcript (tool
+       │     results capped before the model sees them); then append the turn exactly as sent, judge/critique/
+       │     SYSTEM NOTICE included; prune only above max_context_tokens (clear old results, summarize oldest
+       │     half, strip thinking); save; summaries/FAISS/dialog_history.json still written. LEGACY MODE below:

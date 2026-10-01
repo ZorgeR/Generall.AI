@@ -219,6 +219,35 @@ def max_tokens_for(model: str, thinking: bool | None = None) -> int:
 PROMPT_CACHING = _env("PROMPT_CACHING", "true").strip().lower() in ("1", "true", "yes", "on")
 SYSTEM_CACHE_TTL = _env("SYSTEM_CACHE_TTL", "1h")  # "5m" | "1h"
 
+# ---------------------------------------------------------------------------
+# Preserved thinking (agents/main.py). Since Sonnet 5.5 a thinking block is bound
+# to the conversation that produced it: if the system prompt, the tools or any
+# earlier message changed since, the API rejects the request (400) for accounts
+# created on or after 2026-08-31, or records the mismatch for older ones. The
+# transcript is append-only so nothing should ever mismatch; this policy is the
+# safety net for what still slips through (sent with the beta below):
+#   drop_block - drop the stale blocks and answer anyway (default)
+#   error      - fail the request (useful to find history edits while testing)
+#   off        - send no policy and no beta header (the account's own default)
+# ---------------------------------------------------------------------------
+THINKING_BINDING_BETA = "thinking-binding-controls-2026-08-01"
+THINKING_PREFIX_MISMATCH = _env("THINKING_PREFIX_MISMATCH", "drop_block").lower()
+
+
+def thinking_binding(kwargs: dict) -> dict | None:
+    """``kwargs`` for ``client.beta.messages.stream`` with the mismatch policy added, or None
+    when it does not apply: the setting is off, or the request has no adaptive thinking
+    (the API accepts ``block_binding`` only next to ``{"type": "adaptive"}``)."""
+    if THINKING_PREFIX_MISMATCH not in ("drop_block", "error"):
+        return None
+    thinking = kwargs.get("thinking")
+    if not isinstance(thinking, dict) or thinking.get("type") != "adaptive":
+        return None
+    bound = dict(kwargs)
+    bound["thinking"] = {**thinking, "block_binding": {"prefix_mismatch_behavior": THINKING_PREFIX_MISMATCH}}
+    bound["betas"] = [*kwargs.get("betas", []), THINKING_BINDING_BETA]
+    return bound
+
 
 def anthropic_text(message) -> str:
     """The concatenated text blocks of a Messages API response.
