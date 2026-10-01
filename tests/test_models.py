@@ -132,4 +132,12 @@ def test_estimate_image_cost(clean_models):
     # per 1M tokens: text input $5, image input $8, image output $30 (both GPT Image 2.5 models)
     for model in (m.GPT_IMAGE_MODEL, m.GPT_IMAGE_MODEL_FAST):
         assert m.estimate_image_cost(model, 1_000_000, 1_000_000, 1_000_000) == 5.0 + 8.0 + 30.0
-    assert m.estimate_image_cost(m.GEMINI_IMAGE_MODEL_FLASH, 1000, 0, 1000) is None
+    # Gemini Flash Image: $0.50 input (text and images), $60 output per 1M
+    assert m.estimate_image_cost(m.GEMINI_IMAGE_MODEL_FLASH, 1_000_000, 0, 1_000_000) == 0.5 + 60.0
+    assert m.estimate_image_cost(m.GEMINI_IMAGE_MODEL_PRO, 1000, 0, 1000) is None
+
+
+def test_estimate_video_cost(clean_models):
+    m = clean_models
+    assert m.estimate_video_cost(m.VEO_MODEL, m.VEO_DEFAULT_SECONDS) == 8 * 0.40
+    assert m.estimate_video_cost("some-unknown-video-model", 8) is None

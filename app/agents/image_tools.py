@@ -533,6 +533,25 @@ class ImageTools:
         except Exception as e:  # noqa: BLE001
             logger.warning("Could not record image usage for %s: %s", model, e)
 
+    def _record_gemini_usage(self, model: str, response) -> None:
+        """Add one Gemini call's tokens and estimated cost to the turn's trace (never raises).
+
+        Thinking tokens are billed as output, so they are counted with the candidates.
+        """
+        usage = getattr(response, "usage_metadata", None)
+        if usage is None or self.trace is None:
+            return
+        try:
+            input_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
+            output_tokens = int(getattr(usage, "candidates_token_count", 0) or 0) + int(getattr(usage, "thoughts_token_count", 0) or 0)
+            self.trace.add_usage(
+                {"input_tokens": input_tokens, "output_tokens": output_tokens},
+                model=model,
+                cost_usd=estimate_image_cost(model, input_tokens, 0, output_tokens),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not record image usage for %s: %s", model, e)
+
     async def _gemini_images(self, backend, *, prompt, inputs, quality, aspect_ratio, size, variants, fmt, caption, temp_paths):
         """Gemini has no quality knob and returns parts, so variants are separate calls."""
         config = types.GenerateContentConfig(
@@ -550,6 +569,7 @@ class ImageTools:
                 response = await asyncio.to_thread(
                     genai_client().models.generate_content, model=backend.model, contents=contents, config=config
                 )
+                self._record_gemini_usage(backend.model, response)
                 saved.extend(await self._collect_parts(
                     response, backend=backend, fmt=fmt,
                     caption=self._caption(caption, backend, quality, size, index, variants),
@@ -587,6 +607,7 @@ class ImageTools:
                 contents=f"Generate a story about {prompt} in a {style} style. For each scene, generate an image.",
                 config=types.GenerateContentConfig(response_modalities=["Text", "Image"]),
             )
+            self._record_gemini_usage(backend.model, response)
             saved = await self._collect_parts(
                 response, backend=backend, fmt="png", caption="Story illustration", send_text=True
             )

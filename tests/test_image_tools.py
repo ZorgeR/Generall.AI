@@ -397,3 +397,27 @@ async def test_no_trace_or_no_usage_is_not_an_error(workspace, monkeypatch):
     assert tools.trace is None
     await tools.execute_tool("generate_image", {"prompt": "a cat"})
     assert len(sender.documents) == 1
+
+
+async def test_gemini_usage_and_cost_reach_the_turn_trace(workspace, monkeypatch):
+    from agents.trace import ToolTrace
+
+    response = SimpleNamespace(
+        candidates=[SimpleNamespace(content=SimpleNamespace(parts=[SimpleNamespace(inline_data=SimpleNamespace(data=PNG, mime_type="image/png"), text=None)]))],
+        usage_metadata=SimpleNamespace(prompt_token_count=1_000_000, candidates_token_count=900_000, thoughts_token_count=100_000),
+    )
+    calls = []
+
+    def generate_content(**kw):
+        calls.append(kw)
+        return response
+
+    tools, _ = make_tools(monkeypatch, FakeImages())
+    monkeypatch.setattr("agents.image_tools.genai_client", lambda: SimpleNamespace(models=SimpleNamespace(generate_content=generate_content)))
+    tools.trace = ToolTrace()
+    await tools.execute_tool("generate_image", {"prompt": "a dragon", "engine": "story", "variants": 2})
+
+    bucket = tools.trace.usage_by_model[models.GEMINI_IMAGE_MODEL_FLASH]
+    assert len(calls) == 2 and bucket["api_calls"] == 2
+    assert bucket["input_tokens"] == 2_000_000 and bucket["output_tokens"] == 2_000_000  # thinking counted as output
+    assert abs(tools.trace.model_cost(models.GEMINI_IMAGE_MODEL_FLASH) - 2 * (0.5 + 60.0)) < 1e-9

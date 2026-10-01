@@ -283,12 +283,16 @@ def estimate_cost(model: str, input_tokens: int = 0, output_tokens: int = 0, cac
     ) / 1_000_000
 
 
-# OpenAI image models bill tokens by modality (USD per million tokens): text input,
-# image input, image output. Text output is not billed. The cached-input rates
-# ($1.25 text / $2 image) are not applied: the images API reports no cached share.
+# Image models bill tokens by modality (USD per million tokens): text input, image
+# input, image output. GPT Image 2.5: text output is not billed, and the cached-input
+# rates ($1.25 text / $2 image) are not applied because the images API reports no
+# cached share. Gemini Flash Image: one input rate for text and images and one
+# output rate, applied to every output token (story prose and thinking included).
+# Models missing here (the Gemini Pro image model) get token counts but no cost.
 IMAGE_TOKEN_PRICES: dict[str, tuple[float, float, float]] = {
     "gpt-image-2.5-sunburst": (5.0, 8.0, 30.0),
     "gpt-image-2.5-flare": (5.0, 8.0, 30.0),
+    "gemini-3.1-flash-image-preview": (0.5, 0.5, 60.0),
 }
 
 
@@ -299,3 +303,20 @@ def estimate_image_cost(model: str, text_input_tokens: int = 0, image_input_toke
         return None
     text_in, image_in, image_out = prices
     return (text_input_tokens * text_in + image_input_tokens * image_in + image_output_tokens * image_out) / 1_000_000
+
+
+# Video generation (USD per generated second). Veo 3.1 starts at $0.40/s; higher
+# resolutions may cost more, so the estimate is a floor. The video tools never set
+# duration_seconds, so Veo's default length is what gets billed: 8 s for a new
+# video, 7 s for an extension.
+VIDEO_PRICES_PER_SECOND: dict[str, float] = {
+    "veo-3.1-generate-preview": 0.40,
+}
+VEO_DEFAULT_SECONDS = 8
+VEO_EXTENSION_SECONDS = 7
+
+
+def estimate_video_cost(model: str, seconds: float) -> float | None:
+    """USD estimate for ``seconds`` of generated video, or None when the model has no price."""
+    price = VIDEO_PRICES_PER_SECOND.get(model)
+    return None if price is None else seconds * price

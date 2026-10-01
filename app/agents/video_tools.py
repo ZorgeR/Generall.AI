@@ -9,7 +9,7 @@ import uuid
 from google import genai
 from google.genai import types
 from google.genai.types import Image, VideoGenerationReferenceImage
-from models import VEO_MODEL
+from models import VEO_DEFAULT_SECONDS, VEO_EXTENSION_SECONDS, VEO_MODEL, estimate_video_cost
 
 load_dotenv()
 
@@ -31,6 +31,7 @@ class VideoTools:
         """
         self.user_id = user_id
         self.sender = sender
+        self.trace = None  # agents.trace.ToolTrace of the current turn, set by ChainOfThoughtAgent
         self.base_path = Path("./data") / str(user_id)
         # Create base directory if it doesn't exist
         self.base_path.mkdir(parents=True, exist_ok=True)
@@ -259,7 +260,28 @@ class VideoTools:
             operation = await asyncio.to_thread(genai_client.operations.get, operation)
         if not operation.result or not operation.result.generated_videos:
             return False
+        self._record_cost(kwargs, len(operation.result.generated_videos))
         return operation.result.generated_videos[0]
+
+    def _record_cost(self, request: Dict[str, Any], videos: int) -> None:
+        """Add one Veo operation's estimated cost to the turn's trace (never raises).
+
+        Veo bills per generated second; the tools leave duration_seconds unset, so the
+        default length applies (an extension adds a shorter clip to the source video).
+        """
+        if self.trace is None:
+            return
+        try:
+            seconds = getattr(request.get("config"), "duration_seconds", None)
+            if not seconds:
+                seconds = VEO_EXTENSION_SECONDS if "video" in request else VEO_DEFAULT_SECONDS
+            self.trace.add_usage(
+                {"input_tokens": 0, "output_tokens": 0},
+                model=VEO_MODEL,
+                cost_usd=estimate_video_cost(VEO_MODEL, seconds * videos),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not record video cost for %s: %s", VEO_MODEL, e)
 
     async def _save_and_send(self, generated_video, filename: str, caption: str) -> Path:
         video_path = self.videos_path / filename
