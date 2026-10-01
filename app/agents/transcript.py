@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 TRANSCRIPT_VERSION = 1
 CLEARED_MARKER = "[tool result cleared to save context; call the tool again if you need it]"
 SUMMARY_TAG = "earlier_conversation_summary"
-CHARS_PER_TOKEN = 3.2  # conservative for Sonnet 5's tokenizer and non-Latin scripts
+CHARS_PER_TOKEN = 3.2  # conservative for the Sonnet 5.x tokenizer and non-Latin scripts
 
 
 @dataclass

@@ -33,18 +33,18 @@ def _env(name: str, default: str) -> str:
 # Anthropic - agent loop, judge, final compile (agents/main.py); document and
 # image description (bot/media.py)
 # ---------------------------------------------------------------------------
-ANTHROPIC_MODEL = _env("ANTHROPIC_MODEL", "claude-sonnet-5")
+ANTHROPIC_MODEL = _env("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 # Passed as ``output_config={"effort": ...}`` on every call to ANTHROPIC_MODEL.
-# Sonnet 5 accepts low | medium | high | xhigh | max. ANTHROPIC_EFFORT is the
+# Sonnet 5.5 accepts low | medium | high | xhigh | max. ANTHROPIC_EFFORT is the
 # level for the user's "thinking on" mode; ANTHROPIC_EFFORT_LIGHT for "thinking
 # off" and for internal calls (judge, image/document descriptions). Thinking is
-# adaptive in both cases: Anthropic's guidance for Sonnet 5 is to lower effort
-# rather than disable thinking (disabled thinking can leak tool calls into text).
+# adaptive in both cases: Sonnet 5.5 rejects ``thinking: disabled`` (400), and
+# Anthropic's guidance is to lower effort rather than turn thinking off.
 ANTHROPIC_EFFORT = _env("ANTHROPIC_EFFORT", "high")
 ANTHROPIC_EFFORT_LIGHT = _env("ANTHROPIC_EFFORT_LIGHT", "low")
 # max_tokens ceilings. There is no separate thinking budget any more: thinking
 # tokens count against max_tokens, so the ceiling must leave room for the
-# reasoning AND the answer (Sonnet 5 allows up to 128k). The agent loop always
+# reasoning AND the answer (Sonnet 5.5 allows up to 128k). The agent loop always
 # streams, which is what makes the large value safe: the SDK refuses roughly
 # > 21k tokens on non-streaming calls because they could exceed its 10-minute
 # request timeout.
@@ -61,8 +61,8 @@ ANTHROPIC_MODEL_FAST = _env("ANTHROPIC_MODEL_FAST", "claude-haiku-4-5")
 # OpenAI reasoning models - critique (agents/main.py) and GPT vision on photos
 # (bot/media.py); video frame description (bot/media.py)
 # ---------------------------------------------------------------------------
-OPENAI_MODEL = _env("OPENAI_MODEL", "gpt-5.6-terra")
-VIDEO_FRAMES_MODEL = _env("VIDEO_FRAMES_MODEL", "gpt-5.6-luna")
+OPENAI_MODEL = _env("OPENAI_MODEL", "gpt-6.1-sol")
+VIDEO_FRAMES_MODEL = _env("VIDEO_FRAMES_MODEL", "gpt-6-luna")
 # ``reasoning_effort`` for both models above (low | medium | high). Reasoning
 # models reject ``temperature`` / ``top_p`` and take ``max_completion_tokens``
 # instead of ``max_tokens``; that cap covers the hidden reasoning AND the
@@ -165,9 +165,10 @@ TTS_MODEL = _env("TTS_MODEL", "eleven_multilingual_v2")
 def anthropic_request_options(thinking: bool | None = None, *, effort: str | None = None) -> dict:
     """kwargs for ``messages.create`` / ``messages.stream`` on ANTHROPIC_MODEL.
 
-    Adaptive thinking is the only thinking mode on Sonnet 5 (a fixed
-    ``budget_tokens`` is rejected) and it runs whether the parameter is present
-    or omitted, so the user's thinking switch selects *how much*:
+    Adaptive thinking is the thinking mode used on Sonnet 5.5 (a fixed
+    ``budget_tokens`` and ``disabled`` are rejected) and it runs whether the
+    parameter is present or omitted, so the user's thinking switch selects
+    *how much*:
 
     * ``True``  -> effort ANTHROPIC_EFFORT, ``display: "summarized"`` (feeds the
       streaming thinking block and the reasoning file)
@@ -251,6 +252,7 @@ def openai_reasoning_options(model: str) -> dict:
 # written rarely). Unknown models get no cost estimate, only token counts.
 # ---------------------------------------------------------------------------
 MODEL_PRICES: dict[str, tuple[float, float]] = {
+    "claude-sonnet-5-5": (2.0, 10.0),
     "claude-sonnet-5": (2.0, 10.0),
     "claude-sonnet-4-6": (3.0, 15.0),
     "claude-haiku-4-5": (1.0, 5.0),

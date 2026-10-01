@@ -87,10 +87,10 @@ def test_store_round_trip_and_seed(tmp_path):
     t = store.load("42", None)
     assert t.messages == [] and t.user_id == "42"
     t.messages.extend(turn(1))
-    t.model = "claude-sonnet-5"
+    t.model = "claude-sonnet-5-5"
     store.save(t)
     again = store.load("42", None)
-    assert again.messages == turn(1) and again.model == "claude-sonnet-5" and again.created and again.updated
+    assert again.messages == turn(1) and again.model == "claude-sonnet-5-5" and again.created and again.updated
     assert store.path("42", 77).name == "topic_77_transcript.json" and not store.exists("42", 77)
 
     (tmp_path / "42" / "transcripts" / "transcript.json").write_text("{not json")

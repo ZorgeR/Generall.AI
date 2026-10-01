@@ -20,7 +20,7 @@ def make_trace(calls=3, with_usage=True, thinking=True):
         c = trace.start("search_web" if i % 2 == 0 else "run_command", {"query": f"q{i}", "n": i})
         c.done("result line one\nline two" if i else "Error: boom", ok=bool(i))
     if with_usage:
-        trace.add_usage({"input_tokens": 1000, "output_tokens": 200, "cache_read_input_tokens": 9000, "cache_creation_input_tokens": 500}, model="claude-sonnet-5")
+        trace.add_usage({"input_tokens": 1000, "output_tokens": 200, "cache_read_input_tokens": 9000, "cache_creation_input_tokens": 500}, model="claude-sonnet-5-5")
         trace.add_usage({"input_tokens": 100, "output_tokens": 50}, model="mystery-model")
     if thinking:
         trace.add_thinking("Let me think about pings.")
@@ -32,7 +32,7 @@ def test_usage_text_and_cost():
     text = usage_text(trace)
     assert text.startswith("🧮 2 calls · in 10.6k (") and "% cached" in text and "out 250" in text
     assert "≈$" in text  # sonnet-5 is priced; the unknown model only adds tokens
-    assert trace.usage_by_model["claude-sonnet-5"]["cache_read_tokens"] == 9000
+    assert trace.usage_by_model["claude-sonnet-5-5"]["cache_read_tokens"] == 9000
     assert usage_text(ToolTrace()) == ""
     assert ToolTrace().cost_usd is None
 

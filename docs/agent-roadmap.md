@@ -68,7 +68,7 @@ Messages API conversation, replayed as is.
 - **Size control**, in this order: (1) cap each `tool_result` stored in the transcript (large
   outputs are truncated with a note, the model already saw the full text this turn); (2) clear the
   content of tool results older than the last N turns ("[result cleared]"); (3) server-side
-  compaction (`compact-2026-01-12` beta, supported on Sonnet 5): pass `response.content` back
+  compaction (`compact-2026-01-12` beta, supported on Sonnet 5.5): pass `response.content` back
   including compaction blocks; (4) client-side fallback when compaction is unavailable: summarize
   the oldest half with the fast model into one labelled block.
 - **Long-term memory stays**: conversation summaries + FAISS are still written per turn and used
