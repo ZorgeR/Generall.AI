@@ -23,3 +23,4 @@ openpyxl>=3.1.2
 google-genai>=1.45.0
 pillow>=11.1.0
 pillow-heif>=1.4.0
+matplotlib>=3.8.0 # /stats dashboard

@@ -462,7 +462,9 @@ parentheses; see the commented block in `.env.example`):
    When the answer arrives the status is shortened into a **turn summary** kept above it: expandable
    tool calls (arguments and results), the model's thinking, tokens used, cached share and estimated
    cost. `/settings` → Turn Summary turns it off (the status is then deleted).
-9. Admins see token usage and estimated cost per user and in total in `/stats`.
+9. Admins see token usage and estimated cost per user and in total in `/stats`: a dashboard image
+   (messages per day by type, cost per day, top tools, top spenders or a user's hours of activity) and
+   a compact text view with bars, a daily sparkline and changes against the previous 30 days.
 
 ### ⏳ Queues and isolation
 

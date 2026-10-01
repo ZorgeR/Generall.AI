@@ -150,6 +150,121 @@ class StatsTracker:
             totals["turns"] = max(totals["turns"], int(entry["turns"]))  # one turn writes one row per model
         return totals
 
+    # ---- windows and time series (the /stats views and charts) ---------------
+    def _day_start(self, days_back: int) -> datetime:
+        """UTC midnight ``days_back`` days before today."""
+        today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        return today - timedelta(days=days_back)
+
+    @staticmethod
+    def _where(conditions: List[Tuple[str, Any]]) -> Tuple[str, List[Any]]:
+        clause = " AND ".join(c for c, _ in conditions)
+        return (" WHERE " + clause if clause else ""), [v for _, v in conditions]
+
+    def get_window_totals(self, days: Optional[int] = 30, *, offset_days: int = 0,
+                          user_id: Optional[str] = None) -> Dict[str, Any]:
+        """Headline numbers for the window [now - offset - days, now - offset); ``days=None`` = all time.
+
+        ``offset_days=days`` gives the previous period, for the deltas in /stats.
+        """
+        conditions: List[Tuple[str, Any]] = []
+        if user_id is not None:
+            conditions.append(("user_id = ?", str(user_id)))
+        if days is not None:
+            conditions.append(("timestamp >= ?", self._get_cutoff_timestamp(days + offset_days)))
+        if offset_days:
+            conditions.append(("timestamp < ?", self._get_cutoff_timestamp(offset_days)))
+        clause, params = self._where(conditions)
+        with self._get_connection() as conn:
+            ev = conn.execute(
+                "SELECT SUM(event_type = 'message_received') AS received, SUM(event_type = 'message_sent') AS sent, "
+                "SUM(event_type = 'tool_used') AS tools, SUM(event_type = 'describe_used') AS describes, "
+                "SUM(event_type = 'media_group') AS media_groups, COUNT(DISTINCT user_id) AS active_users, "
+                f"MAX(timestamp) AS last_seen FROM stats_events{clause}",
+                params,
+            ).fetchone()
+            us = conn.execute(
+                "SELECT SUM(api_calls) AS api_calls, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, "
+                "SUM(cache_read_tokens) AS cache_read_tokens, SUM(cache_write_tokens) AS cache_write_tokens, "
+                f"SUM(cost_usd) AS cost_usd FROM usage_events{clause}",
+                params,
+            ).fetchone()
+        totals: Dict[str, Any] = {k: int(ev[k] or 0) for k in ("received", "sent", "tools", "describes", "media_groups", "active_users")}
+        totals.update({k: int(us[k] or 0) for k in ("api_calls", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")})
+        totals["cost_usd"] = float(us["cost_usd"] or 0.0)
+        totals["last_seen"] = ev["last_seen"]
+        return totals
+
+    def get_daily_series(self, days: int = 30, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """One entry per UTC calendar day, oldest first, the last one is today; days without events are zeros."""
+        first = self._day_start(days - 1)
+        series = {
+            (first + timedelta(days=i)).date().isoformat(): {
+                "date": (first + timedelta(days=i)).date().isoformat(), "received": {}, "received_total": 0,
+                "sent": 0, "tools": 0, "active_users": 0, "cost_usd": 0.0, "prompt_tokens": 0, "output_tokens": 0,
+            }
+            for i in range(days)
+        }
+        conditions: List[Tuple[str, Any]] = [("timestamp >= ?", first.isoformat())]
+        if user_id is not None:
+            conditions.append(("user_id = ?", str(user_id)))
+        clause, params = self._where(conditions)
+        with self._get_connection() as conn:
+            events = conn.execute(
+                "SELECT substr(timestamp, 1, 10) AS day, event_type, "
+                "CASE WHEN event_type = 'message_received' THEN event_subtype END AS subtype, COUNT(*) AS n "
+                f"FROM stats_events{clause} AND event_type IN ('message_received', 'message_sent', 'tool_used') "
+                "GROUP BY day, event_type, subtype",
+                params,
+            ).fetchall()
+            users = conn.execute(
+                f"SELECT substr(timestamp, 1, 10) AS day, COUNT(DISTINCT user_id) AS n FROM stats_events{clause} GROUP BY day",
+                params,
+            ).fetchall()
+            usage = conn.execute(
+                "SELECT substr(timestamp, 1, 10) AS day, SUM(cost_usd) AS cost_usd, "
+                "SUM(input_tokens + cache_read_tokens + cache_write_tokens) AS prompt_tokens, SUM(output_tokens) AS output_tokens "
+                f"FROM usage_events{clause} GROUP BY day",
+                params,
+            ).fetchall()
+        for r in events:
+            day = series.get(r["day"])
+            if day is None:
+                continue
+            if r["event_type"] == "message_received":
+                subtype = r["subtype"] or "other"
+                day["received"][subtype] = day["received"].get(subtype, 0) + r["n"]
+                day["received_total"] += r["n"]
+            elif r["event_type"] == "message_sent":
+                day["sent"] += r["n"]
+            else:
+                day["tools"] += r["n"]
+        for r in users:
+            if r["day"] in series:
+                series[r["day"]]["active_users"] = r["n"]
+        for r in usage:
+            if r["day"] in series:
+                series[r["day"]].update(cost_usd=float(r["cost_usd"] or 0.0), prompt_tokens=int(r["prompt_tokens"] or 0),
+                                        output_tokens=int(r["output_tokens"] or 0))
+        return list(series.values())
+
+    def get_hourly_activity(self, days: int = 30, user_id: Optional[str] = None) -> List[int]:
+        """Messages received per UTC hour of day (24 buckets) over the last ``days`` days."""
+        conditions: List[Tuple[str, Any]] = [("timestamp >= ?", self._get_cutoff_timestamp(days)),
+                                             ("event_type = ?", "message_received")]
+        if user_id is not None:
+            conditions.append(("user_id = ?", str(user_id)))
+        clause, params = self._where(conditions)
+        hours = [0] * 24
+        with self._get_connection() as conn:
+            for r in conn.execute(
+                f"SELECT CAST(substr(timestamp, 12, 2) AS INTEGER) AS hour, COUNT(*) AS n FROM stats_events{clause} GROUP BY hour",
+                params,
+            ):
+                if r["hour"] is not None and 0 <= r["hour"] < 24:
+                    hours[r["hour"]] = r["n"]
+        return hours
+
     def get_users_ranked_by_cost(self, days: int = 30, limit: int = 20) -> List[Tuple[str, float]]:
         with self._get_connection() as conn:
             rows = conn.execute(

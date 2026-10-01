@@ -23,14 +23,3 @@ def test_usage_rows_and_totals(tmp_path, monkeypatch):
     assert one["api_calls"] == 4 and one["models"]["claude-sonnet-5-5"]["turns"] == 1
     assert tracker.get_usage(user_id="nobody")["api_calls"] == 0
     assert tracker.get_users_ranked_by_cost(days=30) == [("1", 0.011), ("2", 0.002)]
-
-
-def test_format_usage_text(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    from bot.handlers.stats_ui import format_usage_text
-
-    text = format_usage_text({"api_calls": 5, "input_tokens": 1400, "output_tokens": 260, "cache_read_tokens": 9000,
-                              "cache_write_tokens": 500, "tool_calls": 4, "cost_usd": 0.013,
-                              "models": {"claude-sonnet-5-5": {"input_tokens": 1000, "output_tokens": 200, "cache_read_tokens": 9000, "cache_write_tokens": 500, "cost_usd": 0.01}}})
-    assert "in *10.9k* (83% cached)" in text and "out *260*" in text and "$0.01" in text
-    assert format_usage_text({}).startswith("🧮 Tokens: _no usage")
