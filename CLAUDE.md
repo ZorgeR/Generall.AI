@@ -503,7 +503,7 @@ OpenAI reasoning models and `{}` for anything else. No other file holds a model 
 |---|---|---|---|
 | Agent loop, judge, final compile | `claude-sonnet-5-5` via `anthropic.AsyncAnthropic` (`ANTHROPIC_MODEL`) | adaptive thinking always; loop and final call: effort `high` + summarized display when the user's `thinking` setting is on, effort `low` + omitted display when off; judge: light mode, max_tokens 2048; the loop and final call always stream | `agents/main.py` |
 | Document & image description | `claude-sonnet-5-5` (`ANTHROPIC_MODEL`) | light mode (adaptive, effort `low`, display omitted); max_tokens 4096 / 8192 / 16000 leave room for thinking; text read with `anthropic_text` | `bot/media.py` via `bot/clients.py` clients |
-| Topic/summary, complexity classifier, "simple" answers | `claude-haiku-4-5` (`ANTHROPIC_MODEL_FAST`) | none (Haiku rejects `effort`) | `agents/main.py` |
+| Topic/summary, complexity classifier, "simple" answers, fast subagents | `claude-haiku-5-5` (`ANTHROPIC_MODEL_FAST`) | none: no `effort`, no `thinking` parameter (accepted by every model; Haiku 4.5 rejected both). Answers are read with `anthropic_text` and short calls get `ANTHROPIC_MAX_TOKENS_FAST_SHORT` (2048), in case the model thinks by default | `agents/main.py` |
 | Critique | `gpt-6.1-sol` structured output (`beta.chat.completions.parse`) (`OPENAI_MODEL`) | `reasoning_effort` = `high` (`OPENAI_REASONING_EFFORT`); no `temperature`/`max_tokens` | `agents/main.py` |
 | GPT vision on photos (second description after Claude) | `gpt-6.1-sol` (`OPENAI_MODEL`) | `reasoning_effort` `high` | `bot/media.py` |
 | Video frame description | `gpt-6-luna` (`VIDEO_FRAMES_MODEL`) | `reasoning_effort` `high`; no `max_completion_tokens` (it would cap reasoning + answer together) | `bot/media.py` |
@@ -546,7 +546,7 @@ SearchTools and the embeddings `OpenAI` are per instance; ElevenLabs is per call
 | `MAX_AGENT_TOOLS_ITERATIONS`, `MAX_AGENT_CRITIQUE_ITERATIONS` | read, never used | obsolete; per-user settings replaced them |
 | `BROWSER_SERVICE_URL` | nobody | listed in `.env.example`, unused |
 | `THINKING_PREFIX_MISMATCH` (drop_block) | `models` | preserved-thinking safety net sent with the `thinking-binding-controls-2026-08-01` beta: `drop_block` drops a stale thinking block instead of failing, `error` fails (finds history edits while testing), `off` sends neither |
-| `PROMPT_CACHING` (true), `SYSTEM_CACHE_TTL` (1h), `ANTHROPIC_MAX_TOKENS_FAST` (16000) | `models` | explicit breakpoint on the static system block + top-level automatic caching of the conversation tail (`cache_control` kwarg); max_tokens for fast-model subagents |
+| `PROMPT_CACHING` (true), `SYSTEM_CACHE_TTL` (1h), `ANTHROPIC_MAX_TOKENS_FAST` (16000), `ANTHROPIC_MAX_TOKENS_FAST_SHORT` (2048) | `models` | explicit breakpoint on the static system block + top-level automatic caching of the conversation tail (`cache_control` kwarg); max_tokens for fast-model subagents; max_tokens for the short fast-model calls (topic, summary, classifier) |
 
 Never commit `.env`, `data/`, `temp_photos/`, `temp_docs/`, `temp_audio/` (git-ignored by exact
 name; a new temp dir needs its own `.gitignore` line).
@@ -592,7 +592,7 @@ name; a new temp dir needs its own `.gitignore` line).
 ## README vs code
 
 - README model names (Claude Sonnet 5.5 / GPT-6.1 / GPT-6) now match the defaults in `app/models.py`
-  (`claude-sonnet-5-5`, `claude-haiku-4-5`, `gpt-6.1-sol`, `gpt-6-luna`); if they drift again, `app/models.py` wins.
+  (`claude-sonnet-5-5`, `claude-haiku-5-5`, `gpt-6.1-sol`, `gpt-6-luna`); if they drift again, `app/models.py` wins.
 - README lists SSH and Shodan tools; neither exists. SSH is only possible via `run_shell_script`
   inside the sandbox (openssh-client is installed there) with `network_enabled`.
 - README lists PNG/GIF/BMP/WEBP as supported images; as documents only JPG/JPEG/HEIC/HEIF are.
@@ -692,8 +692,9 @@ name; a new temp dir needs its own `.gitignore` line).
   (`ANTHROPIC_MODEL`, `OPENAI_MODEL`, `VIDEO_FRAMES_MODEL`, ...; see `.env.example`). No other file
   holds a model name. Keep the option helpers honest when the new model's API differs: a
   non-reasoning OpenAI model rejects `reasoning_effort` (drop it from `OPENAI_REASONING_MODELS`), a
-  pre-4.6 Claude model needs `budget_tokens` instead of adaptive thinking, and Haiku-class models
-  reject `effort` (which is why `ANTHROPIC_MODEL_FAST` calls never get `anthropic_request_options`).
+  pre-4.6 Claude model needs `budget_tokens` instead of adaptive thinking, and the fast model's calls stay
+  plain (`ANTHROPIC_MODEL_FAST` never gets `anthropic_request_options`; Haiku 4.5 rejected `effort`). Read
+  answers with `models.anthropic_text`, never `content[0].text`: newer models may return a thinking block first.
   Then update the table above and `tests/test_models.py`.
 - **Change sandbox limits/mounts/network**: `ContainerManager._run_command_in_slot`; the slot cap is
   `MAX_SANDBOX_CONTAINERS`.

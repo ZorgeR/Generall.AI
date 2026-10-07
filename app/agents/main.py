@@ -22,6 +22,7 @@ from pathlib import Path
 from pydantic import BaseModel
 from models import (
     ANTHROPIC_MODEL,
+    ANTHROPIC_MAX_TOKENS_FAST_SHORT,
     ANTHROPIC_MODEL_FAST,
     OPENAI_MODEL,
     PROMPT_CACHING,
@@ -734,15 +735,16 @@ Question: {question}
 Response: {response}"""
         
         # Run topic, summary, and embedding generation in parallel
+        # short answers, but the ceiling leaves room for reasoning (see models.ANTHROPIC_MODEL_FAST)
         topic_task = anthropic_client.messages.create(
             model=ANTHROPIC_MODEL_FAST,
             messages=[{"role": "user", "content": [{"type": "text", "text": topic_prompt}]}],
-            max_tokens=50
+            max_tokens=ANTHROPIC_MAX_TOKENS_FAST_SHORT
         )
         summary_task = anthropic_client.messages.create(
             model=ANTHROPIC_MODEL_FAST,
             messages=[{"role": "user", "content": [{"type": "text", "text": summary_prompt}]}],
-            max_tokens=200
+            max_tokens=ANTHROPIC_MAX_TOKENS_FAST_SHORT
         )
         embedding_task = asyncio.to_thread(
             self.conversation_embeddings.add_conversation,
@@ -755,8 +757,8 @@ Response: {response}"""
             topic_task, summary_task, embedding_task
         )
         
-        topic = topic_response.content[0].text.strip()
-        summary = summary_response.content[0].text.strip()
+        topic = anthropic_text(topic_response).strip()
+        summary = anthropic_text(summary_response).strip()
         
         # Save to file
         conversation_data = {
@@ -838,9 +840,9 @@ User message: {question}"""
             response = await anthropic_client.messages.create(
                 model=ANTHROPIC_MODEL_FAST,
                 messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
-                max_tokens=10
+                max_tokens=ANTHROPIC_MAX_TOKENS_FAST_SHORT
             )
-            result = response.content[0].text.strip().lower()
+            result = anthropic_text(response).strip().lower()
             print(f"\nComplexity classification: {result}")
             if result in ("simple", "complex"):
                 return result
@@ -882,10 +884,10 @@ User message: {question}"""
                             response_text += event.text
                             await on_text_chunk(response_text, is_thinking=False)
                     response = await stream.get_final_message()
-                response_text = response.content[0].text
+                response_text = anthropic_text(response)
             else:
                 response = await anthropic_client.messages.create(**api_kwargs)
-                response_text = response.content[0].text
+                response_text = anthropic_text(response)
             thread_messages = [
                 {"role": "user", "content": [{"type": "text", "text": question}]},
                 {"role": "assistant", "content": [{"type": "text", "text": response_text}]}

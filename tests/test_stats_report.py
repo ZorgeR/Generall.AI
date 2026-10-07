@@ -48,7 +48,7 @@ def _seed(tracker):
     _insert(tracker, "2", "message_received", "text", days_ago=40)  # previous period
     _insert(tracker, "3", "message_received", "text", days_ago=100)  # all time only
     _usage(tracker, "1", 2.5)
-    _usage(tracker, "2", 0.5, days_ago=2, model="claude-haiku-4-5")
+    _usage(tracker, "2", 0.5, days_ago=2, model="claude-haiku-5-5")
     _usage(tracker, "1", 1.0, days_ago=40)
 
 

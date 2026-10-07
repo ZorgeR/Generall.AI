@@ -53,9 +53,14 @@ ANTHROPIC_MAX_TOKENS_LIGHT = int(_env("ANTHROPIC_MAX_TOKENS_LIGHT", "16000"))
 
 # ---------------------------------------------------------------------------
 # Anthropic fast - topic/summary, complexity classifier, "simple" answers
-# (agents/main.py). Haiku 4.5 does not accept ``effort``; keep its calls plain.
+# (agents/main.py), fast subagents. Its calls stay plain: no ``effort`` and no
+# ``thinking`` parameter, which every model accepts (Haiku 4.5 rejected both).
+# A newer model may still think by default, so callers read the answer with
+# anthropic_text() (the first block can be thinking) and short answers get
+# ANTHROPIC_MAX_TOKENS_FAST_SHORT, which leaves room for that reasoning.
 # ---------------------------------------------------------------------------
-ANTHROPIC_MODEL_FAST = _env("ANTHROPIC_MODEL_FAST", "claude-haiku-4-5")
+ANTHROPIC_MODEL_FAST = _env("ANTHROPIC_MODEL_FAST", "claude-haiku-5-5")
+ANTHROPIC_MAX_TOKENS_FAST_SHORT = int(_env("ANTHROPIC_MAX_TOKENS_FAST_SHORT", "2048"))
 
 # ---------------------------------------------------------------------------
 # OpenAI reasoning models - critique (agents/main.py) and GPT vision on photos
@@ -198,8 +203,8 @@ ANTHROPIC_MAX_TOKENS_FAST = int(_env("ANTHROPIC_MAX_TOKENS_FAST", "16000"))
 
 
 def request_options_for(model: str, thinking: bool | None = None) -> dict:
-    """Request options for any Anthropic model: nothing for the fast model (Haiku rejects
-    ``effort`` and adaptive thinking), :func:`anthropic_request_options` otherwise."""
+    """Request options for any Anthropic model: nothing for the fast model (its calls stay
+    plain, see ANTHROPIC_MODEL_FAST), :func:`anthropic_request_options` otherwise."""
     if model == ANTHROPIC_MODEL_FAST:
         return {}
     return anthropic_request_options(thinking)
@@ -287,6 +292,7 @@ MODEL_PRICES: dict[str, tuple[float, float]] = {
     "claude-sonnet-5-5": (2.0, 10.0),
     "claude-sonnet-5": (2.0, 10.0),
     "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-haiku-5-5": (0.10, 0.50),
     "claude-haiku-4-5": (1.0, 5.0),
     "claude-opus-5": (5.0, 25.0),
     "claude-opus-4-8": (5.0, 25.0),
