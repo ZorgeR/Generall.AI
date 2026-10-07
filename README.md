@@ -312,7 +312,7 @@ The bot can:
 ### 🔑 API Keys Required
 
 - Telegram Bot Token
-- Anthropic API Key (for Claude Sonnet 5.5 and Haiku 4.5)
+- Anthropic API Key (for Claude Sonnet 5.5 and Haiku 5.5)
 - OpenAI API Key (for GPT-6.1 / GPT-6, Whisper and embeddings)
 - ElevenLabs API Key (for voice synthesis)
 - Google API Key (for Gemini image generation/transformation)
@@ -410,7 +410,7 @@ parentheses; see the commented block in `.env.example`):
 
 - `ANTHROPIC_MODEL` (`claude-sonnet-5-5`): agent loop, judge, final compile, document and image
   description. `ANTHROPIC_EFFORT` (`high`) is sent as `output_config.effort` on every call.
-- `ANTHROPIC_MODEL_FAST` (`claude-haiku-4-5`): topic/summary, complexity classifier, quick answers.
+- `ANTHROPIC_MODEL_FAST` (`claude-haiku-5-5`): topic/summary, complexity classifier, quick answers.
 - `OPENAI_MODEL` (`gpt-6.1-sol`): critique and GPT vision on photos. `VIDEO_FRAMES_MODEL`
   (`gpt-6-luna`): video frame description. Both are reasoning models and get
   `OPENAI_REASONING_EFFORT` (`high`).

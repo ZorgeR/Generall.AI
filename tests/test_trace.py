@@ -85,8 +85,8 @@ def test_trace_keeps_per_model_usage_and_result_excerpts():
     assert len(call.result_excerpt) == 800 and call.result_excerpt.endswith("…")
     assert '"filename": "a.txt"' in call.args_text
     trace.add_usage({"input_tokens": 10, "output_tokens": 5}, model="claude-sonnet-5-5")
-    trace.add_usage({"input_tokens": 20, "output_tokens": 5}, model="claude-haiku-4-5")
-    assert trace.usage_by_model["claude-haiku-4-5"]["input_tokens"] == 20 and trace.input_tokens == 30
+    trace.add_usage({"input_tokens": 20, "output_tokens": 5}, model="claude-haiku-5-5")
+    assert trace.usage_by_model["claude-haiku-5-5"]["input_tokens"] == 20 and trace.input_tokens == 30
     assert trace.cost_usd is not None and trace.cost_usd > 0
     trace.add_thinking("  ")
     trace.add_thinking("plan")

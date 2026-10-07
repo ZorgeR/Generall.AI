@@ -7,6 +7,7 @@ import models
 
 OVERRIDE_VARS = [
     "ANTHROPIC_MODEL", "ANTHROPIC_EFFORT", "ANTHROPIC_EFFORT_LIGHT", "ANTHROPIC_MAX_TOKENS", "ANTHROPIC_MAX_TOKENS_LIGHT", "ANTHROPIC_MODEL_FAST",
+    "ANTHROPIC_MAX_TOKENS_FAST_SHORT",
     "OPENAI_MODEL", "VIDEO_FRAMES_MODEL", "OPENAI_REASONING_EFFORT",
     "WHISPER_MODEL", "EMBEDDING_MODEL", "EMBEDDING_DIMENSION",
     "GEMINI_IMAGE_MODEL_FLASH", "GEMINI_IMAGE_MODEL_PRO", "GPT_IMAGE_MODEL", "GPT_IMAGE_MODEL_FAST",
@@ -30,7 +31,9 @@ def test_defaults(clean_models):
     assert m.ANTHROPIC_EFFORT == "high"
     assert m.ANTHROPIC_EFFORT_LIGHT == "low"
     assert (m.ANTHROPIC_MAX_TOKENS, m.ANTHROPIC_MAX_TOKENS_LIGHT) == (64000, 16000)
-    assert m.ANTHROPIC_MODEL_FAST == "claude-haiku-4-5"
+    assert m.ANTHROPIC_MODEL_FAST == "claude-haiku-5-5"
+    assert m.ANTHROPIC_MAX_TOKENS_FAST_SHORT == 2048
+    assert m.request_options_for(m.ANTHROPIC_MODEL_FAST, True) == {}  # fast-model calls stay plain
     assert m.OPENAI_MODEL == "gpt-6.1-sol"
     assert m.VIDEO_FRAMES_MODEL == "gpt-6-luna"
     assert m.OPENAI_REASONING_EFFORT == "high"
@@ -65,7 +68,7 @@ def test_env_override_is_honoured(clean_models, monkeypatch):
     assert m.openai_reasoning_options("gpt-6.1-sol") == {}  # no longer a configured model
     assert m.EMBEDDING_DIMENSION == 3072
     assert m.VEO_MODEL == "veo-3.1-generate-preview"
-    assert m.ANTHROPIC_MODEL_FAST == "claude-haiku-4-5"  # untouched
+    assert m.ANTHROPIC_MODEL_FAST == "claude-haiku-5-5"  # untouched
 
 
 def test_anthropic_request_options(clean_models):
@@ -120,7 +123,8 @@ def test_estimate_cost(clean_models):
     m = clean_models
     # 1M input at $2 + 1M cache reads at 10% + 1M cache writes at 125% + 1M output at $10
     assert m.estimate_cost("claude-sonnet-5-5", 1_000_000, 1_000_000, 1_000_000, 1_000_000) == 2.0 + 0.2 + 2.5 + 10.0
-    assert m.estimate_cost("claude-haiku-4-5", 1000, 0) == 0.001
+    assert m.estimate_cost("claude-haiku-4-5", 1000, 0) == 0.001  # kept for older usage rows
+    assert m.estimate_cost(m.ANTHROPIC_MODEL_FAST, 1_000_000, 1_000_000) == 0.10 + 0.50
     assert m.estimate_cost("some-unknown-model", 1000, 1000) is None
     # OpenAI rates per 1M tokens: gpt-6.1-sol $2 / $10, gpt-6-luna $0.1 / $0.5
     assert m.estimate_cost(m.OPENAI_MODEL, 1_000_000, 1_000_000) == 2.0 + 10.0
