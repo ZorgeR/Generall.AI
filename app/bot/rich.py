@@ -41,6 +41,10 @@ DRAFT_BYTE_LIMIT = 30000  # keep streaming drafts comfortably under the limit
 MDV2_MAX = 4096  # UTF-16 units per regular message
 
 _state: dict[str, object] = {"available": True, "reason": None}
+# Buttons inside rich messages (``InputRichBlockButtons``, the <tg-button-row> block). Sticky
+# like the flag above: when a rich payload is refused only because of its button blocks, the
+# callers retry without them (an inline keyboard instead) and every later message skips them.
+_buttons: dict[str, object] = {"available": True, "reason": None}
 
 
 # ---- availability flag ------------------------------------------------------
@@ -63,6 +67,20 @@ def reset() -> None:
     """Forget a previous 'unsupported' verdict (tests, or after upgrading the sidecar)."""
     _state["available"] = True
     _state["reason"] = None
+    _buttons["available"] = True
+    _buttons["reason"] = None
+
+
+def buttons_available() -> bool:
+    """Button rows inside rich messages are worth trying (rich support itself is a separate flag)."""
+    return bool(_buttons["available"]) and is_available()
+
+
+def mark_buttons_unavailable(reason: str) -> None:
+    if _buttons["available"]:
+        logger.warning("Buttons inside rich messages are not supported, using inline keyboards instead: %s", reason)
+    _buttons["available"] = False
+    _buttons["reason"] = reason
 
 
 def is_unsupported_error(error: BaseException) -> bool:
