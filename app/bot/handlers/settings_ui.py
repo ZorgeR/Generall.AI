@@ -1,33 +1,71 @@
-"""``/settings`` command and the ``settings_*`` inline-keyboard family.
+"""``/settings``: one rich page with buttons inside it, or the ``settings_*`` inline keyboards.
 
-Ported from the python-telegram-bot handlers in ``main_bot.py``. Every
-user-visible text, button label and ``callback_data`` string is preserved so
-the UI behaves the same; authorization is handled by ``AuthMiddleware``.
+Both UIs change settings through :func:`apply_setting`, so they share every clamp and check.
 
-callback_data scheme: ``settings_<token>[_<action>[_<value>]]`` where
+Settings page (``rich_messages`` on, and the Bot API server takes rich messages with buttons):
+``/settings`` sends ONE rich message. Four collapsible sections (Memory, Agent, Replies,
+Images) hold every setting as a bold paragraph followed by a row of buttons inside the
+message (``InputRichBlockButtons``): a toggle is one "✅ On" / "⬜ Off" button, a number is
+"−  value  +", a choice is one "<current> ▸" button that cycles. A tap applies the change and
+edits the page in place with that setting's section open; there is no submenu navigation.
+callback_data is ``setp_<token>_<action>[_<value>]`` with the same tokens, actions and values
+as the keyboards below, plus ``setp_sysprompt_<type>`` (types contain hyphens, so it is
+parsed by prefix). A server that refuses the collapsible sections gets the same content flat
+(sections as bold paragraphs) and later pages start flat; when that is refused too (and
+the error is not about the chat itself), ``rich.mark_buttons_unavailable`` sends everyone
+to the keyboards.
+
+Keyboards (rich messages off, or the page was refused): ported from the python-telegram-bot
+handlers in ``main_bot.py``. Every user-visible text, button label and ``callback_data``
+string is preserved, so settings messages already sitting in chats keep working;
+authorization is handled by ``AuthMiddleware``.
+
+Keyboard callback_data scheme: ``settings_<token>[_<action>[_<value>]]`` where
 ``<token>`` is a short name (summarization, dialog, reasoning, memory,
-critique, judge, tools, semantic, thinking, rich, transcript, trace, image, main), parsed with a plain
-``split("_")``. ``settings_system_prompt`` and
+critique, judge, tools, semantic, thinking, rich, transcript, trace, image, followups, main),
+parsed with a plain ``split("_")``. ``settings_system_prompt`` and
 ``settings_system_prompt_set_<type>`` are special-cased because of the
 underscore in their token.
 """
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Sequence
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    DisabledButton,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputRichBlockButtons,
+    InputRichBlockDetails,
+    InputRichBlockParagraph,
+    InputRichMessage,
+    Message,
+    RichMessageButton,
+    RichTextBold,
+    RichTextItalic,
+)
 
-from bot.settings import SYSTEM_PROMPT_TYPES, UserSettings
+from bot import rich
+from bot.settings import DEFAULT_SETTINGS, SYSTEM_PROMPT_TYPES, UserSettings
 from models import IMAGE_BACKENDS, IMAGE_MAX_VARIANTS, IMAGE_QUALITIES, IMAGE_SIZES
-from bot.ui import answer_md, edit_md
+from bot.ui import answer_md, edit_md, is_not_modified
 
 logger = logging.getLogger(__name__)
 
 router = Router(name="settings")
 
 SYSTEM_PROMPT_SET_PREFIX = "settings_system_prompt_set_"
+PAGE_PREFIX = "setp_"
+PAGE_SYSTEM_PROMPT_PREFIX = "setp_sysprompt_"
+PAGE_HINT = "Tap a button to change a setting; this page updates in place."
+CALLBACK_DATA_LIMIT = 64  # bytes, Bot API
+ROW_BUTTON_LIMIT = 8  # InputRichBlockButtons holds 1-8 buttons
 
 SIZE_CHOICES = (1, 5, 10, 20, 30, 50)
 ITERATION_CHOICES = (1, 2, 3, 5, 7, 10, 20, 30, 50, 70, 80, 100, 150, 200, 300)
@@ -76,14 +114,203 @@ def _choice_rows(values: tuple[int, ...], callback_prefix: str, per_row: int = 3
     return rows
 
 
-def _to_int(value: str | None) -> int | None:
+def _to_int(value: Any) -> int | None:
     if value is None:
         return None
     try:
         return int(value)
-    except ValueError:
+    except (TypeError, ValueError):
         logger.warning("Non-numeric settings callback value: %r", value)
         return None
+
+
+def _clamp(low: int, high: int) -> Callable[[int], int]:
+    return lambda number: max(low, min(high, int(number)))
+
+
+def _fmt_k(tokens: int) -> str:
+    return f"{tokens // 1000}k" if tokens % 1000 == 0 else f"{tokens / 1000:.1f}k"
+
+
+def _clip(value: Any, limit: int = 24) -> str:
+    text = str(value)
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _number(user_settings: UserSettings, category: str, key: str) -> int:
+    """A numeric setting as int; a hand-edited non-number reads as the default."""
+    try:
+        return int(user_settings.get(category, key))
+    except (TypeError, ValueError):
+        return int(DEFAULT_SETTINGS[category][key])
+
+
+# ---------------------------------------------------------------------------
+# What can be changed, and how (shared by the page and the keyboards)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Control:
+    """One changeable value, addressed the way callbacks address it: ``token`` + ``action``.
+
+    ``kind`` is ``toggle`` (flip a bool), ``number`` (any integer, clamped by ``clamp`` as the
+    keyboards always did; ``choices`` are only the −/+ steps of the page) or ``cycle`` (one of
+    ``choices``, in order). ``name``/``hint`` are the page's paragraph.
+    """
+
+    token: str
+    action: str
+    category: str  # key in DEFAULT_SETTINGS
+    key: str
+    kind: str
+    name: str
+    hint: str = ""
+    choices: tuple = ()
+    clamp: Callable[[int], int] | None = None
+    label: Callable[[int], str] = str
+
+
+@dataclass(frozen=True)
+class Section:
+    id: str
+    title: str
+    controls: tuple[Control, ...]
+    state: Callable[[UserSettings], str]  # compact state shown after the title
+
+
+def _memory_state(s: UserSettings) -> str:
+    return (
+        f"transcript {_mark(s.get('transcript', 'enabled'))} {_fmt_k(_number(s, 'transcript', 'max_context_tokens'))}"
+        f" · summaries {_mark(s.get('summarization_history', 'enabled'))} {_number(s, 'summarization_history', 'size')}"
+    )
+
+
+def _agent_state(s: UserSettings) -> str:
+    return (
+        f"thinking {_mark(s.get('thinking', 'enabled'))}"
+        f" · tools {_mark(s.get('tools', 'enabled'))} {_number(s, 'tools', 'max_iteration')}"
+        f" · {_clip(s.get('system_prompt', 'type'))}"
+    )
+
+
+def _replies_state(s: UserSettings) -> str:
+    return (
+        f"rich {_mark(s.get('rich_messages', 'enabled'))}"
+        f" · summary {_mark(s.get('trace', 'keep_summary'))}"
+        f" · follow-ups {_mark(s.get('follow_ups', 'enabled'))}"
+    )
+
+
+def _images_state(s: UserSettings) -> str:
+    return (
+        f"{_clip(s.get('image', 'engine'))} · {_clip(s.get('image', 'quality'))} · {_clip(s.get('image', 'size'))}"
+        f" · ×{_number(s, 'image', 'max_variants')}"
+    )
+
+
+SECTIONS: tuple[Section, ...] = (
+    Section("memory", "🧠 Memory", (
+        Control("transcript", "toggle", "transcript", "enabled", "toggle",
+                "🧵 Transcript", "the real conversation, tool calls included"),
+        Control("transcript", "ctx", "transcript", "max_context_tokens", "number",
+                "Max context", "tokens kept before old turns are pruned",
+                CONTEXT_TOKEN_CHOICES, UserSettings.validate_context_tokens, _fmt_k),
+        Control("transcript", "keep", "transcript", "keep_tool_results_turns", "number",
+                "Keep tool results", "turns whose tool output stays in full",
+                KEEP_TOOL_RESULTS_CHOICES, _clamp(0, 50)),
+        Control("summarization", "toggle", "summarization_history", "enabled", "toggle",
+                "📚 Summaries", "short summaries of recent conversations"),
+        Control("summarization", "size", "summarization_history", "size", "number",
+                "Summaries kept", "how many recent ones", SIZE_CHOICES, UserSettings.validate_size),
+        Control("dialog", "toggle", "dialog_history", "enabled", "toggle",
+                "💬 Dialog history", "question/answer window, used with the transcript off"),
+        Control("dialog", "size", "dialog_history", "size", "number",
+                "Dialog size", "question/answer pairs kept", SIZE_CHOICES, UserSettings.validate_size),
+        Control("reasoning", "toggle", "reasoning_context", "enabled", "toggle",
+                "🧠 Reasoning context", "last turn's reasoning (transcript off) and the reasoning file"),
+        Control("memory", "toggle", "short_term_memory", "enabled", "toggle",
+                "💭 Short-term memory", "master switch for summaries, dialog and reasoning"),
+        Control("semantic", "toggle", "semantic_search", "enabled", "toggle",
+                "🔍 Semantic search", "related past conversations"),
+        Control("semantic", "max", "semantic_search", "max_results", "number",
+                "Search results", "past conversations added per message",
+                SEMANTIC_MAX_RESULTS_CHOICES, UserSettings.validate_semantic_max_results),
+    ), _memory_state),
+    Section("agent", "🤖 Agent", (
+        Control("thinking", "toggle", "thinking", "enabled", "toggle",
+                "🤔 Thinking", "deep reasoning; off = faster, lighter answers"),
+        Control("tools", "toggle", "tools", "enabled", "toggle",
+                "🛠️ Tools", "files, web, code, images and more"),
+        Control("tools", "iteration", "tools", "max_iteration", "number",
+                "Tool steps", "max tool calls per message", ITERATION_CHOICES, UserSettings.validate_iteration),
+        Control("critique", "toggle", "critique", "enabled", "toggle",
+                "🎯 Critique", "a second model reviews each answer"),
+        Control("critique", "iteration", "critique", "max_iteration", "number",
+                "Critique rounds", "max rewrites", ITERATION_CHOICES, UserSettings.validate_iteration),
+        Control("judge", "toggle", "judge", "enabled", "toggle",
+                "⚖️ Judge", "re-prompts until the answer is complete"),
+        Control("judge", "iteration", "judge", "max_iteration", "number",
+                "Judge rounds", "max re-prompts", ITERATION_CHOICES, UserSettings.validate_iteration),
+        Control("system_prompt", "set", "system_prompt", "type", "cycle",
+                "🧩 System prompt", "tap to switch", SYSTEM_PROMPT_TYPES),
+    ), _agent_state),
+    Section("replies", "💬 Replies", (
+        Control("rich", "toggle", "rich_messages", "enabled", "toggle",
+                "✨ Rich messages", "native formatting and this page; off = classic Markdown and menus"),
+        Control("trace", "toggle", "trace", "keep_summary", "toggle",
+                "🧾 Turn summary", "tool calls, thinking and tokens above each answer"),
+        Control("followups", "toggle", "follow_ups", "enabled", "toggle",
+                "🧭 Follow-ups", "suggested next requests as buttons under answers"),
+    ), _replies_state),
+    Section("images", "🎨 Images", (
+        Control("image", "engine", "image", "engine", "cycle",
+                "🖌 Engine", "auto/best strongest, fast quicker, story for narratives", tuple(sorted(IMAGE_BACKENDS))),
+        Control("image", "quality", "image", "quality", "cycle",
+                "✨ Quality", "effort per image; auto lets the provider decide", tuple(IMAGE_QUALITIES)),
+        Control("image", "size", "image", "size", "cycle",
+                "📐 Size", "resolution tier", tuple(IMAGE_SIZES)),
+        Control("image", "variants", "image", "max_variants", "number",
+                "🔢 Max variants", "alternatives one request may produce",
+                tuple(range(1, IMAGE_MAX_VARIANTS + 1)), _clamp(1, IMAGE_MAX_VARIANTS)),
+        Control("image", "metadata", "image", "metadata", "toggle",
+                "🏷 Caption details", "model, quality and size in each caption"),
+    ), _images_state),
+)
+
+CONTROLS: dict[tuple[str, str], Control] = {(c.token, c.action): c for s in SECTIONS for c in s.controls}
+SECTION_OF_TOKEN: dict[str, str] = {c.token: s.id for s in SECTIONS for c in s.controls}
+
+
+def apply_setting(user_settings: UserSettings, category: str | None, action: str | None, value: Any = None) -> bool:
+    """Apply one change the way a callback addresses it; True when a stored value changed.
+
+    ``category`` is the callback token (``summarization``, ``tools``, ``image``, ``followups``,
+    ``system_prompt`` ...), not the JSON key. Toggles flip and ignore ``value``; numbers are
+    clamped like the keyboards always did (sizes 1..50, iterations 1..300, search results
+    1..20, context 20k..400k tokens, kept tool results 0..50, variants 1..IMAGE_MAX_VARIANTS);
+    choices must be one of the allowed values. Unknown tokens/actions, non-numeric numbers and
+    unknown choices change nothing and return False, as does setting the current value again.
+    """
+    control = CONTROLS.get((category or "", action or ""))
+    if control is None:
+        return False
+    current = user_settings.get(control.category, control.key)
+    if control.kind == "toggle":
+        user_settings.set(control.category, not current, control.key)
+        return True
+    if control.kind == "number":
+        number = _to_int(value)
+        if number is None or control.clamp is None:
+            return False
+        new = control.clamp(number)
+    else:
+        if value not in control.choices:
+            logger.warning("Unknown %s %s value: %r", control.token, control.action, value)
+            return False
+        new = value
+    if new == current:
+        return False
+    user_settings.set(control.category, new, control.key)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +351,8 @@ def _overview(user_settings: UserSettings) -> tuple[str, InlineKeyboardMarkup]:
         f"Context: {int(s.get('transcript', 'max_context_tokens') or 0) // 1000}k\n"
         "🧾 *Turn Summary*: "
         f"{_mark(s.get('trace', 'keep_summary'))}\n"
+        "🧭 *Follow-ups*: "
+        f"{_mark(s.get('follow_ups', 'enabled'))}\n"
         "🎨 *Images*: "
         f"{s.get('image', 'engine')} | "
         f"Quality: {s.get('image', 'quality')} | "
@@ -163,19 +392,225 @@ def _overview(user_settings: UserSettings) -> tuple[str, InlineKeyboardMarkup]:
                 InlineKeyboardButton(text="🧾 Turn Summary", callback_data="settings_trace"),
                 InlineKeyboardButton(text="🎨 Images", callback_data="settings_image"),
             ],
+            [
+                InlineKeyboardButton(text="🧭 Follow-ups", callback_data="settings_followups"),
+            ],
         ]
     )
     return status_text, keyboard
 
 
 # ---------------------------------------------------------------------------
+# Rich settings page
+# ---------------------------------------------------------------------------
+# The server refused the collapsible sections once (and took the flat page): later pages start flat.
+_page_state: dict[str, bool] = {"flat": False}
+
+
+def page_callback(control: Control, value: Any = None) -> str:
+    """callback_data of a page button: ``setp_<token>_<action>[_<value>]`` / ``setp_sysprompt_<type>``."""
+    if control.token == "system_prompt":
+        return f"{PAGE_SYSTEM_PROMPT_PREFIX}{value}"
+    data = f"{PAGE_PREFIX}{control.token}_{control.action}"
+    return data if value is None else f"{data}_{value}"
+
+
+def parse_page_callback(data: str) -> tuple[str, str | None, str | None] | None:
+    """``(token, action, value)`` for :func:`apply_setting`, or None when ``data`` is not a page callback."""
+    if data.startswith(PAGE_SYSTEM_PROMPT_PREFIX):
+        return "system_prompt", "set", data[len(PAGE_SYSTEM_PROMPT_PREFIX):]
+    if not data.startswith(PAGE_PREFIX):
+        return None
+    parts = data[len(PAGE_PREFIX):].split("_")
+    return parts[0], (parts[1] if len(parts) > 1 else None), (parts[2] if len(parts) > 2 else None)
+
+
+def step_values(choices: Sequence[int], current: int) -> tuple[int | None, int | None]:
+    """The choices just below and just above ``current``; None at either end of the list.
+
+    A value that is not in the list (an older choice list, a hand-edited file) snaps onto the
+    nearest choice in the tapped direction, so a tap always changes the value and never skips one.
+    """
+    lower = max((c for c in choices if c < current), default=None)
+    higher = min((c for c in choices if c > current), default=None)
+    return lower, higher
+
+
+def next_choice(choices: Sequence[Any], current: Any) -> Any:
+    """The choice after ``current``, wrapping around; the first one when ``current`` is unknown."""
+    if current in choices:
+        return choices[(list(choices).index(current) + 1) % len(choices)]
+    return choices[0]
+
+
+def _disabled(text: str) -> RichMessageButton:
+    return RichMessageButton(text=text, disabled=DisabledButton())
+
+
+def _step_button(text: str, control: Control, target: int | None) -> RichMessageButton:
+    if target is None:
+        return _disabled(text)
+    return RichMessageButton(text=text, callback_data=page_callback(control, target))
+
+
+def control_row(control: Control, user_settings: UserSettings) -> InputRichBlockButtons:
+    """The button row of one setting, showing its current value."""
+    current = user_settings.get(control.category, control.key)
+    if control.kind == "toggle":
+        button = RichMessageButton(
+            text="✅ On" if current else "⬜ Off",
+            style="success" if current else None,
+            callback_data=page_callback(control),
+        )
+        return InputRichBlockButtons(buttons=[button])
+    if control.kind == "number":
+        value = _number(user_settings, control.category, control.key)
+        lower, higher = step_values(control.choices, value)
+        return InputRichBlockButtons(buttons=[
+            _step_button("−", control, lower),
+            _disabled(control.label(value)),
+            _step_button("+", control, higher),
+        ])
+    shown = _clip(current) if current not in (None, "") else "—"
+    return InputRichBlockButtons(buttons=[
+        RichMessageButton(text=f"{shown} ▸", callback_data=page_callback(control, next_choice(control.choices, current)))
+    ])
+
+
+def _control_paragraph(control: Control) -> InputRichBlockParagraph:
+    text: list = [RichTextBold(text=control.name)]
+    if control.hint:
+        text.append(f" — {control.hint}")
+    return InputRichBlockParagraph(text=text)
+
+
+def section_summary(section: Section, user_settings: UserSettings) -> str:
+    return f"{section.title} · {section.state(user_settings)}"
+
+
+def settings_page_blocks(user_settings: UserSettings, *, open_section: str | None = None, sections: bool = True) -> list:
+    """Blocks of the settings page.
+
+    ``sections``: every section is a collapsible block, only ``open_section`` (a ``Section.id``)
+    open; False gives the flat layout (same content, each section headed by a bold paragraph).
+    """
+    blocks: list = [
+        InputRichBlockParagraph(text=RichTextBold(text="⚙️ Settings")),
+        InputRichBlockParagraph(text=RichTextItalic(text=PAGE_HINT)),
+    ]
+    for section in SECTIONS:
+        inner: list = []
+        for control in section.controls:
+            inner.append(_control_paragraph(control))
+            inner.append(control_row(control, user_settings))
+        summary = section_summary(section, user_settings)
+        if sections:
+            is_open = True if section.id == open_section else None
+            blocks.append(InputRichBlockDetails(summary=summary, is_open=is_open, blocks=inner))
+        else:
+            blocks.append(InputRichBlockParagraph(text=RichTextBold(text=summary)))
+            blocks.extend(inner)
+    return blocks
+
+
+async def _show_page(
+    deliver: Callable[[InputRichMessage], Awaitable[Any]],
+    user_settings: UserSettings,
+    open_section: str | None,
+    *,
+    fresh: bool,
+) -> bool:
+    """Send or edit (``deliver``) the page; True when it is on screen. Never raises.
+
+    The collapsible layout goes first unless it was refused before; a refused one is retried
+    flat once. For a ``fresh`` /settings message a refused flat page means the buttons are the
+    problem, so they are switched off for the process, unless the error is about the chat
+    (``rich.is_chat_error``: topic closed, no rights, ...). An edit of a page that was
+    delivered before fails for reasons of its own (message too old, deleted) and only falls back.
+    """
+    layouts = (False,) if _page_state["flat"] else (True, False)
+    for sectioned in layouts:
+        try:
+            page = InputRichMessage(blocks=settings_page_blocks(user_settings, open_section=open_section, sections=sectioned))
+            await deliver(page)
+        except TelegramAPIError as e:
+            if is_not_modified(e):
+                return True
+            if rich.is_unsupported_error(e):
+                rich.mark_unavailable(str(e))
+                return False
+            if not isinstance(e, TelegramBadRequest):
+                logger.warning("Settings page failed: %s", e)
+                return False
+            if sectioned:
+                logger.warning("Settings page with sections refused (%s); retrying flat", e)
+                continue
+            if fresh and not rich.is_chat_error(e):
+                rich.mark_buttons_unavailable(str(e))
+            else:
+                logger.warning("Settings page refused for this message: %s", e)
+            return False
+        except Exception as e:  # noqa: BLE001 - network hiccup or a bad payload: the keyboards still work
+            logger.warning("Settings page failed: %s", e)
+            return False
+        if not sectioned and len(layouts) > 1:
+            _page_state["flat"] = True
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
 @router.message(F.text, Command("settings"))
-async def settings_command(message: Message) -> None:
-    """Handle the /settings command."""
+async def settings_command(message: Message, bot: Bot) -> None:
+    """Handle the /settings command: the rich page when possible, else the keyboard overview."""
     user_id = str(message.chat.id)
     user_settings = UserSettings(user_id)
+    if user_settings.get("rich_messages", "enabled") and rich.is_available() and rich.buttons_available():
+        kwargs: dict[str, Any] = {"chat_id": message.chat.id}
+        if message.is_topic_message and message.message_thread_id:
+            kwargs["message_thread_id"] = message.message_thread_id
+
+        async def send(page: InputRichMessage) -> None:
+            await bot.send_rich_message(rich_message=page, **kwargs)
+
+        if await _show_page(send, user_settings, None, fresh=True):
+            return
+    status_text, keyboard = _overview(user_settings)
+    await answer_md(message, status_text, keyboard)
+
+
+async def _answer(callback: CallbackQuery) -> None:
+    """Stop the button's spinner; best-effort, so a query that is too old never loses the tap."""
+    try:
+        await callback.answer()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Could not answer the settings button: %s", e)
+
+
+@router.callback_query(F.data.startswith(PAGE_PREFIX))
+async def settings_page_button(callback: CallbackQuery, bot: Bot) -> None:
+    """A button inside the rich settings page: apply it and redraw the page in place."""
+    await _answer(callback)
+    message = callback.message
+    if not isinstance(message, Message):
+        return
+
+    user_id = str(message.chat.id)
+    user_settings = UserSettings(user_id)
+    data = callback.data or ""
+    token, action, value = parse_page_callback(data) or ("", None, None)
+    changed = apply_setting(user_settings, token, action, value)
+    logger.debug("Settings page callback from %s: %s (changed: %s)", user_id, data, changed)
+
+    if rich.is_available():
+        async def edit(page: InputRichMessage) -> None:
+            await bot.edit_message_text(chat_id=message.chat.id, message_id=message.message_id, rich_message=page)
+
+        if await _show_page(edit, user_settings, SECTION_OF_TOKEN.get(token), fresh=False):
+            return
+    logger.warning("Settings page of %s could not be updated; sending the classic menu", user_id)
     status_text, keyboard = _overview(user_settings)
     await answer_md(message, status_text, keyboard)
 
@@ -183,7 +618,7 @@ async def settings_command(message: Message) -> None:
 @router.callback_query(F.data.startswith("settings_"))
 async def settings_button(callback: CallbackQuery) -> None:
     """Handle settings menu button presses."""
-    await callback.answer()
+    await _answer(callback)
     message = callback.message
     if not isinstance(message, Message):
         return
@@ -201,9 +636,7 @@ async def settings_button(callback: CallbackQuery) -> None:
         prompt_type = data[len(SYSTEM_PROMPT_SET_PREFIX):]
         if prompt_type in SYSTEM_PROMPT_TYPES:
             logger.info("Setting system prompt type for %s to: %s", user_id, prompt_type)
-            user_settings.set("system_prompt", prompt_type, "type")
-        else:
-            logger.warning("Unknown system prompt type requested by %s: %r", user_id, prompt_type)
+        apply_setting(user_settings, "system_prompt", "set", prompt_type)  # warns about an unknown type
         await show_system_prompt_menu(message, user_settings)
         return
 
@@ -214,185 +647,40 @@ async def settings_button(callback: CallbackQuery) -> None:
     value = parts[3] if len(parts) > 3 else None
     logger.debug("Parsed settings callback - category: %s, action: %s, value: %s", category, action, value)
 
-    if category == "summarization":
-        if action == "toggle":
-            current = user_settings.get("summarization_history", "enabled")
-            user_settings.set("summarization_history", not current, "enabled")
-            await show_summarization_menu(message, user_settings)
-        elif action == "size":
-            number = _to_int(value)
-            if number is not None:
-                size = user_settings.validate_size(number)
-                user_settings.set("summarization_history", size, "size")
-                await show_summarization_menu(message, user_settings)
-            else:
-                await show_size_input_menu(message, "summarization")
-        else:
-            await show_summarization_menu(message, user_settings)
-
-    elif category == "dialog":
-        if action == "toggle":
-            current = user_settings.get("dialog_history", "enabled")
-            user_settings.set("dialog_history", not current, "enabled")
-            await show_dialog_menu(message, user_settings)
-        elif action == "size":
-            number = _to_int(value)
-            if number is not None:
-                size = user_settings.validate_size(number)
-                user_settings.set("dialog_history", size, "size")
-                await show_dialog_menu(message, user_settings)
-            else:
-                await show_size_input_menu(message, "dialog")
-        else:
-            await show_dialog_menu(message, user_settings)
-
-    elif category == "reasoning":
-        if action == "toggle":
-            current = user_settings.get("reasoning_context", "enabled")
-            user_settings.set("reasoning_context", not current, "enabled")
-        await show_reasoning_menu(message, user_settings)
-
-    elif category == "memory":
-        if action == "toggle":
-            current = user_settings.get("short_term_memory", "enabled")
-            user_settings.set("short_term_memory", not current, "enabled")
-        await show_memory_menu(message, user_settings)
-
-    elif category == "critique":
-        if action == "toggle":
-            current = user_settings.get("critique", "enabled")
-            user_settings.set("critique", not current, "enabled")
-            await show_critique_menu(message, user_settings)
-        elif action == "iteration":
-            number = _to_int(value)
-            if number is not None:
-                iteration = user_settings.validate_iteration(number, "critique")
-                user_settings.set("critique", iteration, "max_iteration")
-                await show_critique_menu(message, user_settings)
-            else:
-                await show_iteration_input_menu(message, "critique")
-        else:
-            await show_critique_menu(message, user_settings)
-
-    elif category == "judge":
-        if action == "toggle":
-            current = user_settings.get("judge", "enabled")
-            user_settings.set("judge", not current, "enabled")
-            await show_judge_menu(message, user_settings)
-        elif action == "iteration":
-            number = _to_int(value)
-            if number is not None:
-                iteration = user_settings.validate_iteration(number, "judge")
-                user_settings.set("judge", iteration, "max_iteration")
-                await show_judge_menu(message, user_settings)
-            else:
-                await show_iteration_input_menu(message, "judge")
-        else:
-            await show_judge_menu(message, user_settings)
-
-    elif category == "tools":
-        if action == "toggle":
-            current = user_settings.get("tools", "enabled")
-            user_settings.set("tools", not current, "enabled")
-            await show_tools_menu(message, user_settings)
-        elif action == "iteration":
-            number = _to_int(value)
-            if number is not None:
-                iteration = user_settings.validate_iteration(number, "tools")
-                user_settings.set("tools", iteration, "max_iteration")
-                await show_tools_menu(message, user_settings)
-            else:
-                await show_iteration_input_menu(message, "tools")
-        else:
-            await show_tools_menu(message, user_settings)
-
-    elif category == "main":
+    if category == "main":
         status_text, keyboard = _overview(user_settings)
         await edit_md(message, status_text, keyboard)
+        return
 
-    elif category == "semantic":
-        if action == "toggle":
-            current = user_settings.get("semantic_search", "enabled")
-            user_settings.set("semantic_search", not current, "enabled")
-            await show_semantic_menu(message, user_settings)
-        elif action == "max":
-            number = _to_int(value)
-            if number is not None:
-                max_results = user_settings.validate_semantic_max_results(number)
-                user_settings.set("semantic_search", max_results, "max_results")
-                await show_semantic_menu(message, user_settings)
-            else:
-                await show_semantic_max_results_menu(message)
-        else:
-            await show_semantic_menu(message, user_settings)
-
-    elif category == "thinking":
-        if action == "toggle":
-            current = user_settings.get("thinking", "enabled")
-            user_settings.set("thinking", not current, "enabled")
-        await show_thinking_menu(message, user_settings)
-
-    elif category == "rich":
-        if action == "toggle":
-            current = user_settings.get("rich_messages", "enabled")
-            user_settings.set("rich_messages", not current, "enabled")
-        await show_rich_menu(message, user_settings)
-
-    elif category == "image":
-        if action in ("engine", "quality", "size") and value:
-            allowed = {
-                "engine": sorted(IMAGE_BACKENDS),
-                "quality": list(IMAGE_QUALITIES),
-                "size": list(IMAGE_SIZES),
-            }[action]
-            if value in allowed:
-                user_settings.set("image", value, action)
-            await show_image_menu(message, user_settings)
-        elif action == "variants":
-            number = _to_int(value)
-            if number is not None:
-                user_settings.set("image", max(1, min(IMAGE_MAX_VARIANTS, number)), "max_variants")
-                await show_image_menu(message, user_settings)
-            else:
-                await show_image_choice_menu(message, "variants")
-        elif action == "metadata":
-            user_settings.set("image", not user_settings.get("image", "metadata"), "metadata")
-            await show_image_menu(message, user_settings)
-        elif action in ("engine", "quality", "size"):
-            await show_image_choice_menu(message, action)
-        else:
-            await show_image_menu(message, user_settings)
-
-    elif category == "trace":
-        if action == "toggle":
-            current = user_settings.get("trace", "keep_summary")
-            user_settings.set("trace", not current, "keep_summary")
-        await show_trace_menu(message, user_settings)
-
-    elif category == "transcript":
-        if action == "toggle":
-            current = user_settings.get("transcript", "enabled")
-            user_settings.set("transcript", not current, "enabled")
-            await show_transcript_menu(message, user_settings)
-        elif action == "ctx":
-            number = _to_int(value)
-            if number is not None:
-                user_settings.set("transcript", user_settings.validate_context_tokens(number), "max_context_tokens")
-                await show_transcript_menu(message, user_settings)
-            else:
-                await show_transcript_choice_menu(message, "ctx")
-        elif action == "keep":
-            number = _to_int(value)
-            if number is not None:
-                user_settings.set("transcript", max(0, min(50, number)), "keep_tool_results_turns")
-                await show_transcript_menu(message, user_settings)
-            else:
-                await show_transcript_choice_menu(message, "keep")
-        else:
-            await show_transcript_menu(message, user_settings)
-
-    else:
+    menu = _LEGACY_MENUS.get(category or "")
+    if menu is None:
         logger.debug("Ignoring unknown settings callback: %s", data)
+        return
+
+    # A number or choice without a usable value opens its choice list; everything else is a
+    # change (or a no-op for an unknown action) followed by the category's menu.
+    control = CONTROLS.get((category or "", action or ""))
+    if control is not None and (
+        (control.kind == "number" and _to_int(value) is None) or (control.kind == "cycle" and not value)
+    ):
+        await _show_choice_menu(message, control)
+        return
+    apply_setting(user_settings, category, action, value)
+    await menu(message, user_settings)
+
+
+async def _show_choice_menu(message: Message, control: Control) -> None:
+    """The keyboards' choice list for one number / choice (e.g. ``settings_tools_iteration``)."""
+    if control.token == "image":
+        await show_image_choice_menu(message, control.action)
+    elif control.token == "transcript":
+        await show_transcript_choice_menu(message, control.action)
+    elif control.token == "semantic":
+        await show_semantic_max_results_menu(message)
+    elif control.action == "size":
+        await show_size_input_menu(message, control.token)
+    elif control.action == "iteration":
+        await show_iteration_input_menu(message, control.token)
 
 
 # ---------------------------------------------------------------------------
@@ -762,3 +1050,40 @@ async def show_system_prompt_menu(message: Message, user_settings: UserSettings)
         "Choose a system prompt type:",
         InlineKeyboardMarkup(inline_keyboard=rows),
     )
+
+
+async def show_followups_menu(message: Message, user_settings: UserSettings) -> None:
+    """Show the follow-up suggestions settings menu."""
+    enabled = user_settings.get("follow_ups", "enabled")
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [_toggle_button(enabled, "settings_followups_toggle")],
+            [_back_button()],
+        ]
+    )
+    await edit_md(
+        message,
+        "*Follow-up Suggestions*\n\n"
+        f"Status: {_status(enabled)}\n\n"
+        "Suggested next requests appear as buttons under answers.",
+        keyboard,
+    )
+
+
+# Keyboard token -> the menu shown after a change (or when the token itself is tapped).
+_LEGACY_MENUS: dict[str, Callable[[Message, UserSettings], Awaitable[None]]] = {
+    "summarization": show_summarization_menu,
+    "dialog": show_dialog_menu,
+    "reasoning": show_reasoning_menu,
+    "memory": show_memory_menu,
+    "critique": show_critique_menu,
+    "judge": show_judge_menu,
+    "tools": show_tools_menu,
+    "semantic": show_semantic_menu,
+    "thinking": show_thinking_menu,
+    "rich": show_rich_menu,
+    "image": show_image_menu,
+    "trace": show_trace_menu,
+    "transcript": show_transcript_menu,
+    "followups": show_followups_menu,
+}

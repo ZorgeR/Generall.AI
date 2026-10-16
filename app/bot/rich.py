@@ -93,6 +93,19 @@ def is_unsupported_error(error: BaseException) -> bool:
     return False
 
 
+# 400s about where a message goes (chat, forum topic, rights), not about what it contains.
+_CHAT_ERROR_MARKERS = (
+    "chat not found", "thread not found", "topic_", "topic closed", "topic deleted",
+    "not enough rights", "have no rights", "chat_write_forbidden", "chat_restricted", "peer_id_invalid",
+)
+
+
+def is_chat_error(error: BaseException) -> bool:
+    """True when a refusal is about the destination chat, so no process-wide flag may follow from it."""
+    msg = str(error).lower()
+    return any(marker in msg for marker in _CHAT_ERROR_MARKERS)
+
+
 # ---- conversions ------------------------------------------------------------
 def _byte_len(text: str) -> int:
     return len(text.encode("utf-8"))

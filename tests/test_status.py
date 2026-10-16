@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 from aiogram.exceptions import TelegramBadRequest, TelegramNotFound
 from aiogram.methods import SendMessage
-from aiogram.types import InputRichBlockDetails, InputRichBlockParagraph
+from aiogram.types import InlineKeyboardMarkup, InputRichBlockButtons, InputRichBlockDetails, InputRichBlockParagraph
 
 from agents.trace import ToolTrace
 from bot import rich
@@ -203,3 +203,199 @@ async def test_summary_falls_back_to_text_when_rich_summary_is_refused():
     assert bot.kinds() == ["rich", "text"]
     assert bot.calls[1][1]["text"].startswith("*🔧 3 tool calls")
     assert status.rich is False
+
+
+# ---- the Stop button ---------------------------------------------------------
+STOP = "queue_stop_1a2b3c"
+
+
+def has_row(kw) -> bool:
+    return any(isinstance(b, InputRichBlockButtons) for b in kw["rich_message"].blocks)
+
+
+def keyboard_data(kw):
+    markup = kw.get("reply_markup")
+    if markup is None:
+        return None
+    assert isinstance(markup, InlineKeyboardMarkup)
+    return [[(b.text, b.style, b.callback_data) for b in row] for row in markup.inline_keyboard]
+
+
+class RowRefusingBot(FakeBot):
+    """Refuses rich edits that contain a button row, like a server without rich buttons."""
+
+    async def edit_message_text(self, **kw):
+        if "rich_message" in kw and has_row(kw):
+            self.calls.append(("rich", kw))
+            raise TelegramBadRequest(method=_M, message="Bad Request: BUTTON_TYPE_INVALID")
+        return await super().edit_message_text(**kw)
+
+
+def test_progress_blocks_end_with_the_stop_row_only_when_asked():
+    trace = make_trace()
+    blocks = progress_blocks("h", "", "s", "d", 1, 0, trace, stop_callback=STOP)
+    row = blocks[-1]
+    assert isinstance(row, InputRichBlockButtons) and len(row.buttons) == 1
+    button = row.buttons[0]
+    assert (button.text, button.style, button.callback_data) == ("🛑 Stop", "danger", STOP)
+    plain = progress_blocks("h", "", "s", "d", 1, 0, trace)
+    assert not any(isinstance(b, InputRichBlockButtons) for b in plain)
+    assert len(blocks) == len(plain) + 1
+
+
+async def test_rich_progress_carries_the_stop_row_and_the_summary_drops_it():
+    bot = FakeBot()
+    status = StatusMessage(ChatSender(bot, 42), SimpleNamespace(message_id=7), rich=True, header="h", stop_callback=STOP)
+    trace = make_trace()
+    await status.update(step="s", details="d", iteration=1, critique=0, trace=trace)
+    kw = bot.calls[0][1]
+    assert has_row(kw) and kw["rich_message"].blocks[-1].buttons[0].callback_data == STOP
+    assert kw.get("reply_markup") is None  # the row replaces the inline keyboard of the first status
+
+    await status.finish(trace, keep=True)
+    kw = bot.calls[-1][1]
+    assert bot.kinds() == ["rich", "rich"] and not has_row(kw) and kw.get("reply_markup") is None
+
+
+async def test_refused_row_falls_back_to_an_inline_keyboard_and_is_remembered():
+    bot = RowRefusingBot()
+    status = StatusMessage(ChatSender(bot, 42), SimpleNamespace(message_id=7), rich=True, header="h", stop_callback=STOP)
+    trace = make_trace()
+    await status.update(step="s", details="d1", iteration=1, critique=0, trace=trace)
+    assert bot.kinds() == ["rich", "rich"]
+    assert has_row(bot.calls[0][1])
+    retry = bot.calls[1][1]
+    assert not has_row(retry) and keyboard_data(retry) == [[("🛑 Stop", "danger", STOP)]]
+    assert rich.buttons_available() is False and rich.is_available() is True
+    assert status.rich is True and status._progress_failures == 0
+
+    # later edits go straight to the inline keyboard, with no refused round-trip first
+    await status.update(step="s", details="d2", iteration=2, critique=0, trace=trace)
+    assert bot.kinds() == ["rich", "rich", "rich"]
+    assert not has_row(bot.calls[2][1]) and keyboard_data(bot.calls[2][1]) == [[("🛑 Stop", "danger", STOP)]]
+
+    await status.set_text("🛑 Stopped.")
+    assert bot.calls[-1][1]["rich_message"].blocks[0].text == "🛑 Stopped." and bot.calls[-1][1].get("reply_markup") is None
+
+
+async def test_refused_row_and_refused_retry_count_one_failure_and_use_the_text_keyboard():
+    bot = FakeBot(rich_error=TelegramBadRequest(method=_M, message="Bad Request: message can't be edited"))
+    status = StatusMessage(ChatSender(bot, 42), SimpleNamespace(message_id=7), rich=True, header="h", stop_callback=STOP)
+    await status.update(step="s", details="d", iteration=1, critique=0, trace=make_trace())
+    assert bot.kinds() == ["rich", "rich", "text"]
+    assert has_row(bot.calls[0][1]) and not has_row(bot.calls[1][1])
+    assert keyboard_data(bot.calls[2][1]) == [[("🛑 Stop", "danger", STOP)]]
+    assert status._progress_failures == 1
+    assert rich.buttons_available() is True  # the row was not the problem
+
+
+async def test_legacy_text_status_has_the_stop_keyboard_until_the_end():
+    bot = FakeBot()
+    status = StatusMessage(ChatSender(bot, 42), SimpleNamespace(message_id=7), rich=False, header="💭 *Thinking...*", stop_callback=STOP)
+    trace = make_trace()
+    await status.update(step="s", details="d", iteration=1, critique=0, trace=trace)
+    kw = bot.calls[0][1]
+    assert bot.kinds() == ["text"] and "*Step:*" in kw["text"]
+    assert keyboard_data(kw) == [[("🛑 Stop", "danger", STOP)]]
+
+    await status.finish(trace, keep=True)
+    assert bot.kinds() == ["text", "text"] and bot.calls[-1][1].get("reply_markup") is None
+    await status.set_text("❌ An error occurred.")
+    assert bot.calls[-1][1]["text"] == "❌ An error occurred." and bot.calls[-1][1].get("reply_markup") is None
+
+
+async def test_no_stop_callback_means_no_button_anywhere():
+    bot = FakeBot()
+    status = StatusMessage(ChatSender(bot, 42), SimpleNamespace(message_id=7), rich=True, header="h")
+    await status.update(step="s", details="d", iteration=1, critique=0, trace=make_trace())
+    assert not has_row(bot.calls[0][1]) and bot.calls[0][1].get("reply_markup") is None
+    text_status = StatusMessage(ChatSender(bot, 42), SimpleNamespace(message_id=8), rich=False, header="h")
+    await text_status.update(step="s", details="d", iteration=1, critique=0, trace=make_trace())
+    assert bot.calls[-1][1].get("reply_markup") is None
+
+
+# ---- action buttons on the summary ---------------------------------------------
+ACTIONS = [("▶️ Continue", "turn_cont_0123456789ab", "primary"), ("🔁 Retry", "turn_retry_0123456789ab", None)]
+AS_KEYBOARD = [[(text, style, data) for text, data, style in ACTIONS]]
+
+
+def row_data(kw):
+    row = kw["rich_message"].blocks[-1]
+    assert isinstance(row, InputRichBlockButtons)
+    return [(b.text, b.callback_data, b.style) for b in row.buttons]
+
+
+async def test_summary_ends_with_the_action_row():
+    bot = FakeBot()
+    status = StatusMessage(ChatSender(bot, 42), SimpleNamespace(message_id=7), rich=True, header="h", stop_callback=STOP)
+    trace = make_trace()
+    await status.update(step="s", details="d", iteration=1, critique=0, trace=trace)
+    assert await status.finish(trace, keep=True, actions=ACTIONS) is True
+    kw = bot.calls[-1][1]
+    assert bot.kinds() == ["rich", "rich"] and kw["message_id"] == 7
+    assert kw["rich_message"].blocks[0].text[0].text.startswith("🔧 3 tool calls")
+    assert row_data(kw) == ACTIONS and kw.get("reply_markup") is None
+    assert STOP not in kw["rich_message"].model_dump_json()  # the Stop button is gone
+
+
+async def test_refused_action_row_moves_to_an_inline_keyboard_and_is_remembered():
+    bot = RowRefusingBot()
+    status = StatusMessage(ChatSender(bot, 42), SimpleNamespace(message_id=7), rich=True, header="h")
+    assert await status.finish(make_trace(), keep=True, actions=ACTIONS) is True
+    assert bot.kinds() == ["rich", "rich"]
+    retry = bot.calls[1][1]
+    assert not has_row(retry) and keyboard_data(retry) == AS_KEYBOARD
+    assert rich.buttons_available() is False and rich.is_available() is True and status.rich is True
+
+
+async def test_known_refused_rows_go_straight_to_the_inline_keyboard():
+    rich.mark_buttons_unavailable("BUTTON_TYPE_INVALID")
+    bot = FakeBot()
+    status = StatusMessage(ChatSender(bot, 42), SimpleNamespace(message_id=7), rich=True, header="h")
+    assert await status.finish(make_trace(), keep=True, actions=ACTIONS) is True
+    assert bot.kinds() == ["rich"] and not has_row(bot.calls[0][1]) and keyboard_data(bot.calls[0][1]) == AS_KEYBOARD
+
+
+async def test_refused_rich_summary_falls_back_to_text_with_the_keyboard():
+    bot = FakeBot(rich_error=TelegramBadRequest(method=_M, message="Bad Request: BLOCK_INVALID"))
+    status = StatusMessage(ChatSender(bot, 42), SimpleNamespace(message_id=7), rich=True, header="h")
+    assert await status.finish(make_trace(), keep=True, actions=ACTIONS) is True
+    assert bot.kinds() == ["rich", "rich", "text"]  # with the row, without it, then text
+    text = bot.calls[-1][1]
+    assert text["text"].startswith("*🔧 3 tool calls") and keyboard_data(text) == AS_KEYBOARD
+    assert status.rich is False and rich.buttons_available() is True  # the row was not the problem
+
+
+async def test_unsupported_server_summary_uses_text_with_the_keyboard():
+    bot = FakeBot(rich_error=TelegramNotFound(method=_M, message="Not Found"))
+    status = StatusMessage(ChatSender(bot, 42), SimpleNamespace(message_id=7), rich=True, header="h")
+    assert await status.finish(make_trace(), keep=True, actions=ACTIONS) is True
+    assert bot.kinds() == ["rich", "text"] and keyboard_data(bot.calls[-1][1]) == AS_KEYBOARD
+    assert rich.is_available() is False
+
+
+async def test_text_status_summary_carries_the_keyboard():
+    bot = FakeBot()
+    status = StatusMessage(ChatSender(bot, 42), SimpleNamespace(message_id=7), rich=False, header="h", stop_callback=STOP)
+    assert await status.finish(make_trace(), keep=True, actions=ACTIONS) is True
+    assert bot.kinds() == ["text"] and keyboard_data(bot.calls[0][1]) == AS_KEYBOARD
+
+
+async def test_actions_are_not_placed_when_deleted_absent_or_every_edit_fails():
+    bot = FakeBot()
+    status = StatusMessage(ChatSender(bot, 42), SimpleNamespace(message_id=7), rich=True, header="h")
+    assert await status.finish(make_trace(), keep=False, actions=ACTIONS) is False
+    assert bot.kinds() == ["delete"]
+
+    assert await StatusMessage(ChatSender(bot, 42), SimpleNamespace(message_id=8), rich=True, header="h").finish(make_trace(), keep=True) is False
+    assert not has_row(bot.calls[-1][1])  # no actions: the summary exactly as before
+
+    class BrokenBot(FakeBot):
+        async def edit_message_text(self, **kw):
+            self.calls.append(("rich" if "rich_message" in kw else "text", kw))
+            raise TelegramBadRequest(method=_M, message="Bad Request: message to edit not found")
+
+    broken = BrokenBot()
+    status = StatusMessage(ChatSender(broken, 42), SimpleNamespace(message_id=9), rich=True, header="h")
+    assert await status.finish(make_trace(), keep=True, actions=ACTIONS) is False
+    assert await StatusMessage(ChatSender(bot, 42), None, rich=True, header="h").finish(make_trace(), keep=True, actions=ACTIONS) is False

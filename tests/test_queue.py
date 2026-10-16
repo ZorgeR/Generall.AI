@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from bot.queue import Job, JobContext, QueueManager
+from bot.queue import Job, JobContext, QueueManager, job_id_from_token
 
 
 def make_job(user_id: str, label: str, coro_factory):
@@ -245,4 +245,87 @@ async def test_timeout_fires_only_after_job_actually_starts():
     await qm.submit(make_job("b", "quick", quick))  # waits ~0.25s for a slot, then runs 0.1s
     await asyncio.sleep(0.6)
     assert fired == []
+    await qm.shutdown()
+
+
+def test_job_ids_are_non_zero_distinct_31_bit_and_round_trip_as_tokens():
+    jobs = [make_job("u1", "t", None) for _ in range(200)]
+    ids = [j.id for j in jobs]
+    assert all(0 < i < 2**31 for i in ids)  # usable directly as a Telegram draft_id
+    assert len(set(ids)) == len(ids)
+    for job in jobs:
+        assert job.token == format(job.id, "x") and job.token == job.token.lower()
+        assert job_id_from_token(job.token) == job.id
+
+
+@pytest.mark.parametrize("token", [None, "", "0", "zz", "-1", "ABC", "1 ", "123456789", "80000000"])
+def test_garbage_tokens_are_rejected(token):
+    assert job_id_from_token(token) is None
+
+
+async def _long_job_queue():
+    """u1 runs a long job with one queued behind it; returns (qm, running job, queued job, events)."""
+    qm = QueueManager(max_concurrent_turns=4, turn_timeout=5)
+    events: list[str] = []
+
+    async def long_job(ctx: JobContext) -> None:
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            events.append(f"cancelled:{ctx.cancel_reason}")
+            raise
+
+    async def queued_job(ctx: JobContext) -> None:
+        events.append("queued-ran")
+
+    running = make_job("u1", "long", long_job)
+    queued = make_job("u1", "queued", queued_job)
+    await qm.submit(running)
+    await qm.submit(queued)
+    await asyncio.sleep(0.05)
+    return qm, running, queued, events
+
+
+async def test_cancel_current_with_matching_id_stops_only_the_running_job():
+    qm, running, queued, events = await _long_job_queue()
+    assert await qm.cancel_current("u1", running.id, reason="user") is True
+    await asyncio.sleep(0.1)
+    # the queued message is not dropped: it runs right after the stopped one
+    assert events == ["cancelled:user", "queued-ran"]
+    assert qm.is_busy("u1") is False
+    await qm.shutdown()
+
+
+async def test_cancel_current_with_another_jobs_id_does_nothing():
+    qm, running, queued, events = await _long_job_queue()
+    # a late press on the status of a finished turn (or of the queued one) names another job
+    assert await qm.cancel_current("u1", queued.id) is False
+    assert await qm.cancel_current("u1", running.id + 1 if running.id < 2**31 - 1 else 1) is False
+    await asyncio.sleep(0.05)
+    assert events == [] and qm.status("u1").current is running and qm.status("u1").pending == 1
+    await qm.shutdown()
+
+
+async def test_cancel_current_without_id_stops_whatever_runs_and_keeps_the_queue():
+    qm, running, queued, events = await _long_job_queue()
+    assert await qm.cancel_current("u1") is True
+    await asyncio.sleep(0.1)
+    assert events == ["cancelled:user", "queued-ran"]
+    await qm.shutdown()
+
+
+async def test_cancel_current_when_nothing_runs():
+    qm = QueueManager(max_concurrent_turns=4, turn_timeout=5)
+    assert await qm.cancel_current("nobody") is False
+    ran: list[str] = []
+
+    async def quick(ctx: JobContext) -> None:
+        ran.append("quick")
+
+    job = make_job("u1", "quick", quick)
+    await qm.submit(job)
+    await asyncio.sleep(0.05)
+    assert ran == ["quick"]
+    assert await qm.cancel_current("u1", job.id) is False  # already finished
+    assert await qm.cancel_current("u1") is False
     await qm.shutdown()

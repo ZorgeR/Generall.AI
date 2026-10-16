@@ -112,6 +112,19 @@ Your reply is delivered as a plain Telegram message where only *bold*, _italic_ 
 </formatting>
 """
 
+# Appended after the formatting guide while the user's follow_ups setting is on. The block
+# is parsed by bot/turn_actions.py: removed from the visible answer, shown as buttons.
+FOLLOW_UPS_GUIDE = """
+<follow_up_suggestions>
+When there are natural next steps, end your reply with up to 3 suggestions of what the user is likely to ask next, in this block at the very end:
+<follow_ups>
+- Make it shorter
+- Compare with 2024
+</follow_ups>
+Write each suggestion as the user's own short request, in the user's language, under 40 characters. The block becomes buttons under your reply and is removed from the visible text, so never refer to it. Skip it for small talk, simple factual answers, or when your reply ends with a question to the user.
+</follow_up_suggestions>
+"""
+
 # OpenAI config
 openai_api_key = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=openai_api_key)
@@ -148,6 +161,7 @@ class AgentAnthropic:
         self.budget = None             # agents.trace.TurnBudget shared with subagents
         self.thinking = False
         self.max_tool_result_chars = None  # tool results are cut to this before the model sees them
+        self.limit_reached = False     # the last generate_response ran out of tool budget (bot offers Continue)
 
     async def critique_response(self, question: str, answer: str, dialog_history: list = [], trace=None) -> str:
         """
@@ -414,6 +428,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         and budget notices carry ``_ephemeral`` (legacy mode does not keep them)."""
         processed_messages = []
         system = system_role
+        self.limit_reached = False
         
         # Process messages to ensure proper format
         for msg in messages:
@@ -569,6 +584,10 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 })
                 
                 continue
+
+            if response.stop_reason == "tool_use" and tools_enabled and budget.remaining <= 0:
+                # The model asked for more tools but the budget is spent: the answer may be unfinished.
+                self.limit_reached = True
             
             # If model stopped without tool use, we have a final text response
             # Run critique if enabled
@@ -630,6 +649,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         
         # Iteration limit reached - ask model for a final compiled response
         print(f"\nWarning: Agent reached the tool-call budget ({budget.limit}), requesting final response")
+        self.limit_reached = True
         processed_messages.append({
             "role": "assistant",
             "content": [{"type": "text", "text": current_text}] if current_text else [{"type": "text", "text": "Processing..."}],
@@ -1430,6 +1450,8 @@ You have been asked to answer a query given sources. Consider the following when
             system_context += RICH_FORMATTING_GUIDE
         else:
             system_context += LEGACY_FORMATTING_GUIDE
+        if ((self.user_settings or {}).get("follow_ups") or {}).get("enabled", True):
+            system_context += FOLLOW_UPS_GUIDE
 
         if (self.user_settings or {}).get("transcript", {}).get("enabled", True):
             return await self._generate_with_transcript(question, system_context, update_status, on_text_chunk, trace)
