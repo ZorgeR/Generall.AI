@@ -1,3 +1,8 @@
 -r app/requirements.txt
 pytest>=8.0
 pytest-asyncio>=0.24
+# tests/test_browser_server.py drives the sandbox browser server; its integration tests are skipped
+# without Playwright or a Chromium binary (BROWSER_SERVER_TEST_CHROME, $PLAYWRIGHT_BROWSERS_PATH,
+# /opt/pw-browsers or ~/.cache/ms-playwright; `python -m playwright install chromium` provides one).
+# 1.56 drives the Chromium build 1194 (141.0.7390.37) installed on the dev machines.
+playwright==1.56.0

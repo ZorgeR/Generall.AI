@@ -23,7 +23,6 @@ from bot.settings import UserSettings
 from bot.ui import escape_markdown
 
 USER = "42"
-NOW = datetime.now(timezone.utc).replace(microsecond=0)
 CLOSES = datetime(2026, 10, 17, 12, 35, tzinfo=timezone.utc)  # 14:35 in Berlin (UTC+2 until Oct 25)
 
 
@@ -40,10 +39,11 @@ def not_running(**extra):
 
 
 def running(**extra):
+    now = datetime.now(timezone.utc).replace(microsecond=0)  # at call time: the suite may run for minutes
     return {
-        "shell": {"running": True, "started": NOW - timedelta(minutes=7), "last_used": NOW,
+        "shell": {"running": True, "started": now - timedelta(minutes=7), "last_used": now,
                   "idle_seconds_left": 1500, "closes_at": CLOSES, "mem_mb": 120},
-        "browser": {"running": True, "started": NOW.timestamp() - 60, "last_used": NOW.isoformat(),
+        "browser": {"running": True, "started": now.timestamp() - 60, "last_used": now.isoformat(),
                     "idle_seconds_left": 1700, "closes_at": CLOSES.isoformat(), "tabs": [
                         {"tab_id": "tab-1", "title": "Shop *deals* [new]\n_sale_", "url": "https://my_shop.example.com/a_b?x=1", "active": False},
                         {"tab_id": "tab-2", "title": "", "url": "about:blank", "active": True},
