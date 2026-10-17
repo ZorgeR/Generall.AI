@@ -215,9 +215,10 @@ plus active reminders and the workspace size (files, MB). Data from `stats.py`
   `user_profile_remove(section, text)`, `user_profile_replace(section, text)`. The system
   prompt tells the agent to save durable facts about the user (name, city, timezone, language,
   preferences, projects) and to honour "forget that".
-* Injection: `_request_context` appends a `<profile>` block (the whole file) when its
-  fingerprint differs from the last `<profile fingerprint="...">` block in the transcript
-  (`transcript.shown_profile_fingerprint`), so an unchanged profile is not repeated.
+* Injection: `_request_context` appends a `<profile>` block (the whole file) to the stored
+  context when its fingerprint differs from the last `<profile fingerprint="...">` block in the
+  transcript (`agents/profile_tools.last_shown_profile_fingerprint`), so an unchanged profile is
+  not repeated; the quick text-only path gets it on every turn (it never sees earlier context blocks).
 * `/profile`: shows the profile, buttons "🗑 Forget everything" (confirm) and a hint: "tell me
   'remember that ...' or 'forget ...'".
 * `memory_search` (host): case-insensitive substring/regex search over conversation summaries,
@@ -260,7 +261,7 @@ plus active reminders and the workspace size (files, MB). Data from `stats.py`
 * `/mcp` (ui router): list servers with tool counts and ✅/⬜ toggles, `/mcp add <name> <url>
   [token]` (token stored as `Authorization: Bearer`), `/mcp remove <name>`, `/mcp refresh`.
   Adding connects once, lists tools, caches `{name, description, input_schema}`.
-* `agents/mcp_tools.py` (`MCPTools`, async provider): tools exposed as `mcp_<server>_<tool>`
+* `agents/mcp_tools.py` (`MCPTools`, async provider; `mcp>=2.0`, the 1.x branches are untested fallbacks): tools exposed as `mcp_<server>_<tool>`
   (sanitized to `^[a-zA-Z0-9_-]{1,64}$`), schemas from the cache (no network at turn start).
   `execute_tool` opens a session (`mcp.client.streamable_http` or `sse_client`), calls the
   tool, converts the result with `anthropic.lib.tools.mcp` helpers where possible (text and

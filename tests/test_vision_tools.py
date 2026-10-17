@@ -207,3 +207,22 @@ def test_the_sandbox_patcher_never_names_the_vision_tools():
     source = (Path(__file__).resolve().parents[1] / "app" / "secure_container" / "tool_integrator.py").read_text()
     for name in ("VisionTools", "vision_tools", "view_image", "describe_image", "read_document"):
         assert name not in source, f"tool_integrator.py names {name}"
+
+
+def test_image_for_vision_re_encodes_a_rotated_camera_jpeg(tmp_path):
+    """A JPEG with an EXIF orientation is not passed through byte for byte: the model would see it sideways."""
+    from PIL import Image
+
+    from bot import media
+
+    path = tmp_path / "camera.jpg"
+    exif = Image.Exif()
+    exif[0x0112] = 6  # rotate 90 degrees clockwise
+    Image.new("RGB", (40, 20), "red").save(path, format="JPEG", exif=exif.tobytes())
+    data, media_type, original, sent = media.image_for_vision(str(path), 1024)
+    assert media_type == "image/jpeg" and original == (20, 40) and sent == (20, 40)
+    assert data != path.read_bytes()  # re-encoded upright, not the original bytes
+    upright = tmp_path / "upright.jpg"
+    Image.new("RGB", (40, 20), "red").save(upright, format="JPEG")
+    data2, _, _, _ = media.image_for_vision(str(upright), 1024)
+    assert data2 == upright.read_bytes()  # an upright JPEG is still passed through unchanged

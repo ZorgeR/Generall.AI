@@ -204,11 +204,21 @@ def image_for_vision(source_path: str, max_px: int | None = None) -> tuple[bytes
         original = ImageOps.exif_transpose(img).size
         media_type = VISION_MEDIA_TYPES.get((img.format or "").upper())
         size = os.path.getsize(source_path)
-        if media_type and max(original) <= max_px and size <= max_bytes and getattr(img, "n_frames", 1) == 1:
+        # A camera JPEG kept byte for byte may carry an EXIF orientation: pass it through only
+        # when it is already upright, otherwise re-encode so the model sees it the right way up.
+        upright = _exif_orientation(img) in (None, 1)
+        if media_type and upright and max(original) <= max_px and size <= max_bytes and getattr(img, "n_frames", 1) == 1:
             with open(source_path, "rb") as f:
                 return f.read(), media_type, original, original
         data, sent = _fit_jpeg(img, max_px, max_bytes)
     return data, "image/jpeg", original, sent
+
+
+def _exif_orientation(img) -> int | None:
+    try:
+        return img.getexif().get(0x0112)
+    except Exception:  # noqa: BLE001 - a broken EXIF block is not a reason to fail
+        return None
 
 
 async def describe_image_anthropic(question: str, image_path: str) -> str:
