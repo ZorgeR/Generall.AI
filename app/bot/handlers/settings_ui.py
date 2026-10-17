@@ -3,17 +3,22 @@
 Both UIs change settings through :func:`apply_setting`, so they share every clamp and check.
 
 Settings page (``rich_messages`` on, and the Bot API server takes rich messages with buttons):
-``/settings`` sends ONE rich message. Four collapsible sections (Memory, Agent, Replies,
-Images) hold every setting as a bold paragraph followed by a row of buttons inside the
-message (``InputRichBlockButtons``): a toggle is one "✅ On" / "⬜ Off" button, a number is
+``/settings`` sends ONE rich message. A first row holds the presets "⚡ Fast · ⚖️ Balanced ·
+🧠 Deep" (``bot.settings.SETTINGS_PRESETS``; the one matching the current values is marked)
+and the "⚙️ Advanced" toggle (``ui.advanced``): off, the power settings (``Control.advanced``:
+transcript sizes, dialog/reasoning/summaries, critique, judge, semantic max, system prompt,
+image variants/metadata) are hidden and only the section summaries show their values. Four
+collapsible sections (Memory, Agent, Replies, Images) hold every setting under a friendly
+name as a bold paragraph followed by a row of buttons inside the message
+(``InputRichBlockButtons``): a toggle is one "✅ On" / "⬜ Off" button, a number is
 "−  value  +", a choice is one "<current> ▸" button that cycles. A tap applies the change and
 edits the page in place with that setting's section open; there is no submenu navigation.
 callback_data is ``setp_<token>_<action>[_<value>]`` with the same tokens, actions and values
 as the keyboards below, plus ``setp_sysprompt_<type>`` (types contain hyphens, so it is
-parsed by prefix). A server that refuses the collapsible sections gets the same content flat
-(sections as bold paragraphs) and later pages start flat; when that is refused too (and
-the error is not about the chat itself), ``rich.mark_buttons_unavailable`` sends everyone
-to the keyboards.
+parsed by prefix), ``setp_preset_<name>`` and ``setp_ui_advanced``. A server that refuses the
+collapsible sections gets the same content flat (sections as bold paragraphs) and later pages
+start flat; when that is refused too (and the error is not about the chat itself),
+``rich.mark_buttons_unavailable`` sends everyone to the keyboards.
 
 Keyboards (rich messages off, or the page was refused): ported from the python-telegram-bot
 handlers in ``main_bot.py``. Every user-visible text, button label and ``callback_data``
@@ -22,10 +27,10 @@ authorization is handled by ``AuthMiddleware``.
 
 Keyboard callback_data scheme: ``settings_<token>[_<action>[_<value>]]`` where
 ``<token>`` is a short name (summarization, dialog, reasoning, memory,
-critique, judge, tools, semantic, thinking, rich, transcript, trace, image, followups, main),
-parsed with a plain ``split("_")``. ``settings_system_prompt`` and
+critique, judge, tools, semantic, thinking, mode, rich, transcript, trace, image, followups,
+main), parsed with a plain ``split("_")``. ``settings_system_prompt`` and
 ``settings_system_prompt_set_<type>`` are special-cased because of the
-underscore in their token.
+underscore in their token; ``settings_preset_<name>`` applies a preset and shows the overview.
 """
 from __future__ import annotations
 
@@ -52,7 +57,15 @@ from aiogram.types import (
 )
 
 from bot import rich
-from bot.settings import DEFAULT_SETTINGS, SYSTEM_PROMPT_TYPES, UserSettings
+from bot.settings import (
+    DEFAULT_SETTINGS,
+    MODE_TYPES,
+    PRESET_NAMES,
+    SYSTEM_PROMPT_TYPES,
+    UserSettings,
+    apply_preset,
+    current_preset,
+)
 from models import IMAGE_BACKENDS, IMAGE_MAX_VARIANTS, IMAGE_QUALITIES, IMAGE_SIZES
 from bot.ui import answer_md, edit_md, is_not_modified
 
@@ -61,17 +74,41 @@ logger = logging.getLogger(__name__)
 router = Router(name="settings")
 
 SYSTEM_PROMPT_SET_PREFIX = "settings_system_prompt_set_"
+PRESET_SET_PREFIX = "settings_preset_"
 PAGE_PREFIX = "setp_"
 PAGE_SYSTEM_PROMPT_PREFIX = "setp_sysprompt_"
-PAGE_HINT = "Tap a button to change a setting; this page updates in place."
+PAGE_PRESET_PREFIX = "setp_preset_"
+PRESET_TOKEN = "preset"  # callback token of the presets row; not a Control (it sets several values)
+PAGE_HINT = "Tap a button to change a setting; this page updates in place. Advanced shows every setting."
 CALLBACK_DATA_LIMIT = 64  # bytes, Bot API
 ROW_BUTTON_LIMIT = 8  # InputRichBlockButtons holds 1-8 buttons
+
+PRESET_LABELS: dict[str, str] = {"fast": "⚡ Fast", "balanced": "⚖️ Balanced", "deep": "🧠 Deep"}
+PRESET_HINT = "⚡ Fast: quickest model · ⚖️ Balanced: picks per message · 🧠 Deep: full reasoning every time"
+MODE_HINT = "Auto: picks per message · Speed: fastest model · Intelligence: full reasoning every time"
+MODE_DESCRIPTIONS: dict[str, str] = {
+    "auto": "a quick model answers simple messages, the full agent takes the rest",
+    "speed": "the fastest model runs every message, tools included, with light thinking",
+    "intelligence": "the main model with deep reasoning on every message",
+}
 
 SIZE_CHOICES = (1, 5, 10, 20, 30, 50)
 ITERATION_CHOICES = (1, 2, 3, 5, 7, 10, 20, 30, 50, 70, 80, 100, 150, 200, 300)
 SEMANTIC_MAX_RESULTS_CHOICES = (1, 3, 5, 7, 10, 15, 20)
 CONTEXT_TOKEN_CHOICES = (50000, 100000, 120000, 150000, 200000, 300000)
 KEEP_TOOL_RESULTS_CHOICES = (1, 2, 3, 5, 10)
+
+# Button text of a choice on the settings page, when the stored value is not readable as is.
+CHOICE_LABELS: dict[tuple[str, str], dict[str, str]] = {
+    ("system_prompt", "type"): {
+        "generall-ai-v2": "GenerALL v2",
+        "generall-ai-v1": "GenerALL v1",
+        "perplexity-deep-research": "Deep research",
+        "perplexity-r1": "Perplexity R1",
+    },
+}
+CHOICE_ROW_BUTTONS = 4  # at most this many choice buttons side by side ...
+CHOICE_ROW_CHARS = 42  # ... and buttons share a row's width, so the longest label × buttons stays under this
 
 SYSTEM_PROMPT_DESCRIPTIONS: dict[str, str] = {
     "generall-ai-v2": "Generall.AI v2 system prompt.",
@@ -153,8 +190,10 @@ class Control:
     """One changeable value, addressed the way callbacks address it: ``token`` + ``action``.
 
     ``kind`` is ``toggle`` (flip a bool), ``number`` (any integer, clamped by ``clamp`` as the
-    keyboards always did; ``choices`` are only the −/+ steps of the page) or ``cycle`` (one of
-    ``choices``, in order). ``name``/``hint`` are the page's paragraph.
+    keyboards always did; ``choices`` are only the −/+ steps of the page) or ``choice`` (one of
+    ``choices``: the page shows every choice as its own button, the current one checked). ``name``/``hint``
+    are the page's paragraph (friendly words, not the
+    JSON key). ``advanced`` controls are on the page only while ``ui.advanced`` is on.
     """
 
     token: str
@@ -167,6 +206,7 @@ class Control:
     choices: tuple = ()
     clamp: Callable[[int], int] | None = None
     label: Callable[[int], str] = str
+    advanced: bool = False
 
 
 @dataclass(frozen=True)
@@ -186,7 +226,8 @@ def _memory_state(s: UserSettings) -> str:
 
 def _agent_state(s: UserSettings) -> str:
     return (
-        f"thinking {_mark(s.get('thinking', 'enabled'))}"
+        f"{_clip(s.get('mode', 'type'))}"
+        f" · thinking {_mark(s.get('thinking', 'enabled'))}"
         f" · tools {_mark(s.get('tools', 'enabled'))} {_number(s, 'tools', 'max_iteration')}"
         f" · {_clip(s.get('system_prompt', 'type'))}"
     )
@@ -210,86 +251,105 @@ def _images_state(s: UserSettings) -> str:
 SECTIONS: tuple[Section, ...] = (
     Section("memory", "🧠 Memory", (
         Control("transcript", "toggle", "transcript", "enabled", "toggle",
-                "🧵 Transcript", "the real conversation, tool calls included"),
+                "🧵 Remember this chat in full", "the real conversation, tool calls included"),
         Control("transcript", "ctx", "transcript", "max_context_tokens", "number",
-                "Max context", "tokens kept before old turns are pruned",
-                CONTEXT_TOKEN_CHOICES, UserSettings.validate_context_tokens, _fmt_k),
+                "Memory window", "tokens kept before the oldest turns are summarized",
+                CONTEXT_TOKEN_CHOICES, UserSettings.validate_context_tokens, _fmt_k, advanced=True),
         Control("transcript", "keep", "transcript", "keep_tool_results_turns", "number",
-                "Keep tool results", "turns whose tool output stays in full",
-                KEEP_TOOL_RESULTS_CHOICES, _clamp(0, 50)),
+                "Keep tool results (turns)", "turns whose tool output stays in full",
+                KEEP_TOOL_RESULTS_CHOICES, _clamp(0, 50), advanced=True),
         Control("summarization", "toggle", "summarization_history", "enabled", "toggle",
-                "📚 Summaries", "short summaries of recent conversations"),
+                "📚 Recent summaries in memory", "short summaries of recent conversations"),
         Control("summarization", "size", "summarization_history", "size", "number",
-                "Summaries kept", "how many recent ones", SIZE_CHOICES, UserSettings.validate_size),
+                "Summaries kept", "how many recent ones", SIZE_CHOICES, UserSettings.validate_size, advanced=True),
         Control("dialog", "toggle", "dialog_history", "enabled", "toggle",
-                "💬 Dialog history", "question/answer window, used with the transcript off"),
+                "💬 Dialog history", "question/answer window, used when the full chat is off", advanced=True),
         Control("dialog", "size", "dialog_history", "size", "number",
-                "Dialog size", "question/answer pairs kept", SIZE_CHOICES, UserSettings.validate_size),
+                "Dialog size", "question/answer pairs kept", SIZE_CHOICES, UserSettings.validate_size, advanced=True),
         Control("reasoning", "toggle", "reasoning_context", "enabled", "toggle",
-                "🧠 Reasoning context", "last turn's reasoning (transcript off) and the reasoning file"),
+                "🧠 Reasoning context", "last turn's reasoning (full chat off) and the reasoning file", advanced=True),
         Control("memory", "toggle", "short_term_memory", "enabled", "toggle",
-                "💭 Short-term memory", "master switch for summaries, dialog and reasoning"),
+                "💭 Short-term memory", "master switch for summaries, dialog and reasoning", advanced=True),
         Control("semantic", "toggle", "semantic_search", "enabled", "toggle",
-                "🔍 Semantic search", "related past conversations"),
+                "🔍 Recall similar past chats", "related conversations found by meaning"),
         Control("semantic", "max", "semantic_search", "max_results", "number",
-                "Search results", "past conversations added per message",
-                SEMANTIC_MAX_RESULTS_CHOICES, UserSettings.validate_semantic_max_results),
+                "Recalled chats per message", "how many related conversations are added",
+                SEMANTIC_MAX_RESULTS_CHOICES, UserSettings.validate_semantic_max_results, advanced=True),
     ), _memory_state),
     Section("agent", "🤖 Agent", (
+        Control("mode", "set", "mode", "type", "choice",
+                "🎛 Quick answers vs. deep work", MODE_HINT, MODE_TYPES),
         Control("thinking", "toggle", "thinking", "enabled", "toggle",
-                "🤔 Thinking", "deep reasoning; off = faster, lighter answers"),
+                "🤔 Deep reasoning", "think longer before answering; off = faster, lighter answers"),
         Control("tools", "toggle", "tools", "enabled", "toggle",
                 "🛠️ Tools", "files, web, code, images and more"),
         Control("tools", "iteration", "tools", "max_iteration", "number",
-                "Tool steps", "max tool calls per message", ITERATION_CHOICES, UserSettings.validate_iteration),
+                "Tool calls per answer", "the most tool calls one message may take",
+                ITERATION_CHOICES, UserSettings.validate_iteration),
         Control("critique", "toggle", "critique", "enabled", "toggle",
-                "🎯 Critique", "a second model reviews each answer"),
+                "🎯 Second opinion rewrite (GPT)", "a second model reviews each answer", advanced=True),
         Control("critique", "iteration", "critique", "max_iteration", "number",
-                "Critique rounds", "max rewrites", ITERATION_CHOICES, UserSettings.validate_iteration),
+                "Rewrite rounds", "max rewrites", ITERATION_CHOICES, UserSettings.validate_iteration, advanced=True),
         Control("judge", "toggle", "judge", "enabled", "toggle",
-                "⚖️ Judge", "re-prompts until the answer is complete"),
+                "⚖️ Completeness check", "re-prompts until the answer is complete", advanced=True),
         Control("judge", "iteration", "judge", "max_iteration", "number",
-                "Judge rounds", "max re-prompts", ITERATION_CHOICES, UserSettings.validate_iteration),
-        Control("system_prompt", "set", "system_prompt", "type", "cycle",
-                "🧩 System prompt", "tap to switch", SYSTEM_PROMPT_TYPES),
+                "Check rounds", "max re-prompts", ITERATION_CHOICES, UserSettings.validate_iteration, advanced=True),
+        Control("system_prompt", "set", "system_prompt", "type", "choice",
+                "🧩 Personality prompt", "the system prompt the assistant follows", SYSTEM_PROMPT_TYPES, advanced=True),
     ), _agent_state),
     Section("replies", "💬 Replies", (
         Control("rich", "toggle", "rich_messages", "enabled", "toggle",
-                "✨ Rich messages", "native formatting and this page; off = classic Markdown and menus"),
+                "✨ Rich formatting", "native formatting and this page; off = classic Markdown and menus"),
         Control("trace", "toggle", "trace", "keep_summary", "toggle",
-                "🧾 Turn summary", "tool calls, thinking and tokens above each answer"),
+                "🧾 Show work summary", "tool calls, thinking and tokens above each answer"),
         Control("followups", "toggle", "follow_ups", "enabled", "toggle",
-                "🧭 Follow-ups", "suggested next requests as buttons under answers"),
+                "🧭 Suggested next questions", "as buttons under answers"),
     ), _replies_state),
     Section("images", "🎨 Images", (
-        Control("image", "engine", "image", "engine", "cycle",
-                "🖌 Engine", "auto/best strongest, fast quicker, story for narratives", tuple(sorted(IMAGE_BACKENDS))),
-        Control("image", "quality", "image", "quality", "cycle",
-                "✨ Quality", "effort per image; auto lets the provider decide", tuple(IMAGE_QUALITIES)),
-        Control("image", "size", "image", "size", "cycle",
-                "📐 Size", "resolution tier", tuple(IMAGE_SIZES)),
+        Control("image", "engine", "image", "engine", "choice",
+                "🖌 Image engine", "auto/best strongest, fast quicker, story for narratives", tuple(sorted(IMAGE_BACKENDS))),
+        Control("image", "quality", "image", "quality", "choice",
+                "✨ Image quality", "effort per image; auto lets the provider decide", tuple(IMAGE_QUALITIES)),
+        Control("image", "size", "image", "size", "choice",
+                "📐 Image size", "resolution tier", tuple(IMAGE_SIZES)),
         Control("image", "variants", "image", "max_variants", "number",
-                "🔢 Max variants", "alternatives one request may produce",
-                tuple(range(1, IMAGE_MAX_VARIANTS + 1)), _clamp(1, IMAGE_MAX_VARIANTS)),
+                "🔢 Images per request", "the most alternatives one request may produce",
+                tuple(range(1, IMAGE_MAX_VARIANTS + 1)), _clamp(1, IMAGE_MAX_VARIANTS), advanced=True),
         Control("image", "metadata", "image", "metadata", "toggle",
-                "🏷 Caption details", "model, quality and size in each caption"),
+                "🏷 Caption details", "model, quality and size in each caption", advanced=True),
     ), _images_state),
 )
 
+# The "⚙️ Advanced" toggle of the first row: a Control (apply_setting, the keyboards' parser),
+# but page state rather than a setting of a section.
+ADVANCED = Control("ui", "advanced", "ui", "advanced", "toggle", "⚙️ Advanced", "show every setting")
+
 CONTROLS: dict[tuple[str, str], Control] = {(c.token, c.action): c for s in SECTIONS for c in s.controls}
+CONTROLS[(ADVANCED.token, ADVANCED.action)] = ADVANCED
 SECTION_OF_TOKEN: dict[str, str] = {c.token: s.id for s in SECTIONS for c in s.controls}
+SECTION_OF_TOKEN[PRESET_TOKEN] = "agent"  # a preset changes the mode, thinking and tool calls
+
+
+def visible_controls(section: Section, user_settings: UserSettings) -> list[Control]:
+    """The controls of ``section`` on the page: all of them with ``ui.advanced`` on, else the basic ones."""
+    advanced = bool(user_settings.get("ui", "advanced"))
+    return [c for c in section.controls if advanced or not c.advanced]
 
 
 def apply_setting(user_settings: UserSettings, category: str | None, action: str | None, value: Any = None) -> bool:
     """Apply one change the way a callback addresses it; True when a stored value changed.
 
     ``category`` is the callback token (``summarization``, ``tools``, ``image``, ``followups``,
-    ``system_prompt`` ...), not the JSON key. Toggles flip and ignore ``value``; numbers are
-    clamped like the keyboards always did (sizes 1..50, iterations 1..300, search results
-    1..20, context 20k..400k tokens, kept tool results 0..50, variants 1..IMAGE_MAX_VARIANTS);
-    choices must be one of the allowed values. Unknown tokens/actions, non-numeric numbers and
-    unknown choices change nothing and return False, as does setting the current value again.
+    ``system_prompt``, ``mode``, ``ui`` ...), not the JSON key. Toggles flip and ignore
+    ``value``; numbers are clamped like the keyboards always did (sizes 1..50, iterations
+    1..300, search results 1..20, context 20k..400k tokens, kept tool results 0..50, variants
+    1..IMAGE_MAX_VARIANTS); choices must be one of the allowed values. ``("preset", "set",
+    <name>)`` applies a whole preset (``bot.settings.apply_preset``). Unknown tokens/actions,
+    non-numeric numbers and unknown choices change nothing and return False, as does setting
+    the current value (or the active preset) again.
     """
+    if category == PRESET_TOKEN:
+        return apply_preset(user_settings, value) if action == "set" else False
     control = CONTROLS.get((category or "", action or ""))
     if control is None:
         return False
@@ -344,6 +404,8 @@ def _overview(user_settings: UserSettings) -> tuple[str, InlineKeyboardMarkup]:
         f"Max Results: {s.get('semantic_search', 'max_results')}\n"
         "🤔 *Thinking Status*: "
         f"{_mark(s.get('thinking', 'enabled'))}\n"
+        "🎛 *Mode*: "
+        f"{s.get('mode', 'type')}\n"
         "✨ *Rich Messages*: "
         f"{_mark(s.get('rich_messages', 'enabled'))}\n"
         "🧵 *Transcript*: "
@@ -362,8 +424,16 @@ def _overview(user_settings: UserSettings) -> tuple[str, InlineKeyboardMarkup]:
         "Select a setting to configure:"
     )
 
+    active = current_preset(s)
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"{'✅ ' if name == active else ''}{PRESET_LABELS[name]}",
+                    callback_data=f"{PRESET_SET_PREFIX}{name}",
+                )
+                for name in PRESET_NAMES
+            ],
             [
                 InlineKeyboardButton(text="📚 Summarization", callback_data="settings_summarization"),
                 InlineKeyboardButton(text="💬 Dialog", callback_data="settings_dialog"),
@@ -394,6 +464,7 @@ def _overview(user_settings: UserSettings) -> tuple[str, InlineKeyboardMarkup]:
             ],
             [
                 InlineKeyboardButton(text="🧭 Follow-ups", callback_data="settings_followups"),
+                InlineKeyboardButton(text="🎛 Mode", callback_data="settings_mode"),
             ],
         ]
     )
@@ -415,10 +486,17 @@ def page_callback(control: Control, value: Any = None) -> str:
     return data if value is None else f"{data}_{value}"
 
 
+def preset_callback(name: str) -> str:
+    """callback_data of a preset button: ``setp_preset_<name>``."""
+    return f"{PAGE_PRESET_PREFIX}{name}"
+
+
 def parse_page_callback(data: str) -> tuple[str, str | None, str | None] | None:
     """``(token, action, value)`` for :func:`apply_setting`, or None when ``data`` is not a page callback."""
     if data.startswith(PAGE_SYSTEM_PROMPT_PREFIX):
         return "system_prompt", "set", data[len(PAGE_SYSTEM_PROMPT_PREFIX):]
+    if data.startswith(PAGE_PRESET_PREFIX):
+        return PRESET_TOKEN, "set", data[len(PAGE_PRESET_PREFIX):]
     if not data.startswith(PAGE_PREFIX):
         return None
     parts = data[len(PAGE_PREFIX):].split("_")
@@ -436,12 +514,28 @@ def step_values(choices: Sequence[int], current: int) -> tuple[int | None, int |
     return lower, higher
 
 
-def next_choice(choices: Sequence[Any], current: Any) -> Any:
-    """The choice after ``current``, wrapping around; the first one when ``current`` is unknown."""
-    if current in choices:
-        return choices[(list(choices).index(current) + 1) % len(choices)]
-    return choices[0]
+def choice_label(control: Control, value: Any) -> str:
+    return CHOICE_LABELS.get((control.category, control.key), {}).get(str(value), _clip(value))
 
+
+def split_rows(labels: Sequence[str], max_buttons: int = CHOICE_ROW_BUTTONS, max_chars: int = CHOICE_ROW_CHARS) -> list[int]:
+    """How many buttons go on each row: as few rows as fit, then spread evenly (six choices become
+    3 + 3, not 4 + 2), keeping the order. Buttons in a row share its width, so a row fits when its
+    longest label (with the "✅ " of the checked one) times its button count stays under ``max_chars``."""
+    count = len(labels)
+    for rows in range(1, count + 1):
+        base, extra = divmod(count, rows)
+        sizes = [base + (1 if i < extra else 0) for i in range(rows)]
+        start, fits = 0, True
+        for size in sizes:
+            widest = max(len(label) for label in labels[start:start + size]) + 2
+            if size > max_buttons or (size > 1 and widest * size > max_chars):
+                fits = False
+                break
+            start += size
+        if fits:
+            return sizes
+    return [1] * count
 
 def _disabled(text: str) -> RichMessageButton:
     return RichMessageButton(text=text, disabled=DisabledButton())
@@ -453,8 +547,14 @@ def _step_button(text: str, control: Control, target: int | None) -> RichMessage
     return RichMessageButton(text=text, callback_data=page_callback(control, target))
 
 
-def control_row(control: Control, user_settings: UserSettings) -> InputRichBlockButtons:
-    """The button row of one setting, showing its current value."""
+def control_rows(control: Control, user_settings: UserSettings) -> list[InputRichBlockButtons]:
+    """The button row(s) of one setting, showing its current value.
+
+    A toggle is one button, a number is "−  value  +", a choice is one button per choice (several
+    rows when they do not fit one), the current one checked and not tappable, so every option is
+    visible and one tap picks it. A stored value that is not in the list (an older choice, a
+    hand-edited file) leaves every button tappable.
+    """
     current = user_settings.get(control.category, control.key)
     if control.kind == "toggle":
         button = RichMessageButton(
@@ -462,19 +562,25 @@ def control_row(control: Control, user_settings: UserSettings) -> InputRichBlock
             style="success" if current else None,
             callback_data=page_callback(control),
         )
-        return InputRichBlockButtons(buttons=[button])
+        return [InputRichBlockButtons(buttons=[button])]
     if control.kind == "number":
         value = _number(user_settings, control.category, control.key)
         lower, higher = step_values(control.choices, value)
-        return InputRichBlockButtons(buttons=[
+        return [InputRichBlockButtons(buttons=[
             _step_button("−", control, lower),
             _disabled(control.label(value)),
             _step_button("+", control, higher),
-        ])
-    shown = _clip(current) if current not in (None, "") else "—"
-    return InputRichBlockButtons(buttons=[
-        RichMessageButton(text=f"{shown} ▸", callback_data=page_callback(control, next_choice(control.choices, current)))
-    ])
+        ])]
+    labels = [choice_label(control, choice) for choice in control.choices]
+    buttons = [
+        _disabled(f"✅ {label}") if choice == current else RichMessageButton(text=label, callback_data=page_callback(control, choice))
+        for choice, label in zip(control.choices, labels)
+    ]
+    rows, start = [], 0
+    for size in split_rows(labels):
+        rows.append(InputRichBlockButtons(buttons=buttons[start:start + size]))
+        start += size
+    return rows
 
 
 def _control_paragraph(control: Control) -> InputRichBlockParagraph:
@@ -488,21 +594,43 @@ def section_summary(section: Section, user_settings: UserSettings) -> str:
     return f"{section.title} · {section.state(user_settings)}"
 
 
+def preset_row(user_settings: UserSettings) -> InputRichBlockButtons:
+    """The first row of the page: the presets (the active one checked and primary) and the Advanced toggle."""
+    active = current_preset(user_settings)
+    buttons = [
+        RichMessageButton(
+            text=f"✅ {PRESET_LABELS[name]}" if name == active else PRESET_LABELS[name],
+            style="primary" if name == active else None,
+            callback_data=preset_callback(name),
+        )
+        for name in PRESET_NAMES
+    ]
+    advanced = bool(user_settings.get(ADVANCED.category, ADVANCED.key))
+    buttons.append(RichMessageButton(
+        text=f"{ADVANCED.name} {'✅' if advanced else '⬜'}",
+        callback_data=page_callback(ADVANCED),
+    ))
+    return InputRichBlockButtons(buttons=buttons)
+
+
 def settings_page_blocks(user_settings: UserSettings, *, open_section: str | None = None, sections: bool = True) -> list:
     """Blocks of the settings page.
 
     ``sections``: every section is a collapsible block, only ``open_section`` (a ``Section.id``)
     open; False gives the flat layout (same content, each section headed by a bold paragraph).
+    Advanced controls are left out while ``ui.advanced`` is off (:func:`visible_controls`).
     """
     blocks: list = [
         InputRichBlockParagraph(text=RichTextBold(text="⚙️ Settings")),
         InputRichBlockParagraph(text=RichTextItalic(text=PAGE_HINT)),
+        InputRichBlockParagraph(text=[RichTextBold(text="Preset"), f" — {PRESET_HINT}"]),
+        preset_row(user_settings),
     ]
     for section in SECTIONS:
         inner: list = []
-        for control in section.controls:
+        for control in visible_controls(section, user_settings):
             inner.append(_control_paragraph(control))
-            inner.append(control_row(control, user_settings))
+            inner.extend(control_rows(control, user_settings))
         summary = section_summary(section, user_settings)
         if sections:
             is_open = True if section.id == open_section else None
@@ -639,6 +767,13 @@ async def settings_button(callback: CallbackQuery) -> None:
         apply_setting(user_settings, "system_prompt", "set", prompt_type)  # warns about an unknown type
         await show_system_prompt_menu(message, user_settings)
         return
+    if data.startswith(PRESET_SET_PREFIX):
+        name = data[len(PRESET_SET_PREFIX):]
+        if not apply_setting(user_settings, PRESET_TOKEN, "set", name):
+            logger.debug("Preset %s of %s: nothing to change", name, user_id)
+        status_text, keyboard = _overview(user_settings)
+        await edit_md(message, status_text, keyboard)
+        return
 
     # Regular settings navigation: settings_<token>[_<action>[_<value>]]
     parts = data.split("_")
@@ -661,15 +796,15 @@ async def settings_button(callback: CallbackQuery) -> None:
     # change (or a no-op for an unknown action) followed by the category's menu.
     control = CONTROLS.get((category or "", action or ""))
     if control is not None and (
-        (control.kind == "number" and _to_int(value) is None) or (control.kind == "cycle" and not value)
+        (control.kind == "number" and _to_int(value) is None) or (control.kind == "choice" and not value)
     ):
-        await _show_choice_menu(message, control)
+        await _show_choice_menu(message, control, user_settings)
         return
     apply_setting(user_settings, category, action, value)
     await menu(message, user_settings)
 
 
-async def _show_choice_menu(message: Message, control: Control) -> None:
+async def _show_choice_menu(message: Message, control: Control, user_settings: UserSettings) -> None:
     """The keyboards' choice list for one number / choice (e.g. ``settings_tools_iteration``)."""
     if control.token == "image":
         await show_image_choice_menu(message, control.action)
@@ -677,6 +812,8 @@ async def _show_choice_menu(message: Message, control: Control) -> None:
         await show_transcript_choice_menu(message, control.action)
     elif control.token == "semantic":
         await show_semantic_max_results_menu(message)
+    elif control.token == "mode":
+        await show_mode_menu(message, user_settings)  # its menu is the choice list
     elif control.action == "size":
         await show_size_input_menu(message, control.token)
     elif control.action == "iteration":
@@ -898,6 +1035,28 @@ async def show_thinking_menu(message: Message, user_settings: UserSettings) -> N
     )
 
 
+async def show_mode_menu(message: Message, user_settings: UserSettings) -> None:
+    """Quick answers vs. deep work: one button per mode (``settings_mode_set_<value>``)."""
+    current = user_settings.get("mode", "type")
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(
+            text=f"{'✅' if mode == current else '○'} {mode.title()}",
+            callback_data=f"settings_mode_set_{mode}",
+        )]
+        for mode in MODE_TYPES
+    ]
+    rows.append([_back_button()])
+    lines = "\n".join(f"• *{mode.title()}*: {MODE_DESCRIPTIONS[mode]}" for mode in MODE_TYPES)
+    await edit_md(
+        message,
+        "*Mode Settings*\n\n"
+        f"Current: *{current}*\n\n"
+        f"{lines}\n\n"
+        "Quick answers vs. deep work:",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
 async def show_rich_menu(message: Message, user_settings: UserSettings) -> None:
     """Show rich messages settings menu."""
     enabled = user_settings.get("rich_messages", "enabled")
@@ -1081,6 +1240,7 @@ _LEGACY_MENUS: dict[str, Callable[[Message, UserSettings], Awaitable[None]]] = {
     "tools": show_tools_menu,
     "semantic": show_semantic_menu,
     "thinking": show_thinking_menu,
+    "mode": show_mode_menu,
     "rich": show_rich_menu,
     "image": show_image_menu,
     "trace": show_trace_menu,

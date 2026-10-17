@@ -72,7 +72,7 @@ def load_config() -> Config:
         invite_limit=_env_int("INVITE_LIMIT", 3),
         use_local_api=_env_bool("TELEGRAM_USE_LOCAL_API", False),
         local_api_url=(os.getenv("TELEGRAM_LOCAL_API_URL") or "http://localhost:8081").rstrip("/"),
-        streaming_enabled=_env_bool("STREAMING_ENABLED", False),
+        streaming_enabled=_env_bool("STREAMING_ENABLED", True),  # agents/main.py reads the same variable
         drop_pending_updates=_env_bool("DROP_PENDING_UPDATES", True),
         max_concurrent_turns=max(1, _env_int("MAX_CONCURRENT_TURNS", 8)),
         turn_timeout_seconds=max(60, _env_int("TURN_TIMEOUT_SECONDS", 1800)),

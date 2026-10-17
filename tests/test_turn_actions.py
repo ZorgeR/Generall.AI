@@ -394,7 +394,7 @@ async def test_a_refused_keyboard_never_breaks_the_turn(env, monkeypatch):
     assert result is not None and len(bot.of("edit_message_reply_markup")) == 1
 
 
-async def test_errors_get_no_buttons(env, monkeypatch):
+async def test_errors_get_only_a_retry_button(env, monkeypatch):
     class Agent:
         def __init__(self, **kw):
             pass
@@ -405,7 +405,11 @@ async def test_errors_get_no_buttons(env, monkeypatch):
     monkeypatch.setattr(agent_runner, "_agents", lambda: SimpleNamespace(ChainOfThoughtAgent=Agent))
     bot = FakeBot()
     assert await run_turn(bot=bot, user_id=USER, chat_id=42, prompt="hi") is None
-    assert bot.of("edit_message_reply_markup") == [] and not (Path("data") / USER / "turns").exists()
+    assert bot.of("edit_message_reply_markup") == []  # no answer message to hang buttons under
+    row = bot.of("edit_message_text")[-1]["rich_message"].blocks[-1]  # the status: reason + Retry (tests/test_error_recovery.py)
+    assert isinstance(row, InputRichBlockButtons) and [b.text for b in row.buttons] == ["🔁 Retry"]
+    (record_file,) = (Path("data") / USER / "turns").glob("*.json")  # the failed turn is saved so Retry can replay it
+    assert json.loads(record_file.read_text())["error"].startswith("Something went wrong.")
 
 
 # ---- streaming drafts --------------------------------------------------------------------
@@ -517,9 +521,11 @@ async def test_follow_ups_guide_follows_the_setting(agents_main, monkeypatch, en
 
     monkeypatch.setattr(agent, "_generate_with_transcript", capture)
     await agent.generate_response("hi")
-    # right after the formatting guide, and only when the setting is on
+    # right after the formatting guide, and only when the setting is on; the providers'
+    # <capabilities> notes (ChainOfThoughtAgent._provider_notes) come after the guides
     tail = agents_main.RICH_FORMATTING_GUIDE + (agents_main.FOLLOW_UPS_GUIDE if enabled else "")
-    assert seen[0].endswith(tail) and (agents_main.FOLLOW_UPS_GUIDE in seen[0]) is enabled
+    before_notes = seen[0].split("\n<capabilities>")[0]
+    assert before_notes.endswith(tail) and (agents_main.FOLLOW_UPS_GUIDE in seen[0]) is enabled
     assert "follow_ups" not in SUBAGENT_SYSTEM  # subagents report to the main agent, never to the user
 
 

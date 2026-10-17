@@ -2,7 +2,8 @@ import os
 
 import pytest
 
-from agents.paths import resolve_under
+from agents import paths
+from agents.paths import regular_files, resolve_under
 
 
 @pytest.fixture
@@ -50,3 +51,84 @@ def test_symlink_pointing_outside_is_rejected(workspace):
     link = workspace / "images" / "escape.jpg"
     os.symlink(workspace.parent / "41" / "secret.txt", link)
     assert resolve_under(workspace, "images/escape.jpg") is None
+
+
+@pytest.fixture
+def folder(workspace):
+    """data/42/notes with a regular file, a non-matching name, bad UTF-8, a FIFO and links out."""
+    notes = workspace / "notes"
+    notes.mkdir()
+    (notes / "a_note.json").write_text("mine", encoding="utf-8")
+    (notes / "other.txt").write_text("not matched", encoding="utf-8")
+    (notes / "b_note.json").write_bytes(b"\xff\xfe broken")
+    os.mkfifo(notes / "c_note.json")
+    secret = workspace.parent / "41" / "secret.txt"
+    os.symlink(secret, notes / "d_note.json")
+    os.symlink(workspace.parent / "41", notes / "e_note.json")
+    return notes
+
+
+@pytest.mark.parametrize("by_path", [False, True])
+def test_regular_files_reads_only_regular_files_and_never_follows_links(folder, monkeypatch, by_path):
+    if by_path:  # the fallback for platforms without O_NOFOLLOW / dir_fd
+        monkeypatch.setattr(paths.os, "O_NOFOLLOW", 0, raising=False)
+    assert [(p.name, text) for p, text in regular_files(folder, "*_note.json")] == [("a_note.json", "mine")]
+    assert [p for p in regular_files(folder, "*_note.json")][0][0] == folder / "a_note.json"
+
+
+@pytest.mark.parametrize("by_path", [False, True])
+def test_regular_files_of_a_linked_or_missing_folder_is_empty(workspace, monkeypatch, by_path):
+    if by_path:
+        monkeypatch.setattr(paths.os, "O_NOFOLLOW", 0, raising=False)
+    os.symlink(workspace.parent / "41", workspace / "linked")
+    assert list(regular_files(workspace / "linked", "*")) == []
+    assert list(regular_files(workspace / "missing", "*")) == []
+    assert list(regular_files(workspace / "images" / "cat.jpg", "*")) == []  # a file, not a folder
+
+
+# ---- ensure_real_dir: folders the bot prepares inside the sandbox-writable workspace ----------
+def test_ensure_real_dir_creates_and_sets_the_mode(tmp_path):
+    from agents.paths import ensure_real_dir
+
+    target = ensure_real_dir(tmp_path / "data" / "7" / "downloads", 0o777)
+    assert target.is_dir() and not target.is_symlink()
+    assert (target.stat().st_mode & 0o777) == 0o777
+
+
+def test_ensure_real_dir_replaces_a_link_and_never_touches_its_target(tmp_path):
+    from agents.paths import ensure_real_dir
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.chmod(outside, 0o700)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("x")
+    os.chmod(secret, 0o600)
+    user = tmp_path / "data" / "7"
+    user.mkdir(parents=True)
+    (user / "downloads").symlink_to(outside)
+    (user / "documents").symlink_to(secret)
+    for name in ("downloads", "documents"):
+        made = ensure_real_dir(user / name, 0o777)
+        assert made.is_dir() and not made.is_symlink()
+    assert (outside.stat().st_mode & 0o777) == 0o700  # the link's target kept its mode
+    assert (secret.stat().st_mode & 0o777) == 0o600 and secret.read_text() == "x"
+
+
+def test_ensure_real_dir_replaces_a_plain_file(tmp_path):
+    from agents.paths import ensure_real_dir
+
+    (tmp_path / "downloads").write_text("not a folder")
+    assert ensure_real_dir(tmp_path / "downloads").is_dir()
+
+
+def test_writable_dir_never_follows_a_link(tmp_path):
+    from agents import web_tools
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.chmod(outside, 0o755)
+    (tmp_path / "downloads").symlink_to(outside)
+    made = web_tools.writable_dir(tmp_path / "downloads")
+    assert made.is_dir() and not made.is_symlink()
+    assert (outside.stat().st_mode & 0o777) == 0o755

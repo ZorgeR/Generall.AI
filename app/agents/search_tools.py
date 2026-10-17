@@ -2,10 +2,20 @@ from typing import List, Dict, Any, Union
 from tavily import TavilyClient
 import requests
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 import json
 from models import PERPLEXITY_MODEL, PERPLEXITY_MODELS, PERPLEXITY_REASONING_MODEL
+from agents.paths import regular_files
+from agents.transcript import is_context_block, is_tool_result_message, message_text
+
+MEMORY_SEARCH_MAX_RESULTS = 20
+MEMORY_SEARCH_SNIPPET = 120  # characters kept on each side of a match
+_ALTERNATIVES_RE = re.compile(r"\s+\|\s+")  # "lisbon | lisboa": any alternative matches
+_CONTEXT_TIME_RE = re.compile(r"Current time in UTC\+0: (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+_CONVERSATION_TS_RE = re.compile(r"^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})$")
+_NOTE_DATE_RE = re.compile(r"^-\s*\[(\d{4}-\d{2}-\d{2})\]")  # a dated profile note
 
 class SearchTools:
     def __init__(self, user_id: str = None):
@@ -21,18 +31,32 @@ class SearchTools:
         return [
             {
                 "name": "memory_search",
-                "description": "Search through long term memory files for specific words or phrases",
+                "description": (
+                    "Search your long-term memory: past conversation summaries, questions and answers, "
+                    "the user's profile and the current transcript. Use it before saying you do not remember "
+                    "something. Plain substring search (no regex); separate alternatives with ' | ', e.g. "
+                    "'Lisbon | Lisboa', and search in the user's language and in English. Returns a JSON "
+                    "array of hits, newest first: source (conversation | profile | transcript), timestamp, "
+                    "topic, field and a snippet around the match."
+                ),
                 "input_schema": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "The word or phrase to search for in memory files. Language specific. For best result, make a 2 search, on user language and English.", 
+                            "description": "The word or phrase to look for; several alternatives separated by ' | '.",
                         },
                         "case_sensitive": {
                             "type": "boolean",
-                            "description": "Whether to perform case-sensitive search",
+                            "description": "Match case exactly (default: no)",
                             "default": False
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": f"Hits to return, newest first (default {MEMORY_SEARCH_MAX_RESULTS})",
+                            "minimum": 1,
+                            "maximum": 100,
+                            "default": MEMORY_SEARCH_MAX_RESULTS
                         }
                     },
                     "required": ["query"],
@@ -164,7 +188,8 @@ class SearchTools:
         elif tool_name == "memory_search":
             return self.memory_search(
                 query=tool_args["query"],
-                case_sensitive=tool_args.get("case_sensitive", False)
+                case_sensitive=tool_args.get("case_sensitive", False),
+                max_results=tool_args.get("max_results", MEMORY_SEARCH_MAX_RESULTS),
             )
         elif tool_name == "deep_research":
             return self.deep_research(
@@ -275,64 +300,126 @@ class SearchTools:
         except Exception as e:
             return f"Error performing search: {str(e)}. Parameters sent: {params}"
 
-    def memory_search(self, query: str, case_sensitive: bool = False) -> str:
-        """Search through memory files for specific words or phrases.
-        First searches for the complete phrase, then searches for individual words.
-        
-        Returns:
-            str: JSON-formatted string containing:
-                - full_match: list of file paths containing the complete phrase
-                - word_match: list of dicts with word found and file path
+    def memory_search(self, query: str, case_sensitive: bool = False, max_results: int = MEMORY_SEARCH_MAX_RESULTS) -> str:
+        """Substring search over the user's long-term memory, in the bot process.
+
+        Sources under ``data/<uid>/``: the conversation files (summary, topic, question, response),
+        ``profile.md`` (one hit per matching entry, field = its section) and the text view of the
+        transcripts (user and assistant text blocks only: no context blocks, tool calls, tool
+        results or base64 media). ``query`` may hold several alternatives separated by ``" | "``.
+        Returns a JSON array of hits ``{source, timestamp, topic, field, snippet}`` newest first,
+        at most ``max_results``, or a "No matches ..." sentence.
         """
+        terms = [t for t in (s.strip() for s in _ALTERNATIVES_RE.split(query or "")) if t]
+        if not terms:
+            return "Error: memory_search needs a word or phrase to look for."
         try:
-            # Determine search path based on user_id
-            search_path = self.base_path
-            
-            # Compile search patterns
-            flags = 0 if case_sensitive else re.IGNORECASE
-            full_pattern = re.compile(re.escape(query), flags=flags)
-            
-            # Split query into individual words and create patterns
-            words = query.split()
-            word_patterns = {word: re.compile(re.escape(word), flags=flags) for word in words}
-            
-            # Initialize results
-            full_matches = []
-            word_matches = []
-            
-            # Search through files
-            for file_path in search_path.glob("**/*"):
-                if file_path.is_file() and file_path.suffix in ['.txt', '.json', '.md']:
-                    try:
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            content = f.read()
-                            rel_path = str(file_path.relative_to(self.base_path))
-                            
-                            # Check for full phrase match
-                            if full_pattern.search(content):
-                                full_matches.append(rel_path)
-                            
-                            # Check for individual word matches
-                            for word, pattern in word_patterns.items():
-                                if pattern.search(content):
-                                    word_matches.append({
-                                        "word_find": word,
-                                        "file_path": rel_path
-                                    })
-                    except Exception as e:
-                        print(f"Error reading file {file_path}: {str(e)}")
-                        continue
-            
-            # Format results
-            result = {
-                "full_match": full_matches,
-                "word_match": word_matches
-            }
-            
-            return str(result)
-                
-        except Exception as e:
-            return f"Error performing memory search: {str(e)}"
+            max_results = max(1, min(int(max_results or MEMORY_SEARCH_MAX_RESULTS), 100))
+        except (TypeError, ValueError):
+            max_results = MEMORY_SEARCH_MAX_RESULTS
+        flags = 0 if case_sensitive else re.IGNORECASE
+        pattern = re.compile("|".join(re.escape(t) for t in sorted(terms, key=len, reverse=True)), flags)
+        try:
+            hits = self._conversation_hits(pattern) + self._profile_hits(pattern) + self._transcript_hits(pattern)
+        except Exception as e:  # noqa: BLE001 - a tool result, never an exception for the turn
+            return f"Error performing memory search: {e}"
+        if not hits:
+            return f"No matches for {' | '.join(terms)} in your memory (conversations, profile, transcript)."
+        hits.sort(key=lambda h: h["timestamp"], reverse=True)
+        return json.dumps(hits[:max_results], ensure_ascii=False)
+
+    # ---- memory_search internals ----------------------------------------------
+    @staticmethod
+    def _snippet(text: str, match: re.Match) -> str:
+        start, end = max(0, match.start() - MEMORY_SEARCH_SNIPPET), min(len(text), match.end() + MEMORY_SEARCH_SNIPPET)
+        return ("…" if start else "") + text[start:end] + ("…" if end < len(text) else "")
+
+    def _hit(self, pattern: re.Pattern, text, source: str, timestamp: str, topic: str, field: str) -> dict | None:
+        text = " ".join(str(text or "").split())
+        match = pattern.search(text) if text else None
+        if not match:
+            return None
+        return {"source": source, "timestamp": timestamp, "topic": topic, "field": field, "snippet": self._snippet(text, match)}
+
+    @staticmethod
+    def _conversation_timestamp(data: dict, path: Path) -> str:
+        raw = str(data.get("timestamp") or "")
+        m = _CONVERSATION_TS_RE.match(raw) or _CONVERSATION_TS_RE.match("_".join(path.stem.split("_")[1:3]))
+        if m:
+            y, mo, d, h, mi, s = m.groups()
+            return f"{y}-{mo}-{d} {h}:{mi}:{s}"
+        return raw
+
+    def _conversation_hits(self, pattern: re.Pattern) -> list[dict]:
+        hits: list[dict] = []
+        # never through a link: data/<uid> is the sandbox's workspace (see agents.paths.regular_files)
+        for path, raw in regular_files(self.base_path / "conversations", "conversation_*.json"):
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            timestamp = self._conversation_timestamp(data, path)
+            topic = str(data.get("topic") or "general")
+            for field in ("summary", "topic", "question", "response"):
+                hit = self._hit(pattern, data.get(field), "conversation", timestamp, topic, field)
+                if hit:
+                    hits.append(hit)
+        return hits
+
+    def _profile_hits(self, pattern: re.Pattern) -> list[dict]:
+        from bot.profile import read_regular_text  # never follows a link the sandbox planted
+
+        path = self.base_path / "profile.md"
+        try:
+            text = read_regular_text(path)
+            if not text:
+                return []
+            modified = datetime.fromtimestamp(path.lstat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        except (OSError, UnicodeDecodeError):
+            return []
+        hits: list[dict] = []
+        section = "About"
+        for line in text.splitlines():
+            if line.startswith("## "):
+                section = line[3:].strip() or section
+                continue
+            dated = _NOTE_DATE_RE.match(line)
+            hit = self._hit(pattern, line, "profile", f"{dated.group(1)} 00:00:00" if dated else modified, "profile", section)
+            if hit:
+                hits.append(hit)
+        return hits
+
+    def _transcript_hits(self, pattern: re.Pattern) -> list[dict]:
+        hits: list[dict] = []
+        for path, raw in regular_files(self.base_path / "transcripts", "*transcript.json"):  # links skipped
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
+                continue
+            topic = "current conversation" if path.name == "transcript.json" else path.name.replace("_transcript.json", "").replace("_", " ")
+            # Messages before the first context block are the OLDEST content (the summary prune
+            # leaves on top, a transcript seeded from dialog_history.json): the file's creation time,
+            # or nothing (sorted last), never its last update. A turn's own context block carries its time.
+            timestamp = str(data.get("created") or "")[:19].replace("T", " ")
+            for message in data["messages"]:
+                if not isinstance(message, dict) or is_tool_result_message(message):
+                    continue
+                content = message.get("content")
+                if message.get("role") == "user" and isinstance(content, list):
+                    for block in content:
+                        if is_context_block(block):
+                            m = _CONTEXT_TIME_RE.search(block["text"])
+                            if m:
+                                timestamp = m.group(1)
+                field = "user" if message.get("role") == "user" else "assistant"
+                hit = self._hit(pattern, message_text(message), "transcript", timestamp, topic, field)
+                if hit:
+                    hits.append(hit)
+        return hits
 
     def deep_research(
         self,

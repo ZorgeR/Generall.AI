@@ -35,9 +35,35 @@ DEFAULT_SETTINGS: dict[str, dict[str, Any]] = {
     # The model may end an answer with a <follow_ups> block; it is removed from the text and
     # shown as buttons under the answer. Off = the instruction is not added to the prompt.
     "follow_ups": {"enabled": True},
+    # Quick answers vs. deep work: auto = the fast-model classifier picks the
+    # quick path or the full agent per message; speed = always the fast model; intelligence = always
+    # the full agent with deep thinking.
+    "mode": {"type": "auto"},
+    # IANA zone name of the user ("" = unknown: times are shown in UTC until the user or the agent sets it).
+    "timezone": {"name": ""},
+    # Agent-managed profile and notes (data/<uid>/profile.md) injected into the context block.
+    "profile": {"enabled": True},
+    # /settings page state: advanced = every setting is shown; off = only the everyday ones
+    # (the presets row and the section summaries still cover the hidden values).
+    "ui": {"advanced": False},
 }
 
 SYSTEM_PROMPT_TYPES = ("generall-ai-v2", "generall-ai-v1", "perplexity-deep-research", "perplexity-r1")
+MODE_TYPES = ("auto", "speed", "intelligence")
+
+# Presets: one tap sets the few values that decide speed vs. depth.
+# {(category, key): value}; "balanced" is the defaults. Applied with apply_preset, recognized with
+# current_preset (every key must match exactly; anything else is a custom state with no preset).
+# Deep also turns the judge off: deep thinking already checks the answer, a second pass only costs.
+SETTINGS_PRESETS: dict[str, dict[tuple[str, str], Any]] = {
+    "fast": {("mode", "type"): "speed", ("thinking", "enabled"): False, ("tools", "max_iteration"): 10},
+    "balanced": {("mode", "type"): "auto", ("thinking", "enabled"): True, ("tools", "max_iteration"): 20},
+    "deep": {
+        ("mode", "type"): "intelligence", ("thinking", "enabled"): True, ("tools", "max_iteration"): 40,
+        ("judge", "enabled"): False,
+    },
+}
+PRESET_NAMES = tuple(SETTINGS_PRESETS)
 
 SIZE_MIN, SIZE_MAX = 1, 50
 CONTEXT_TOKENS_MIN, CONTEXT_TOKENS_MAX = 20000, 400000
@@ -114,3 +140,33 @@ class UserSettings:
     @staticmethod
     def validate_context_tokens(tokens: int) -> int:
         return max(CONTEXT_TOKENS_MIN, min(CONTEXT_TOKENS_MAX, int(tokens)))
+
+
+def current_preset(user_settings: UserSettings) -> str | None:
+    """The preset whose every value the settings hold right now, or None (a custom state)."""
+    for name, values in SETTINGS_PRESETS.items():
+        if all(user_settings.get(category, key) == value for (category, key), value in values.items()):
+            return name
+    return None
+
+
+def apply_preset(user_settings: UserSettings, name: str | None) -> bool:
+    """Set every value of preset ``name`` (one save); True when a stored value changed.
+
+    Unknown names change nothing. Other settings are left as they are, so a preset is a
+    starting point, not a reset.
+    """
+    values = SETTINGS_PRESETS.get(str(name or "").lower())
+    if values is None:
+        return False
+    changed = False
+    for (category, key), value in values.items():
+        current = user_settings.settings.get(category)
+        if not isinstance(current, dict):
+            user_settings.settings[category] = current = {}
+        if current.get(key) != value:
+            current[key] = value
+            changed = True
+    if changed:
+        user_settings.save()
+    return changed

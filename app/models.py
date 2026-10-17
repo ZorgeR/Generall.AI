@@ -82,11 +82,13 @@ OPENAI_REASONING_MODELS = frozenset({OPENAI_MODEL, VIDEO_FRAMES_MODEL})
 WHISPER_MODEL = _env("WHISPER_MODEL", "whisper-1")
 
 # ---------------------------------------------------------------------------
-# Embeddings (agents/embeddings.py) - the FAISS index is built with this
-# dimension, so changing the model needs a matching dimension (and a rebuilt
-# index for existing users).
+# Embeddings (agents/embeddings.py) - semantic memory over past conversations.
+# metadata.json records the model an index was built with; a different model
+# here makes the index stale (vectors of two models are not comparable) and it
+# is rebuilt from conversations/*.json in the background. The dimension must
+# match the model (text-embedding-3-small and ada-002 are both 1536).
 # ---------------------------------------------------------------------------
-EMBEDDING_MODEL = _env("EMBEDDING_MODEL", "text-embedding-ada-002")
+EMBEDDING_MODEL = _env("EMBEDDING_MODEL", "text-embedding-3-small")
 EMBEDDING_DIMENSION = int(_env("EMBEDDING_DIMENSION", "1536"))
 
 # ---------------------------------------------------------------------------

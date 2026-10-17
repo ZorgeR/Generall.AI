@@ -4,6 +4,7 @@ import uuid
 import logging
 import tempfile
 import json
+import shlex
 import shutil
 import threading
 from pathlib import Path
@@ -15,6 +16,44 @@ import time
 # limited to 512 MB / one CPU; without a cap a burst of users could exhaust the host.
 MAX_SANDBOX_CONTAINERS = max(1, int(os.getenv("MAX_SANDBOX_CONTAINERS", "4") or "4"))
 _SANDBOX_SLOTS = threading.BoundedSemaphore(MAX_SANDBOX_CONTAINERS)
+
+# Memory limit of a sandbox container unless the caller asks for more (run_script(mem_limit=...)
+# for the headless browser and the PDF renderer, which need about 1 GB).
+DEFAULT_MEM_LIMIT = "512m"
+
+# Scripts shipped with the bot that run_script() copies into a user's workspace and runs inside
+# the sandbox (browse.py: headless Chromium page reader; render_document.py: pdf/docx/xlsx).
+SCRIPTS_DIR = Path(__file__).parent / "scripts"
+IMAGE_NAME = "secure-container"
+# The files baked into the sandbox image. Scripts under scripts/ are copied into the workspace at
+# run time (run_script), so they are not part of the image and not of its tag.
+IMAGE_BUILD_FILES = ("Dockerfile", "entrypoint.sh", "requirements.txt")
+IMAGE_LATEST_TAG = "latest"  # alias kept for people: the content tag is what the bot runs; also the
+                             # fallback when building a new content tag fails (_ensure_image_exists)
+# Content tags whose build failed in this process: the other ContainerManager instances
+# (SecureToolWrapper's, web_tools') use the fallback instead of starting another long build.
+_FAILED_BUILDS: set[str] = set()
+
+
+def image_build_fingerprint(dockerfile_dir: Path | None = None) -> str:
+    """12 hex chars of the sandbox build context (IMAGE_BUILD_FILES): the image tag.
+
+    A deploy that changes the Dockerfile or the requirements gets a new tag, so
+    ``_ensure_image_exists`` builds the new image on the first startup instead of silently
+    keeping the old one (the ``latest`` tag used to be built once and never again)."""
+    import hashlib
+
+    directory = Path(dockerfile_dir) if dockerfile_dir is not None else Path(__file__).parent
+    digest = hashlib.sha256()
+    for name in IMAGE_BUILD_FILES:
+        path = directory / name
+        digest.update(name.encode("utf-8") + b"\0")
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(b"<missing>")
+        digest.update(b"\0")
+    return digest.hexdigest()[:12]
 
 # Set up logging
 logging.basicConfig(
@@ -39,8 +78,8 @@ class ContainerManager:
                            If None, will be auto-detected or use base_data_path
         """
         self.base_data_path = Path(base_data_path)
-        self.image_name = "secure-container"
-        self.image_tag = "latest"
+        self.image_name = IMAGE_NAME
+        self.image_tag = image_build_fingerprint()  # content hash: a changed build context = a rebuild
         self.container_prefix = "secure-container-"
         
         # Determine the host data path for volume mounting
@@ -91,9 +130,12 @@ class ContainerManager:
         try:
             self.docker_client.images.get(f"{self.image_name}:{self.image_tag}")
             logger.info(f"Image {self.image_name}:{self.image_tag} already exists")
+            return None
         except ImageNotFound:
-            logger.info(f"Building image {self.image_name}:{self.image_tag}")
-            
+            if self.image_tag in _FAILED_BUILDS and self._fall_back_to_latest():
+                return None
+            logger.info(f"Building image {self.image_name}:{self.image_tag} (the build context changed or no image yet)")
+
             # Get the directory of the Dockerfile
             dockerfile_dir = Path(__file__).parent.absolute()
             logger.info(f"Dockerfile directory: {dockerfile_dir}")
@@ -131,14 +173,58 @@ class ContainerManager:
                     forcerm=True
                 )
                 logger.info(f"Successfully built image {self.image_name}:{self.image_tag}")
+                self._retag_latest_and_prune()
                 return build_result
             except Exception as e:
                 logger.error(f"Failed to build image: {str(e)}")
                 # Print more detailed error information
                 if hasattr(e, 'stderr'):
                     logger.error(f"Build stderr: {e.stderr}")
+                # A failed build (network, a removed upstream package) must not take the whole bot
+                # down while the previous image is still there: run on that one, rebuild next start.
+                _FAILED_BUILDS.add(self.image_tag)
+                if self._fall_back_to_latest():
+                    return None
                 raise
-    
+
+    def _fall_back_to_latest(self) -> bool:
+        """Run on ``secure-container:latest`` (the last image built successfully) when the current
+        content tag could not be built. False when there is no such image either."""
+        wanted = f"{self.image_name}:{self.image_tag}"
+        try:
+            self.docker_client.images.get(f"{self.image_name}:{IMAGE_LATEST_TAG}")
+        except Exception:  # noqa: BLE001 - ImageNotFound or Docker trouble: nothing to fall back to
+            return False
+        logger.error(
+            f"Could not build {wanted}; running on the previous sandbox image "
+            f"{self.image_name}:{IMAGE_LATEST_TAG} until a restart builds it (tools that need the new "
+            f"image, e.g. browse_webpage or the pdf render, may fail meanwhile)"
+        )
+        self.image_tag = IMAGE_LATEST_TAG
+        return True
+
+    def _retag_latest_and_prune(self):
+        """Point ``secure-container:latest`` at the new image and drop the older content-tagged
+        images (they only take disk). Best effort: a failure here never fails startup."""
+        current = f"{self.image_name}:{self.image_tag}"
+        try:
+            image = self.docker_client.images.get(current)
+            image.tag(self.image_name, IMAGE_LATEST_TAG, force=True)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Could not tag {current} as {IMAGE_LATEST_TAG}: {e}")
+            return
+        try:
+            for old in self.docker_client.images.list(name=self.image_name):
+                if old.id == image.id:
+                    continue
+                tags = [t for t in (old.tags or []) if t.startswith(f"{self.image_name}:")]
+                if not tags:
+                    continue
+                logger.info(f"Removing stale sandbox image {', '.join(tags)}")
+                self.docker_client.images.remove(old.id, force=True)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Could not prune old sandbox images: {e}")
+
     def ensure_user_directory(self, user_id):
         """
         Ensure the user directory exists.
@@ -158,7 +244,7 @@ class ContainerManager:
         os.chmod(user_dir, 0o777)
         return user_dir
     
-    def run_command(self, user_id, command, timeout=60, network_enabled=False):
+    def run_command(self, user_id, command, timeout=60, network_enabled=False, mem_limit=None):
         """
         Run a command in a secure container for the specified user.
 
@@ -170,12 +256,50 @@ class ContainerManager:
             command: Command to run
             timeout: Timeout in seconds
             network_enabled: Whether to enable network access for the container
+            mem_limit: Docker memory limit for this container (e.g. "1g"); None = DEFAULT_MEM_LIMIT
 
         Returns:
             Command output
         """
         with _SANDBOX_SLOTS:
-            return self._run_command_in_slot(user_id, command, timeout, network_enabled)
+            return self._run_command_in_slot(user_id, command, timeout, network_enabled, mem_limit)
+
+    def run_script(self, user_id, script_path, args=(), timeout=90, network_enabled=False, mem_limit=None):
+        """Run one of the bundled sandbox scripts (``secure_container/scripts/``) for a user.
+
+        The script is copied into the user's workspace under a unique temp name (tool calls
+        of one message run concurrently) and executed as ``python -I <file> <args>`` through
+        :meth:`run_command`, so slots, mounts and the package prelude behave as for every
+        sandboxed call. ``script_path`` is the bare file name of a bundled script (anything
+        with a directory part, ``../`` included, is refused: the model never chooses what runs
+        here, but the tools must not be able to ship arbitrary files either); ``args`` are
+        quoted for the shell. The temp file is removed afterwards; the return value is the raw
+        container output (entrypoint banner first, so callers that expect JSON take the last
+        line that parses, see ``agents.web_tools.last_json_line``).
+        """
+        name = str(script_path or "")
+        if not name or Path(name).name != name:
+            return f"Error: sandbox script not found: {script_path}"
+        source = SCRIPTS_DIR / name
+        if not source.is_file():
+            return f"Error: sandbox script not found: {script_path}"
+        user_dir = self.ensure_user_directory(user_id)
+        target_file, file_in_container = self._workspace_file(user_dir, "temp_tool", ".py")
+        try:
+            shutil.copy(source, target_file)
+            os.chmod(target_file, 0o755)
+            # -I (isolated): the script's directory is the user's workspace, where the model writes
+            # files; without it a workspace json.py/random.py or a `pip install --user` copy of
+            # openpyxl/playwright would shadow what the script imports. The image installs the
+            # script dependencies system-wide, and PLAYWRIGHT_BROWSERS_PATH is not a PYTHON* variable.
+            command = " ".join([f"python -I {file_in_container}"] + [shlex.quote(str(a)) for a in args])
+            return self.run_command(user_id, command, timeout, network_enabled, mem_limit)
+        finally:
+            try:
+                if target_file.exists():
+                    target_file.unlink()
+            except Exception as e:
+                logger.error(f"Error removing temporary script {target_file}: {str(e)}")
 
     @staticmethod
     def _workspace_file(user_dir, prefix, suffix):
@@ -189,7 +313,7 @@ class ContainerManager:
         name = f"{prefix}_{uuid.uuid4().hex[:8]}{suffix}"
         return user_dir / name, f"/home/runner/workspace/{name}"
 
-    def _run_command_in_slot(self, user_id, command, timeout=60, network_enabled=False):
+    def _run_command_in_slot(self, user_id, command, timeout=60, network_enabled=False, mem_limit=None):
         # Ensure user directory exists
         user_dir = self.ensure_user_directory(user_id)
         
@@ -307,7 +431,7 @@ class ContainerManager:
                 remove=False,  # We'll remove it manually after getting logs
                 network_mode=network_mode,  # Network access based on parameter
                 cap_add=["SYS_PTRACE"] if "strace" in command else None,  # Add capabilities for strace if needed
-                mem_limit="512m",  # Limit memory to prevent resource exhaustion
+                mem_limit=mem_limit or DEFAULT_MEM_LIMIT,  # Limit memory to prevent resource exhaustion
                 cpu_quota=100000,  # Limit CPU usage (100% of one CPU)
                 cpu_period=100000
             )

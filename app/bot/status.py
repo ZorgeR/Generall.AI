@@ -14,7 +14,9 @@ version (and on rich edits once button rows were refused, see
 ``rich.buttons_available``). The summary and the stopped/error notices carry no
 Stop button, so it disappears when the turn ends. Instead the summary can carry
 the turn's action buttons (Retry, Listen, … from ``bot/turn_actions.py``): a row
-at its end, with the same inline-keyboard fallbacks.
+at its end, with the same inline-keyboard fallbacks. A failed turn ends the same
+way (``fail()``): the plain-language reason with a Retry row, so an error is never
+a dead end.
 """
 from __future__ import annotations
 
@@ -387,18 +389,36 @@ class StatusMessage:
             if not keep:
                 await self.sender.delete([self.message])
                 return False
-            keyboard = actions_keyboard(actions) if actions else None
             # Always worth one rich attempt: the summary differs from every progress payload.
-            if self.rich:
-                blocks = summary_blocks(trace)
-                if keyboard is not None and rich_render.buttons_available():
-                    edited = await self._edit_rich(blocks + [action_row(actions)], progress=False, buttons_fallback=keyboard)
-                else:
-                    edited = await self._edit_rich(blocks, progress=False, reply_markup=keyboard)
-                if edited:
-                    return keyboard is not None
-            edited_text = await self.sender.edit_text(self.message, trace_summary(trace), fallback="strip", reply_markup=keyboard)
-            return keyboard is not None and edited_text is not None
+            return await self._final_edit(lambda: summary_blocks(trace), trace_summary(trace), actions, markdown=True)
+
+    async def fail(self, text: str, actions: list | None = None) -> bool:
+        """End of a failed turn: ``text`` (plain, e.g. "❌ …") with the action row (Retry), no Stop button.
+
+        The same fallbacks as ``finish()``: a rich paragraph plus the button row, the paragraph
+        with an inline keyboard once rows are refused, the plain text with the keyboard when rich
+        fails. Returns True when the actions were placed.
+        """
+        if self.message is None:
+            return False
+        async with self._lock:
+            return await self._final_edit(lambda: [InputRichBlockParagraph(text=text)], text, actions, markdown=False)
+
+    async def _final_edit(self, blocks, text: str, actions: list | None, *, markdown: bool) -> bool:
+        """The last edit of a turn: ``blocks()`` (rich) or ``text`` (legacy Markdown or plain), with
+        ``actions`` as a button row at the end, an inline keyboard when rows are refused, and the
+        text version with the keyboard when every rich edit fails. True when the actions were placed."""
+        keyboard = actions_keyboard(actions) if actions else None
+        if self.rich:
+            rich_blocks = blocks()
+            if keyboard is not None and rich_render.buttons_available():
+                edited = await self._edit_rich(rich_blocks + [action_row(actions)], progress=False, buttons_fallback=keyboard)
+            else:
+                edited = await self._edit_rich(rich_blocks, progress=False, reply_markup=keyboard)
+            if edited:
+                return keyboard is not None
+        edited_text = await self.sender.edit_text(self.message, text, markdown=markdown, fallback="strip", reply_markup=keyboard)
+        return keyboard is not None and edited_text is not None
 
     async def set_text(self, text: str) -> None:
         """Stopped / error notices (no Stop button)."""

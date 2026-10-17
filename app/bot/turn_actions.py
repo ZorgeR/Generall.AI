@@ -12,14 +12,16 @@ suggestions, which become buttons under the answer (one per row). Streaming
 drafts hide the block as it is written (``strip_follow_ups_draft``), including a
 half-typed opening tag, so it never flickers on screen.
 
-Every successful turn is saved as a small record (``data/<uid>/turns/<id>.json``,
-plus ``<id>.reasoning.txt`` when there is a reasoning transcript), newest
-``MAX_TURNS`` per user. The buttons carry only the turn id (``turn_<action>_<id>``
-and ``turn_fu_<id>_<index>``), so a press loads the record: Retry re-runs the
-stored prompt, Continue asks the agent to finish a turn that hit the tool
-budget, Listen reads the answer aloud, Reasoning sends the transcript file on
-demand (it is no longer sent after every turn). A record that is gone (pruned,
-or a forged id) turns the press into "expired".
+Every turn is saved as a small record (``data/<uid>/turns/<id>.json``, plus
+``<id>.reasoning.txt`` when there is a reasoning transcript), newest ``MAX_TURNS``
+per user. A turn that failed is saved too, with ``error`` set and no answer, so
+its Retry button can replay the prompt; a scheduled task's record keeps its
+``quiet_marker``, so a Retry that has nothing to report stays quiet too. The
+buttons carry only the turn id (``turn_<action>_<id>`` and ``turn_fu_<id>_<index>``), so a press loads the
+record: Retry re-runs the stored prompt, Continue asks the agent to finish a turn
+that hit the tool budget, Listen reads the answer aloud, Reasoning sends the
+transcript file on demand (it is no longer sent after every turn). A record that
+is gone (pruned, or a forged id) turns the press into "expired".
 
 Placement is decided by ``bot/agent_runner.py``: the action row goes at the end
 of the rich turn summary when there is one, otherwise into an inline keyboard
@@ -138,7 +140,7 @@ def valid_turn_id(turn_id: Any) -> bool:
 @dataclass
 class TurnRecord:
     id: str
-    prompt: str  # exactly what run_turn received: Retry sends it again
+    prompt: str  # the text view of what run_turn received: Retry sends it again (or prompt_blocks)
     response: str  # the displayed answer (follow-ups removed): what Listen reads
     created: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
     speak: bool = False
@@ -147,6 +149,9 @@ class TurnRecord:
     follow_ups: list[str] = field(default_factory=list)
     reasoning_caption: str = DEFAULT_REASONING_CAPTION
     has_reasoning: bool = False
+    prompt_blocks: list | None = None  # the prompt as content blocks (media refs, agents.content) when it had media
+    error: str | None = None  # the turn failed with this plain-language reason: only Retry applies, response is ""
+    quiet_marker: str | None = None  # a scheduled task's "nothing to say" answer: Retry runs with it again
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -158,6 +163,7 @@ class TurnRecord:
             return None
         thread_id = data.get("thread_id")
         follow_ups = data.get("follow_ups")
+        prompt_blocks = data.get("prompt_blocks")
         return cls(
             id=data["id"],
             prompt=str(data.get("prompt") or ""),
@@ -169,6 +175,9 @@ class TurnRecord:
             follow_ups=[str(s) for s in follow_ups if isinstance(s, str) and s] if isinstance(follow_ups, list) else [],
             reasoning_caption=str(data.get("reasoning_caption") or DEFAULT_REASONING_CAPTION),
             has_reasoning=data.get("has_reasoning") is True,
+            prompt_blocks=[b for b in prompt_blocks if isinstance(b, dict)] if isinstance(prompt_blocks, list) and prompt_blocks else None,
+            error=str(data["error"]) if data.get("error") else None,
+            quiet_marker=data["quiet_marker"] if isinstance(data.get("quiet_marker"), str) and data["quiet_marker"] else None,
         )
 
 
@@ -310,7 +319,12 @@ def tts_available() -> bool:
 
 
 def record_actions(record: TurnRecord, *, tts: bool | None = None) -> list[Action]:
-    """Continue (only after the tool budget ran out), Retry, Listen (TTS configured), Reasoning (if stored)."""
+    """Continue (only after the tool budget ran out), Retry, Listen (TTS configured), Reasoning (if stored).
+
+    A failed turn (``record.error``) has no answer to listen to, continue or explain: Retry only.
+    """
+    if record.error:
+        return [(RETRY_LABEL, callback_data(RETRY, record.id), None)]
     actions: list[Action] = []
     if record.limit_reached:
         actions.append((CONTINUE_LABEL, callback_data(CONTINUE, record.id), "primary"))

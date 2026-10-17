@@ -4,12 +4,19 @@ All read-modify-write cycles go through ``update()`` which holds a per-user
 ``asyncio.Lock`` so the scheduler, the UI and the agent tool cannot clobber
 each other's writes.
 
-Reminder record shape (unchanged from the previous implementation, plus the
-``processing_since`` field used while an agent reminder is queued/running)::
+Reminder record shape (the ``processing_since`` field is used while an agent reminder is
+queued/running; ``timezone``, ``weekdays`` and the ``last_result`` / ``quiet_runs`` fields came
+with the v3 wave)::
 
     {id, user_id, text, time (ISO UTC), type: "user"|"agent", status: "pending"|"processing"|"completed"|"failed",
      created_at, is_periodic, period_type, period_interval, last_triggered, next_trigger,
-     [enabled], [completed_at], [agent_response], [processing_since]}
+     [enabled], [completed_at], [agent_response], [processing_since],
+     [timezone: IANA name the reminder was scheduled in], [weekdays: [0..6], Monday = 0, daily reminders only],
+     [last_result: "quiet"|"answered"], [quiet_runs: int], [snoozed_from: id]}
+
+Times are stored in UTC. ``calculate_next_trigger`` steps daily/weekly/monthly periods in the
+reminder's own zone (wall-clock time, so "every day at 9" stays at 9 across a DST change) and
+skips the days a ``weekdays`` list leaves out; hourly periods are absolute.
 """
 from __future__ import annotations
 
@@ -20,10 +27,12 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 logger = logging.getLogger(__name__)
 
 PERIOD_TYPES = ("hourly", "daily", "weekly", "monthly")
+WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 
 def period_delta(period_type: str, interval: int) -> timedelta:
@@ -39,17 +48,78 @@ def period_delta(period_type: str, interval: int) -> timedelta:
     raise ValueError(f"Unknown period type: {period_type}")
 
 
-def calculate_next_trigger(reminder_time: str, period_type: str, period_interval: int) -> datetime:
-    """Next trigger strictly in the future, stepping from ``reminder_time`` by the period."""
+def zone_or_utc(tz: Any) -> ZoneInfo | timezone:
+    """``ZoneInfo`` for a stored zone name (or a ``ZoneInfo`` as is); UTC for "" / None / unknown."""
+    if isinstance(tz, ZoneInfo):
+        return tz
+    if not tz:
+        return timezone.utc
+    try:
+        return ZoneInfo(str(tz))
+    except (ZoneInfoNotFoundError, ValueError):
+        logger.warning("Unknown reminder time zone %r, using UTC", tz)
+        return timezone.utc
+
+
+def clean_weekdays(weekdays: Any) -> list[int] | None:
+    """Sorted, de-duplicated weekday numbers (0 = Monday .. 6 = Sunday); None when nothing was given.
+
+    Raises ``ValueError`` for anything that is not an int in 0..6 or for an empty list."""
+    if weekdays is None:
+        return None
+    if isinstance(weekdays, (str, bytes)) or not hasattr(weekdays, "__iter__"):
+        raise ValueError("weekdays must be a list of integers 0 (Monday) .. 6 (Sunday)")
+    days: set[int] = set()
+    for item in weekdays:
+        if isinstance(item, bool) or not isinstance(item, int) or not 0 <= item <= 6:
+            raise ValueError("weekdays must be a list of integers 0 (Monday) .. 6 (Sunday)")
+        days.add(item)
+    if not days:
+        raise ValueError("weekdays must name at least one day")
+    return sorted(days)
+
+
+def _allowed_day(moment: datetime, weekdays: list[int] | None, tz: ZoneInfo | timezone) -> bool:
+    return not weekdays or moment.astimezone(tz).weekday() in weekdays
+
+
+def first_allowed_trigger(first: datetime, weekdays: list[int] | None, tz: Any = None) -> datetime:
+    """``first`` itself, or the same local time on the next day in ``weekdays`` (in zone ``tz``)."""
+    zone = zone_or_utc(tz)
+    moment = first
+    for _ in range(8):
+        if _allowed_day(moment, weekdays, zone):
+            return moment
+        moment = (moment.astimezone(zone) + timedelta(days=1)).astimezone(timezone.utc)
+    return first  # unreachable with a valid list; never loop forever on a corrupt record
+
+
+def calculate_next_trigger(
+    reminder_time: str, period_type: str, period_interval: int, weekdays: Any = None, tz: Any = None,
+) -> datetime:
+    """Next trigger strictly in the future, stepping from ``reminder_time`` by the period.
+
+    Daily, weekly and monthly steps are wall-clock steps in zone ``tz`` (an IANA name or ``ZoneInfo``;
+    None = UTC), so a local 09:00 stays 09:00 across a DST change; hourly steps are absolute. With a
+    ``weekdays`` list (daily reminders) days outside the list are skipped."""
     now = datetime.now(timezone.utc)
     last = parse_time(reminder_time)
     step = period_delta(period_type, period_interval)
     if step <= timedelta(0):
         raise ValueError("period_interval must be positive")
-    next_trigger = last + step
-    while next_trigger <= now:
-        next_trigger += step
-    return next_trigger
+    zone = zone_or_utc(tz)
+    days = clean_weekdays(weekdays)
+    if period_type == "hourly":
+        zone_for_step: ZoneInfo | timezone = timezone.utc
+    else:
+        zone_for_step = zone
+    local = last.astimezone(zone_for_step)
+    for _ in range(100_000):  # bounded: a reminder far in the past still terminates
+        local = local + step  # aware + timedelta = wall-clock arithmetic in zone_for_step
+        candidate = local.astimezone(timezone.utc)
+        if candidate > now and _allowed_day(candidate, days, zone):
+            return candidate
+    raise ValueError("could not find the next trigger time")
 
 
 def parse_time(value: str) -> datetime:

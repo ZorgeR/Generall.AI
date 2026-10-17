@@ -91,6 +91,8 @@ class SubagentTools:
             provider = getattr(self.parent, slot, None)
             if provider is not None:
                 names.update(t["name"] for t in provider.tools_schema)
+        for provider, _blocking in getattr(self.parent, "extra_providers", []):
+            names.update(t["name"] for t in provider.tools_schema)
         return names
 
     def _child(self, model: str, allowed: set[str] | None, budget: TurnBudget):
@@ -100,6 +102,7 @@ class SubagentTools:
         for slot in PROVIDER_SLOTS:
             setattr(child, slot, getattr(self.parent, slot, None))
         child.subagents = None  # depth 1: a subagent cannot spawn subagents
+        child.extra_providers = list(getattr(self.parent, "extra_providers", []))  # registered providers too
         child.allowed_tools = allowed
         child.thinking = getattr(self.parent, "thinking", False)
         child.trace_depth = getattr(self.parent, "trace_depth", 0) + 1

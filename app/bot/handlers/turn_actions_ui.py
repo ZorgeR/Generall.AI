@@ -3,7 +3,8 @@
 ``router`` (ui: auth only) handles actions that do not run the agent: 🔊 Listen
 reads the stored answer aloud, 📄 Reasoning sends the stored reasoning file.
 ``turn_router`` (chat: auth + action limit, so its handlers get ``limit``) handles
-the ones that start a new turn: 🔁 Retry runs the stored prompt again, ▶️ Continue
+the ones that start a new turn: 🔁 Retry runs the stored prompt again (a scheduled
+task's with its quiet marker: "nothing new" ends as ``QUIET_NOTICE``), ▶️ Continue
 asks the agent to finish what it listed, and a follow-up button sends its
 suggestion. Those post a short echo of what was pressed and queue the turn on it
 like a typed message (busy notice included), so the answer replies to the echo.
@@ -38,6 +39,7 @@ CONTINUE_PROMPT = "Continue the task from where you stopped: do the remaining st
 RETRY_ECHO = "🔁 Retry"
 CONTINUE_ECHO = "▶️ Continue"
 FOLLOW_UP_ECHO = "💬 {}"
+QUIET_NOTICE = "📭 Nothing new to report."  # a retried scheduled task answered its quiet marker
 
 _P = turn_actions.CALLBACK_PREFIX
 _listening: set[tuple[str, str]] = set()  # (user_id, turn_id) whose audio is being generated
@@ -136,18 +138,22 @@ async def on_reasoning(callback: CallbackQuery, bot: Bot, user_id: str) -> None:
 # a new agent turn: retry, continue, follow-up
 # ---------------------------------------------------------------------------
 async def _run_button_turn(
-    bot: Bot, user_id: str, chat_id: int, thread_id: int | None, prompt: str, reply_to: int,
-    limit: int | None, speak: bool, ctx: JobContext,
+    bot: Bot, user_id: str, chat_id: int, thread_id: int | None, prompt: str | list, reply_to: int,
+    limit: int | None, speak: bool, ctx: JobContext, *, quiet_marker: str | None = None,
 ) -> None:
+    # A scheduled task's prompt asks for the quiet marker when there is nothing new: it must not
+    # be shown as the answer, and the user who pressed the button still gets a short reply.
     await run_turn(
         bot=bot, user_id=user_id, chat_id=chat_id, prompt=prompt, thread_id=thread_id,
         reply_to_message_id=reply_to, ctx=ctx, limit=limit, speak=speak,
+        quiet_marker=quiet_marker, quiet_notice=QUIET_NOTICE if quiet_marker else None,
     )
 
 
 async def _start_turn(
     callback: CallbackQuery, bot: Bot, user_id: str, limit: int | None, message: Message,
-    record: turn_actions.TurnRecord, *, prompt: str, echo: str, label: str, speak: bool = False,
+    record: turn_actions.TurnRecord, *, prompt: str | list, echo: str, label: str, speak: bool = False,
+    quiet_marker: str | None = None,
 ) -> None:
     """Echo the press as a plain message and queue the turn on it, like a typed message."""
     await _answer(callback)
@@ -155,7 +161,10 @@ async def _start_turn(
     thread_id = _thread_id(message, record)
     echo_message = await ChatSender(bot, chat_id, thread_id).send_text(echo, markdown=False)
     _stats().track_message_received(user_id, "button")
-    run = partial(_run_button_turn, bot, user_id, chat_id, thread_id, prompt, echo_message.message_id, limit, speak)
+    run = partial(
+        _run_button_turn, bot, user_id, chat_id, thread_id, prompt, echo_message.message_id, limit, speak,
+        quiet_marker=quiet_marker,
+    )
     await chat_messages.submit(echo_message, Job(user_id=user_id, label=label, run=run))
 
 
@@ -167,7 +176,8 @@ async def on_retry(callback: CallbackQuery, bot: Bot, user_id: str, limit: int |
     message, record, _ = pressed
     await _start_turn(
         callback, bot, user_id, limit, message, record,
-        prompt=record.prompt, echo=RETRY_ECHO, label="retry", speak=record.speak,
+        prompt=record.prompt_blocks or record.prompt, echo=RETRY_ECHO, label="retry", speak=record.speak,
+        quiet_marker=record.quiet_marker,
     )
 
 

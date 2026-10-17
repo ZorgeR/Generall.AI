@@ -279,31 +279,17 @@ class ToolIntegrator:
     
     def patch_search_tools(self, search_tools_class):
         """
-        Patch the search tools class to run search operations in a secure container.
-        
+        SearchTools is left as it is: nothing in it runs in a secure container.
+
+        The web search and the deep research are API calls, and the long-term memory search reads
+        the user's conversation summaries, profile and transcript (JSON and Markdown under
+        data/<uid>/) in the bot process, where it has the parsers for them.
+        The sandbox version used to grep *.txt files, which that memory never had.
+
         Args:
-            search_tools_class: The search tools class to patch
+            search_tools_class: The search tools class (not modified)
         """
-        # Only patch memory_search as it operates on local files
-        if hasattr(search_tools_class, "memory_search"):
-            original_memory_search = search_tools_class.memory_search
-            
-            def secure_memory_search(self, query, case_sensitive=False):
-                """Secure version of memory_search that runs in a container"""
-                logger.info(f"Intercepted memory search for user {self.user_id}: {query}")
-                return self.secure_wrapper.wrap_search_operation(
-                    self.user_id, 
-                    "memory_search", 
-                    {"query": query, "case_sensitive": case_sensitive}
-                )
-            
-            # Add secure wrapper to the class
-            search_tools_class.secure_wrapper = self.secure_wrapper
-            
-            # Replace the original method with the secure version
-            search_tools_class.memory_search = secure_memory_search
-            
-            logger.info("Search tools patched to use secure container")
+        logger.info("Search tools left unpatched: the long-term memory search runs on the host")
     
     def patch_embeddings(self, embeddings_class):
         """

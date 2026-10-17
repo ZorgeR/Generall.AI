@@ -6,7 +6,9 @@
 #
 # Required environment: REF (branch, tag or full commit SHA to deploy) and ROOT (the
 # git checkout holding docker-compose.yml, .env and data/). Optional: HEALTH_TIMEOUT,
-# seconds to wait for the bot to come up (default 90).
+# seconds to wait for the bot to come up (default 90), and SANDBOX_BUILD_TIMEOUT, the
+# wait used instead when the deploy changes the sandbox image's build files (default
+# 1200: the bot builds that image before it starts, apt layers plus Chromium).
 #
 # What it does: refuses to run over locally modified tracked files, updates the
 # checkout to REF, installs the .env the workflow uploaded as .env.new (the old one is
@@ -104,7 +106,7 @@ install_env_file() {
 main() {
   : "${REF:?REF (git ref to deploy) is not set}"
   : "${ROOT:?ROOT (checkout path on the server) is not set}"
-  local health_timeout="${HEALTH_TIMEOUT:-90}" previous
+  local health_timeout="${HEALTH_TIMEOUT:-90}" build_timeout="${SANDBOX_BUILD_TIMEOUT:-1200}" previous
 
   export BUILDKIT_PROGRESS=plain DOCKER_CLI_HINTS=false GIT_TERMINAL_PROMPT=0
 
@@ -119,6 +121,15 @@ main() {
   log "Checked out $(git log -1 --oneline)"
 
   install_env_file
+
+  # The bot builds secure-container:<hash of these files> at startup, before it logs "is running".
+  if ! git diff --quiet "$previous" HEAD -- app/secure_container/Dockerfile \
+      app/secure_container/entrypoint.sh app/secure_container/requirements.txt; then
+    if (( build_timeout > health_timeout )); then
+      log "The sandbox image changed and is rebuilt at startup: waiting up to ${build_timeout}s instead of ${health_timeout}s"
+      health_timeout=$build_timeout
+    fi
+  fi
 
   log "Pulling the telegram-bot-api image (best effort; rich messages need Bot API >= 10.1)"
   docker compose pull --quiet telegram-bot-api || echo "WARNING: pull failed, keeping the current image"

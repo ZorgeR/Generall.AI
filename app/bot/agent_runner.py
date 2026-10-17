@@ -21,6 +21,12 @@ when there is no summary, and the model's ``<follow_ups>`` suggestions become on
 button per row under the answer. The reasoning file is sent only when its button
 is pressed; if the record cannot be saved it is sent right away, as before, and
 the turn gets no buttons.
+
+A failed turn is not a dead end either: the status becomes "❌ <plain-language
+reason> (trace <id>)" (``friendly_error``: rate limit, overloaded provider, network,
+request too large, Telegram refusal, or a generic line; the id is in the log) with a
+🔁 Retry button, backed by a turn record that carries the prompt and ``error``.
+The tokens spent before the failure are still accounted for.
 """
 from __future__ import annotations
 
@@ -31,7 +37,9 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+import anthropic
 from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError
 from aiogram.types import Message
 
 from bot import turn_actions
@@ -40,6 +48,7 @@ from bot.media import synthesize_speech, user_dir
 from bot.queue import STOP_CALLBACK_PREFIX, JobContext
 from bot.sender import ChatSender
 from bot.settings import UserSettings
+from bot.ui import delete_quietly
 from bot.status import StatusMessage, entity_safe, render_trace, stop_keyboard, trace_summary, usage_text  # noqa: F401 (re-exported)
 from bot.streaming import create_streaming_callback
 from models import ANTHROPIC_MODEL
@@ -47,7 +56,50 @@ from models import ANTHROPIC_MODEL
 logger = logging.getLogger(__name__)
 
 THINKING = "💭 *Thinking...*"
+QUIET_MARKER = "<no_update/>"  # a scheduled task answers with this alone when there is nothing to say
 STOPPED_NOTE = "⏹ Stopped — partial answer, not saved to memory."
+
+# Plain-language reasons for a failed turn (friendly_error). The technical detail is in the log.
+ERROR_RATE_LIMIT = "The AI provider is rate-limiting us right now. Try again in a minute."
+ERROR_OVERLOADED = "The AI provider is overloaded. Try again shortly."
+ERROR_NETWORK = "Network problem reaching the AI provider."
+ERROR_TOO_LARGE = "The request was too large (very long conversation or file). Try a shorter message, a smaller file or a new topic."
+ERROR_TELEGRAM = "Telegram refused the message: {}"
+ERROR_GENERIC = "Something went wrong."
+_TOO_LARGE_HINTS = ("too large", "prompt is too long", "max_tokens", "exceed")
+_TELEGRAM_DETAIL_CHARS = 120
+
+
+def friendly_error(error: BaseException, trace_id: str | None = None) -> str:
+    """What the user is told about a failed turn, with " (trace <id>)" appended when given.
+
+    Anthropic SDK errors are told apart by class and status: a rate limit, an overloaded or
+    failing provider (5xx), a connection or timeout problem, a request the API found too
+    large; a Telegram refusal quotes Telegram's short description; everything else is the
+    generic line. The trace id is what the log entry carries, so support can find it.
+    """
+    text = str(error).lower()
+    if isinstance(error, anthropic.RateLimitError):
+        reason = ERROR_RATE_LIMIT
+    elif isinstance(error, anthropic.APIConnectionError):  # APITimeoutError included
+        reason = ERROR_NETWORK
+    elif isinstance(error, anthropic.APIStatusError) and (
+        (isinstance(error.status_code, int) and error.status_code >= 500)
+        or getattr(error, "type", None) == "overloaded_error" or "overloaded" in text
+    ):
+        reason = ERROR_OVERLOADED
+    elif isinstance(error, anthropic.APIStatusError) and (
+        error.status_code == 413 or (isinstance(error, anthropic.BadRequestError) and any(hint in text for hint in _TOO_LARGE_HINTS))
+    ):
+        reason = ERROR_TOO_LARGE
+    elif isinstance(error, TelegramAPIError):
+        detail = " ".join(str(getattr(error, "message", None) or error).split())
+        if len(detail) > _TELEGRAM_DETAIL_CHARS:
+            detail = detail[: _TELEGRAM_DETAIL_CHARS - 1].rstrip() + "…"
+        reason = ERROR_TELEGRAM.format(detail)
+    else:
+        reason = ERROR_GENERIC
+    return f"{reason} (trace {trace_id})" if trace_id else reason
 
 
 @dataclass
@@ -55,6 +107,7 @@ class TurnResult:
     response: str  # the displayed answer: the follow-ups block is removed
     messages: list
     turn_id: str | None = None  # the saved turn record (bot.turn_actions), None when saving failed
+    quiet: bool = False  # the answer was the quiet marker: nothing was sent (scheduled tasks)
 
 
 def _agents():
@@ -204,7 +257,7 @@ async def run_turn(
     bot: Bot,
     user_id: str,
     chat_id: int,
-    prompt: str,
+    prompt: str | list,
     thread_id: int | None = None,
     reply_to_message_id: int | None = None,
     ctx: JobContext | None = None,
@@ -213,15 +266,27 @@ async def run_turn(
     header: str = THINKING,
     speak: bool = False,
     reasoning_caption: str = "Reasoning history.",
+    quiet_marker: str | None = None,
+    quiet_notice: str | None = None,
 ) -> TurnResult | None:
-    """Run the agent on ``prompt`` and deliver the result. Returns None after reporting an error.
+    """Run the agent on ``prompt`` (a string, or a list of content blocks built with
+    ``agents.content``: text and media refs) and deliver the result. Returns None after reporting an error.
 
     With ``ctx`` the status gets a Stop button for ``ctx.job`` and the drafts use
     ``ctx.job.id``; without it (no queue job) there is no Stop button. A successful
     turn is saved (``bot.turn_actions``) and gets its action and follow-up buttons.
+
+    ``quiet_marker`` (scheduled tasks): an answer consisting of exactly that marker means the
+    agent has nothing worth saying; nothing is sent, the status message is removed (or, with
+    ``quiet_notice``, edited into that line: a turn the user started by a button expects some
+    reply) and the result carries ``quiet=True``. The marker is stored on the turn record, so
+    Retry runs with it again.
     """
     from stats import stats_tracker
+    from agents import content as prompt_content  # no import-time side effects; after the patcher ran
 
+    prompt_text = prompt_content.prompt_text(prompt)
+    prompt_blocks = [dict(b) for b in prompt_content.normalize(prompt)] if isinstance(prompt, list) else None
     settings = UserSettings(user_id)
     settings.save()  # persist any defaults added since the file was written
     user_settings: dict[str, Any] = settings.as_dict()
@@ -284,10 +349,19 @@ async def run_turn(
         display, suggestions = turn_actions.parse_follow_ups(response or "")
         if not (user_settings.get("follow_ups") or {}).get("enabled", True):
             suggestions = []
+        if quiet_marker and display.strip() == quiet_marker:
+            # Nothing to tell the user: no answer, no voice, no buttons; the status goes away too
+            # (or says so, when the user pressed a button and waits for a reply).
+            status_final = True
+            if quiet_notice:
+                await status_msg.set_text(quiet_notice)
+            else:
+                await delete_quietly(status)
+            return TurnResult(response="", messages=messages, turn_id=None, quiet=True)
         limit_reached = getattr(getattr(agent, "agent", None), "limit_reached", False) is True
         record = await save_turn(user_id, turn_actions.TurnRecord(
-            id=turn_actions.new_turn_id(), prompt=prompt, response=display, speak=speak, thread_id=thread_id,
-            limit_reached=limit_reached, follow_ups=suggestions, reasoning_caption=reasoning_caption,
+            id=turn_actions.new_turn_id(), prompt=prompt_text, prompt_blocks=prompt_blocks, response=display, speak=speak, thread_id=thread_id,
+            limit_reached=limit_reached, follow_ups=suggestions, reasoning_caption=reasoning_caption, quiet_marker=quiet_marker,
         ), messages, settings)
 
         if speak and display:
@@ -334,6 +408,17 @@ async def run_turn(
         _close_drafts(on_text_chunk)
         trace_id = str(uuid.uuid4())
         logger.exception("Turn failed for user %s (trace %s): %s", user_id, trace_id, e)
-        if not status_final:
-            await status_msg.set_text(f"❌ An error occurred. Trace ID: {trace_id}")
+        if not agent_done:
+            record_usage(stats_tracker, user_id, trace)  # the tokens spent before the failure
+        if status_final:
+            return None  # the answer (or the summary) is already there; nothing to replace it with
+        reason = friendly_error(e, trace_id)
+        # The failed turn is saved too (prompt and reason, no answer, no reasoning file), so the
+        # status can carry a Retry button; when even that fails, the text goes out without buttons.
+        record = await save_turn(user_id, turn_actions.TurnRecord(
+            id=turn_actions.new_turn_id(), prompt=prompt_text, prompt_blocks=prompt_blocks, response="", speak=speak,
+            thread_id=thread_id, reasoning_caption=reasoning_caption, error=reason, quiet_marker=quiet_marker,
+        ), [], settings)
+        actions = turn_actions.record_actions(record) if record is not None else []
+        await status_msg.fail(f"❌ {reason}", actions=actions)
         return None

@@ -12,6 +12,8 @@ from .image_tools import ImageTools
 from .video_tools import VideoTools
 from .sms_tools import SMSTools
 from .user_interactions import UserInteractions
+from .web_tools import WebTools
+from .document_tools import DocumentTools
 from .embeddings import ConversationEmbeddings
 from stats import stats_tracker
 from tavily import TavilyClient
@@ -37,6 +39,11 @@ from models import (
 )
 from agents.trace import TurnBudget
 from agents.subagent import SubagentTools
+from agents import content as prompt_content
+from agents.mcp_tools import MCPTools
+from agents.profile_tools import ProfileTools, last_shown_profile_fingerprint, profile_block, profile_store
+from agents.profile_tools import fingerprint as profile_fingerprint
+from agents.vision_tools import VisionTools
 from agents.transcript import (
     MEMORY_BULLET,
     cap_text,
@@ -86,8 +93,64 @@ def log_input_transformations(response) -> None:
         )
         print(f"WARNING: the API changed {len(entries)} thinking block(s) in the request: {described}")
 
-# Streaming config
-streaming_enabled = os.getenv("STREAMING_ENABLED", "false").lower() == "true"
+
+# ---- automatic recovery inside the loop --------------------------
+# A failed API call is retried by AgentAnthropic._stream_message when the failure is the
+# provider's or the network's: after these delays (seconds), so three extra attempts in all.
+STREAM_RETRY_DELAYS = (2.0, 5.0, 12.0)
+MAX_RETRY_AFTER = 30.0  # a Retry-After header is honoured up to this many seconds
+
+
+def is_transient_error(error: BaseException) -> bool:
+    """A rate limit, an overloaded or failing provider (5xx), or a connection/timeout problem:
+    worth a retry. Any other 4xx (bad request, authentication, permission) is final."""
+    if isinstance(error, anthropic.APIConnectionError):  # APITimeoutError included
+        return True
+    if isinstance(error, anthropic.RateLimitError):
+        return True
+    if isinstance(error, anthropic.APIStatusError):
+        status = getattr(error, "status_code", None)
+        if isinstance(status, int) and status >= 500:
+            return True
+        return getattr(error, "type", None) == "overloaded_error" or "overloaded" in str(error).lower()
+    return False
+
+
+def transient_reason(error: BaseException) -> str:
+    """The short reason shown in the recovery note."""
+    if isinstance(error, anthropic.RateLimitError):
+        return "a rate limit"
+    if isinstance(error, anthropic.APIConnectionError):
+        return "a network error"
+    return "a provider error"
+
+
+def retry_delay(error: BaseException, default: float) -> float:
+    """``default`` seconds, unless the response carries a numeric Retry-After (capped)."""
+    headers = getattr(getattr(error, "response", None), "headers", None)
+    value = headers.get("retry-after") if headers is not None else None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return default  # absent, or an HTTP date: the backoff is good enough
+    return max(0.0, min(seconds, MAX_RETRY_AFTER))
+
+
+def is_thinking_mismatch(error: BaseException) -> bool:
+    """A 400 about the stored thinking blocks (stale signature, a prefix that changed), which
+    goes away once they are removed from the request. The binding-beta refusal is a different
+    400 and is handled by ``_stream_once``."""
+    if not isinstance(error, anthropic.BadRequestError) or is_binding_refusal(error):
+        return False
+    text = str(error).lower()
+    if "prefix mismatch" in text or "prefix_mismatch" in text or "signature" in text:
+        return True
+    return "thinking" in text and "block" in text
+
+
+# Streaming config: on by default (STREAMING_ENABLED=false turns the drafts off); bot/config.py
+# reads the same variable for the Telegram side, so the two defaults must agree.
+streaming_enabled = os.getenv("STREAMING_ENABLED", "true").lower() == "true"
 print(f"Agent streaming_enabled: {streaming_enabled} (env: {os.getenv('STREAMING_ENABLED', 'not set')})")
 
 # Appended to every system prompt so the model knows how its answer is rendered
@@ -162,6 +225,10 @@ class AgentAnthropic:
         self.thinking = False
         self.max_tool_result_chars = None  # tool results are cut to this before the model sees them
         self.limit_reached = False     # the last generate_response ran out of tool budget (bot offers Continue)
+        self.extra_providers = []      # [(provider, blocking)] added with register_provider
+        self.on_recovery = None        # optional coroutine(note): told about every automatic retry (the status line)
+        self.history_edited = False    # a request only went through without its thinking blocks: the stored prefix is stale
+        self.prefix_len = None         # messages this turn started from (stored history + question): a thinking strip touches only these
 
     async def critique_response(self, question: str, answer: str, dialog_history: list = [], trace=None) -> str:
         """
@@ -281,7 +348,9 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                     "content": [{"type": "text", "text": judge_prompt}]
                 }],
                 max_tokens=2048,  # adaptive thinking counts against this; the verdict itself is one word
-                **anthropic_request_options(thinking=False),
+                # Judged by the loop's model: in speed mode that is the fast model, which takes
+                # no effort/thinking parameters (request_options_for gives it none).
+                **request_options_for(self.model, False),
                 system="You are AI assistant as a judge, and you must respond with ONLY 'Yes' or 'No'. You task is to judge if the response is complete and correct and relevant to the user question."
             )
 
@@ -291,6 +360,14 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         except Exception as e:
             print(f"Error in judge: {str(e)}")
             return True
+
+    def register_provider(self, provider, *, blocking: bool = False) -> None:
+        """Add a tool provider after the named slots (deterministic order = registration order).
+
+        ``blocking`` providers have a synchronous ``execute_tool`` and run in a worker thread;
+        the others are awaited. Tool names must be globally unique (first match wins).
+        """
+        self.extra_providers.append((provider, bool(blocking)))
 
     def get_tools_schema(self):
         """Get combined tools schema from all tool providers"""
@@ -315,6 +392,8 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             tools.extend(self.user_interactions.tools_schema)
         if self.subagents:
             tools.extend(self.subagents.tools_schema)
+        for provider, _blocking in self.extra_providers:
+            tools.extend(provider.tools_schema)
         if self.allowed_tools is not None:
             tools = [t for t in tools if t["name"] in self.allowed_tools]
         return tools
@@ -347,8 +426,12 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             return await self.user_interactions.execute_tool(tool_name, tool_args)
         elif self.subagents and tool_name in [t["name"] for t in self.subagents.tools_schema]:
             return await self.subagents.execute_tool(tool_name, tool_args)
-        else:
-            return f"Unknown tool: {tool_name}"
+        for provider, blocking in self.extra_providers:
+            if tool_name in [t["name"] for t in provider.tools_schema]:
+                if blocking:
+                    return await asyncio.to_thread(provider.execute_tool, tool_name, tool_args)
+                return await provider.execute_tool(tool_name, tool_args)
+        return f"Unknown tool: {tool_name}"
 
     @staticmethod
     def _request_messages(messages: list) -> list:
@@ -357,7 +440,67 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         return [{k: v for k, v in m.items() if not str(k).startswith("_")} for m in messages]
 
     async def _stream_message(self, kwargs: dict, on_event=None):
-        """One streamed Messages API call; returns the final message.
+        """One streamed Messages API call with automatic recovery; returns the final message.
+
+        A transient failure (rate limit, overloaded or 5xx provider, connection or timeout) is
+        retried after ``STREAM_RETRY_DELAYS`` seconds, a Retry-After header winning up to
+        ``MAX_RETRY_AFTER``; after the last delay the error propagates. A 400 about the stored
+        thinking blocks is retried once with the thinking blocks of the stored prefix (the first
+        ``prefix_len`` messages, set by ``generate_response``; the whole request when unset)
+        removed, and ``history_edited`` tells the caller that the stored prefix must lose them
+        too (the rest of the turn then sends without them right away). The blocks this turn
+        produced stay: they were made against this very request, and the API wants the last
+        tool-calling assistant message to keep its thinking. Any other error propagates at
+        once. Every retry is reported through ``on_recovery(note)`` when the caller set it.
+        """
+        if self.history_edited:
+            kwargs = self._without_thinking(kwargs) or kwargs
+        retries = 0
+        stripped = False
+        while True:
+            try:
+                return await self._stream_once(kwargs, on_event)
+            except anthropic.BadRequestError as e:
+                bare = self._without_thinking(kwargs) if not stripped and is_thinking_mismatch(e) else None
+                if bare is None:
+                    raise  # not about stale thinking, already stripped, or nothing to strip
+                kwargs, stripped, self.history_edited = bare, True, True
+                print(f"WARNING: the API refused the stored thinking blocks ({e}); retrying without them")
+                await self._recovering("Retrying without the stored thinking blocks")
+            except anthropic.APIError as e:
+                if retries >= len(STREAM_RETRY_DELAYS) or not is_transient_error(e):
+                    raise
+                delay = retry_delay(e, STREAM_RETRY_DELAYS[retries])
+                retries += 1
+                print(f"WARNING: API call failed ({e}); retry {retries}/{len(STREAM_RETRY_DELAYS)} in {delay:g}s")
+                await self._recovering(f"Retrying after {transient_reason(e)} ({retries}/{len(STREAM_RETRY_DELAYS)})")
+                await asyncio.sleep(delay)
+
+    def _without_thinking(self, kwargs: dict) -> dict | None:
+        """``kwargs`` with a copy of the messages whose stored prefix (the first ``prefix_len``
+        messages, every message when unset) has no thinking blocks, or None when there were
+        none to remove (the request is left untouched). This turn's own messages keep theirs."""
+        messages = clone(kwargs.get("messages") or [])
+        n = len(messages) if self.prefix_len is None else min(self.prefix_len, len(messages))
+        prefix = messages[:n]
+        if not strip_thinking(prefix):
+            return None
+        return {**kwargs, "messages": prefix + messages[n:]}
+
+    async def _recovering(self, note: str) -> None:
+        """Tell the caller (the status line) about a retry; a failing hook never stops the retry."""
+        hook = self.on_recovery
+        if hook is None:
+            return
+        try:
+            await hook(note)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            print(f"WARNING: recovery hook failed: {e}")
+
+    async def _stream_once(self, kwargs: dict, on_event=None):
+        """One attempt of the streamed call; returns the final message.
 
         Requests with adaptive thinking carry the preserved-thinking mismatch policy
         (models.thinking_binding) on the beta client. If the API refuses the beta itself,
@@ -398,8 +541,12 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
 
         async def run_one(block):
             call = trace.start(block.name, block.input, depth=self.trace_depth) if trace is not None else None
+            blocks = None  # a provider may return content blocks (text + images) instead of a string
             try:
-                text = str(await self.execute_tool(block.name, block.input))
+                raw = await self.execute_tool(block.name, block.input)
+                if isinstance(raw, list):
+                    blocks = raw
+                text = prompt_content.result_preview(raw) if blocks is not None else str(raw)
                 is_error = False
             except asyncio.CancelledError:
                 raise
@@ -409,11 +556,16 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 # tools report their own failures as "Error ..." text; show those as failed too
                 call.done(text, ok=not is_error and not text.lstrip().lower().startswith("error"))
             # cut before the model sees it, so the stored transcript holds exactly what was sent
-            text = cap_text(text, self.max_tool_result_chars)
-            print(f"Tool name: {block.name}\nTool result: {text}")
+            if blocks is not None:
+                content_value = prompt_content.cap_blocks(blocks, self.max_tool_result_chars)
+                print(f"Tool name: {block.name}\nTool result: {cap_text(text, self.max_tool_result_chars)}")
+            else:
+                text = cap_text(text, self.max_tool_result_chars)
+                content_value = text
+                print(f"Tool name: {block.name}\nTool result: {text}")
             if refresh is not None:
                 await refresh(f"{block.name} finished")
-            result = {"type": "tool_result", "tool_use_id": block.id, "content": text}
+            result = {"type": "tool_result", "tool_use_id": block.id, "content": content_value}
             if is_error:
                 result["is_error"] = True
             return result
@@ -453,6 +605,10 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 "role": "user", 
                 "content": [{"type": "text", "text": prompt}]
             }]
+
+        # Where this turn begins: a thinking-mismatch recovery (_stream_message) strips thinking
+        # blocks from the messages before this index only, never from the ones this turn appends.
+        self.prefix_len = len(processed_messages)
 
         cicles = 0
         critique = 0
@@ -516,7 +672,11 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             draft = {"text": "", "thinking": ""}
 
             async def forward_event(event) -> None:
-                if event.type == "text":
+                if event.type == "message_start":
+                    # every attempt of the call starts here, a retry after a mid-stream failure
+                    # too (_stream_message): the draft starts over instead of doubling up
+                    draft["text"] = draft["thinking"] = ""
+                elif event.type == "text":
                     draft["text"] += event.text
                     await on_text_chunk(draft["text"], is_thinking=False)
                 elif event.type == "thinking":
@@ -668,10 +828,16 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         })
         
         try:
+            # The loop's tool definitions go out unchanged: they belong to the prefix every
+            # thinking block (and the cache) is bound to, and dropping them would make each block
+            # of the request stale. tool_choice "none" (allowed with thinking, outside that
+            # prefix) is what keeps the model from calling a tool.
             final_kwargs = {
                 "model": self.model,
                 "messages": self._request_messages(processed_messages),
                 "system": system,
+                "tools": self.get_tools_schema(),
+                "tool_choice": {"type": "none"},
                 "max_tokens": max_tokens_for(self.model, self.thinking),
                 **request_options_for(self.model, self.thinking),
             }
@@ -726,6 +892,14 @@ class ChainOfThoughtAgent:
         self.short_term_memory_path.mkdir(parents=True, exist_ok=True)
         
         if model_type == "anthropic":
+            # Mode: speed = the fast model runs the whole tool loop with
+            # light thinking (request_options_for gives it no effort/thinking parameters);
+            # intelligence = the main model thinks deeply whatever the thinking toggle says;
+            # auto (and any unknown value) = the main model, thinking as set, and the quick-answer
+            # classifier (_decide_complexity) picks the path per message.
+            self.mode = self._mode_of(self.user_settings)
+            if self.mode == "speed":
+                model = ANTHROPIC_MODEL_FAST
             self.agent = AgentAnthropic(model, user_id=user_id)
             self.agent.file_ops = self.file_ops
             self.agent.search_tools = self.search_tools
@@ -738,7 +912,23 @@ class ChainOfThoughtAgent:
             self.agent.user_interactions = self.user_interactions
             self.subagents = SubagentTools(self.agent, self.user_settings)
             self.agent.subagents = self.subagents
-            self.agent.thinking = self.user_settings.get("thinking").get("enabled", False)
+            # Providers added in the v3 wave: registered, not slotted.
+            self.vision_tools = VisionTools(user_id, sender)
+            self.agent.register_provider(self.vision_tools)
+            self.profile_tools = ProfileTools(user_id)
+            self.agent.register_provider(self.profile_tools)
+            self.mcp_tools = MCPTools(user_id)
+            self.agent.register_provider(self.mcp_tools)
+            self.web_tools = WebTools(user_id, sender)
+            self.agent.register_provider(self.web_tools, blocking=True)
+            self.document_tools = DocumentTools(user_id, sender)
+            self.agent.register_provider(self.document_tools, blocking=True)
+            if self.mode == "speed":
+                self.agent.thinking = False
+            elif self.mode == "intelligence":
+                self.agent.thinking = True
+            else:
+                self.agent.thinking = bool(self.user_settings.get("thinking").get("enabled", False))
         else:
             raise ValueError("Currently only Anthropic models are supported with the new tool pattern")
 
@@ -766,19 +956,20 @@ Response: {response}"""
             messages=[{"role": "user", "content": [{"type": "text", "text": summary_prompt}]}],
             max_tokens=ANTHROPIC_MAX_TOKENS_FAST_SHORT
         )
-        embedding_task = asyncio.to_thread(
-            self.conversation_embeddings.add_conversation,
-            question=question,
-            answer=response,
-            timestamp=timestamp
-        )
-        
-        topic_response, summary_response, _ = await asyncio.gather(
-            topic_task, summary_task, embedding_task
-        )
+        topic_response, summary_response = await asyncio.gather(topic_task, summary_task)
         
         topic = anthropic_text(topic_response).strip()
         summary = anthropic_text(summary_response).strip()
+        # Embedded after the summary exists, so topic and summary are part of the vector text at once
+        # (not only after the next reindex); the embedding call is blocking HTTP, so off the loop.
+        await asyncio.to_thread(
+            self.conversation_embeddings.add_conversation,
+            question=question,
+            answer=response,
+            timestamp=timestamp,
+            topic=topic,
+            summary=summary,
+        )
         
         # Save to file
         conversation_data = {
@@ -788,7 +979,7 @@ Response: {response}"""
             "summary": summary,
             "question": question,
             "response": response,
-            "full_history": messages
+            "full_history": prompt_content.strip_media(messages),  # pictures stay in the transcript, not here
         }
         
         file_path = self.conversations_path / f"conversation_{timestamp}_{topic}.json"
@@ -939,6 +1130,25 @@ User message: {question}"""
     _TIME_BLOCK_RE = _re.compile(r"\n?<current_time>.*?</current_time>\n?", _re.S)
     _TIME_LINE_RE = _re.compile(r"^[ \t]*Current time in UTC\+0:.*$", _re.M)
 
+    _PROVIDER_SLOTS = (
+        "file_ops", "search_tools", "code_tools", "terminal_tools", "time_tools",
+        "image_tools", "video_tools", "sms_tools", "user_interactions", "subagents",
+    )
+
+    def _provider_notes(self) -> str:
+        """Static prompt text contributed by tool providers (``prompt_notes``), in tool order.
+
+        Part of the static system prompt (so of the cache prefix and the transcript fingerprint):
+        providers put instructions about their tools here instead of editing the prompts above.
+        Per-turn text never belongs here."""
+        providers = [getattr(self.agent, slot, None) for slot in self._PROVIDER_SLOTS]
+        providers += [p for p, _blocking in getattr(self.agent, "extra_providers", [])]
+        notes = [str(getattr(p, "prompt_notes", "") or "").strip() for p in providers if p is not None]
+        notes = [n for n in notes if n]
+        if not notes:
+            return ""
+        return "\n<capabilities>\n" + "\n\n".join(notes) + "\n</capabilities>\n"
+
     def _static_system_prompt(self, system_context: str) -> str:
         """The selected prompt without anything that changes per turn, so the prefix can be cached."""
         text = self._TIME_BLOCK_RE.sub("\n", system_context)
@@ -985,15 +1195,19 @@ User message: {question}"""
             lines.append(f"{MEMORY_BULLET}[{conv.get('timestamp', '')}] Q: {q} / A: {a}")
         return lines
 
-    async def _request_context(self, question: str, update_status=None, shown: set[str] | None = None) -> tuple[str, str]:
-        """Per-turn context: time plus the long-term memory retrieved for this question.
+    async def _request_context(self, question: str, update_status=None, messages: list[dict] | None = None) -> tuple[str, str]:
+        """Per-turn context: time, the long-term memory retrieved for this question and the
+        user's profile (``data/<uid>/profile.md``, when ``profile.enabled``).
 
-        Returns ``(full, new)``. ``new`` leaves out the memory lines this transcript already
-        showed (``shown``); it is stored as the first block of the user turn, so what the
-        model saw stays in the history and the transcript stays append-only. ``full`` keeps
-        every line, for the quick text-only path, which never sees earlier context blocks.
+        Returns ``(full, new)``. ``new`` leaves out what this transcript (``messages``) already
+        showed: the memory lines of earlier context blocks and the profile when the version
+        last shown (``<profile fingerprint="...">``) is the current one; it is stored as the
+        first block of the user turn, so what the model saw stays in the history and the
+        transcript stays append-only. ``full`` keeps every line and the whole profile, for the
+        quick text-only path, which never sees earlier context blocks.
         """
         s = self.user_settings
+        messages = messages or []
         recent: list[str] = []
         hits: list[str] = []
         if s.get("summarization_history", {}).get("enabled", True) and s.get("short_term_memory", {}).get("enabled", True):
@@ -1002,14 +1216,32 @@ User message: {question}"""
             if update_status:
                 await update_status(step="initial", details="Searching memory", iteration=0, critique=0)
             hits = await self._semantic_hits(question, int(s.get("semantic_search", {}).get("max_results", 3)))
-        shown = shown or set()
+        shown = shown_memory_lines(messages)
         new_recent = [line for line in recent if line not in shown]
         new_hits = [line for line in hits if line not in shown]
-        return self._render_context(recent, hits), self._render_context(new_recent, new_hits)
+        profile = new_profile = ""
+        if s.get("profile", {}).get("enabled", True):
+            text = await asyncio.to_thread(profile_store.text, self.user_id)
+            if text.strip():
+                fp = profile_fingerprint(text)
+                profile = profile_block(text, fp)
+                if fp != last_shown_profile_fingerprint(messages):
+                    new_profile = profile
+        return self._render_context(recent, hits, profile), self._render_context(new_recent, new_hits, new_profile)
 
-    @staticmethod
-    def _render_context(recent: list[str], hits: list[str]) -> str:
-        parts = [f"Current time in UTC+0: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"]
+    def _render_context(self, recent: list[str], hits: list[str], profile: str = "") -> str:
+        """The ``<context>`` block: UTC time, the user's local time (or the hint that the zone is
+        unknown, so the agent asks once and saves it with ``set_user_timezone``),
+        then the memory lines and the profile."""
+        from bot import timezones  # stdlib-only helpers, no import-time side effects
+
+        now_utc = timezones.now_local(None)
+        zone = timezones.zone_of(self.user_settings)
+        if zone is None:
+            local_line = "User timezone: unknown (ask once and save it with set_user_timezone)"
+        else:
+            local_line = f"Local time ({timezones.zone_name(zone)}): {timezones.format_local(now_utc, zone, with_zone=False)}"
+        parts = [f"Current time in UTC+0: {now_utc.strftime('%Y-%m-%d %H:%M:%S')}", local_line]
         memory: list[str] = []
         if recent:
             memory.append("Recent conversations (newest first):\n" + "\n".join(recent))
@@ -1017,7 +1249,20 @@ User message: {question}"""
             memory.append("Related earlier conversations (semantic search):\n" + "\n".join(hits))
         if memory:
             parts.append("<memory>\n" + "\n\n".join(memory) + "\n</memory>")
+        if profile:
+            parts.append(profile)  # <profile fingerprint="..."> ... </profile> (agents.profile_tools.profile_block)
         return "<context>\n" + "\n".join(parts) + "\n</context>"
+
+    async def _legacy_context(self) -> str:
+        """The ``<context>`` block of a legacy-mode turn (transcript off): UTC and local time and
+        the profile (``profile.enabled``), which the static ``<capabilities>`` notes promise. No
+        memory lines: the legacy prompt carries the summaries and the semantic hits itself."""
+        profile = ""
+        if (self.user_settings.get("profile") or {}).get("enabled", True):
+            text = await asyncio.to_thread(profile_store.text, self.user_id)
+            if text.strip():
+                profile = profile_block(text, profile_fingerprint(text))
+        return self._render_context([], [], profile)
 
     async def _summarize_messages(self, old: list[dict]) -> str:
         """Fast-model summary of the oldest part of a transcript (used by transcript.prune)."""
@@ -1058,11 +1303,36 @@ User message: {question}"""
         with open(self.short_term_memory_path / self._get_memory_filename("dialog_history.json"), "w", encoding="utf-8") as f:
             json.dump(history[-size:], f, indent=2, ensure_ascii=False)
 
-    async def _generate_with_transcript(self, question: str, system_context: str, update_status=None, on_text_chunk=None, trace=None):
+    @staticmethod
+    def _mode_of(user_settings: dict | None) -> str:
+        """The user's ``mode.type``: "auto", "speed" or "intelligence"; anything else (an unknown
+        value, a missing category, no settings at all) behaves as auto."""
+        category = user_settings.get("mode") if isinstance(user_settings, dict) else None
+        value = category.get("type") if isinstance(category, dict) else None  # a hand-edited file may hold anything
+        mode = str(value or "auto").strip().lower()
+        return mode if mode in ("speed", "intelligence") else "auto"
+
+    async def _decide_complexity(self, question: str, history_view: list, *, has_media: bool = False) -> str:
+        """Quick fast-model answer or the full agent for this turn. A prompt with pictures or
+        documents always takes the full agent (the quick path is text-only), and so does every
+        turn in speed and intelligence mode: only auto asks the classifier."""
+        if has_media or self._mode_of(getattr(self, "user_settings", None)) != "auto":
+            return "complex"
+        return await self._classify_complexity(question, history_view)
+
+    async def _build_user_message(self, turn_context: str, blocks: list) -> dict:
+        """The user turn exactly as sent: the <context> block first, then the prompt's blocks with
+        media refs materialized into base64 image/document blocks (file reads in a thread), each
+        ref confined to the user's workspace (a Retry re-reads refs stored long before)."""
+        workspace = Path("./data") / str(self.user_id)
+        materialized = await asyncio.to_thread(prompt_content.materialize, blocks, workspace)
+        return {"role": "user", "content": [{"type": "text", "text": turn_context}, *materialized]}
+
+    async def _generate_with_transcript(self, question: str, system_context: str, update_status=None, on_text_chunk=None, trace=None, question_blocks: list | None = None):
         ts = self.user_settings.get("transcript", {})
         if update_status:
             await update_status(step="initial", details="Loading transcript", iteration=0, critique=0)
-        transcript = transcript_store.load(self.user_id, self.thread_id)
+        transcript = await asyncio.to_thread(transcript_store.load, self.user_id, self.thread_id)  # may hold base64 media
         if not transcript.messages and not transcript_store.exists(self.user_id, self.thread_id):
             legacy = self._load_legacy_dialog_history()
             if legacy:
@@ -1079,15 +1349,17 @@ User message: {question}"""
             if stripped:
                 print(f"Transcript prefix changed (model, system prompt or tools): dropped {stripped} thinking block(s)")
             transcript.fingerprint = fingerprint
-        full_context, turn_context = await self._request_context(question, update_status, shown_memory_lines(transcript.messages))
+        full_context, turn_context = await self._request_context(question, update_status, transcript.messages)
         if self.subagents is not None:
             self.subagents.update_status = update_status
             self.subagents.trace = trace
 
         history_view = text_only_view(transcript.messages)
-        complexity = await self._classify_complexity(question, history_view)
+        blocks = question_blocks if question_blocks is not None else prompt_content.normalize(question)
+        has_media = any(prompt_content.is_media_ref(b) for b in blocks)
+        complexity = await self._decide_complexity(question, history_view, has_media=has_media)
         # the context block is stored with the question: the transcript keeps what was sent
-        user_message = {"role": "user", "content": [{"type": "text", "text": turn_context}, {"type": "text", "text": question}]}
+        user_message = await self._build_user_message(turn_context, blocks)
         base_len = len(transcript.messages)
         response, new_messages = None, []
 
@@ -1125,6 +1397,14 @@ User message: {question}"""
         # Persist the transcript first (local, cheap), then the long-term memory (API calls). A
         # failure here must never turn into an error for the user: the answer is already generated.
         try:
+            if self.agent.history_edited:
+                # A request of this turn only went through without the thinking blocks of the
+                # stored prefix (AgentAnthropic._stream_message): drop them from the store too,
+                # before the turn is appended, so the stored history is what was actually sent.
+                # The turn's own blocks were made against that stripped prefix and stay.
+                self.agent.history_edited = False
+                dropped = strip_thinking(transcript.messages)
+                print(f"Transcript thinking blocks were refused by the API: dropped {dropped} stored block(s)")
             transcript.messages.extend(clone(new_messages))
             transcript.model = self.agent.model
             stats = await prune(
@@ -1133,7 +1413,7 @@ User message: {question}"""
                 keep_tool_results_turns=int(ts.get("keep_tool_results_turns", 3)),
                 summarize=self._summarize_messages,
             )
-            transcript_store.save(transcript)
+            await asyncio.to_thread(transcript_store.save, transcript)
             print(f"Transcript saved: {len(transcript.messages)} messages (~{estimate_tokens(transcript.messages)} tokens), prune={stats}")
         except Exception as e:  # noqa: BLE001
             print(f"WARNING: failed to save transcript: {e}")
@@ -1148,15 +1428,27 @@ User message: {question}"""
             print(f"WARNING: failed to update dialog history: {e}")
         return response, new_messages
 
-    async def generate_response(self, question: str, update_status=None, on_text_chunk=None, trace=None) -> str:
+    async def generate_response(self, question, update_status=None, on_text_chunk=None, trace=None) -> str:
+        """``question`` is a string or a list of content blocks (agents.content: text blocks and
+        media refs). The text view drives the classifier, the memory and the legacy path; the
+        blocks become the user turn in transcript mode."""
         # image and video calls add their tokens and cost to the turn
         if self.image_tools is not None:
             self.image_tools.trace = trace
         if self.video_tools is not None:
             self.video_tools.trace = trace
+        if update_status:
+            # automatic retries inside the loop (AgentAnthropic._stream_message) show up as a
+            # status line, in transcript and legacy mode alike
+            async def recovering(note: str) -> None:
+                await update_status(step="recovering", details=note, iteration="-", critique="-")
+
+            self.agent.on_recovery = recovering
+        received = f"Message received time in UTC+0: {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}\n\n"
+        question_blocks = prompt_content.with_prefix(prompt_content.normalize(question), received)
+        question = prompt_content.prompt_text(question_blocks)  # text view for everything below
         print(f"\n=== Starting Chain of Thought for Question: {question} ===")
         print(f"Thread ID: {self.thread_id or 'None (no topic)'}")
-        question = f"Message received time in UTC+0: {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}\n\n{question}"
         
         system_context_generall_ai_v1 = f"""You are a persistent agent (state is automaticly saved and loaded from disk between different sessions) with long-term memory capabilities through file operations, web search, code execution, terminal commands, and more tools.
 
@@ -1452,9 +1744,10 @@ You have been asked to answer a query given sources. Consider the following when
             system_context += LEGACY_FORMATTING_GUIDE
         if ((self.user_settings or {}).get("follow_ups") or {}).get("enabled", True):
             system_context += FOLLOW_UPS_GUIDE
+        system_context += self._provider_notes()
 
         if (self.user_settings or {}).get("transcript", {}).get("enabled", True):
-            return await self._generate_with_transcript(question, system_context, update_status, on_text_chunk, trace)
+            return await self._generate_with_transcript(question, system_context, update_status, on_text_chunk, trace, question_blocks=question_blocks)
 
         # Search for relevant past conversations
         if self.user_settings.get("semantic_search").get("enabled"):
@@ -1570,8 +1863,10 @@ You have been asked to answer a query given sources. Consider the following when
                 if text:
                     context_memory.append({"role": message["role"], "content": text})
         
-        # Pass user message separately
-        user_question = [{"role": "user", "content": question}]
+        # Pass user message separately, behind the per-turn <context> block (times, profile) as
+        # in transcript mode; the quick path gets the same text. Memory keeps the bare question.
+        turn_text = f"{await self._legacy_context()}\n\n{question}"
+        user_question = [{"role": "user", "content": turn_text}]
         context_memory.extend(user_question)
 
         # formated json print of context_memory
@@ -1593,7 +1888,7 @@ You have been asked to answer a query given sources. Consider the following when
             dialog_history = []
 
         # Route: classify complexity to decide fast vs full path
-        complexity = await self._classify_complexity(question, dialog_history)
+        complexity = await self._decide_complexity(question, dialog_history)  # mode setting applies to the legacy path too
         
         response = None
         
@@ -1616,7 +1911,12 @@ You have been asked to answer a query given sources. Consider the following when
             )
             # remove first 2 messages from thread_messages array
             thread_messages = thread_messages[2:]
-        
+            # the stored turn is the bare question: a stale <context> block must not come back
+            # with the reasoning context (short_term_memory.json) next turn
+            for msg in thread_messages:
+                if msg.get("role") == "user" and self._get_msg_text(msg) == turn_text:
+                    msg["content"] = [{"type": "text", "text": question}]
+
         # print("\n========== Thread Messages: ==========")
         #print(json.dumps(thread_messages, indent=2, ensure_ascii=False))
         # print("\n========== Response: ==========")

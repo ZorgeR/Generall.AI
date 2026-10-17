@@ -8,6 +8,16 @@ the new message is processed as its own turn once the queue reaches it.
 button stop the running job and clear the queue; the Stop button in a turn's
 status (``queue_stop_<job token>``) and Telegram's Stop button on its streaming
 draft (a ``stopped_message_generation`` update) stop only that job.
+
+Every job puts the reply / forward preamble (``bot.message_context``) in front of
+its prompt, so a reply to an earlier message or a forwarded post reaches the agent
+with what it refers to.
+
+Photos and PDFs are not described beforehand: the image job and the document job
+build a block prompt (``agents.content``: one text block, then an ``image_ref`` per
+picture or a ``document_ref`` for a PDF within the limits) and the agent sees the
+media itself. Text, docx, xlsx and json documents go in as
+extracted text; a PDF too large to attach falls back to the description path.
 """
 from __future__ import annotations
 
@@ -26,6 +36,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from bot import media
 from bot.agent_runner import THINKING, run_turn
+from bot.message_context import with_reference
 from bot.queue import STOP_CALLBACK_PREFIX, Job, JobContext, SubmitResult, job_id_from_token
 from bot.runtime import queue
 from bot.sender import ChatSender
@@ -41,14 +52,40 @@ MEDIA_GROUP_TIMEOUT = 10.0
 CANCEL_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛑 Stop current task", callback_data="queue_cancel")]])
 
 
+TEXT_PROMPT_CAP = 30_000  # characters of a text document put in the prompt
+EXTRACTED_TEXT_CAP = 60_000  # characters of extracted docx/xlsx/json text put in the prompt
+IMAGE_EMBED_HINT = "The images are saved in your workspace; to show one inline in your answer, write ![caption](images/<file name>)."
+
+
 def _stats():
     from stats import stats_tracker
 
     return stats_tracker
 
 
+def _content():
+    """``agents.content`` on first use (bot/ imports nothing from agents at module level)."""
+    from agents import content
+
+    return content
+
+
+def _prompt_with_reference(text: str, media_blocks: list, message: Message, bot_id: int | None) -> str | list:
+    """The job's prompt: the preamble + ``text`` as one string when there is no media (exactly
+    ``with_reference``), else that string as the first text block followed by the media refs."""
+    text = with_reference(text, message, bot_id)
+    if not media_blocks:
+        return text
+    return [_content().text_block(text), *media_blocks]
+
+
 def _thread_id(message: Message) -> int | None:
     return message.message_thread_id if message.is_topic_message else None
+
+
+def _bot_id(bot: Bot) -> int | None:
+    """``Bot.id`` (from the token); None for the bot stand-ins of the tests."""
+    return getattr(bot, "id", None)
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -178,11 +215,36 @@ async def draft_stopped(event: MessageGenerationStopped, user_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# location → time zone; the agent never sees locations
+# ---------------------------------------------------------------------------
+LOCATION_NO_FINDER = (
+    "I can't tell the time zone from a location on this server.\n"
+    "Please type it: /timezone Europe/Berlin (any city name works too)."
+)
+
+
+@control_router.message(F.location)
+async def on_location(message: Message, user_id: str) -> None:
+    """A shared location sets ``timezone.name`` (timezonefinder, optional; else the zone name is asked for)."""
+    from bot import timezones
+    from bot.handlers.commands import timezone_set_text
+    from bot.settings import UserSettings
+
+    location = message.location
+    name = await asyncio.to_thread(timezones.zone_from_location, location.latitude, location.longitude)
+    if name is None:
+        await answer_md(message, LOCATION_NO_FINDER)
+        return
+    UserSettings(user_id).set("timezone", name, "name")
+    await answer_md(message, timezone_set_text(name))
+
+
+# ---------------------------------------------------------------------------
 # text
 # ---------------------------------------------------------------------------
 async def _run_text(bot: Bot, message: Message, user_id: str, limit: int | None, ctx: JobContext) -> None:
     await run_turn(
-        bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=message.text or "",
+        bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=with_reference(message.text or "", message, _bot_id(bot)),
         thread_id=_thread_id(message), reply_to_message_id=message.message_id, ctx=ctx, limit=limit,
     )
 
@@ -214,7 +276,7 @@ async def _run_voice(bot: Bot, message: Message, user_id: str, limit: int | None
         shown = transcription[:512] + "..." if len(transcription) > 1500 else transcription
         await sender.edit_text(status, f"🎙️ *Transcription:*\n{shown}")
         await run_turn(
-            bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=transcription,
+            bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=with_reference(transcription, message, _bot_id(bot)),
             thread_id=_thread_id(message), reply_to_message_id=message.message_id, ctx=ctx, limit=limit, speak=True,
         )
     except asyncio.CancelledError:
@@ -309,7 +371,7 @@ async def _run_video(bot: Bot, message: Message, user_id: str, limit: int | None
                 label = media.FRAME_LABELS[i] if i < len(media.FRAME_LABELS) else f"frame {i + 1}"
                 lines.append(f"  - Frame at {label}: {sp}")
             parts.append("Video screenshots saved:\n" + "\n".join(lines))
-        prompt = "\n\n".join(parts)
+        prompt = with_reference("\n\n".join(parts), message, _bot_id(bot))
 
         await run_turn(
             bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=prompt,
@@ -357,7 +419,7 @@ async def _run_audio(bot: Bot, message: Message, user_id: str, limit: int | None
             prompt += f"\nUser message: {caption}"
         await sender.edit_text(status, "🎵 *Audio saved, processing...*")
         result = await run_turn(
-            bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=prompt,
+            bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=with_reference(prompt, message, _bot_id(bot)),
             thread_id=_thread_id(message), reply_to_message_id=message.message_id, ctx=ctx, limit=limit,
         )
         if result is not None:
@@ -383,58 +445,56 @@ async def _run_images(
     bot: Bot, message: Message, user_id: str, limit: int | None, refs: list[Any], caption: str | None,
     status: Message | None, ctx: JobContext,
 ) -> None:
+    """Photos (one message or a flushed album) go to the agent as image blocks, not descriptions.
+
+    Each picture is kept twice under ``images/``: ``image_<uuid>.jpg`` at full resolution (the
+    path the prompt names, for edits and re-sends) and ``image_<uuid>_v.jpg``, downscaled to
+    ``MAX_IMAGE_RESOLUTION_VISION`` and under the API size limit, which is what the ``image_ref``
+    points at and what the transcript stores.
+    """
     sender = ChatSender(bot, message.chat.id, _thread_id(message), message.message_id)
-    if caption is None:
-        caption = "Describe what is in this image in user language."
-        question = caption
-    else:
-        question = f"Describe what is in this image and answer to this question: {caption}"
     if status is not None:
-        await sender.edit_text(status, "🖼️ *Analyzing images...*")
+        await sender.edit_text(status, "🖼️ *Preparing images...*")
     else:
-        status = await sender.send_text("🖼️ *Analyzing images...*")
+        status = await sender.send_text("🖼️ *Preparing images...*")
     media.ensure_temp_dirs()
     temp_files: list[str] = []
-    descriptions: list[dict] = []
+    lines: list[str] = []
+    media_blocks: list[dict] = []
     try:
+        images_dir = media.user_dir(user_id, "images")
         for i, ref in enumerate(refs, 1):
             try:
-                ctx.set_progress(f"describing image {i}/{len(refs)}")
+                ctx.set_progress(f"preparing image {i}/{len(refs)}")
                 ext = os.path.splitext(getattr(ref, "file_name", "") or "")[1].lower()
                 if ext not in IMAGE_EXTENSIONS:
                     ext = ".jpg"
                 downloaded = os.path.join(media.TEMP_PHOTOS, f"photo_{uuid.uuid4()}{ext}")
                 temp_files.append(downloaded)
                 await bot.download(ref.file_id, destination=downloaded)
-                jpeg = os.path.join(media.TEMP_PHOTOS, f"photo_{uuid.uuid4()}.jpg")
-                temp_files.append(jpeg)
-                await asyncio.to_thread(media.prepare_downloaded_image_for_vision, downloaded, jpeg)
-                permanent = str(media.user_dir(user_id, "images") / f"image_{uuid.uuid4()}.jpg")
-                await asyncio.to_thread(shutil.copy, jpeg, permanent)
-
-                suffix = f" for image {i}" if len(refs) > 1 else ""
-                await sender.edit_text(status, f"🤖 *Getting Anthropic description{suffix}...*")
-                anthropic_desc = await media.describe_image_anthropic(question, jpeg)
-                _stats().track_describe_used(user_id, "image_anthropic")
-                await sender.edit_text(status, f"🤖 *Getting OpenAI description{suffix}...*")
-                openai_desc = await media.describe_image_openai(question, jpeg, user_id=user_id)
-                _stats().track_describe_used(user_id, "image_openai")
-                descriptions.append({"anthropic": anthropic_desc, "openai": openai_desc, "path": permanent})
+                stem = f"image_{uuid.uuid4()}"
+                permanent = str(images_dir / f"{stem}.jpg")
+                await asyncio.to_thread(media.prepare_downloaded_image_for_vision, downloaded, permanent)
+                vision_copy = str(images_dir / f"{stem}_v.jpg")
+                await asyncio.to_thread(media.save_vision_copy, permanent, vision_copy)
+                lines.append(f"Image {i}: {permanent}")
+                media_blocks.append(_content().image_ref(vision_copy, caption=f"Image {i}"))
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
                 logger.error("Error processing photo %d: %s", i, e)
-                descriptions.append({"anthropic": f"Error processing image {i}", "openai": f"Error processing image {i}", "path": "error_path"})
+                lines.append(f"Image {i}: could not be processed ({type(e).__name__})")
 
-        details = "\n\n".join(
-            f"Image {i + 1} (path: {d['path']}):\nAnthropic description: {d['anthropic']}\nOpenAI description: {d['openai']}"
-            for i, d in enumerate(descriptions)
-        )
-        prompt = (
-            f"{caption}\n\nUser attached {len(descriptions)} image(s) to this message. "
-            f"Here are the details about each image from Anthropic and OpenAI:\n\n{details}\n\n"
-            "The images are saved in your workspace; to show one inline in your answer, write ![caption](images/<file name>)."
-        )
+        if not media_blocks:
+            await sender.edit_text(status, "❌ Could not process the image(s).", markdown=False)
+            return
+        n = len(refs)
+        if caption is None:
+            head = f"User sent {n} photo(s)."
+        else:
+            head = f"{caption}\n\nUser attached {n} image(s) to this message."
+        text = f"{head} They are shown below as images and saved in your workspace:\n" + "\n".join(lines) + f"\n\n{IMAGE_EMBED_HINT}"
+        prompt = _prompt_with_reference(text, media_blocks, message, _bot_id(bot))
         await sender.edit_text(status, "🤖 *Processing...*")
         result = await run_turn(
             bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=prompt,
@@ -447,8 +507,8 @@ async def _run_images(
         raise
     except Exception as e:  # noqa: BLE001
         trace_id = str(uuid.uuid4())
-        logger.exception("Error analyzing images (trace %s): %s", trace_id, e)
-        await sender.edit_text(status, f"❌ An error occurred while analyzing the images. Trace ID: {trace_id}", markdown=False)
+        logger.exception("Error processing images (trace %s): %s", trace_id, e)
+        await sender.edit_text(status, f"❌ An error occurred while processing the images. Trace ID: {trace_id}", markdown=False)
     finally:
         media.remove_files(temp_files)
 
@@ -520,36 +580,100 @@ async def on_photo(message: Message, bot: Bot, user_id: str, limit: int | None =
 # ---------------------------------------------------------------------------
 # documents
 # ---------------------------------------------------------------------------
+def _cap_document_text(text: str, limit: int, hint: str) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n…(truncated: {hint})"
+
+
+async def _describe_fallback(
+    sender: ChatSender, status: Message, user_id: str, ext: str, doc_type: str, file_name: str, saved: str,
+    caption: str | None, reason: str,
+) -> str:
+    """The pre-F7 path: a model's analysis of the document goes in the prompt (a PDF over the
+    block limits, text that could not be extracted or is too long to include)."""
+    default = "Analyze this document and describe its contents in detail."
+    question = default if caption is None else f"{default} When you are done, answer the following question: {caption}"
+    await sender.edit_text(status, f"🤖 *Analyzing {doc_type} content...*")
+    description = await media.describe_document(question, saved)
+    _stats().track_describe_used(user_id, media.describe_type_for(ext))
+    return (
+        f"{caption or default}\n\nUser attached a {doc_type} document to this message.\nFile: {file_name}\nSaved to: {saved}\n"
+        f"{reason}\n\nHere is the analysis of document contents:\n\n{description}"
+    )
+
+
+async def _document_prompt(
+    sender: ChatSender, status: Message, user_id: str, ext: str, doc_type: str, file_name: str, saved: str, caption: str | None,
+) -> tuple[str, list]:
+    """(prompt text, media blocks) for a saved document, by extension: a PDF within the limits
+    as a ``document_ref``; text files and extracted docx/xlsx/json text in the prompt (capped);
+    everything else through ``_describe_fallback``."""
+    user_line = f"\nUser message: {caption}" if caption else ""
+    if ext == ".pdf":
+        try:
+            pages = await asyncio.to_thread(media.pdf_page_count, saved)
+        except Exception as e:  # noqa: BLE001 - not a PDF pypdf can read
+            logger.warning("Could not read %s with pypdf: %s", saved, e)
+            pages = None
+        if pages is not None and media.pdf_fits_as_block(saved, pages):
+            text = (
+                f"User sent a PDF: {file_name} ({pages} pages), saved at {saved}.{user_line}\n"
+                "Read it from the attached document block; read_document gives it to you again later."
+            )
+            return text, [_content().document_ref(saved, title=file_name)]
+        if pages is None:
+            reason = "The PDF could not be attached directly (it could not be parsed as a PDF)."
+        else:
+            size_mb = os.path.getsize(saved) / (1024 * 1024)
+            reason = (
+                f"The PDF was too large to attach directly ({pages} pages, {size_mb:.1f} MB; the limits are "
+                f"{media.PDF_MAX_PAGES} pages and {media.PDF_MAX_BYTES // (1024 * 1024)} MB), so it was analyzed instead."
+            )
+        return await _describe_fallback(sender, status, user_id, ext, doc_type, file_name, saved, caption, reason), []
+    if ext in media.TEXT_EXTENSIONS:
+        content = await asyncio.to_thread(media.extract_document_text, saved)
+        shown = _cap_document_text(content, TEXT_PROMPT_CAP, "use read_file for the rest")
+        text = (
+            f"User sent a {doc_type} file: {file_name} ({len(content)} characters), saved at {saved}.{user_line}\n\n"
+            f"File content:\n<file_content>\n{shown}\n</file_content>"
+        )
+        return text, []
+    if ext in media.OFFICE_EXTENSIONS:
+        try:
+            extracted = await asyncio.to_thread(media.extract_document_text, saved)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not extract text from %s: %s", saved, e)
+            extracted = None
+        if extracted is not None and len(extracted) <= EXTRACTED_TEXT_CAP:
+            text = (
+                f"User sent a {doc_type} document: {file_name}, saved at {saved}.{user_line}\n\n"
+                f"Extracted text:\n<document_text>\n{extracted}\n</document_text>"
+            )
+            return text, []
+        reason = (
+            "The document's text could not be extracted, so it was analyzed instead." if extracted is None
+            else f"The document's text ({len(extracted)} characters) is too long to include, so it was analyzed instead; read_file / execute_python give you the details."
+        )
+        return await _describe_fallback(sender, status, user_id, ext, doc_type, file_name, saved, caption, reason), []
+    return await _describe_fallback(sender, status, user_id, ext, doc_type, file_name, saved, caption, ""), []
+
+
 async def _run_document(bot: Bot, message: Message, user_id: str, limit: int | None, ctx: JobContext) -> None:
+    """A document goes to the agent as a block prompt (``_document_prompt``); the file is saved
+    under ``documents/<lowercased name>`` first (a re-upload overwrites)."""
     sender = ChatSender(bot, message.chat.id, _thread_id(message), message.message_id)
     document = message.document
     file_name = os.path.basename((document.file_name or f"document_{uuid.uuid4()}").lower())
     ext = os.path.splitext(file_name)[1].lower()
     doc_type = ext.replace(".", "").upper()
-    media.ensure_temp_dirs()
-    temp_file = os.path.join(media.TEMP_DOCS, f"doc_{uuid.uuid4()}{ext}")
     status = await sender.send_text(f"📄 *Processing {doc_type} document...*")
     try:
-        ctx.set_progress("analyzing document")
-        await bot.download(document.file_id, destination=temp_file)
+        ctx.set_progress("reading document")
         saved = str(media.user_dir(user_id, "documents") / file_name)
-        await asyncio.to_thread(shutil.copy, temp_file, saved)
-
-        if message.caption is None:
-            caption = "Analyze this document and describe its contents in detail."
-            question = caption
-        else:
-            caption = message.caption
-            question = f"Analyze this document and describe its contents in detail. When you are done, answer the following question: {caption}"
-
-        await sender.edit_text(status, f"🤖 *Analyzing {doc_type} content...*")
-        description = await media.describe_document(question, temp_file)
-        _stats().track_describe_used(user_id, media.describe_type_for(ext))
-
-        prompt = (
-            f"{caption}\n\nUser attached a {doc_type} document to this message.\nFile: {file_name}\nSaved to: {saved}\n\n"
-            f"Here is the analysis of document contents:\n\n{description}"
-        )
+        await bot.download(document.file_id, destination=saved)
+        text, media_blocks = await _document_prompt(sender, status, user_id, ext, doc_type, file_name, saved, message.caption)
+        prompt = _prompt_with_reference(text, media_blocks, message, _bot_id(bot))
         await sender.edit_text(status, "🤖 *Processing...*")
         result = await run_turn(
             bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=prompt,
@@ -562,10 +686,8 @@ async def _run_document(bot: Bot, message: Message, user_id: str, limit: int | N
         raise
     except Exception as e:  # noqa: BLE001
         trace_id = str(uuid.uuid4())
-        logger.exception("Error analyzing document (trace %s): %s", trace_id, e)
-        await sender.edit_text(status, f"❌ An error occurred while analyzing the document. Trace ID: {trace_id}", markdown=False)
-    finally:
-        media.remove_files([temp_file])
+        logger.exception("Error processing document (trace %s): %s", trace_id, e)
+        await sender.edit_text(status, f"❌ An error occurred while processing the document. Trace ID: {trace_id}", markdown=False)
 
 
 @router.message(F.document)
