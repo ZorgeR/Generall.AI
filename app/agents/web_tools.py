@@ -14,6 +14,7 @@ Tests replace ``_container_manager`` with a fake whose ``run_script`` returns ca
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import threading
@@ -21,6 +22,10 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List
 from urllib.parse import urlparse
+
+from agents.paths import ensure_real_dir
+
+logger = logging.getLogger(__name__)
 
 _container_manager = None
 _manager_lock = threading.Lock()
@@ -80,12 +85,13 @@ def writable_dir(path: Path) -> Path:
 
     ``data/<uid>`` itself is made world-writable by ContainerManager.ensure_user_directory; a
     subdirectory the bot created (root, 755) would still refuse the container's screenshot.
+    The sandbox may have replaced the folder with a link: ``paths.ensure_real_dir`` removes it
+    and never follows it (a plain chmod would make the link's target world-writable, as root).
     """
-    path.mkdir(parents=True, exist_ok=True)
     try:
-        os.chmod(path, 0o777)
-    except OSError:
-        pass
+        ensure_real_dir(path, 0o777)
+    except OSError as e:
+        logger.warning("Could not prepare %s for the sandbox: %s", path, e)
     return path
 
 

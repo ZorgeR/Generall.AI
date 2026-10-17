@@ -84,3 +84,51 @@ def test_regular_files_of_a_linked_or_missing_folder_is_empty(workspace, monkeyp
     assert list(regular_files(workspace / "linked", "*")) == []
     assert list(regular_files(workspace / "missing", "*")) == []
     assert list(regular_files(workspace / "images" / "cat.jpg", "*")) == []  # a file, not a folder
+
+
+# ---- ensure_real_dir: folders the bot prepares inside the sandbox-writable workspace ----------
+def test_ensure_real_dir_creates_and_sets_the_mode(tmp_path):
+    from agents.paths import ensure_real_dir
+
+    target = ensure_real_dir(tmp_path / "data" / "7" / "downloads", 0o777)
+    assert target.is_dir() and not target.is_symlink()
+    assert (target.stat().st_mode & 0o777) == 0o777
+
+
+def test_ensure_real_dir_replaces_a_link_and_never_touches_its_target(tmp_path):
+    from agents.paths import ensure_real_dir
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.chmod(outside, 0o700)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("x")
+    os.chmod(secret, 0o600)
+    user = tmp_path / "data" / "7"
+    user.mkdir(parents=True)
+    (user / "downloads").symlink_to(outside)
+    (user / "documents").symlink_to(secret)
+    for name in ("downloads", "documents"):
+        made = ensure_real_dir(user / name, 0o777)
+        assert made.is_dir() and not made.is_symlink()
+    assert (outside.stat().st_mode & 0o777) == 0o700  # the link's target kept its mode
+    assert (secret.stat().st_mode & 0o777) == 0o600 and secret.read_text() == "x"
+
+
+def test_ensure_real_dir_replaces_a_plain_file(tmp_path):
+    from agents.paths import ensure_real_dir
+
+    (tmp_path / "downloads").write_text("not a folder")
+    assert ensure_real_dir(tmp_path / "downloads").is_dir()
+
+
+def test_writable_dir_never_follows_a_link(tmp_path):
+    from agents import web_tools
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.chmod(outside, 0o755)
+    (tmp_path / "downloads").symlink_to(outside)
+    made = web_tools.writable_dir(tmp_path / "downloads")
+    assert made.is_dir() and not made.is_symlink()
+    assert (outside.stat().st_mode & 0o777) == 0o755

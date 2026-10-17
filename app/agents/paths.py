@@ -86,6 +86,42 @@ def resolve_under(
     return None
 
 
+def ensure_real_dir(path: Path, mode: int = 0o777) -> Path:
+    """Make ``path`` a real directory and set its mode without ever following a link.
+
+    The sandbox can write the user's workspace, so a subfolder the bot prepares there
+    (``downloads/``, ``documents/``) may have been replaced by a symlink or a file. A plain
+    ``mkdir`` + ``chmod`` would follow the link and change whatever it points at, as root. A link
+    or a file in its place is removed (``unlink`` never follows) and a real directory made; the
+    mode is set through a descriptor opened with ``O_NOFOLLOW``, so a link swapped in meanwhile
+    raises ``OSError`` instead of being followed. The parents must be trusted (bot-created).
+    """
+    path = Path(path)
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        st = None
+    if st is not None and not stat.S_ISDIR(st.st_mode):
+        os.unlink(path)
+        st = None
+    if st is None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.mkdir(path)
+        except FileExistsError:
+            pass
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, mode)
+        else:  # pragma: no cover - platforms without fchmod (Windows)
+            os.chmod(path, mode)
+    finally:
+        os.close(fd)
+    return path
+
+
 def regular_files(folder: Path, pattern: str) -> Iterator[tuple[Path, str]]:
     """``(path, UTF-8 text)`` of each regular file directly in ``folder`` whose name matches ``pattern``.
 
