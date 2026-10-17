@@ -292,7 +292,8 @@ async def test_no_profile_block_when_empty_or_disabled(agent):
     assert "<profile" not in full and "<profile" not in new
     # the rest of the block is what it always was
     assert re.fullmatch(
-        r"<context>\nCurrent time in UTC\+0: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\n<memory>\n"
+        r"<context>\nCurrent time in UTC\+0: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\n"
+        r"User timezone: unknown \(ask once and save it with set_user_timezone\)\n<memory>\n"
         r"Recent conversations \(newest first\):\n" + re.escape(MEMORY_LINE) + r"\n\n"
         r"Related earlier conversations \(semantic search\):\n" + re.escape(HIT_LINE) + r"\n</memory>\n</context>",
         new,
@@ -303,7 +304,7 @@ def test_render_context_without_a_profile_is_unchanged(agent):
     plain = agent._render_context(["• a"], ["• b"])
     assert plain == agent._render_context(["• a"], ["• b"], "")
     assert plain.endswith("<memory>\nRecent conversations (newest first):\n• a\n\nRelated earlier conversations (semantic search):\n• b\n</memory>\n</context>")
-    assert agent._render_context([], []).count("\n") == 2  # time only
+    assert agent._render_context([], []).count("\n") == 3  # UTC time and the timezone line only
 
 
 # ---- /profile ------------------------------------------------------------------

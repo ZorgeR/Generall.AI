@@ -242,13 +242,15 @@ async def test_cancel_before_delivery_still_marks_the_status(monkeypatch):
     assert edit_text(last) == "🛑 Cancelled." and buttons(last) == []
 
 
-async def test_a_failed_turn_has_no_stop_and_no_turn_buttons(monkeypatch):
+async def test_a_failed_turn_has_no_stop_and_only_retry(monkeypatch):
     use_agent(monkeypatch, error=RuntimeError("boom"))
     bot = FakeBot()
     ctx = JobContext(Job(user_id=USER, label="text", run=None))
     assert await run_turn_task(bot, ctx) is None
     last = bot.of("edit_message_text")[-1]
-    assert edit_text(last).startswith("❌ An error occurred") and buttons(last) == []
+    assert edit_text(last).startswith("❌ Something went wrong.")
+    assert len(buttons(last)) == 1 and buttons(last)[0].startswith("turn_retry_")  # Retry only (tests/test_error_recovery.py)
+    assert not any(d.startswith("queue_stop_") for d in buttons(last))
     assert bot.of("edit_message_reply_markup") == [] and bot.of("send_document") == []
 
 
@@ -451,6 +453,11 @@ ROUTING = {
     "setp_ui_advanced": "settings_ui.settings_page_button",
     "settings_preset_fast": "settings_ui.settings_button",
     "settings_mode_set_speed": "settings_ui.settings_button",
+    "tz_set_0": "commands.timezone_button",
+    "reminder_snooze_abcd1234_10": "reminders_ui.reminder_button",
+    "reminder_delay_abcd1234_60": "reminders_ui.reminder_button",
+    "reminder_edit_abcd1234": "reminders_ui.reminder_button",
+    "reminders_new": "reminders_ui.reminder_button",
 }
 
 

@@ -215,6 +215,31 @@ async def draft_stopped(event: MessageGenerationStopped, user_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# location → time zone (docs/design-v3.md, F5); the agent never sees locations
+# ---------------------------------------------------------------------------
+LOCATION_NO_FINDER = (
+    "I can't tell the time zone from a location on this server.\n"
+    "Please type it: /timezone Europe/Berlin (any city name works too)."
+)
+
+
+@control_router.message(F.location)
+async def on_location(message: Message, user_id: str) -> None:
+    """A shared location sets ``timezone.name`` (timezonefinder, optional; else the zone name is asked for)."""
+    from bot import timezones
+    from bot.handlers.commands import timezone_set_text
+    from bot.settings import UserSettings
+
+    location = message.location
+    name = await asyncio.to_thread(timezones.zone_from_location, location.latitude, location.longitude)
+    if name is None:
+        await answer_md(message, LOCATION_NO_FINDER)
+        return
+    UserSettings(user_id).set("timezone", name, "name")
+    await answer_md(message, timezone_set_text(name))
+
+
+# ---------------------------------------------------------------------------
 # text
 # ---------------------------------------------------------------------------
 async def _run_text(bot: Bot, message: Message, user_id: str, limit: int | None, ctx: JobContext) -> None:

@@ -93,6 +93,61 @@ def log_input_transformations(response) -> None:
         )
         print(f"WARNING: the API changed {len(entries)} thinking block(s) in the request: {described}")
 
+
+# ---- automatic recovery inside the loop (docs/design-v3.md, F2) --------------------------
+# A failed API call is retried by AgentAnthropic._stream_message when the failure is the
+# provider's or the network's: after these delays (seconds), so three extra attempts in all.
+STREAM_RETRY_DELAYS = (2.0, 5.0, 12.0)
+MAX_RETRY_AFTER = 30.0  # a Retry-After header is honoured up to this many seconds
+
+
+def is_transient_error(error: BaseException) -> bool:
+    """A rate limit, an overloaded or failing provider (5xx), or a connection/timeout problem:
+    worth a retry. Any other 4xx (bad request, authentication, permission) is final."""
+    if isinstance(error, anthropic.APIConnectionError):  # APITimeoutError included
+        return True
+    if isinstance(error, anthropic.RateLimitError):
+        return True
+    if isinstance(error, anthropic.APIStatusError):
+        status = getattr(error, "status_code", None)
+        if isinstance(status, int) and status >= 500:
+            return True
+        return getattr(error, "type", None) == "overloaded_error" or "overloaded" in str(error).lower()
+    return False
+
+
+def transient_reason(error: BaseException) -> str:
+    """The short reason shown in the recovery note."""
+    if isinstance(error, anthropic.RateLimitError):
+        return "a rate limit"
+    if isinstance(error, anthropic.APIConnectionError):
+        return "a network error"
+    return "a provider error"
+
+
+def retry_delay(error: BaseException, default: float) -> float:
+    """``default`` seconds, unless the response carries a numeric Retry-After (capped)."""
+    headers = getattr(getattr(error, "response", None), "headers", None)
+    value = headers.get("retry-after") if headers is not None else None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return default  # absent, or an HTTP date: the backoff is good enough
+    return max(0.0, min(seconds, MAX_RETRY_AFTER))
+
+
+def is_thinking_mismatch(error: BaseException) -> bool:
+    """A 400 about the stored thinking blocks (stale signature, a prefix that changed), which
+    goes away once they are removed from the request. The binding-beta refusal is a different
+    400 and is handled by ``_stream_once``."""
+    if not isinstance(error, anthropic.BadRequestError) or is_binding_refusal(error):
+        return False
+    text = str(error).lower()
+    if "prefix mismatch" in text or "prefix_mismatch" in text or "signature" in text:
+        return True
+    return "thinking" in text and "block" in text
+
+
 # Streaming config: on by default (STREAMING_ENABLED=false turns the drafts off); bot/config.py
 # reads the same variable for the Telegram side, so the two defaults must agree.
 streaming_enabled = os.getenv("STREAMING_ENABLED", "true").lower() == "true"
@@ -171,6 +226,9 @@ class AgentAnthropic:
         self.max_tool_result_chars = None  # tool results are cut to this before the model sees them
         self.limit_reached = False     # the last generate_response ran out of tool budget (bot offers Continue)
         self.extra_providers = []      # [(provider, blocking)] added with register_provider (docs/design-v3.md)
+        self.on_recovery = None        # optional coroutine(note): told about every automatic retry (the status line)
+        self.history_edited = False    # a request only went through without its thinking blocks: the stored prefix is stale
+        self.prefix_len = None         # messages this turn started from (stored history + question): a thinking strip touches only these
 
     async def critique_response(self, question: str, answer: str, dialog_history: list = [], trace=None) -> str:
         """
@@ -382,7 +440,67 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         return [{k: v for k, v in m.items() if not str(k).startswith("_")} for m in messages]
 
     async def _stream_message(self, kwargs: dict, on_event=None):
-        """One streamed Messages API call; returns the final message.
+        """One streamed Messages API call with automatic recovery; returns the final message.
+
+        A transient failure (rate limit, overloaded or 5xx provider, connection or timeout) is
+        retried after ``STREAM_RETRY_DELAYS`` seconds, a Retry-After header winning up to
+        ``MAX_RETRY_AFTER``; after the last delay the error propagates. A 400 about the stored
+        thinking blocks is retried once with the thinking blocks of the stored prefix (the first
+        ``prefix_len`` messages, set by ``generate_response``; the whole request when unset)
+        removed, and ``history_edited`` tells the caller that the stored prefix must lose them
+        too (the rest of the turn then sends without them right away). The blocks this turn
+        produced stay: they were made against this very request, and the API wants the last
+        tool-calling assistant message to keep its thinking. Any other error propagates at
+        once. Every retry is reported through ``on_recovery(note)`` when the caller set it.
+        """
+        if self.history_edited:
+            kwargs = self._without_thinking(kwargs) or kwargs
+        retries = 0
+        stripped = False
+        while True:
+            try:
+                return await self._stream_once(kwargs, on_event)
+            except anthropic.BadRequestError as e:
+                bare = self._without_thinking(kwargs) if not stripped and is_thinking_mismatch(e) else None
+                if bare is None:
+                    raise  # not about stale thinking, already stripped, or nothing to strip
+                kwargs, stripped, self.history_edited = bare, True, True
+                print(f"WARNING: the API refused the stored thinking blocks ({e}); retrying without them")
+                await self._recovering("Retrying without the stored thinking blocks")
+            except anthropic.APIError as e:
+                if retries >= len(STREAM_RETRY_DELAYS) or not is_transient_error(e):
+                    raise
+                delay = retry_delay(e, STREAM_RETRY_DELAYS[retries])
+                retries += 1
+                print(f"WARNING: API call failed ({e}); retry {retries}/{len(STREAM_RETRY_DELAYS)} in {delay:g}s")
+                await self._recovering(f"Retrying after {transient_reason(e)} ({retries}/{len(STREAM_RETRY_DELAYS)})")
+                await asyncio.sleep(delay)
+
+    def _without_thinking(self, kwargs: dict) -> dict | None:
+        """``kwargs`` with a copy of the messages whose stored prefix (the first ``prefix_len``
+        messages, every message when unset) has no thinking blocks, or None when there were
+        none to remove (the request is left untouched). This turn's own messages keep theirs."""
+        messages = clone(kwargs.get("messages") or [])
+        n = len(messages) if self.prefix_len is None else min(self.prefix_len, len(messages))
+        prefix = messages[:n]
+        if not strip_thinking(prefix):
+            return None
+        return {**kwargs, "messages": prefix + messages[n:]}
+
+    async def _recovering(self, note: str) -> None:
+        """Tell the caller (the status line) about a retry; a failing hook never stops the retry."""
+        hook = self.on_recovery
+        if hook is None:
+            return
+        try:
+            await hook(note)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            print(f"WARNING: recovery hook failed: {e}")
+
+    async def _stream_once(self, kwargs: dict, on_event=None):
+        """One attempt of the streamed call; returns the final message.
 
         Requests with adaptive thinking carry the preserved-thinking mismatch policy
         (models.thinking_binding) on the beta client. If the API refuses the beta itself,
@@ -488,6 +606,10 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 "content": [{"type": "text", "text": prompt}]
             }]
 
+        # Where this turn begins: a thinking-mismatch recovery (_stream_message) strips thinking
+        # blocks from the messages before this index only, never from the ones this turn appends.
+        self.prefix_len = len(processed_messages)
+
         cicles = 0
         critique = 0
         judge = 0
@@ -550,7 +672,11 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             draft = {"text": "", "thinking": ""}
 
             async def forward_event(event) -> None:
-                if event.type == "text":
+                if event.type == "message_start":
+                    # every attempt of the call starts here, a retry after a mid-stream failure
+                    # too (_stream_message): the draft starts over instead of doubling up
+                    draft["text"] = draft["thinking"] = ""
+                elif event.type == "text":
                     draft["text"] += event.text
                     await on_text_chunk(draft["text"], is_thinking=False)
                 elif event.type == "thinking":
@@ -1097,9 +1223,19 @@ User message: {question}"""
                     new_profile = profile
         return self._render_context(recent, hits, profile), self._render_context(new_recent, new_hits, new_profile)
 
-    @staticmethod
-    def _render_context(recent: list[str], hits: list[str], profile: str = "") -> str:
-        parts = [f"Current time in UTC+0: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"]
+    def _render_context(self, recent: list[str], hits: list[str], profile: str = "") -> str:
+        """The ``<context>`` block: UTC time, the user's local time (or the hint that the zone is
+        unknown, so the agent asks once and saves it with ``set_user_timezone``; docs/design-v3.md F5),
+        then the memory lines and the profile."""
+        from bot import timezones  # stdlib-only helpers, no import-time side effects
+
+        now_utc = timezones.now_local(None)
+        zone = timezones.zone_of(self.user_settings)
+        if zone is None:
+            local_line = "User timezone: unknown (ask once and save it with set_user_timezone)"
+        else:
+            local_line = f"Local time ({timezones.zone_name(zone)}): {timezones.format_local(now_utc, zone, with_zone=False)}"
+        parts = [f"Current time in UTC+0: {now_utc.strftime('%Y-%m-%d %H:%M:%S')}", local_line]
         memory: list[str] = []
         if recent:
             memory.append("Recent conversations (newest first):\n" + "\n".join(recent))
@@ -1242,6 +1378,14 @@ User message: {question}"""
         # Persist the transcript first (local, cheap), then the long-term memory (API calls). A
         # failure here must never turn into an error for the user: the answer is already generated.
         try:
+            if self.agent.history_edited:
+                # A request of this turn only went through without the thinking blocks of the
+                # stored prefix (AgentAnthropic._stream_message): drop them from the store too,
+                # before the turn is appended, so the stored history is what was actually sent.
+                # The turn's own blocks were made against that stripped prefix and stay.
+                self.agent.history_edited = False
+                dropped = strip_thinking(transcript.messages)
+                print(f"Transcript thinking blocks were refused by the API: dropped {dropped} stored block(s)")
             transcript.messages.extend(clone(new_messages))
             transcript.model = self.agent.model
             stats = await prune(
@@ -1274,6 +1418,13 @@ User message: {question}"""
             self.image_tools.trace = trace
         if self.video_tools is not None:
             self.video_tools.trace = trace
+        if update_status:
+            # automatic retries inside the loop (AgentAnthropic._stream_message) show up as a
+            # status line, in transcript and legacy mode alike
+            async def recovering(note: str) -> None:
+                await update_status(step="recovering", details=note, iteration="-", critique="-")
+
+            self.agent.on_recovery = recovering
         received = f"Message received time in UTC+0: {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}\n\n"
         question_blocks = prompt_content.with_prefix(prompt_content.normalize(question), received)
         question = prompt_content.prompt_text(question_blocks)  # text view for everything below

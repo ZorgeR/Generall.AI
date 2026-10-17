@@ -183,7 +183,9 @@ plus active reminders and the workspace size (files, MB). Data from `stats.py`
 * Proactive tasks: agent reminders run with a framing prompt ("This is a scheduled task you
   set up earlier: <text>. It is <local time>. ...") and may answer with the marker
   `<no_update/>` alone when there is nothing worth telling the user; then nothing is sent and
-  the record notes `quiet: true`. Periodic reminders gain `weekdays` (list of 0-6) for
+  the record stores the marker as `agent_response`, `last_result` = quiet | answered and a
+  `quiet_runs` counter. Snoozing a periodic reminder adds a one-off copy (`snoozed_from`) instead
+  of moving the series. Periodic reminders gain `weekdays` (list of 0-6) for
   "every weekday at 9". `/reminders` separates "⏰ Reminders" and "🤖 Tasks".
 
 ### F7 media to the agent

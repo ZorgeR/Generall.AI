@@ -1,8 +1,13 @@
-"""/start, /help, /invite, /listusers and /voice, plus the command menu.
+"""/start, /help, /invite, /listusers, /voice and /timezone, plus the command menu.
 
 ``COMMANDS`` is the one list of user commands: the menu Telegram shows behind the "/"
 button (``bot_commands``, registered at startup by ``bot.app``) and the command section
 of ``/help`` are both rendered from it. Admin-only commands are not in it.
+
+``/timezone`` (docs/design-v3.md, F5) shows the saved zone and local time with a picker of
+``timezones.COMMON_ZONES`` (``tz_set_<index>`` buttons) and the other ways to set it (share a
+location, type a name); ``/timezone <name>`` validates with ``timezones.valid_zone`` (IANA names,
+any capitalization, big-city aliases) and saves settings ``timezone.name``.
 """
 from __future__ import annotations
 
@@ -12,9 +17,11 @@ from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from bot import timezones
 from bot.auth import auth
 from bot.config import config
-from bot.ui import answer_md, edit_md
+from bot.settings import UserSettings
+from bot.ui import answer_md, edit_md, escape_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -235,3 +242,85 @@ async def voice_button(callback: CallbackQuery, user_id: str) -> None:
         await edit_md(callback.message, f"*Choose a voice:*\n\n_Voice set to:_ {name}", reply_markup=_voice_keyboard(name))
     else:
         await edit_md(callback.message, f"Error setting voice to: {name}\nPlease try again.")
+
+
+# ---------------------------------------------------------------------------
+# /timezone
+# ---------------------------------------------------------------------------
+TZ_SET_PREFIX = "tz_set_"
+TIMEZONE_HINT = (
+    "Pick one below, send me your location, or type /timezone Europe/Berlin "
+    "(any city name works too, e.g. /timezone Kyiv)."
+)
+TIMEZONE_UNKNOWN = (
+    "❌ I don't know the time zone *{name}*.\n"
+    "Use an IANA name such as Europe/Berlin or America/New\\_York, or a big city or country name."
+)
+
+
+def timezone_set_text(name: str) -> str:
+    """Confirmation after the zone was saved (legacy Markdown), with the user's local time.
+
+    The name sits inside a bold span, where legacy Markdown takes ``_`` literally (and forbids
+    escaping), so ``America/New_York`` needs no escape here; ``timezone_overview`` shows it
+    outside a span and escapes it."""
+    zone = timezones.zone_named(name)
+    local = timezones.format_local(timezones.now_local(None), zone, with_zone=False)
+    return f"🕒 Time zone set to *{name}*.\nYour local time is {local}."
+
+
+def timezone_overview(name: str) -> str:
+    zone = timezones.zone_named(name)
+    if zone is None:
+        return f"🕒 *Your time zone* is not set: times are shown in UTC.\n\n{TIMEZONE_HINT}"
+    local = timezones.format_local(timezones.now_local(None), zone, with_zone=False)
+    return f"🕒 *Your time zone*: {escape_markdown(name)}\nLocal time: {local}\n\n{TIMEZONE_HINT}"
+
+
+def timezone_keyboard(current: str | None) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for i, name in enumerate(timezones.COMMON_ZONES):
+        label = f"✓ {name}" if name == current else name
+        button = InlineKeyboardButton(text=label, callback_data=f"{TZ_SET_PREFIX}{i}")
+        if i % 2 == 0:
+            rows.append([button])
+        else:
+            rows[-1].append(button)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@voice_router.message(F.text, Command("timezone"))
+async def timezone_command(message: Message, user_id: str, command: CommandObject) -> None:
+    settings = UserSettings(user_id)
+    args = (command.args or "").strip()
+    if not args:
+        current = str(settings.get("timezone", "name") or "")
+        await answer_md(message, timezone_overview(current), reply_markup=timezone_keyboard(current or None))
+        return
+    name = timezones.valid_zone(args)
+    if name is None:
+        await answer_md(message, TIMEZONE_UNKNOWN.format(name=args.replace("*", "").replace("_", " ")))
+        return
+    settings.set("timezone", name, "name")
+    await answer_md(message, timezone_set_text(name))
+
+
+@voice_router.callback_query(F.data.startswith("tz_"))
+async def timezone_button(callback: CallbackQuery, user_id: str) -> None:
+    """``tz_set_<index>``: a picker button; the message becomes the confirmation."""
+    try:
+        await callback.answer()
+    except Exception as e:  # noqa: BLE001 - the query may have expired
+        logger.debug("Could not answer the timezone button: %s", e)
+    if not isinstance(callback.message, Message):
+        return
+    data = callback.data or ""
+    try:
+        name = timezones.COMMON_ZONES[int(data[len(TZ_SET_PREFIX):])] if data.startswith(TZ_SET_PREFIX) else None
+    except (ValueError, IndexError):
+        name = None
+    if name is None:
+        logger.warning("Unknown timezone callback from %s: %r", user_id, data)
+        return
+    UserSettings(user_id).set("timezone", name, "name")
+    await edit_md(callback.message, timezone_set_text(name), reply_markup=timezone_keyboard(name))
