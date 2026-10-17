@@ -40,6 +40,7 @@ from bot.media import synthesize_speech, user_dir
 from bot.queue import STOP_CALLBACK_PREFIX, JobContext
 from bot.sender import ChatSender
 from bot.settings import UserSettings
+from bot.ui import delete_quietly
 from bot.status import StatusMessage, entity_safe, render_trace, stop_keyboard, trace_summary, usage_text  # noqa: F401 (re-exported)
 from bot.streaming import create_streaming_callback
 from models import ANTHROPIC_MODEL
@@ -47,6 +48,7 @@ from models import ANTHROPIC_MODEL
 logger = logging.getLogger(__name__)
 
 THINKING = "💭 *Thinking...*"
+QUIET_MARKER = "<no_update/>"  # a scheduled task answers with this alone when there is nothing to say
 STOPPED_NOTE = "⏹ Stopped — partial answer, not saved to memory."
 
 
@@ -55,6 +57,7 @@ class TurnResult:
     response: str  # the displayed answer: the follow-ups block is removed
     messages: list
     turn_id: str | None = None  # the saved turn record (bot.turn_actions), None when saving failed
+    quiet: bool = False  # the answer was the quiet marker: nothing was sent (scheduled tasks)
 
 
 def _agents():
@@ -213,6 +216,7 @@ async def run_turn(
     header: str = THINKING,
     speak: bool = False,
     reasoning_caption: str = "Reasoning history.",
+    quiet_marker: str | None = None,
 ) -> TurnResult | None:
     """Run the agent on ``prompt`` (a string, or a list of content blocks built with
     ``agents.content``: text and media refs) and deliver the result. Returns None after reporting an error.
@@ -220,6 +224,10 @@ async def run_turn(
     With ``ctx`` the status gets a Stop button for ``ctx.job`` and the drafts use
     ``ctx.job.id``; without it (no queue job) there is no Stop button. A successful
     turn is saved (``bot.turn_actions``) and gets its action and follow-up buttons.
+
+    ``quiet_marker`` (scheduled tasks): an answer consisting of exactly that marker means the
+    agent has nothing worth saying; nothing is sent, the status message is removed and the
+    result carries ``quiet=True``.
     """
     from stats import stats_tracker
     from agents import content as prompt_content  # no import-time side effects; after the patcher ran
@@ -288,6 +296,11 @@ async def run_turn(
         display, suggestions = turn_actions.parse_follow_ups(response or "")
         if not (user_settings.get("follow_ups") or {}).get("enabled", True):
             suggestions = []
+        if quiet_marker and display.strip() == quiet_marker:
+            # Nothing to tell the user: no answer, no voice, no buttons; the status goes away too.
+            status_final = True
+            await delete_quietly(status)
+            return TurnResult(response="", messages=messages, turn_id=None, quiet=True)
         limit_reached = getattr(getattr(agent, "agent", None), "limit_reached", False) is True
         record = await save_turn(user_id, turn_actions.TurnRecord(
             id=turn_actions.new_turn_id(), prompt=prompt_text, prompt_blocks=prompt_blocks, response=display, speak=speak, thread_id=thread_id,
