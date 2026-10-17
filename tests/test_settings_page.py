@@ -127,6 +127,7 @@ EDGE_SETTINGS = [
         ("semantic_search", "max_results"): 1, ("image", "max_variants"): 1, ("image", "metadata"): False,
         ("follow_ups", "enabled"): False, ("rich_messages", "enabled"): False, ("trace", "keep_summary"): False,
         ("mode", "type"): "speed", ("thinking", "enabled"): False,
+        ("browser", "enabled"): False, ("browser", "stream"): False, ("browser", "remember"): False,
     },
     {  # every number at its maximum, last choices, every setting shown
         ("transcript", "max_context_tokens"): 400000, ("transcript", "keep_tool_results_turns"): 50,
@@ -150,11 +151,12 @@ def test_page_layout_for_defaults():
     assert blocks[1].text.text == su.PAGE_HINT
     assert blocks[2].text[0].text == "Preset" and isinstance(blocks[3], InputRichBlockButtons)
     sections = details(blocks)
-    assert [d.summary.split(" · ")[0] for d in sections] == ["🧠 Memory", "🤖 Agent", "💬 Replies", "🎨 Images"]
+    assert [d.summary.split(" · ")[0] for d in sections] == ["🧠 Memory", "🤖 Agent", "💬 Replies", "🎨 Images", "🌐 Browser"]
     assert sections[0].summary == "🧠 Memory · transcript ✅ 120k · summaries ✅ 5"
     assert sections[1].summary == "🤖 Agent · auto · thinking ✅ · tools ✅ 20 · generall-ai-v2"
     assert sections[2].summary == "💬 Replies · rich ✅ · summary ✅ · follow-ups ✅"
     assert sections[3].summary == "🎨 Images · auto · auto · 2K · ×4"
+    assert sections[4].summary == "🌐 Browser · on · screenshots ✅ · logins ✅"
     assert not any(d.is_open for d in sections)  # a fresh /settings: all closed
     # Every setting is a bold paragraph followed by its button row.
     for section in sections:
@@ -169,7 +171,7 @@ def test_page_layout_for_defaults():
 
 def test_only_the_open_section_is_open():
     blocks = su.settings_page_blocks(UserSettings(str(USER)), open_section="replies")
-    assert [bool(d.is_open) for d in details(blocks)] == [False, False, True, False]
+    assert [bool(d.is_open) for d in details(blocks)] == [False, False, True, False, False]
 
 
 def test_flat_layout_has_the_same_content_without_details():
@@ -323,6 +325,37 @@ def test_advanced_toggle_hides_the_power_settings():
     assert names_on(su.settings_page_blocks(UserSettings(str(USER)), sections=False)) == names_on(basic_page)
 
 
+BROWSER_NAMES = ["🌐 Interactive browser", "📸 Show screenshots while browsing", "🔑 Remember logins"]
+
+
+def test_browser_section_has_three_everyday_toggles():
+    blocks = su.settings_page_blocks(UserSettings(str(USER)), open_section="browser")
+    browser = details(blocks)[4]
+    assert browser.is_open and browser.summary.startswith("🌐 Browser")
+    names = [b.text[0].text for b in browser.blocks if isinstance(b, InputRichBlockParagraph)]
+    assert names == BROWSER_NAMES
+    assert all(not c.advanced for c in su.SECTIONS[4].controls)
+    datas = [row_of(blocks, name).buttons[0].callback_data for name in BROWSER_NAMES]
+    assert datas == ["setp_browser_toggle", "setp_browser_stream", "setp_browser_remember"]
+    assert all(row_of(blocks, name).buttons[0].text == "✅ On" for name in BROWSER_NAMES)
+    hints = " ".join(c.hint for c in su.SECTIONS[4].controls)
+    assert "/sandbox" in hints and "close" in hints and "forget" in hints
+    off = with_values({("browser", "enabled"): False, ("browser", "stream"): False, ("browser", "remember"): False})
+    assert su.section_summary(su.SECTIONS[4], off) == "🌐 Browser · off · screenshots ❌ · logins ❌"
+    assert all(row_of(su.settings_page_blocks(off), name).buttons[0].text == "⬜ Off" for name in BROWSER_NAMES)
+
+
+@pytest.mark.parametrize("action, key", [("toggle", "enabled"), ("stream", "stream"), ("remember", "remember")])
+def test_apply_setting_browser_toggles(action, key):
+    us = UserSettings(str(USER))
+    assert su.apply_setting(us, "browser", action) is True
+    assert UserSettings(str(USER)).get("browser", key) is False
+    assert su.apply_setting(us, "browser", action, "ignored") is True
+    assert UserSettings(str(USER)).get("browser", key) is True
+    others = {"enabled", "stream", "remember"} - {key}
+    assert all(UserSettings(str(USER)).get("browser", k) is True for k in others)
+
+
 def test_parse_page_callback():
     assert su.parse_page_callback("setp_tools_iteration_30") == ("tools", "iteration", "30")
     assert su.parse_page_callback("setp_followups_toggle") == ("followups", "toggle", None)
@@ -429,7 +462,7 @@ async def test_settings_command_sends_one_rich_page(ui):
     assert kw["chat_id"] == USER and "message_thread_id" not in kw
     page = kw["rich_message"]
     assert isinstance(page, InputRichMessage) and page.markdown is None and page.html is None
-    assert len(details(page.blocks)) == 4 and not any(d.is_open for d in details(page.blocks))
+    assert len(details(page.blocks)) == 5 and not any(d.is_open for d in details(page.blocks))
 
 
 async def test_settings_command_in_a_forum_topic(ui):
@@ -496,7 +529,7 @@ async def test_page_button_applies_and_edits_in_place(ui):
     kw = bot.edit_message_text.await_args.kwargs
     assert (kw["chat_id"], kw["message_id"]) == (USER, 55)
     sections = details(kw["rich_message"].blocks)
-    assert [bool(d.is_open) for d in sections] == [False, True, False, False]
+    assert [bool(d.is_open) for d in sections] == [False, True, False, False, False]
     assert "tools ✅ 30" in sections[1].summary
     assert ui == []
 
@@ -506,6 +539,7 @@ async def test_page_button_applies_and_edits_in_place(ui):
     ("setp_sysprompt_perplexity-r1", 1, lambda s: s.get("system_prompt", "type") == "perplexity-r1"),
     ("setp_image_size_4K", 3, lambda s: s.get("image", "size") == "4K"),
     ("setp_summarization_size_10", 0, lambda s: s.get("summarization_history", "size") == 10),
+    ("setp_browser_remember", 4, lambda s: s.get("browser", "remember") is False),
 ])
 async def test_page_button_opens_the_changed_section(ui, data, open_index, check):
     bot = make_bot()
@@ -522,7 +556,7 @@ async def test_page_preset_button_applies_the_preset_and_opens_the_agent_section
     assert (s.get("mode", "type"), s.get("thinking", "enabled"), s.get("tools", "max_iteration")) == ("speed", False, 10)
     blocks = bot.edit_message_text.await_args.kwargs["rich_message"].blocks
     assert [(b.text, b.style) for b in blocks[3].buttons[:3]] == [("✅ ⚡ Fast", "primary"), ("⚖️ Balanced", None), ("🧠 Deep", None)]
-    assert [bool(d.is_open) for d in details(blocks)] == [False, True, False, False]
+    assert [bool(d.is_open) for d in details(blocks)] == [False, True, False, False, False]
     assert "speed · thinking ❌ · tools ✅ 10" in details(blocks)[1].summary
     assert ui == []
 
@@ -613,6 +647,29 @@ async def test_keyboard_followups(ui):
     await su.settings_button(make_callback("settings_followups_toggle"))
     assert UserSettings(str(USER)).get("follow_ups", "enabled") is False
     assert "Status: Disabled" in ui[-1][1]
+
+
+async def test_keyboard_browser_menu(ui):
+    await su.settings_button(make_callback("settings_main"))
+    text, keyboard = ui[-1][1], ui[-1][2]
+    assert "🌐 *Browser*: ✅ | Screenshots: ✅ | Logins: ✅" in text
+    assert "settings_browser" in [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    await su.settings_button(make_callback("settings_browser"))
+    text, keyboard = ui[-1][1], ui[-1][2]
+    assert text.startswith("*Browser Settings*") and "/sandbox" in text
+    datas = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    assert datas == ["settings_browser_toggle", "settings_browser_stream", "settings_browser_remember", "settings_main"]
+    assert [row[0].text for row in keyboard.inline_keyboard[:3]] == [
+        "✅ Interactive browser", "✅ Screenshots while browsing", "✅ Remember logins"]
+    for data, key in (("settings_browser_stream", "stream"), ("settings_browser_remember", "remember"), ("settings_browser_toggle", "enabled")):
+        await su.settings_button(make_callback(data))
+        assert UserSettings(str(USER)).get("browser", key) is False
+        assert ui[-1][1].startswith("*Browser Settings*")
+    text, keyboard = ui[-1][1], ui[-1][2]
+    assert "Interactive browser: Disabled" in text and "Remember logins: Disabled" in text
+    assert keyboard.inline_keyboard[0][0].text == "❌ Interactive browser"
+    await su.settings_button(make_callback("settings_browser_explode"))  # unknown action: just the menu again
+    assert UserSettings(str(USER)).get("browser") == {"enabled": False, "stream": False, "remember": False}
 
 
 async def test_keyboard_main_and_unknown(ui):

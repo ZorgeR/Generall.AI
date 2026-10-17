@@ -1,4 +1,5 @@
-"""ContainerManager.run_script: bundled sandbox scripts run from a unique workspace copy."""
+"""ContainerManager.run_script: bundled sandbox scripts run from a unique workspace copy, always in a
+one-off container (run_one_shot) and without the saved-package replay."""
 import importlib
 import shlex
 from pathlib import Path
@@ -31,16 +32,17 @@ def test_scripts_dir_holds_the_bundled_scripts():
 def test_run_script_copies_quotes_and_cleans_up(manager, monkeypatch):
     calls = []
 
-    def fake_run_command(user_id, command, timeout=60, network_enabled=False, mem_limit=None):
+    def fake_run_one_shot(user_id, command, timeout=60, network_enabled=False, mem_limit=None, **kw):
         parts = shlex.split(command)
         copied = manager.base_data_path / user_id / Path(parts[1]).name
         calls.append(SimpleNamespace(
             user_id=user_id, parts=parts, timeout=timeout, network_enabled=network_enabled, mem_limit=mem_limit,
-            existed=copied.exists(), content=copied.read_text() if copied.exists() else None,
+            existed=copied.exists(), content=copied.read_text() if copied.exists() else None, kw=kw,
         ))
         return BANNER + '{"ok": true}\n'
 
-    monkeypatch.setattr(manager, "run_command", fake_run_command)
+    monkeypatch.setattr(manager, "run_one_shot", fake_run_one_shot)
+    monkeypatch.setattr(manager, "run_command", lambda *a, **k: pytest.fail("run_script never uses the session"))
 
     logs = manager.run_script("7", "browse.py", ["https://x.y/?a=1&b=2", "--screenshot", "downloads/s p.png"],
                               timeout=75, network_enabled=True, mem_limit="1g")
@@ -48,6 +50,7 @@ def test_run_script_copies_quotes_and_cleans_up(manager, monkeypatch):
     assert logs.endswith('{"ok": true}\n')
     call = calls[0]
     assert call.user_id == "7" and call.timeout == 75 and call.network_enabled is True and call.mem_limit == "1g"
+    assert call.kw == {"replay_packages": False}  # bundled scripts need no saved packages
     assert call.parts[0] == "python"
     assert call.parts[1].startswith("/home/runner/workspace/temp_tool_") and call.parts[1].endswith(".py")
     assert call.parts[2:] == ["https://x.y/?a=1&b=2", "--screenshot", "downloads/s p.png"]  # shell-safe quoting
@@ -58,7 +61,7 @@ def test_run_script_copies_quotes_and_cleans_up(manager, monkeypatch):
 
 def test_run_script_defaults_and_unique_names(manager, monkeypatch):
     names = []
-    monkeypatch.setattr(manager, "run_command", lambda uid, cmd, timeout=60, network_enabled=False, mem_limit=None:
+    monkeypatch.setattr(manager, "run_one_shot", lambda uid, cmd, timeout=60, network_enabled=False, mem_limit=None, **kw:
                         names.append((shlex.split(cmd)[1], timeout, network_enabled, mem_limit)) or "")
     for _ in range(3):
         manager.run_script("7", "render_document.py")
@@ -70,14 +73,14 @@ def test_run_script_cleans_up_when_run_command_raises(manager, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("docker down")
 
-    monkeypatch.setattr(manager, "run_command", boom)
+    monkeypatch.setattr(manager, "run_one_shot", boom)
     with pytest.raises(RuntimeError):
         manager.run_script("7", "browse.py", ["https://x"])
     assert list((manager.base_data_path / "7").glob("temp_tool_*")) == []
 
 
 def test_run_script_refuses_unknown_scripts(manager, monkeypatch):
-    monkeypatch.setattr(manager, "run_command", lambda *a, **k: pytest.fail("must not run"))
+    monkeypatch.setattr(manager, "run_one_shot", lambda *a, **k: pytest.fail("must not run"))
     assert manager.run_script("7", "nope.py").startswith("Error: sandbox script not found")
     assert manager.run_script("7", "").startswith("Error: sandbox script not found")
     assert manager.run_script("7", None).startswith("Error: sandbox script not found")
@@ -87,7 +90,7 @@ def test_run_script_accepts_only_bare_names_of_bundled_scripts(manager, monkeypa
     """Anything with a directory part is refused before the filesystem is consulted, even when the
     file exists: ``../container_manager.py`` does exist next to SCRIPTS_DIR, and so does the
     absolute path of a bundled script."""
-    monkeypatch.setattr(manager, "run_command", lambda *a, **k: pytest.fail("must not run"))
+    monkeypatch.setattr(manager, "run_one_shot", lambda *a, **k: pytest.fail("must not run"))
     script = tmp_path / "custom.py"
     script.write_text("print('hi')\n")
     assert (cm_module.SCRIPTS_DIR / "../container_manager.py").is_file()

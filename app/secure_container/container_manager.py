@@ -12,6 +12,8 @@ import docker
 from docker.errors import DockerException, ImageNotFound, ContainerError
 import time
 
+from . import sessions
+
 # Cap on sandbox containers running at the same time across all users. Each container is
 # limited to 512 MB / one CPU; without a cap a burst of users could exhaust the host.
 MAX_SANDBOX_CONTAINERS = max(1, int(os.getenv("MAX_SANDBOX_CONTAINERS", "4") or "4"))
@@ -61,7 +63,13 @@ logger = logging.getLogger(__name__)
 class ContainerManager:
     """
     Manages secure Docker containers for running potentially dangerous operations.
-    Each user gets their own container that is created on demand and destroyed after use.
+
+    Commands (run_command and everything built on it: Python code, shell scripts, package installs,
+    the patched delete_file / create_directory) go to the user's PERSISTENT sandbox session
+    (``secure_container.sessions``) when SANDBOX_SESSIONS is on and the session manager is up.
+    When no session can start (memory, caps, a refused egress filter, a Docker error) or sessions
+    are off, the command runs in a one-off container created for the call and removed afterwards,
+    as before. ``run_script`` (browse_webpage, document rendering) is always one-off.
     """
     
     def __init__(self, base_data_path="./data", host_data_path=None):
@@ -97,6 +105,16 @@ class ContainerManager:
         
         # Ensure the secure container image is built
         self._ensure_image_exists()
+
+        # The process-wide persistent-session manager (idempotent: this class is constructed more
+        # than once at startup). A failure leaves sessions off: every call is then a one-off container.
+        self.session_manager = None
+        try:
+            self.session_manager = sessions.init_manager(
+                self.docker_client, f"{self.image_name}:{self.image_tag}", self.host_data_path, self.base_data_path
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Persistent sandbox sessions are unavailable, using one-off containers: {e}")
     
     def _detect_host_data_path(self):
         """
@@ -217,33 +235,72 @@ class ContainerManager:
         os.chmod(user_dir, 0o777)
         return user_dir
     
+    def _sessions(self):
+        """The session manager commands go to, or None (SANDBOX_SESSIONS off or no manager).
+
+        Read from the instance, not the module: a ContainerManager built without ``__init__``
+        (tests) has none and always uses one-off containers."""
+        if not sessions.SESSIONS_ENABLED:
+            return None
+        return getattr(self, "session_manager", None)
+
     def run_command(self, user_id, command, timeout=60, network_enabled=False, mem_limit=None):
         """
-        Run a command in a secure container for the specified user.
+        Run a command for the specified user: in the persistent sandbox session when possible,
+        else in a one-off container.
 
-        Blocks until a sandbox slot is free (see MAX_SANDBOX_CONTAINERS); callers run
-        this in a worker thread, so waiting here never blocks the bot's event loop.
+        In the session the command runs as ``timeout -k 5 <timeout> bash -lc <command>``, so shell
+        syntax works, and ``network_enabled`` / ``mem_limit`` are ignored (the session always has
+        filtered internet and its own memory limit). When no session can start (CapacityError) or
+        sessions are off, a one-off container runs ``bash -lc <command>`` with ``network_enabled``
+        and ``mem_limit`` as given (blocking until a MAX_SANDBOX_CONTAINERS slot is free); a note
+        says so. Callers run this in a worker thread.
 
         Args:
             user_id: User ID
             command: Command to run
             timeout: Timeout in seconds
-            network_enabled: Whether to enable network access for the container
-            mem_limit: Docker memory limit for this container (e.g. "1g"); None = DEFAULT_MEM_LIMIT
+            network_enabled: Network access for a one-off container
+            mem_limit: Docker memory limit for a one-off container (e.g. "1g"); None = DEFAULT_MEM_LIMIT
 
         Returns:
             Command output
         """
+        manager = self._sessions()
+        reason = None
+        if manager is not None:
+            try:
+                return manager.exec(user_id, command, timeout=timeout)
+            except sessions.CapacityError as e:
+                reason = str(e)
+                logger.warning(f"No sandbox session for user {user_id} ({reason}); using a one-off container")
+        result = self.run_one_shot(user_id, command, timeout, network_enabled, mem_limit, shell=True)
+        if reason:
+            result += (f"\n[Note: this ran in a one-off container because the persistent sandbox session is "
+                       f"unavailable: {reason} Background processes and packages installed there do not stay.]")
+        return result
+
+    def run_one_shot(self, user_id, command, timeout=60, network_enabled=False, mem_limit=None, *,
+                     shell=False, replay_packages=True):
+        """Run ``command`` in a fresh container that is removed afterwards (the pre-session path).
+
+        Blocks until a sandbox slot is free (see MAX_SANDBOX_CONTAINERS). ``shell=True`` runs it
+        through ``bash -lc`` (otherwise Docker splits the string itself, no shell syntax);
+        ``replay_packages`` reinstalls the user's saved packages first (forces network on)."""
         with _SANDBOX_SLOTS:
-            return self._run_command_in_slot(user_id, command, timeout, network_enabled, mem_limit)
+            return self._run_command_in_slot(user_id, command, timeout, network_enabled, mem_limit,
+                                             shell=shell, replay_packages=replay_packages)
 
     def run_script(self, user_id, script_path, args=(), timeout=90, network_enabled=False, mem_limit=None):
         """Run one of the bundled sandbox scripts (``secure_container/scripts/``) for a user.
 
+        Always a one-off container (:meth:`run_one_shot`), never the persistent session: the
+        browser reader and the PDF renderer need their own memory limit, and the user's saved
+        packages are NOT reinstalled first (the scripts only use the image's libraries, and a
+        replay would add network and minutes to every call).
         The script is copied into the user's workspace under a unique temp name (tool calls
-        of one message run concurrently) and executed as ``python <file> <args>`` through
-        :meth:`run_command`, so slots, mounts and the package prelude behave as for every
-        sandboxed call. ``script_path`` is the bare file name of a bundled script (anything
+        of one message run concurrently) and executed as ``python <file> <args>``.
+        ``script_path`` is the bare file name of a bundled script (anything
         with a directory part, ``../`` included, is refused: the model never chooses what runs
         here, but the tools must not be able to ship arbitrary files either); ``args`` are
         quoted for the shell. The temp file is removed afterwards; the return value is the raw
@@ -262,7 +319,7 @@ class ContainerManager:
             shutil.copy(source, target_file)
             os.chmod(target_file, 0o755)
             command = " ".join([f"python {file_in_container}"] + [shlex.quote(str(a)) for a in args])
-            return self.run_command(user_id, command, timeout, network_enabled, mem_limit)
+            return self.run_one_shot(user_id, command, timeout, network_enabled, mem_limit, replay_packages=False)
         finally:
             try:
                 if target_file.exists():
@@ -282,7 +339,21 @@ class ContainerManager:
         name = f"{prefix}_{uuid.uuid4().hex[:8]}{suffix}"
         return user_dir / name, f"/home/runner/workspace/{name}"
 
-    def _run_command_in_slot(self, user_id, command, timeout=60, network_enabled=False, mem_limit=None):
+    def _one_shot_network(self, network_enabled):
+        """docker run kwargs for a one-off container's network: none, or with network the sandbox
+        network when the session manager set it up (egress-filtered), else Docker's default bridge."""
+        if not network_enabled:
+            return {"network_mode": "none"}
+        manager = getattr(self, "session_manager", None)
+        if manager is not None:
+            kwargs = {"network": manager.network_name}
+            if sessions.DNS_SERVERS:
+                kwargs["dns"] = list(sessions.DNS_SERVERS)
+            return kwargs
+        return {"network_mode": "bridge"}
+
+    def _run_command_in_slot(self, user_id, command, timeout=60, network_enabled=False, mem_limit=None, *,
+                             shell=False, replay_packages=True):
         # Ensure user directory exists
         user_dir = self.ensure_user_directory(user_id)
         
@@ -292,7 +363,7 @@ class ContainerManager:
         package_installation_prefix = ""
 
         apt_packages = []
-        if packages_file.exists():
+        if replay_packages and packages_file.exists():
             try:
                 with open(packages_file, 'r') as f:
                     apt_packages = [line.strip() for line in f if line.strip()]
@@ -300,7 +371,7 @@ class ContainerManager:
                 logger.error(f"Error reading apt packages file for user {user_id}: {str(e)}")
 
         pip_packages = []
-        if python_packages_file.exists():
+        if replay_packages and python_packages_file.exists():
             try:
                 with open(python_packages_file, 'r') as f:
                     pip_packages = [line.strip() for line in f if line.strip()]
@@ -354,12 +425,13 @@ class ContainerManager:
         # Generate a unique container name
         container_name = f"{self.container_prefix}{user_id}-{uuid.uuid4().hex[:8]}"
         
+        command_text = command  # what the logs and the strace check look at
         try:
             # Run the container with the user directory mounted
             logger.info(f"Running command in container {container_name}: {command}")
             
-            # Determine network mode based on parameter
-            network_mode = "bridge" if network_enabled else "none"
+            # Network: none, the filtered sandbox network, or the default bridge (see _one_shot_network)
+            network_kwargs = self._one_shot_network(network_enabled)
             
             # If we have packages to install, create a script to do that first
             if package_installation_prefix:
@@ -374,6 +446,9 @@ class ContainerManager:
                 
                 # Update the command to run our script
                 command = script_in_container
+            elif shell:
+                # Through bash, like the persistent session: pipes, &&, cd and globs work
+                command = ["bash", "-lc", command]
             
             # Get the host path for the user directory to mount into the container
             # user_dir is relative to base_data_path, so we need to construct the host path
@@ -398,8 +473,8 @@ class ContainerManager:
                 name=container_name,
                 detach=True,
                 remove=False,  # We'll remove it manually after getting logs
-                network_mode=network_mode,  # Network access based on parameter
-                cap_add=["SYS_PTRACE"] if "strace" in command else None,  # Add capabilities for strace if needed
+                **network_kwargs,  # Network access based on parameter
+                cap_add=["SYS_PTRACE"] if "strace" in command_text else None,  # Add capabilities for strace if needed
                 mem_limit=mem_limit or DEFAULT_MEM_LIMIT,  # Limit memory to prevent resource exhaustion
                 cpu_quota=100000,  # Limit CPU usage (100% of one CPU)
                 cpu_period=100000
@@ -633,110 +708,49 @@ print(json.dumps(result))
             if os.path.exists(temp_file_path):
                 os.unlink(temp_file_path)
     
-    def install_package(self, user_id, package_name, timeout=300):
+    def install_package(self, user_id, package_name, timeout=300, manager="apt"):
         """
-        Install a package in the secure container and save it to the user's package list.
-        
+        Install apt or pip packages for the user and save them so new sessions reinstall them.
+
+        In the persistent session (``SessionManager.install_package``): ``sudo apt-get install`` or
+        ``pip install --user``, then the names go to installed_packages.txt (apt) or
+        installed_python_packages.txt (pip) in the workspace on success. Without a session
+        (CapacityError, sessions off) the install runs in a one-off container with network, which
+        only saves the names; the next session start reinstalls them.
+
         Args:
             user_id: User ID
-            package_name: Name of the package to install
+            package_name: One or more package names separated by spaces (validated, never a shell string)
             timeout: Timeout in seconds
-            
+            manager: "apt" (default) or "pip"
+
         Returns:
-            Installation output
+            Installation output, or "Error: ..."
         """
-        # Ensure user directory exists
-        user_dir = self.ensure_user_directory(user_id)
-        
-        # Create a script to install the package
-        script = f"""#!/bin/bash
-set -e
-echo "Installing package: {package_name}"
-sudo apt-get update
-sudo apt-get install -y {package_name}
-if [ $? -eq 0 ]; then
-    echo "Package {package_name} installed successfully"
-    exit 0
-else
-    echo "Failed to install package {package_name}"
-    exit 1
-fi
-"""
-        
-        # Run the script with network access enabled
-        result = self.run_shell_script(user_id, script, timeout, network_enabled=True)
-        
-        # If installation was successful, add the package to the user's package list
-        if "installed successfully" in result:
-            packages_file = user_dir / "installed_packages.txt"
-            
-            # Read existing packages
-            existing_packages = set()
-            if packages_file.exists():
-                with open(packages_file, 'r') as f:
-                    existing_packages = set(line.strip() for line in f if line.strip())
-            
-            # Add the new package if it's not already in the list
-            if package_name not in existing_packages:
-                existing_packages.add(package_name)
-                
-                # Write the updated package list
-                with open(packages_file, 'w') as f:
-                    for pkg in sorted(existing_packages):
-                        f.write(f"{pkg}\n")
-                
-                logger.info(f"Added {package_name} to user {user_id}'s package list")
-        
-        return result
-    
+        manager_name = str(manager or "apt").strip().lower()
+        if manager_name not in sessions.PACKAGE_FILES:
+            return 'Error: manager must be "apt" or "pip".'
+        try:
+            packages = sessions.parse_packages(manager_name, package_name)
+        except ValueError as e:
+            return f"Error: {e}"
+        session_manager = self._sessions()
+        if session_manager is not None:
+            try:
+                return session_manager.install_package(user_id, " ".join(packages), manager_name, timeout=timeout)
+            except sessions.CapacityError as e:
+                logger.warning(f"No sandbox session for user {user_id} ({e}); installing in a one-off container")
+        command = sessions.install_command(manager_name, packages)
+        result = self.run_one_shot(user_id, command, timeout, True, None, shell=True, replay_packages=False)
+        if result.startswith(("Error", "Container error")):
+            return result
+        added = sessions.add_persisted_packages(self.ensure_user_directory(user_id), manager_name, packages)
+        logger.info(f"Saved {manager_name} packages {added or packages} for user {user_id}")
+        return f"{result.rstrip()}\n{sessions.persisted_note(manager_name, packages, added)}"
+
     def install_python_package(self, user_id, package_name, timeout=300):
-        """
-        Install a Python package via pip in the secure container and persist it
-        to the user's pip package list so it is restored on future runs.
-
-        Args:
-            user_id: User ID
-            package_name: Name of the pip package to install (e.g. "requests==2.31.0" or "requests")
-            timeout: Timeout in seconds
-
-        Returns:
-            Installation output
-        """
-        user_dir = self.ensure_user_directory(user_id)
-
-        script = f"""#!/bin/bash
-set -e
-echo "Installing Python package: {package_name}"
-# --user: installs to ~/.local so the non-root runner user can write without sudo.
-# Python 3.12 always includes ~/.local/lib/python3.12/site-packages/ in sys.path.
-pip install --user {package_name}
-if [ $? -eq 0 ]; then
-    echo "Python package {package_name} installed successfully"
-    exit 0
-else
-    echo "Failed to install Python package {package_name}"
-    exit 1
-fi
-"""
-
-        result = self.run_shell_script(user_id, script, timeout, network_enabled=True)
-
-        if "installed successfully" in result:
-            python_packages_file = user_dir / "installed_python_packages.txt"
-
-            existing_packages = set()
-            if python_packages_file.exists():
-                with open(python_packages_file, 'r') as f:
-                    existing_packages = set(line.strip() for line in f if line.strip())
-
-            if package_name not in existing_packages:
-                existing_packages.add(package_name)
-                with open(python_packages_file, 'w') as f:
-                    for pkg in sorted(existing_packages):
-                        f.write(f"{pkg}\n")
-                logger.info(f"Added {package_name} to user {user_id}'s pip package list")
-
-        return result
+        """``install_package(..., manager="pip")`` (kept for SystemTools and older callers)."""
+        return self.install_package(user_id, package_name, timeout=timeout, manager="pip")
 
     def cleanup_all_containers(self):
         """Clean up all containers created by this manager"""

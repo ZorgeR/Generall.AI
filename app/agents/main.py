@@ -44,6 +44,8 @@ from agents.mcp_tools import MCPTools
 from agents.profile_tools import ProfileTools, last_shown_profile_fingerprint, profile_block, profile_store
 from agents.profile_tools import fingerprint as profile_fingerprint
 from agents.vision_tools import VisionTools
+from agents import browser_tools
+from agents.browser_tools import NOT_EXECUTED, BrowserTools, SandboxTools
 from agents.transcript import (
     MEMORY_BULLET,
     cap_text,
@@ -146,6 +148,31 @@ def is_thinking_mismatch(error: BaseException) -> bool:
     if "prefix mismatch" in text or "prefix_mismatch" in text or "signature" in text:
         return True
     return "thinking" in text and "block" in text
+
+
+# ---- client-side toolsets (agents.browser_tools) -------------------
+# A toolset member's tool_use block carries ``toolset_name`` (the family, e.g. "browser") and is
+# named after the member ("left_click"). Its tool_result must echo ``toolset_name``; a normal
+# tool's result must not carry it.
+def toolset_of(block) -> str | None:
+    """The toolset family of a tool_use block (SDK object or dict), None for a normal tool."""
+    value = block.get("toolset_name") if isinstance(block, dict) else getattr(block, "toolset_name", None)
+    return str(value) if value else None
+
+
+def tool_display_name(block) -> str:
+    """``browser.left_click`` for a toolset member, the plain tool name otherwise (trace, status, logs)."""
+    name = block.get("name") if isinstance(block, dict) else getattr(block, "name", "")
+    family = toolset_of(block)
+    return f"{family}.{name}" if family else str(name)
+
+
+def block_input(block) -> dict:
+    """A tool_use block's input as a plain dict (typed SDK inputs dumped with their wire names)."""
+    value = block.get("input") if isinstance(block, dict) else getattr(block, "input", None)
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(by_alias=True, exclude_none=True)
+    return value if isinstance(value, dict) else {}
 
 
 # Streaming config: on by default (STREAMING_ENABLED=false turns the drafts off); bot/config.py
@@ -370,33 +397,49 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         self.extra_providers.append((provider, bool(blocking)))
 
     def get_tools_schema(self):
-        """Get combined tools schema from all tool providers"""
-        tools = []
-        if self.file_ops:
-            tools.extend(self.file_ops.tools_schema)
-        if self.search_tools:
-            tools.extend(self.search_tools.tools_schema)
-        if self.code_tools:
-            tools.extend(self.code_tools.tools_schema)
-        if self.terminal_tools:
-            tools.extend(self.terminal_tools.tools_schema)
-        if self.time_tools:
-            tools.extend(self.time_tools.tools_schema)
-        if self.image_tools:
-            tools.extend(self.image_tools.tools_schema)
-        if self.video_tools:
-            tools.extend(self.video_tools.tools_schema)
-        if self.sms_tools:
-            tools.extend(self.sms_tools.tools_schema)
-        if self.user_interactions:
-            tools.extend(self.user_interactions.tools_schema)
-        if self.subagents:
-            tools.extend(self.subagents.tools_schema)
+        """Get combined tools schema from all tool providers.
+
+        A registered provider may also declare a client-side toolset (``toolset``: one nameless
+        ``tools`` entry such as ``{"type": "browser_toolset_20260801"}``, and ``toolset_name``:
+        the family its member calls carry); the entry follows that provider's own tools. With
+        ``allowed_tools`` set, a toolset stays only when its ``toolset_name`` is allowed."""
+        entries: list[tuple[str, dict]] = []  # (name used by allowed_tools, schema)
+
+        def add(schemas) -> None:
+            entries.extend((str(t.get("name") or ""), t) for t in schemas)
+
+        for slot in self._SLOT_ORDER:
+            provider = getattr(self, slot, None)
+            if provider:
+                add(provider.tools_schema)
         for provider, _blocking in self.extra_providers:
-            tools.extend(provider.tools_schema)
+            add(provider.tools_schema)
+            toolset = getattr(provider, "toolset", None)
+            if toolset:
+                entries.append((str(getattr(provider, "toolset_name", "") or toolset.get("type", "")), dict(toolset)))
         if self.allowed_tools is not None:
-            tools = [t for t in tools if t["name"] in self.allowed_tools]
-        return tools
+            entries = [e for e in entries if e[0] in self.allowed_tools]
+        return [schema for _key, schema in entries]
+
+    # named provider slots, in the order their tools are offered
+    _SLOT_ORDER = (
+        "file_ops", "search_tools", "code_tools", "terminal_tools", "time_tools",
+        "image_tools", "video_tools", "sms_tools", "user_interactions", "subagents",
+    )
+
+    def toolset_provider(self, toolset_name: str):
+        """The registered provider that owns the toolset ``toolset_name``, or None."""
+        for provider, _blocking in self.extra_providers:
+            if getattr(provider, "toolset", None) and getattr(provider, "toolset_name", None) == toolset_name:
+                return provider
+        return None
+
+    @staticmethod
+    def batch_units(tool_blocks: list) -> int:
+        """Budget units of one assistant message's tool calls: one per normal tool call, ONE per
+        toolset with calls in it (a browser batch of five actions costs one unit)."""
+        plain = sum(1 for b in tool_blocks if not toolset_of(b))
+        return plain + len({toolset_of(b) for b in tool_blocks if toolset_of(b)})
 
     async def execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
         """Execute a tool by routing to the appropriate tool provider"""
@@ -530,47 +573,107 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             return await stream.get_final_message()
 
     async def run_tool_batch(self, tool_blocks: list, trace=None, refresh=None) -> list:
-        """Run every tool_use block of one assistant message concurrently.
+        """Run every tool_use block of one assistant message.
 
-        Returns the tool_result blocks in the same order as ``tool_blocks`` (the API wants
-        all results of a message back in ONE user message). A tool that raises becomes a
-        tool_result with ``is_error`` instead of aborting the turn. ``trace`` (agents.trace
-        .ToolTrace) records each call; ``refresh(details)`` re-renders the status message
-        as calls finish.
+        Normal tools run concurrently. The calls of a client-side toolset (blocks carrying
+        ``toolset_name``, e.g. the browser) go to the provider that owns it (``execute_member``)
+        one after the other in block order, alongside the normal tools; the first failing call
+        ends the sequence and every later call of that toolset is answered with ``is_error`` and
+        ``NOT_EXECUTED``. A toolset counts as ONE tool use for the user's quota per message
+        (``track_tool_used(uid, <toolset>)``), and its provider's ``after_batch()`` runs when its
+        sequence is done (the browser's live view).
+
+        Returns the tool_result blocks in the same order as ``tool_blocks`` (the API wants all
+        results of a message back in ONE user message); a toolset result echoes
+        ``toolset_name``. A tool that raises becomes a tool_result with ``is_error`` instead of
+        aborting the turn. ``trace`` (agents.trace.ToolTrace) records each call (toolset members
+        as ``<toolset>.<member>``); ``refresh(details)`` re-renders the status message as calls
+        finish.
         """
+        results: dict[int, dict] = {}
 
-        async def run_one(block):
-            call = trace.start(block.name, block.input, depth=self.trace_depth) if trace is not None else None
-            blocks = None  # a provider may return content blocks (text + images) instead of a string
-            try:
-                raw = await self.execute_tool(block.name, block.input)
-                if isinstance(raw, list):
-                    blocks = raw
-                text = prompt_content.result_preview(raw) if blocks is not None else str(raw)
-                is_error = False
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:  # noqa: BLE001 - one broken tool must not kill the turn
-                text, is_error = f"Error executing {block.name}: {e}", True
+        def finish(block, raw, is_error: bool, call) -> dict:
+            blocks = raw if isinstance(raw, list) else None  # content blocks (text, images, browser_state)
+            text = prompt_content.result_preview(raw) if blocks is not None else str(raw)
+            name = tool_display_name(block)
             if call is not None:
                 # tools report their own failures as "Error ..." text; show those as failed too
                 call.done(text, ok=not is_error and not text.lstrip().lower().startswith("error"))
             # cut before the model sees it, so the stored transcript holds exactly what was sent
             if blocks is not None:
                 content_value = prompt_content.cap_blocks(blocks, self.max_tool_result_chars)
-                print(f"Tool name: {block.name}\nTool result: {cap_text(text, self.max_tool_result_chars)}")
+                print(f"Tool name: {name}\nTool result: {cap_text(text, self.max_tool_result_chars)}")
             else:
-                text = cap_text(text, self.max_tool_result_chars)
-                content_value = text
-                print(f"Tool name: {block.name}\nTool result: {text}")
-            if refresh is not None:
-                await refresh(f"{block.name} finished")
+                content_value = cap_text(text, self.max_tool_result_chars)
+                print(f"Tool name: {name}\nTool result: {content_value}")
             result = {"type": "tool_result", "tool_use_id": block.id, "content": content_value}
             if is_error:
                 result["is_error"] = True
+            family = toolset_of(block)
+            if family:
+                result["toolset_name"] = family
             return result
 
-        return list(await asyncio.gather(*(run_one(block) for block in tool_blocks)))
+        def start(block):
+            return trace.start(tool_display_name(block), block_input(block), depth=self.trace_depth) if trace is not None else None
+
+        async def run_one(index: int, block) -> None:
+            call = start(block)
+            try:
+                raw, is_error = await self.execute_tool(block.name, block.input), False
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - one broken tool must not kill the turn
+                raw, is_error = f"Error executing {block.name}: {e}", True
+            results[index] = finish(block, raw, is_error, call)
+            if refresh is not None:
+                await refresh(f"{block.name} finished")
+
+        async def run_toolset(family: str, items: list) -> None:
+            provider = self.toolset_provider(family)
+            if self.user_id:
+                stats_tracker.track_tool_used(self.user_id, family)  # one quota unit per message
+            failed = False
+            for index, block in items:
+                if failed:
+                    results[index] = finish(block, NOT_EXECUTED, True, None)
+                    continue
+                call = start(block)
+                try:
+                    if provider is None:
+                        raw, is_error = f"Error: the {family} tools are not available in this conversation.", True
+                    else:
+                        raw, is_error = await provider.execute_member(block.name, block_input(block))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    raw, is_error = f"Error executing {tool_display_name(block)}: {e}", True
+                results[index] = finish(block, raw, bool(is_error), call)
+                failed = bool(is_error)
+                if refresh is not None:
+                    await refresh(f"{tool_display_name(block)} finished")
+            after = getattr(provider, "after_batch", None)
+            if after is not None:
+                try:
+                    await after()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001 - a convenience, never the turn's problem
+                    print(f"WARNING: {family} after_batch failed: {e}")
+
+        plain: list = []
+        toolsets: dict[str, list] = {}
+        for index, block in enumerate(tool_blocks):
+            family = toolset_of(block)
+            if family:
+                toolsets.setdefault(family, []).append((index, block))
+            else:
+                plain.append((index, block))
+        await asyncio.gather(
+            *(run_one(index, block) for index, block in plain),
+            *(run_toolset(family, items) for family, items in toolsets.items()),
+        )
+        return [results[index] for index in range(len(tool_blocks))]
 
     async def generate_response(self, messages: list = [], prompt: str = "", system_role="", question: str = "", update_status=None, dialog_history: list = [], user_settings: dict = None, on_text_chunk=None, trace=None, budget=None) -> str:
         """Run the tool loop. ``system_role`` may be a string or a list of system blocks (with
@@ -711,7 +814,12 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                         if block.text:
                             cleaned_content.append({"type": "text", "text": block.text})
                     elif block.type == "tool_use":
-                        cleaned_content.append({"type": "tool_use", "id": block.id, "name": block.name, "input": block.input})
+                        family = toolset_of(block)
+                        if family:
+                            # a toolset member (the browser): the block keeps its family, as the API sent it
+                            cleaned_content.append({"type": "tool_use", "id": block.id, "name": block.name, "input": block_input(block), "toolset_name": family})
+                        else:
+                            cleaned_content.append({"type": "tool_use", "id": block.id, "name": block.name, "input": block.input})
                     elif block.type == "thinking":
                         cleaned_content.append({"type": "thinking", "thinking": block.thinking, "signature": block.signature})
                     elif block.type == "redacted_thinking":
@@ -724,17 +832,22 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 
                 # Execute every requested tool concurrently and build proper tool_result blocks
                 tool_blocks = [b for b in response.content if b.type == 'tool_use']
-                cicles += len(tool_blocks)
-                budget.take(len(tool_blocks))
-                last_tool_name = tool_blocks[-1].name if tool_blocks else last_tool_name
+                # one unit per normal tool call, one per toolset batch (all browser actions of
+                # this message together), so a careful step-by-step browser session is not
+                # charged per click
+                units = self.batch_units(tool_blocks)
+                cicles += units
+                budget.take(units)
+                last_tool_name = tool_display_name(tool_blocks[-1]) if tool_blocks else last_tool_name
                 last_step_category = "executing-tools"
-                print(f"\nExecuting {len(tool_blocks)} tool(s): {', '.join(b.name for b in tool_blocks)}")
+                names = ", ".join(tool_display_name(b) for b in tool_blocks)
+                print(f"\nExecuting {len(tool_blocks)} tool(s): {names}")
 
                 async def refresh(details: str) -> None:
                     if update_status:
                         await update_status(step=last_step_category, details=details, iteration=cicles, critique=critique)
 
-                await refresh("Running: " + ", ".join(b.name for b in tool_blocks))
+                await refresh("Running: " + names)
                 tool_result_blocks = await self.run_tool_batch(tool_blocks, trace=trace, refresh=refresh)
 
                 # Send tool results back as proper tool_result message
@@ -917,6 +1030,21 @@ class ChainOfThoughtAgent:
             self.agent.register_provider(self.web_tools, blocking=True)
             self.document_tools = DocumentTools(user_id, sender)
             self.agent.register_provider(self.document_tools, blocking=True)
+            # The persistent sandbox (secure_container.sessions): its facts and status whenever the
+            # process has a session manager and commands run in sessions (SANDBOX_SESSIONS); the
+            # interactive browser whenever there is a manager and the user's browser.enabled
+            # setting is on (toggling it changes the tool list: stored thinking is stripped once,
+            # as for any tool change). Subagents never get the browser.
+            self.sandbox_tools = None
+            self.browser_tools = None
+            manager = browser_tools.session_manager()
+            if manager is not None:
+                if browser_tools.shell_sessions_enabled():
+                    self.sandbox_tools = SandboxTools(user_id, self.user_settings, manager)
+                    self.agent.register_provider(self.sandbox_tools)
+                if browser_tools.browser_enabled(self.user_settings):
+                    self.browser_tools = BrowserTools(user_id, sender, self.user_settings, manager)
+                    self.agent.register_provider(self.browser_tools)
             if self.mode == "speed":
                 self.agent.thinking = False
             elif self.mode == "intelligence":
@@ -1251,7 +1379,7 @@ User message: {question}"""
         """Fast-model summary of the oldest part of a transcript (used by transcript.prune)."""
         view = text_only_view(old)
         text = "\n\n".join(f"{m['role'].upper()}: {m['content'][:4000]}" for m in view)[:60000]
-        tools = sorted({b["name"] for m in old if m.get("role") == "assistant"
+        tools = sorted({tool_display_name(b) for m in old if m.get("role") == "assistant"
                         for b in (m.get("content") or []) if isinstance(b, dict) and b.get("type") == "tool_use"})
         prompt = (
             "Summarize this earlier part of a conversation between a user and their personal AI assistant. "

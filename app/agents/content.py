@@ -6,8 +6,9 @@ base64 ``image`` / ``document`` blocks the Messages API takes, right before the 
 built, so the transcript stores exactly what was sent while turn records and logs keep the
 small reference form.
 
-A tool may likewise return a list of blocks (``text`` and ``image``) instead of a string;
-``result_preview`` / ``cap_blocks`` give the trace text and the capped content for it.
+A tool may likewise return a list of blocks (``text`` and ``image``; a browser toolset result
+also a ``browser_state`` block, the tab inventory the API renders for the model) instead of a
+string; ``result_preview`` / ``cap_blocks`` give the trace text and the capped content for it.
 
 No imports from the rest of the agent package: ``agents.transcript`` imports the token
 estimates from here.
@@ -21,6 +22,7 @@ from typing import Any
 
 MEDIA_REF = "media_ref"
 API_MEDIA_TYPES = ("image", "document")
+BROWSER_STATE = "browser_state"  # tabs + state changes after a browser toolset call (never media)
 
 IMAGE_MEDIA_TYPES = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp",
@@ -174,7 +176,8 @@ def materialize(blocks: list[dict]) -> list[dict]:
 
 def strip_media(messages: list[dict]) -> list[dict]:
     """A copy of ``messages`` with every image/document block replaced by its marker (for files
-    that must stay small: conversation history, reasoning transcripts)."""
+    that must stay small: conversation history, reasoning transcripts). Everything else, a
+    tool result's ``browser_state`` block and ``toolset_name`` included, is kept as it is."""
     out: list[dict] = []
     for m in messages:
         content = m.get("content") if isinstance(m, dict) else None
@@ -195,6 +198,23 @@ def strip_media(messages: list[dict]) -> list[dict]:
 
 
 # ---- tool results as blocks ------------------------------------------------------
+def browser_state_text(block: dict) -> str:
+    """One line for a ``browser_state`` block: the active tab, the tab count and what changed."""
+    tabs = [t for t in (block.get("tabs") or []) if isinstance(t, dict)]
+    active = next((t for t in tabs if t.get("active")), None)
+    parts = [f"{len(tabs)} tab(s)"]
+    if active is not None:
+        title = " ".join(str(active.get("title") or "").split())[:80]
+        parts.append(f"active {active.get('tab_id', '?')}: {title} {active.get('url', '')}".rstrip())
+    for change in block.get("state_changes") or []:
+        if not isinstance(change, dict):
+            continue
+        kind = str(change.get("type") or "change")
+        detail = change.get("path") or change.get("tab_id") or change.get("url") or ""
+        parts.append(f"{kind.replace('_', ' ')} {detail}".rstrip())
+    return "[browser: " + "; ".join(parts) + "]"
+
+
 def result_preview(result: Any) -> str:
     """Trace / log text of a tool result that may be a list of blocks."""
     if not isinstance(result, list):
@@ -203,6 +223,8 @@ def result_preview(result: Any) -> str:
     for b in result:
         if isinstance(b, dict) and b.get("type") == "text":
             parts.append(str(b.get("text", "")))
+        elif isinstance(b, dict) and b.get("type") == BROWSER_STATE:
+            parts.append(browser_state_text(b))
         elif isinstance(b, dict):
             parts.append(media_marker(b) or f"[{b.get('type', 'block')}]")
         else:
@@ -211,7 +233,8 @@ def result_preview(result: Any) -> str:
 
 
 def cap_blocks(blocks: list, max_chars: int | None) -> list:
-    """Text blocks cut to ``max_chars`` in total (with a note); media blocks untouched."""
+    """Text blocks cut to ``max_chars`` in total (with a note); media and ``browser_state``
+    blocks untouched (the API requires the latter verbatim and it is small)."""
     if not max_chars:
         return list(blocks)
     out: list = []
@@ -245,6 +268,9 @@ def estimate_block_tokens(block: Any) -> int:
         return max(DOCUMENT_MIN_TOKENS, int(kb * DOCUMENT_TOKENS_PER_KB))
     if kind == MEDIA_REF:
         return IMAGE_TOKENS if block.get("kind") == "image" else DOCUMENT_MIN_TOKENS
+    if kind == BROWSER_STATE:
+        # the API renders a short text from it (tabs, state changes): about its JSON size
+        return int(len(json.dumps(block, ensure_ascii=False, default=str)) / CHARS_PER_TOKEN)
     if kind == "tool_result" and isinstance(block.get("content"), list):
         return sum(estimate_block_tokens(b) for b in block["content"]) + 8
     return int(len(json.dumps(block, ensure_ascii=False, default=str)) / CHARS_PER_TOKEN)

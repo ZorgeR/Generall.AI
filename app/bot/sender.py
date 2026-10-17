@@ -21,7 +21,7 @@ from typing import Iterable
 from aiogram import Bot
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest, TelegramNotFound
-from aiogram.types import BufferedInputFile, FSInputFile, InlineKeyboardMarkup, Message, ReactionTypeEmoji
+from aiogram.types import BufferedInputFile, FSInputFile, InlineKeyboardMarkup, InputMediaPhoto, Message, ReactionTypeEmoji
 
 from bot import rich as rich_render
 from bot.ui import LEGACY_MARKDOWN, is_not_modified, strip_markdown
@@ -291,8 +291,46 @@ class ChatSender:
     ) -> Message:
         return await self.bot.send_document(document=_input_file(source, filename), caption=_caption(caption), **self._kw())
 
-    async def send_photo(self, source: str | Path | bytes, *, filename: str | None = None, caption: str | None = None) -> Message:
-        return await self.bot.send_photo(photo=_input_file(source, filename), caption=_caption(caption), **self._kw())
+    async def send_photo(
+        self,
+        source: str | Path | bytes,
+        *,
+        filename: str | None = None,
+        caption: str | None = None,
+        silent: bool = False,
+    ) -> Message:
+        """A photo from a path or from bytes (``filename`` names the upload), caption plain text.
+        ``silent`` sends it without a notification (the browser's live view)."""
+        extra = {"disable_notification": True} if silent else {}
+        return await self.bot.send_photo(photo=_input_file(source, filename), caption=_caption(caption), **extra, **self._kw())
+
+    async def edit_photo(
+        self,
+        message: Message,
+        source: str | Path | bytes,
+        *,
+        filename: str | None = None,
+        caption: str | None = None,
+    ) -> Message | None:
+        """Replace the picture (and caption) of a photo message this bot sent, in place.
+
+        Best effort like ``edit_text``: never raises. Returns the edited message, or None when
+        Telegram refused the edit ("not modified" included) or the request failed, so the caller
+        can decide whether to send a new photo instead."""
+        try:
+            edited = await self.bot.edit_message_media(
+                media=InputMediaPhoto(media=_input_file(source, filename or "photo.jpg"), caption=_caption(caption)),
+                chat_id=self.chat_id,
+                message_id=message.message_id,
+            )
+        except TelegramBadRequest as e:
+            if not is_not_modified(e):
+                logger.warning("edit_photo failed: %s", e)
+            return None
+        except Exception as e:  # noqa: BLE001
+            logger.warning("edit_photo failed: %s", e)
+            return None
+        return edited if isinstance(edited, Message) else message
 
     async def send_video(self, source: str | Path | bytes, *, filename: str | None = None, caption: str | None = None) -> Message:
         return await self.bot.send_video(

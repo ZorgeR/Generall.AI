@@ -14,7 +14,8 @@ edited in place, with two deliberate exceptions, both of which strip every
 thinking block (``strip_thinking``) because the old blocks no longer match:
 
 * a compaction boundary (``prune``): only when the estimated size exceeds
-  ``max_context_tokens``, tool results older than the last
+  ``max_context_tokens`` or the transcript holds more than ``MAX_TRANSCRIPT_IMAGES``
+  pictures (browser screenshots pile up fast), tool results older than the last
   ``keep_tool_results_turns`` user turns are cleared to a short marker, image and
   document blocks of those turns become a marker naming how to get the file back
   (``clear_old_media``) and, if
@@ -57,6 +58,14 @@ DOCUMENT_CLEARED_MARKER = (
     "[document '{title}' removed from the context to save space; it is still in the workspace: "
     "use read_document with its path]"
 )
+SCREENSHOT_CLEARED_MARKER = (
+    "[browser screenshot removed from the context to save space; take a new screenshot if you need to see the page]"
+)
+# More pictures than this in a transcript (photos, view_image results, browser screenshots, top
+# level and inside tool results) is a compaction boundary too: each one costs ~1600 tokens and
+# the API caps the images of one request. Old turns lose theirs first; if the kept turns alone
+# still hold more, older ones among them follow, the newest turn never.
+MAX_TRANSCRIPT_IMAGES = 40
 SUMMARY_TAG = "earlier_conversation_summary"
 CONTEXT_OPEN = "<context>\n"  # the per-turn context block stored first in each user turn
 MEMORY_BULLET = "• "  # one memory line (summary or semantic hit) inside a context block
@@ -280,10 +289,27 @@ def clear_old_tool_results(messages: list[dict], keep_turns: int) -> int:
     return cleared
 
 
-def _media_cleared_block(block: dict) -> dict:
+def _media_cleared_block(block: dict, screenshot: bool = False) -> dict:
     if block.get("type") == "document":
         return {"type": "text", "text": DOCUMENT_CLEARED_MARKER.format(title=block.get("title") or "document")}
-    return {"type": "text", "text": IMAGE_CLEARED_MARKER}
+    return {"type": "text", "text": SCREENSHOT_CLEARED_MARKER if screenshot else IMAGE_CLEARED_MARKER}
+
+
+def count_images(messages: list[dict]) -> int:
+    """Image blocks in the transcript: user message content and inside tool_result content lists."""
+    total = 0
+    for m in messages:
+        content = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "image":
+                total += 1
+            elif block.get("type") == "tool_result" and isinstance(block.get("content"), list):
+                total += sum(1 for part in block["content"] if isinstance(part, dict) and part.get("type") == "image")
+    return total
 
 
 def clear_old_media(messages: list[dict], keep_turns: int) -> int:
@@ -307,9 +333,10 @@ def clear_old_media(messages: list[dict], keep_turns: int) -> int:
                 cleared += 1
             elif isinstance(block, dict) and block.get("type") == "tool_result" and isinstance(block.get("content"), list):
                 inner = block["content"]
+                screenshot = bool(block.get("toolset_name"))  # a browser result: no file to reopen
                 for j, part in enumerate(inner):
                     if is_media_block(part):
-                        inner[j] = _media_cleared_block(part)
+                        inner[j] = _media_cleared_block(part, screenshot)
                         cleared += 1
     return cleared
 
@@ -339,17 +366,26 @@ async def prune(
     keep_tool_results_turns: int,
     summarize: Callable[[list[dict]], Awaitable[str]] | None = None,
 ) -> dict:
-    """Compaction boundary, in place. Below ``max_context_tokens`` nothing changes (the
-    history stays append-only). Above it: clear old tool results, then summarize the
-    oldest half until under ``PRUNE_TARGET_RATIO`` of the budget; if anything was edited,
-    strip every thinking block. Returns counters for logging."""
+    """Compaction boundary, in place. Below ``max_context_tokens`` and with at most
+    ``MAX_TRANSCRIPT_IMAGES`` pictures nothing changes (the history stays append-only).
+    Otherwise: clear old tool results and old media; while the pictures are still too many,
+    clear the media of more recent turns too (never the newest turn); then, when the size
+    was above ``max_context_tokens`` and is still above the target, summarize the oldest
+    half until under ``PRUNE_TARGET_RATIO`` of the budget (a boundary set off by the
+    pictures alone summarizes nothing). If anything was edited, strip every thinking block.
+    Returns counters for logging."""
     stats = {"cleared": 0, "cleared_media": 0, "summarized": 0, "thinking_stripped": 0}
-    if estimate_tokens(messages) <= max_context_tokens:
+    over_budget = estimate_tokens(messages) > max_context_tokens
+    if not over_budget and count_images(messages) <= MAX_TRANSCRIPT_IMAGES:
         return stats
     target = int(max_context_tokens * PRUNE_TARGET_RATIO)
     stats["cleared"] = clear_old_tool_results(messages, keep_tool_results_turns)
     stats["cleared_media"] = clear_old_media(messages, keep_tool_results_turns)
-    if estimate_tokens(messages) > target and summarize is not None:
+    keep = keep_tool_results_turns
+    while count_images(messages) > MAX_TRANSCRIPT_IMAGES and keep > 1:
+        keep -= 1
+        stats["cleared_media"] += clear_old_media(messages, keep)
+    if over_budget and estimate_tokens(messages) > target and summarize is not None:
         for _ in range(4):  # a few rounds at most; each halves the transcript
             old, rest = split_for_summary(messages)
             if not old:

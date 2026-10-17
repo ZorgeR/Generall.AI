@@ -10,11 +10,11 @@ from aiogram.filters import CommandObject
 from aiogram.types import Chat, Message
 
 from bot import app, runtime
-from bot.handlers import commands
+from bot.handlers import commands, sandbox_ui
 
 USER = "42"
-MENU = ["start", "help", "settings", "usage", "reminders", "profile", "timezone", "voice", "mcp", "cancel"]
-HELP_COMMANDS = ["/help", "/settings", "/usage", "/reminders", "/profile", "/timezone", "/voice", "/mcp", "/cancel"]
+MENU = ["start", "help", "settings", "usage", "reminders", "profile", "timezone", "voice", "mcp", "sandbox", "cancel"]
+HELP_COMMANDS = ["/help", "/settings", "/usage", "/reminders", "/profile", "/timezone", "/voice", "/mcp", "/sandbox", "/cancel"]
 
 
 class FakeAuth:
@@ -47,8 +47,12 @@ def test_help_lists_capabilities_commands_and_examples():
     assert 4 <= len(commands.HELP_EXAMPLES) <= 6
     assert all(example in text for example in commands.HELP_EXAMPLES)
     lowered = text.lower()
-    for capability in ("voice", "photo", "document", "video", "web", "code", "file", "image", "reminder", "memory"):
+    for capability in ("voice", "photo", "document", "video", "web", "code", "file", "image", "reminder", "memory", "browser"):
         assert capability in lowered, capability
+    # the interactive browser: what it does, that it asks first, and where to close it
+    browser = next(line for line in commands.HELP_ABOUT.splitlines() if "browser" in line)
+    for word in ("click", "type", "logged in", "ask you first", "/sandbox"):
+        assert word in browser, word
 
 
 def test_help_for_an_unauthorized_user_explains_the_invite_flow():
@@ -101,6 +105,7 @@ async def quiet_startup(monkeypatch, tmp_path):
         await asyncio.sleep(3600)
 
     monkeypatch.setattr(app, "reminders_loop", idle_loop)
+    monkeypatch.setattr(sandbox_ui, "session_manager", lambda: None)  # no sandbox sessions here
     yield
     for task in runtime.background_tasks:
         task.cancel()

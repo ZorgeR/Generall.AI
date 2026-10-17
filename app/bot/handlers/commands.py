@@ -33,13 +33,14 @@ voice_router = Router(name="voice")
 COMMANDS: tuple[tuple[str, str], ...] = (
     ("start", "Welcome and a few things to try"),
     ("help", "What I can do, the commands and example prompts"),
-    ("settings", "How I work: fast / balanced / deep, memory, replies, images"),
+    ("settings", "How I work: fast / balanced / deep, memory, replies, images, browser"),
     ("usage", "Your usage over the last 30 days"),
     ("reminders", "Your reminders and scheduled tasks"),
     ("profile", "What I remember about you"),
     ("timezone", "Set your time zone, e.g. /timezone Europe/Berlin"),
     ("voice", "Choose the voice of spoken replies"),
     ("mcp", "Connect MCP tool servers"),
+    ("sandbox", "Your sandbox and browser: what runs, close them, forget logins"),
     ("cancel", "Stop the current task and clear the queue"),
 )
 
@@ -84,6 +85,8 @@ HELP_ABOUT = (
     "• Look at photos, read documents (PDF, DOCX, XLSX, TXT, JSON) and watch videos\n"
     "• Research the web and read pages\n"
     "• Write and run code, work with the files in your workspace and send them back\n"
+    "• Use websites in my own browser: click, type, fill forms and stay logged in; I ask you first "
+    "before buying, paying, sending messages or deleting anything (/sandbox closes it or forgets logins)\n"
     "• Generate and edit images, make short videos\n"
     "• Set reminders and scheduled tasks that report back to you\n"
     "• Remember: conversation memory plus a profile of durable facts about you\n\n"

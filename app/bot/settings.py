@@ -46,6 +46,11 @@ DEFAULT_SETTINGS: dict[str, dict[str, Any]] = {
     # /settings page state: advanced = every setting is shown; off = only the everyday ones
     # (the presets row and the section summaries still cover the hidden values).
     "ui": {"advanced": False},
+    # Interactive browser (the agent's own Chromium in the sandbox): enabled = the browser tools are
+    # offered at all; stream = screenshots of the page are shown in the chat while the agent works;
+    # remember = cookies/logins persist between browser sessions (off = a fresh profile each time).
+    # /sandbox closes the browser or forgets the stored logins.
+    "browser": {"enabled": True, "stream": True, "remember": True},
 }
 
 SYSTEM_PROMPT_TYPES = ("generall-ai-v2", "generall-ai-v1", "perplexity-deep-research", "perplexity-r1")
