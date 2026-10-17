@@ -33,6 +33,13 @@ GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bo
 - **📝 Documents out**: the agent writes PDF, DOCX, XLSX, Markdown or HTML files from Markdown (`create_document`) and sends them to you
 - **🌐 Web reading and headless browsing**: pages are reduced to their readable content; JavaScript-heavy sites are
   rendered by a headless Chromium inside the sandbox (`browse_webpage`), with an optional screenshot
+- **🧭 Interactive browser**: the agent opens sites in its own Chromium, clicks, types, fills forms, signs up
+  and logs in, over several pages and turns, and shows you live screenshots while it works. It asks you first
+  (with a screenshot) before buying, paying, sending a message or deleting anything, and hands you captchas.
+  Logins are kept between sessions until you forget them in `/sandbox`
+- **🧰 Persistent sandbox**: commands run in your own long-lived container: background jobs keep running,
+  installed apt/pip packages are reinstalled automatically, and it closes after 30 minutes without use
+  (you get a "closing in 5 minutes" message with a Keep open button)
 - **⏰ Reminder System**: reminders in natural language, one-off or periodic (down to "every weekday"), in your
   local time; `/reminders` groups them, pushes one by +1h / +1d, edits its text, and a reminder that fires comes
   with snooze buttons (10 min, 1 h, tomorrow 09:00)
@@ -42,7 +49,7 @@ GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bo
   are; it asks once when it does not know, and then shows times and schedules reminders in your local time
 - **🔁 Retry on errors**: a failed answer ends with a plain-language reason (rate limit, overloaded provider,
   network, request too large) and a Retry button; transient provider errors are retried behind the scenes first
-- **🔒 Secure Container System**: Run unsafe commands in isolated Docker containers
+- **🔒 Secure Container System**: Run unsafe commands in isolated Docker containers that cannot reach private networks
 - **💻 Terminal Access**: Execute system commands securely through the bot interface
 - **📦 Package Management**: Install and run packages in a secure containerized environment
 - **📁 File Sharing**: Send files directly to users through Telegram
@@ -62,7 +69,7 @@ GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bo
 - **🧩 Reasoning Systems**: Multiple stages of reasoning with critique and judge mechanisms
 - **☁️ Cloud Storage**: Upload and manage files on S3-compatible storage
 - **💻 Code Execution**: Write and execute Python and Bash scripts in secure environments (SSH to your own servers is
-  possible from the sandbox shell with network enabled; there is no dedicated SSH tool)
+  possible from the sandbox shell; there is no dedicated SSH tool)
 - **💬 In-Process Communication**: Send Telegram messages, files, or reactions directly during thinking operations through tool-based interactions, not just as final bot output
 - **🎟️ Invite System**: Control access through user invites with admin oversight
   - Users can create and share limited invite codes (3 per user by default, `INVITE_LIMIT`)
@@ -310,6 +317,27 @@ save it to a file. For pages that need JavaScript the agent uses `browse_webpage
 inside the sandbox loads the page with network enabled, extracts the text and the first links and can
 take a screenshot the agent then looks at.
 
+### 🧭 Interactive browser and the persistent sandbox
+
+The agent drives a real Chromium through Anthropic's browser toolset: navigate, click, type, scroll, read the
+page or its accessibility tree, find elements, use tabs. The browser runs in its own container per user, next
+to your sandbox, and cannot reach private or local addresses. While it works you see one screenshot that
+updates in place (turn it off in `/settings` → 🌐 Browser).
+
+- **Asks before it matters**: purchases, payments, sending messages, deleting things and account-security
+  changes need your ✅ Allow on a screenshot first. Registering, logging in and accepting terms do not.
+- **You help where only you can**: it sends you a captcha or asks for the username you want.
+- **Logins persist**: cookies stay between sessions until you tap 🧹 Forget browser logins in `/sandbox`
+  (or turn off "Remember logins" in `/settings`).
+
+Commands and code run in a sandbox container that stays up while you use it, so several commands can build on
+each other and background jobs keep running. Your workspace files and the packages installed with
+`install_package` (apt or pip) persist; everything else goes when the sandbox closes after 30 minutes without
+use. Five minutes before that you get a message with 👌 OK and ⏳ Keep open 30 min. `/sandbox` shows what
+runs, when it closes, the open tabs and the saved packages, with buttons to keep it open, close it or forget
+the browser logins. A session only starts when the server has the memory for it; otherwise the bot says so
+(commands then run in a one-off container).
+
 ### 📝 Documents out
 
 Ask for a report, a table or a brief as a file: `create_document` renders Markdown to **PDF**, **DOCX**,
@@ -532,7 +560,19 @@ parentheses; see the commented block in `.env.example`):
 ### ⚙️ Concurrency
 
 - `MAX_CONCURRENT_TURNS`: agent turns running at the same time across all users (default: 8)
-- `MAX_SANDBOX_CONTAINERS`: sandbox containers running at the same time (default: 4)
+- `MAX_SANDBOX_CONTAINERS`: one-off sandbox containers running at the same time (default: 4)
+
+### 🧰 Sandbox sessions and the browser
+
+- `SANDBOX_SESSIONS`: one persistent sandbox per user (default: true; false = a throwaway container per command)
+- `SANDBOX_IDLE_SECONDS` / `SANDBOX_WARN_BEFORE_SECONDS`: closes after 30 min without use, warns 5 min before
+- `SANDBOX_SESSION_MEM_MB` / `BROWSER_MEM_MB`: memory per sandbox (768) and per browser (1536)
+- `SANDBOX_MEMORY_RESERVE_MB`: memory always left to the server (1536); sessions start only above it
+- `SANDBOX_MAX_SESSIONS` / `BROWSER_MAX_SESSIONS`: count caps, 0 = automatic from the server's memory
+  (8 GB: 8 sandboxes, 4 browsers)
+- `SANDBOX_NETWORK`, `SANDBOX_SUBNET`, `SANDBOX_DNS`: the sessions' Docker network, its subnet and resolvers
+- `SANDBOX_EGRESS_FILTER`: keep sandboxes off private networks and the host with iptables
+  (`best_effort` default, `required`, `off`)
 - `THREAD_POOL_SIZE`: worker threads for blocking work such as Docker waits and HTTP SDK calls (default: 32)
 - `TURN_TIMEOUT_SECONDS`: hard limit for one message or scheduled task (default: 1800)
 - `DROP_PENDING_UPDATES`: discard messages that arrived while the bot was down (default: true)
@@ -575,7 +615,8 @@ parentheses; see the commented block in `.env.example`):
 4. Use `/settings` to pick a preset (Fast / Balanced / Deep) and customize the bot's behavior
 5. Use `/timezone` (or share your location) so times and reminders are in your local time; `/reminders` to
    manage reminders and scheduled tasks (push, edit, snooze), `/profile` to see what the bot remembers about
-   you, `/usage` for your last 30 days, `/mcp` to connect tool servers
+   you, `/usage` for your last 30 days, `/mcp` to connect tool servers, `/sandbox` to see, keep open or close
+   your sandbox and browser and to forget the browser logins
 6. Use `/cancel` to stop the task that is running and clear your queue
 7. Use `/settings` → Rich Messages to switch between rich and classic formatting
 8. While the agent works, the "Thinking…" message lists the tool calls as they run (✅ done, ⏳ running,
