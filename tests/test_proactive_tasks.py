@@ -1,4 +1,4 @@
-"""Scheduled tasks and local-time reminders (docs/design-v3.md, F5/F11): the set_user_timezone tool,
+"""Scheduled tasks and local-time reminders: the set_user_timezone tool,
 schedule_reminder's local-time conversion and weekdays, calculate_next_trigger, the scheduler's
 framing prompt / quiet marker, and the snooze buttons on fired user reminders."""
 import datetime as dt

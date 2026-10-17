@@ -1,4 +1,4 @@
-"""The user profile (docs/design-v3.md, F8): the store, the agent's tools, the <profile> block in
+"""The user profile: the store, the agent's tools, the <profile> block in
 the per-turn context and the /profile command with its buttons."""
 import copy
 import importlib

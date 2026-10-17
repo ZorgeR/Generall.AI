@@ -10,9 +10,10 @@ A single-process Python Telegram bot (aiogram 3, asyncio) that wraps a Claude
 tool-use agent. Users send text / voice / photos / video / audio / documents in
 Telegram; the bot builds a prompt of content blocks (text, plus the photos and PDFs
 themselves as image/document blocks, with the replied-to or forwarded message quoted
-in front), runs a per-message agent loop with 43 built-in tools (files, web search and
+in front), runs a per-message agent loop with 44 built-in tools (files, web search and
 a headless browser, code execution in a Docker sandbox, image/video generation, documents
-out as pdf/docx/xlsx, reminders, SMS, S3, TTS, button questions, a user profile) plus
+out as pdf/docx/xlsx, reminders and scheduled tasks in the user's time zone, SMS, S3, TTS,
+button questions, a user profile) plus
 the tools of the user's MCP servers, persists multi-layer memory per user on disk
 (transcript, summaries + embeddings, profile), and replies in Telegram. Claude drives
 the tool loop; OpenAI (`gpt-6.1-sol`) is only consulted by the optional critique step,
@@ -28,7 +29,10 @@ settings, presets and the /settings page, auth, reminder store, text splitting, 
 module, the /stats views and /usage, the Stop buttons, the turn buttons, `ask_user_choice`, the
 reply/forward preamble and /help, content blocks and media prompts, the vision tools, the profile
 and memory_search, the MCP client and /mcp, the mode setting, the web/document tools and the
-sandbox image tag, embeddings, and how these features meet (`tests/test_cross_features.py`).
+sandbox image tag, embeddings, time zones and the /reminders UI, scheduled tasks, the agent's retry
+loop and the error path (`test_timezones.py`, `test_reminders_ui.py`, `test_proactive_tasks.py`,
+`test_stream_retry.py`, `test_error_recovery.py`), and how these features meet
+(`tests/test_cross_features.py`).
 There is no CI, linter, formatter or type checking. Validate changes with the tests and
 the import smoke check at the end of this file.
 
@@ -50,12 +54,13 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
     rich.py                 rich-message helpers: split/convert (telegramify-markdown), inline media extraction,
                             sticky "unsupported" flag, sticky "buttons inside rich messages" flag, is_chat_error
     agent_runner.py         run_turn(prompt: str | content blocks): builds ChainOfThoughtAgent, status updates (Stop
-                            button), streaming, voice reply, answer, turn record + buttons, partial answer on Stop,
-                            token accounting (record_usage), quiet_marker (scheduled tasks: an answer that is only the
-                            marker sends nothing)
+                            button, "recovering" lines from the agent's retries), streaming, voice reply, answer, turn
+                            record + buttons, partial answer on Stop, token accounting (record_usage), quiet_marker
+                            (scheduled tasks: an answer that is only the marker sends nothing); a failed turn ends as
+                            "❌ <friendly_error(e)> (trace <uuid>)" + 🔁 Retry over an error TurnRecord (ERROR_* texts)
     turn_actions.py         buttons of a finished turn: <follow_ups> parsing, TurnRecord store (data/<uid>/turns/; prompt
-                            text view + prompt_blocks media refs for Retry), turn_* callback data, action rows
-                            (Continue/Retry/Listen/Reasoning) and answer keyboard
+                            text view + prompt_blocks media refs for Retry; error = a failed turn, Retry only), turn_*
+                            callback data, action rows (Continue/Retry/Listen/Reasoning) and answer keyboard
     message_context.py      reply / forward preamble: describe_reference(message, bot_id) and with_reference(prompt,
                             message, bot_id), pure (metadata + quoted text only, nothing downloaded); every content job
                             puts it in front of its prompt
@@ -69,8 +74,8 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
     questions.py            ask_user_choice backend: in-memory pending questions (Future per question), ask_*
                             callback data, rich button rows / inline keyboard, timeout and cancel outcomes
     status.py               StatusMessage: rich status edited in place (progress blocks + Stop button → end-of-turn
-                            summary with expandable tool calls, thinking, tokens/cost, action row) with legacy-Markdown
-                            fallback
+                            summary with expandable tool calls, thinking, tokens/cost, action row; fail() = the error
+                            text + Retry row through the same _final_edit fallbacks) with legacy-Markdown fallback
     media.py                Whisper transcription, picture preparation for the agent (full-res JPEG + downscaled
                             vision copy, image_for_vision), PDF limits (pdf_page_count / pdf_fits_as_block),
                             extract_document_text, the Claude/GPT describe_* fallbacks, video frames, TTS, ffmpeg setup
@@ -80,8 +85,13 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
     limits.py               check_user_limits() (rolling 30-day action quota via stats.db)
     settings.py             DEFAULT_SETTINGS + UserSettings (single source of truth), MODE_TYPES, SETTINGS_PRESETS
                             (fast / balanced / deep) with apply_preset / current_preset
+    timezones.py            the user's zone (settings timezone.name) and local-time helpers, stdlib only: valid_zone
+                            (IANA names in any case, ALIASES of ~60 cities/countries consulted first), zone_of, format_local,
+                            to_utc, COMMON_ZONES (the /timezone picker), zone_from_location (optional timezonefinder, lazy)
     ui.py                   answer_md/edit_md helpers: legacy Markdown with plain-text fallback
-    jobs.py                 reminders scheduler loop (10 s): sends user reminders, queues agent reminders
+    jobs.py                 reminders scheduler loop (10 s): sends user reminders with snooze buttons, runs agent
+                            reminders as scheduled tasks (task_prompt framing + QUIET_MARKER through run_turn, no
+                            announcement; last_result / quiet_runs on the record)
     clients.py              lazily built OpenAI/Whisper/Anthropic clients + model name constants
     stats_report.py         /stats data: collect() → StatsReport (stats_tracker queries; blocking, run in to_thread)
                             and the legacy-Markdown text views (Unicode bars, daily sparkline, deltas vs previous 30 days,
@@ -93,8 +103,10 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
       middleware.py         AuthMiddleware(require_admin, check_limits) injects user_id / limit kwargs
       messages.py           text/voice/video/audio/photo(+albums)/document handlers (block prompts: reply/forward
                             preamble + text + image_ref/document_ref), busy notice, /cancel, Stop buttons (queue_stop_
-                            callback, stopped_message_generation update)
-      commands.py           /start, /help, /invite, /listusers, /voice; COMMANDS = the one list of user commands
+                            callback, stopped_message_generation update), on_location (a shared location sets the
+                            time zone; the agent never sees locations)
+      commands.py           /start, /help, /invite, /listusers, /voice, /timezone (picker tz_set_<i>, name or city
+                            alias, confirmation with the local time); COMMANDS = the one list of user commands
                             (the Telegram command menu via bot_commands() and the command section of /help)
       settings_ui.py        /settings: one rich page with buttons inside it (setp_ callbacks; presets row, Advanced
                             toggle, SECTIONS of Controls with friendly names, apply_setting shared with the keyboards),
@@ -111,13 +123,19 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
       turn_actions_ui.py    turn_ buttons: router (ui: Listen, Reasoning) + turn_router (chat, quota: Retry,
                             Continue, follow-ups; they echo the press and queue a turn like a typed message)
       questions_ui.py       ask_ buttons: resolve the pending question, edit it into its final state
-      reminders_ui.py       /reminders inline keyboards
+      reminders_ui.py       /reminders inline keyboards: local times, "⏰ Reminders" / "🤖 Tasks" groups, detail page
+                            with +1h / +1d / Edit text (the next text message, _pending_edits, 5 min) / Delete / Disable,
+                            ➕ New hint, snooze handling for fired reminders (reminder_snooze_), legacy-Markdown escaping
+                            of zone names
       stats_ui.py           admin /stats: dashboard photo + text view, users page, per-user view, limits, block;
                             display names cached 1 h (successful lookups only)
-  reminders_store.py        RemindersStore (`reminders_store` singleton): per-user locked JSON read/modify/write
+  reminders_store.py        RemindersStore (`reminders_store` singleton): per-user locked JSON read/modify/write;
+                            calculate_next_trigger steps daily/weekly/monthly in the reminder's zone and skips days
+                            outside `weekdays`; clean_weekdays, first_allowed_trigger, WEEKDAY_NAMES
   agents/
     main.py                 Agent core: AgentAnthropic (tool loop, named provider slots + register_provider list,
-                            tool results as text or blocks) + ChainOfThoughtAgent (memory, prompts, mode, routing,
+                            tool results as text or blocks, _stream_message = the streamed call with retries and the
+                            thinking-mismatch strip) + ChainOfThoughtAgent (memory, prompts, mode, routing,
                             persistence). The 4 system prompts live here; providers add their own instructions via
                             prompt_notes (the <capabilities> block).
     content.py              prompt / tool-result content blocks: text_block, image_ref, document_ref (stored media_ref
@@ -144,8 +162,9 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
     image_tools.py          ImageTools: one generate_image tool (generate/edit/compose) over the
                             models.IMAGE_BACKENDS table, plus generate_story_images
     video_tools.py          VideoTools: Google Veo 3.1 text→video, image→video, extend, interpolate
-    user_interactions.py    UserInteractions: mid-run Telegram messages, TTS voice, reactions,
-                            schedule_reminder, send file from content, ask_user_choice (via bot/questions.py)
+    user_interactions.py    UserInteractions: mid-run Telegram messages, TTS voice, reactions, set_user_timezone,
+                            schedule_reminder (local time, timezone, weekdays), send file from content,
+                            ask_user_choice (via bot/questions.py); prompt_notes on zones and quiet scheduled tasks
     embeddings.py           ConversationEmbeddings: OpenAI text-embedding-3-small + FAISS IndexFlatIP (cosine) per user;
                             model-tagged metadata, stale detection, one background rebuild per user per process
     system_tools.py         SystemTools: apt/pip/service/network tools — NOT wired into the agent
@@ -176,7 +195,8 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
   image_utils.py            JPEG/HEIC/PNG/WebP/GIF/BMP helpers (IMAGE_EXTENSIONS, flatten_to_rgb; pillow-heif registered
                             on import)
   voice/                    VoiceManager: ElevenLabs voice ids (voices.json) + per-user choice (config.json)
-  Dockerfile, requirements.txt   bot image (python:3.12-slim + git, docker.io, ffmpeg)
+  Dockerfile, requirements.txt   bot image (python:3.12-slim + git, docker.io, ffmpeg); timezonefinder is a commented,
+                            optional line there (time zone from a shared location)
 tests/                      pytest suite (pytest.ini sets pythonpath=app, asyncio_mode=auto)
 .github/workflows/deploy.yml  manual production deploy (workflow_dispatch, environment PROD), see "Running"
 deploy/                     render_env.py (PROD secrets+vars → .env, runs on the runner) and
@@ -184,8 +204,7 @@ deploy/                     render_env.py (PROD secrets+vars → .env, runs on t
 requirements-dev.txt        app requirements + pytest, pytest-asyncio
 docker-compose.yml          services: telegram-bot-api (local Bot API server) + bot
 .env.example                template for .env (WORKSPACE_ROOT comes from docker-compose.yml; BROWSER_SERVICE_URL is unused)
-docs/                       design notes: agent-roadmap.md (transcript / caching / subagents), design-v3.md (the v3 feature
-                            wave: reply context, mode, /usage, media blocks, profile, MCP, web/document tools, ...)
+docs/                       design notes: agent-roadmap.md (transcript / caching / subagents)
 static/                     README images only
 data/                       runtime state, git-ignored (see "On-disk data layout"); also the admin's MCP servers file
 ```
@@ -325,9 +344,17 @@ execution between host and sandbox.
 - Global caps: `MAX_CONCURRENT_TURNS` (asyncio semaphore in `QueueManager`) and
   `MAX_SANDBOX_CONTAINERS` (threading semaphore in `container_manager.py`). `TURN_TIMEOUT_SECONDS`
   cancels a stuck job and tells the user; the worker continues with the next job.
-- Agent reminders go through the same per-user queue (`bot/jobs.py`), so they never interleave with
-  the user's own turn. While queued/running the record has `status: "processing"`; a stale
-  `processing` older than twice the turn timeout is reset to `pending` on the next scan.
+- Agent reminders go through the same per-user queue (`bot/jobs.py`, label "scheduled agent task"), so they
+  never interleave with the user's own turn. The job is `run_agent_reminder`: `run_turn(prompt=task_prompt(...),
+  header="🤖 *Scheduled task...*", quiet_marker=QUIET_MARKER)`, no announcement message; the framing prompt is
+  "[Scheduled task] This is a task you scheduled earlier (id <id>; it is <local time>). Task: <text>. Do it
+  now. If there is nothing new or worth telling the user, reply with exactly <no_update/> and nothing else."
+  An answer that is exactly the marker sends nothing and deletes the status (`TurnResult.quiet`); the record
+  gets `agent_response` (the marker when quiet), `last_result` quiet|answered and a `quiet_runs` counter.
+  `run_turn` returning None (error) marks a one-shot task `failed`; a periodic one is rescheduled anyway.
+  While queued/running the record has `status: "processing"`; a stale `processing` older than twice the
+  turn timeout is reset to `pending` on the next scan. Fired user reminders are sent directly with snooze
+  buttons (`reminder_snooze_<id>_<10|60|tomorrow>`) and rescheduled/completed only once delivered.
 - Forum topics: the queue key is the chat id, so all topics of one chat share one queue.
 
 ## Request flow (text message)
@@ -354,25 +381,30 @@ worker → _run_text → prompt = message_context.with_reference(text, message, 
        `thinking` toggle. Named slots (file_ops … subagents) + register_provider(Vision, Profile, MCP, Web*, Document*)
        (* = blocking=True, run in to_thread)
     .generate_response(question, update_status, on_text_chunk)
+       ├─ agent.on_recovery = update_status(step="recovering", details=note) (transcript and legacy mode alike)
        ├─ question_blocks = content.with_prefix(normalize(question), "Message received time in UTC+0: <ts>\n\n")
        │     (the prefix goes on the first text block); question = content.prompt_text(question_blocks): the text
        │     view, media as [image: <path>] / [document: <title>], used by the classifier, memory, logs, legacy path
        ├─ pick system prompt by settings.system_prompt.type (4 inline prompts; unknown → generall-ai-v2),
        │     + RICH_/LEGACY_FORMATTING_GUIDE, + FOLLOW_UPS_GUIDE when follow_ups.enabled (<follow_ups> block),
-       │     + _provider_notes(): every provider's `prompt_notes` inside ONE <capabilities> block (VisionTools and
-       │       ProfileTools always, MCPTools only when the user has MCP tools) — all static, part of the cache prefix
+       │     + _provider_notes(): every provider's `prompt_notes` inside ONE <capabilities> block (VisionTools,
+       │       ProfileTools and UserInteractions always, MCPTools only when the user has MCP tools) — all static,
+       │       part of the cache prefix
        ├─ TRANSCRIPT MODE (default, transcript.enabled): _generate_with_transcript → load
        │     data/<uid>/transcripts/[topic_<id>_]transcript.json (seeded from dialog_history.json on first use);
        │     static prompt (time stripped) as ONE cached system block (ttl SYSTEM_CACHE_TTL); fingerprint of
        │     model + static prompt + tools changed → strip stored thinking; _request_context(question, status,
-       │     messages) → <context> = time + <memory> (recent summaries + FAISS hits not shown before) +
+       │     messages) → <context> = UTC time + "Local time (<zone>): … (UTC+2)" or "User timezone: unknown (ask
+       │     once and save it with set_user_timezone)" (_render_context, settings timezone.name) + <memory> (recent
+       │     summaries + FAISS hits not shown before) +
        │     <profile fingerprint="..."> (profile.enabled; only when the fingerprint differs from the last one shown
        │     in this transcript), stored as the first block of the new user turn; _decide_complexity: mode auto AND
        │     no media → Haiku classifier (text view, context blocks excluded), else "complex"; "simple" → tool-less
        │     Haiku answer on the FULL context (profile every time); _build_user_message materializes the media refs
        │     (base64 image/document blocks, to_thread) behind the <context> text block; tool loop on the real
-       │     transcript (tool results capped before the model sees them); then append the turn exactly as sent,
-       │     judge/critique/SYSTEM NOTICE included; prune only above max_context_tokens (clear old tool results AND
+       │     transcript (tool results capped before the model sees them); history_edited → strip every thinking
+       │     block of the stored transcript first (the prefix was sent stripped); then append the turn exactly as
+       │     sent, judge/critique/SYSTEM NOTICE included; prune only above max_context_tokens (clear old tool results AND
        │     old image/document blocks → text markers, summarize oldest half, strip thinking); save;
        │     summaries/FAISS/dialog_history.json still written. LEGACY MODE below:
        ├─ semantic_search: FAISS hits appended to the system prompt (to_thread; failure → skipped)
@@ -383,10 +415,19 @@ worker → _run_text → prompt = message_context.with_reference(text, message, 
        │     + short_term_memory.json messages whose FIRST block is text (reasoning_context)
        │     + the question                       (all three gated by short_term_memory.enabled too)
        ├─ _classify_complexity (Haiku, auto mode only) → "simple": tool-less Haiku answer; on any error fall back ↓
-       ├─ AgentAnthropic.generate_response: for iteration in range(tools.max_iteration):
-       │     messages.stream (always) (model, system, tools=get_tools_schema(), request_options_for(model, thinking):
-       │        output_config.effort + adaptive thinking for Sonnet, nothing for the fast model; max_tokens_for:
-       │        64000 deep / 16000 light / ANTHROPIC_MAX_TOKENS_FAST; thinking tokens count against it)
+       ├─ AgentAnthropic.generate_response: prefix_len = len(incoming messages);
+       │  for iteration in range(tools.max_iteration):
+       │     _stream_message → messages.stream (always) (model, system, tools=get_tools_schema(),
+       │        request_options_for(model, thinking): output_config.effort + adaptive thinking for Sonnet, nothing
+       │        for the fast model; max_tokens_for: 64000 deep / 16000 light / ANTHROPIC_MAX_TOKENS_FAST; thinking
+       │        tokens count against it)
+       │        RateLimitError / APIStatusError ≥ 500 or overloaded / APIConnectionError → retried after
+       │        STREAM_RETRY_DELAYS 2, 5, 12 s (a numeric Retry-After wins, ≤ MAX_RETRY_AFTER 30 s), each retry
+       │        on_recovery(note) → status step "recovering" ("Retrying after a rate limit (2/3)"); the 4th failure
+       │        propagates. A 400 naming thinking blocks / signatures / prefix mismatch (is_thinking_mismatch, not the
+       │        binding-beta refusal) → retried once with the thinking blocks of the first prefix_len messages removed,
+       │        history_edited = True (the rest of the turn sends the prefix stripped); other 4xx propagate at once.
+       │        forward_event resets the draft accumulators on message_start, so a retried stream starts over
        │     stop_reason == tool_use AND tools.enabled AND cicles < max → run ALL blocks concurrently
        │        (run_tool_batch: asyncio.gather, is_error on exceptions, trace + status refresh per call; a tool may
        │        return a str OR a list of text/image blocks: cap_blocks cuts only the text, the trace shows [image]),
@@ -403,7 +444,8 @@ worker → _run_text → prompt = message_context.with_reference(text, message, 
     record_usage(): one usage_events row per model of the turn (tokens, cache, tool calls, cost estimate)
     turn_actions.parse_follow_ups(response) → (display, suggestions): the LAST <follow_ups> block is cut from
        the visible answer (always) and becomes ≤4 suggestions (none when follow_ups is off)
-    quiet_marker given (scheduled tasks) and display == marker → nothing sent, status deleted, TurnResult(quiet=True)
+    quiet_marker given (scheduled tasks: bot/jobs.run_agent_reminder passes QUIET_MARKER "<no_update/>" with the
+       framing prompt, see "Queues") and display == marker → nothing sent, status deleted, TurnResult(quiet=True)
     save_turn(): TurnRecord(id 12 hex, prompt (text view), prompt_blocks (media refs, Retry re-runs them), display,
        speak, thread, limit_reached, follow_ups) + reasoning text (if reasoning_context.enabled) → data/<uid>/turns/
        (to_thread, newest 50 kept)
@@ -415,12 +457,21 @@ worker → _run_text → prompt = message_context.with_reference(text, message, 
        rich (default): split ≤32 KB → sendRichMessage(markdown) → on parse error rich HTML
        (telegramify-markdown) → on 404 sticky MarkdownV2 → legacy Markdown → raw; status deleted after
        legacy (rich_messages off): ≤4000 edit status in place; else new chunks + notice
-    buttons (success only): actions = ▶️ Continue (limit_reached) · 🔁 Retry · 🔊 Listen (TTS key) · 📄 Reasoning
+    buttons (success; a failed turn gets 🔁 Retry alone, see "errors" below): actions = ▶️ Continue (limit_reached) ·
+       🔁 Retry · 🔊 Listen (TTS key) · 📄 Reasoning
        (stored); on the summary when it took them, else under the last answer message below the follow-up
        rows (one per row). The reasoning file is sent only by its button; if save_turn failed it is sent
        right away (send_reasoning_file) and the turn gets no buttons
     returns TurnResult(response=display, messages, turn_id)
-    errors → status edited to "❌ An error occurred. Trace ID: …", no buttons, returns None
+    errors → logger.exception("Turn failed … (trace <uuid>)"); record_usage unless the agent had already returned
+       (counted then); a status that already became the answer/summary is left alone; else save_turn(TurnRecord(
+       prompt, prompt_blocks, response="", error=friendly_error(e, trace_id))) (no reasoning file) and
+       status_msg.fail("❌ <reason> (trace <uuid>)", actions=record_actions(record) = 🔁 Retry only): rich paragraph +
+       button row → inline keyboard once rows are refused → plain text + keyboard; a failed save → the text without
+       buttons. friendly_error: RateLimitError → ERROR_RATE_LIMIT, APIConnectionError/APITimeoutError → ERROR_NETWORK,
+       APIStatusError ≥ 500 or overloaded → ERROR_OVERLOADED, 413 or a BadRequestError saying too large / prompt is too
+       long / max_tokens / exceed → ERROR_TOO_LARGE, aiogram TelegramAPIError → "Telegram refused the message: <≤120
+       chars>", else "Something went wrong.". Returns None
     CancelledError → user stop before the agent returned: partial answer; status "🛑 Stopped." (user) /
        "🛑 Cancelled." (deadline, shutdown), unless it already became the answer/summary; re-raised
 ```
@@ -476,6 +527,9 @@ topics: Telegram sets `reply_to_message` on every topic message to the topic's c
   failed extraction → describe fallback. `on_document` reroutes video extensions to the video job and every
   `image_utils.IMAGE_EXTENSIONS` (jpg/jpeg/heic/heif/png/webp/gif/bmp) to the image job (single or album);
   everything else is rejected with the supported list.
+- Pre-processing failures inside the image and document jobs (download, conversion, extraction) are not turn
+  errors: they edit the status to "❌ An error occurred while processing the images/document. Trace ID: …" with
+  no Retry button. Only a failure inside `run_turn` gets the friendly reason, the error record and 🔁 Retry.
 
 Return-type note: both `generate_response` methods are annotated `-> str` but return
 `(text, messages)` tuples. `ChainOfThoughtAgent.generate_response(question)` and `run_turn(prompt=...)`
@@ -538,7 +592,7 @@ API even when `tools.enabled` is false. All `tool_use` blocks of one assistant m
 exception becomes a `tool_result` with `is_error: true`, a returned string starting with "Error" is passed
 through as content (shown ❌ in the trace).
 
-Effective tool list as the model sees it (after patching; 43 built-in tools plus the user's `mcp_*` ones):
+Effective tool list as the model sees it (after patching; 44 built-in tools plus the user's `mcp_*` ones):
 
 | Provider | Tools | Runs where |
 |---|---|---|
@@ -552,7 +606,7 @@ Effective tool list as the model sees it (after patching; 43 built-in tools plus
 | ImageTools | `generate_image` (no `images` → generate, one → edit, several → compose; engine `auto`/`best`/`fast`/`story`), `generate_story_images` | bot process (SDK calls in worker threads), never sandboxed, delivers each result itself as a document, once |
 | VideoTools | `video_generator`, `image_to_video_generator`, `video_from_reference_images`, `video_interpolation_generator`, `video_extension_generator` | bot process (Veo in worker threads, async polling up to 5 min) |
 | SMSTools | `send_sms` | bot process, worker thread |
-| UserInteractions | `send_user_telegram_message`, `send_voice_message`, `set_message_reaction`, `schedule_reminder`, `send_file_content_to_user_via_telegram`, `ask_user_choice` (question + 2-8 option buttons, waits for the tap up to `timeout_seconds` 30..900, default 300; returns `User chose: "<option>"`, a no-answer notice or `Error: …`) | bot process |
+| UserInteractions | `send_user_telegram_message`, `send_voice_message`, `set_message_reaction`, `set_user_timezone` (IANA name or city/country alias via `timezones.valid_zone`; saves settings `timezone.name` in to_thread and returns the user's local time, `Error: unknown time zone …` otherwise), `schedule_reminder` (reminder_text; reminder_time `YYYY-MM-DD HH:MM[:SS]` read in the user's zone, or in the optional `timezone` param, unless it carries a `Z`/`±HH:MM` offset, which wins; reminder_type user\|agent; is_periodic + period_type hourly\|daily\|weekly\|monthly + period_interval; `weekdays` [0=Mon..6=Sun] for daily periodic reminders only, the first run moved to an allowed day by `first_allowed_trigger`; stores UTC plus the zone; confirms in local time; user reminders fire with snooze buttons, agent tasks run as scheduled tasks and may answer `<no_update/>`), `send_file_content_to_user_via_telegram`, `ask_user_choice` (question + 2-8 option buttons, waits for the tap up to `timeout_seconds` 30..900, default 300; returns `User chose: "<option>"`, a no-answer notice or `Error: …`); its `prompt_notes` (static) tell the model to infer or ask for the zone once and save it, to schedule and confirm in local time, and to answer exactly `<no_update/>` on an uneventful scheduled run | bot process |
 | SubagentTools | `run_subagent` (task, tools subset, model main/fast, max_tool_calls) | bot process: a fresh `AgentAnthropic` with the same providers (registered ones included), empty non-persisted context, budget slice of the parent's `TurnBudget`, trace depth 1; main agent only (a subagent has no `run_subagent`); model "main" is `ANTHROPIC_MODEL` whatever the mode |
 | VisionTools (registered, awaited) | `view_image` (path, max_px 128..2048, default `MAX_IMAGE_RESOLUTION_VISION`) → `[image block, text "<rel path> · WxH px (shown at wxh)"]` (JPEG/PNG/GIF/WebP within the limits and upright pass through unchanged, else re-encoded as JPEG); `describe_image` (path, question?, model anthropic\|openai) → text from `bot.media.describe_image_anthropic/openai` (temp JPEG in the system temp dir; the OpenAI call writes its own usage row); `read_document` (path, question?) → a PDF within the limits as `[document block, text "<name> · N pages"]`, else extracted text capped at `vision_tools.EXTRACTED_TEXT_CAP` (60000), unknown types through `describe_document` | bot process, never sandboxed; paths via `resolve_under` with images/downloads/documents fallbacks |
 | ProfileTools (registered, awaited) | `user_profile_read`, `user_profile_add(section, text)`, `user_profile_remove(section, needle)`, `user_profile_replace(section, old, new)`; needle = exact entry, a unique substring or a 1-based index; results = confirmation + the numbered section; registered always (the `profile` setting only gates the `<profile>` block in the context) | bot process, file I/O in to_thread |
@@ -658,14 +712,18 @@ data/
                                     answer (≤ 2000 chars each), timestamp, topic, text_hash}]}; a bare list (legacy) is treated as stale;
                                     both files written tmp + os.replace
     turns/<turn id>.json, <turn id>.reasoning.txt
-                                    one TurnRecord per successful turn (prompt = text view, prompt_blocks = media refs when the
-                                    prompt had media, displayed answer, speak, thread_id, limit_reached, follow_ups, has_reasoning)
-                                    + its reasoning transcript; what the turn_ buttons load; newest 50 kept (pruned on save);
-                                    atomic writes
+                                    one TurnRecord per turn (prompt = text view, prompt_blocks = media refs when the prompt had
+                                    media, displayed answer, speak, thread_id, limit_reached, follow_ups, has_reasoning, error =
+                                    the friendly reason of a FAILED turn: response "", no reasoning file, Retry only; records
+                                    without the key read as null) + its reasoning transcript; what the turn_ buttons load;
+                                    newest 50 kept (pruned on save); atomic writes
     reminders/reminders.json        list of {id (8 hex), user_id, text, time (ISO UTC), type: user|agent,
                                     status: pending|processing|completed|failed, created_at, is_periodic, period_type,
                                     period_interval, last_triggered, next_trigger, enabled, [completed_at],
-                                    [agent_response], [processing_since]}; written atomically under a per-user lock
+                                    [agent_response: the task's answer, "<no_update/>" after a quiet run], [processing_since],
+                                    [timezone: IANA zone it was scheduled in, "" = UTC], [weekdays: [0..6], daily periodic only],
+                                    [last_result: quiet|answered], [quiet_runs: int], [snoozed_from: id of the periodic
+                                    reminder this one-off copy was snoozed from]}; written atomically under a per-user lock
     images/                         image_<uuid>.jpg (uploads, full resolution, the path the prompt names) + image_<uuid>_v.jpg (the
                                     downscaled copy the model saw; Retry re-sends it, so it must stay), video_frame_<uuid>.jpg,
                                     generated_*/transformed_*/composed_*/gpt_generated_*/gpt_edited_*/story_image_*, edit_input_* (transient)
@@ -731,6 +789,10 @@ Memory semantics worth knowing before touching `ChainOfThoughtAgent.generate_res
 - Reloading `short_term_memory.json` keeps only messages whose first block is `text`. With thinking
   on, intermediate tool-calling assistant turns start with a `thinking` block and are dropped; the
   final answer (re-appended as text-only) is kept. Tool-result user messages are never reloaded.
+- Scheduled tasks are ordinary turns for the memory: the framing prompt and the answer, `<no_update/>`
+  included, are appended to the transcript, written to dialog_history.json, summarized by Haiku and embedded
+  like any turn; the agent core knows nothing about the marker (`run_turn` checks it after `generate_response`
+  returned, and only skips the delivery).
 - Prompt caching (transcript mode): the static system prompt is one `text` block with an explicit
   `cache_control` breakpoint (`SYSTEM_CACHE_TTL`), covering the tool schemas before it; every request also
   passes the top-level `cache_control={"type": "ephemeral"}` so the API places an automatic breakpoint on
@@ -772,7 +834,7 @@ every `set`. `run_turn` saves once per turn so new defaults reach disk. Agent co
 | `semantic_search` | enabled (true), max_results (3, 1..20) | FAISS hits in system prompt |
 | `thinking` | enabled (true) | on ("deep"): adaptive thinking, `display: summarized`, effort `ANTHROPIC_EFFORT` (high), max_tokens `ANTHROPIC_MAX_TOKENS` (64000); off ("light"): still adaptive, `display: omitted`, effort `ANTHROPIC_EFFORT_LIGHT` (low), max_tokens 16000. Never `disabled` (`models.anthropic_request_options` / `anthropic_max_tokens`). Overridden by `mode` speed (off) and intelligence (on) |
 | `mode` | type (`auto`; also `speed`, `intelligence`; `MODE_TYPES`) | `ChainOfThoughtAgent.__init__` (`_mode_of`: unknown → auto) and `_decide_complexity`. auto: the Haiku classifier picks quick answer vs full agent, model `ANTHROPIC_MODEL`, thinking = the toggle; speed: no classifier, the fast model runs the whole tool loop (`request_options_for` gives it no effort/thinking, `ANTHROPIC_MAX_TOKENS_FAST`), thinking off; intelligence: no classifier, `ANTHROPIC_MODEL`, thinking on. A prompt with media is always "complex" |
-| `timezone` | name ("" = unknown, IANA zone) | wave 3 (timezone + reminders UI: `bot/timezones.py`, `/timezone`, local times in the context block and reminders); see the note at the top of "Known pitfalls" |
+| `timezone` | name ("" = unknown → times in UTC; a canonical IANA name otherwise) | set by `/timezone` (picker `tz_set_<i>` over `COMMON_ZONES`, or `/timezone <name\|city>` through `timezones.valid_zone`), by sharing a location (`messages.on_location`, needs the optional `timezonefinder`) or by the agent's `set_user_timezone`; not on the `/settings` page. Read by `_render_context` (the local-time line of the `<context>` block), `schedule_reminder` (default zone of `reminder_time`), `jobs.task_prompt` (the time in the framing prompt) and the `/reminders` pages (`timezones.format_local`) |
 | `profile` | enabled (true) | the `<profile>` block in the `<context>`; the `user_profile_*` tools work regardless (the model then sees the file only via `user_profile_read`) |
 | `ui` | advanced (false) | `/settings` page only: off hides the power settings (`Control.advanced`); the section summaries still show their values |
 | `rich_messages` | enabled (true) | answers as Telegram rich messages (native GFM); off = legacy Markdown v1 path; also selects the `<formatting>` prompt section and rich vs plain streaming drafts |
@@ -877,6 +939,11 @@ SearchTools and the embeddings `OpenAI` are per instance; ElevenLabs is per call
 | `THINKING_PREFIX_MISMATCH` (drop_block) | `models` | preserved-thinking safety net sent with the `thinking-binding-controls-2026-08-01` beta: `drop_block` drops a stale thinking block instead of failing, `error` fails (finds history edits while testing), `off` sends neither |
 | `PROMPT_CACHING` (true), `SYSTEM_CACHE_TTL` (1h), `ANTHROPIC_MAX_TOKENS_FAST` (16000), `ANTHROPIC_MAX_TOKENS_FAST_SHORT` (2048) | `models` | explicit breakpoint on the static system block + top-level automatic caching of the conversation tail (`cache_control` kwarg); max_tokens for fast-model subagents; max_tokens for the short fast-model calls (topic, summary, classifier) |
 
+Optional dependency, not an env var: `timezonefinder` (a commented line in `app/requirements.txt`). When it is
+installed, a shared Telegram location sets the time zone (`timezones.zone_from_location`: lazy import, one
+cached instance, the polygon load runs in a worker thread); without it the bot answers `LOCATION_NO_FINDER`
+and asks for the zone name. Nothing else depends on it.
+
 Never commit `.env`, `data/`, `temp_photos/`, `temp_docs/`, `temp_audio/` (git-ignored by exact
 name; a new temp dir needs its own `.gitignore` line).
 
@@ -884,7 +951,8 @@ name; a new temp dir needs its own `.gitignore` line).
 
 - Routers and middleware (`bot/handlers/__init__.py`): `public` (/start, /help, /invite: no auth; /help
   shows unauthorized users the invite flow), `admin` (/listusers, /stats: `AuthMiddleware(require_admin=True)`),
-  `ui` (/voice, /settings, /reminders, /usage, /profile, /mcp, /cancel, `queue_cancel`, Stop, `ask_` answers,
+  `ui` (/voice, /timezone + `tz_` buttons, /settings, /reminders + the pending-edit text handler, /usage,
+  /profile, /mcp, /cancel, `queue_cancel`, Stop, shared locations (`F.location` → time zone), `ask_` answers,
   Listen/Reasoning, `usage_`/`profile_`/`mcp_` buttons: `AuthMiddleware()`, also on the
   `stopped_message_generation` observer), `chat` (content handlers and the turn-starting buttons
   Retry/Continue/follow-ups: `AuthMiddleware(check_limits=True)` on message AND callback_query). Handlers
@@ -896,8 +964,11 @@ name; a new temp dir needs its own `.gitignore` line).
   pointers to /help and /settings via `answer_md`; the unauthorized branch is unchanged HTML), `/help`
   (`HELP_ABOUT` capabilities, the `COMMANDS` with one-line descriptions, tips, 6 example prompts; legacy
   Markdown), `/invite [code]`, `/voice`, `/settings`, `/usage`, `/profile`, `/mcp [add <name> <url> [token]
-  [sse] | remove <name> | refresh [name] | help]`, `/reminders`, `/cancel`, `/stats` (admin), `/listusers`
-  (admin). `/timezone` is in the command menu already; its handler lands with wave 3.
+  [sse] | remove <name> | refresh [name] | help]`, `/reminders`, `/timezone [name|city]` (`commands.py`,
+  `voice_router`: no argument → the saved zone and local time, a picker of `timezones.COMMON_ZONES` two per
+  row (`tz_set_<index>`) and the hint to share a location or type a name; an argument → `valid_zone`, save,
+  confirm with the local time (`timezone_set_text`), or `TIMEZONE_UNKNOWN`), `/cancel`, `/stats` (admin),
+  `/listusers` (admin).
 - Command menu: `commands.COMMANDS` (start, help, settings, usage, reminders, profile, timezone, voice, mcp,
   cancel; descriptions ≤ 256 chars) is the one list: `bot_commands()` feeds `set_my_commands` at startup and
   `help_text` renders the command section of /help from it. /invite and the admin-only commands are not
@@ -909,13 +980,28 @@ name; a new temp dir needs its own `.gitignore` line).
   answers "expired"), `stats_`, `usage_refresh` (`usage_ui.usage_button` matches `usage_`), `profile_`
   (`profile_refresh`, `profile_clear`, `profile_clear_yes`, `profile_cancel` → `profile_ui.profile_button`),
   `mcp_<action>[_<name>]` (`mcp_toggle_`, `mcp_refresh_`, `mcp_remove_` → confirm `mcp_rm_` / `mcp_back`,
-  `mcp_refreshall` → `mcp_ui.mcp_button`; actions carry no underscore, names are `[a-z0-9_-]`). `tz_` is
-  reserved for the wave-3 timezone picker; `rem_` is NOT free. A new family needs a prefix that is not a
-  prefix of (and does not start with) any other, and a `@router.callback_query(F.data.startswith(...))`
-  handler on the router with the right middleware; `tests/test_cross_features.py::ROUTING` checks that every
-  family reaches its own handler in router order (rows exist for usage_, profile_, mcp_, setp_preset_,
-  setp_ui_advanced, settings_preset_, settings_mode_set_). Read the chat from `callback.message.chat.id`
-  and guard `isinstance(callback.message, Message)`. Answer the callback best-effort (an old query raises).
+  `mcp_refreshall` → `mcp_ui.mcp_button`; actions carry no underscore, names are `[a-z0-9_-]`), `tz_set_<index>`
+  (the /timezone picker → `commands.timezone_button`, an index into `COMMON_ZONES`). The reminders family
+  (`reminders_ui.reminder_button`, parsed `split("_", 2)` → action + payload, a trailing `_<value>` taken off
+  the payload with `rpartition`): `reminders_page_<n>`, `reminders_summary`, `reminders_new`, `reminder_info_<id>`,
+  `reminder_delete_<id>`, `reminder_toggle_<id>`, `reminder_delay_<id>_<minutes>` (+1h = 60, +1d = 1440),
+  `reminder_edit_<id>`, `reminder_editcancel_<id>`, `reminder_snooze_<id>_<10|60|tomorrow>` (on fired
+  reminders, built by `jobs.snooze_keyboard`); group titles and spacers are `noop`. `rem_` is NOT free. A new
+  family needs a prefix that is not a prefix of (and does not start with) any other, and a
+  `@router.callback_query(F.data.startswith(...))` handler on the router with the right middleware;
+  `tests/test_cross_features.py::ROUTING` checks that every family reaches its own handler in router order
+  (rows exist for usage_, profile_, mcp_, setp_preset_, setp_ui_advanced, settings_preset_, settings_mode_set_,
+  tz_set_, reminder_snooze_, reminder_delay_, reminder_edit_, reminders_new). Read the chat from
+  `callback.message.chat.id` and guard `isinstance(callback.message, Message)`. Answer the callback best-effort
+  (an old query raises).
+- Message handlers outside `chat`: `reminders_ui.reminder_edit_text` (`F.text & ~F.text.startswith("/")` AND
+  `_edit_is_pending`: the chat has a pending `✏️ Edit text`, `_pending_edits[user_id] = (reminder id, monotonic
+  deadline)`, `EDIT_TIMEOUT` 300 s) sits on the `ui` router, which runs before `chat`, so the next plain text
+  becomes the reminder text and never reaches the agent; it is not a queue job, so it also works while a turn
+  runs. Commands pass through the filter; only `/reminders` and `✖️ Cancel edit` clear the pending state.
+  `messages.on_location` (`F.location`, `control_router`) sets the zone from a shared location
+  (`zone_from_location` in `to_thread`) and confirms with `commands.timezone_set_text`, or asks for the name
+  (`LOCATION_NO_FINDER`) when `timezonefinder` is missing; the location never reaches the agent.
 - Buttons inside rich messages (`InputRichBlockButtons` rows: the settings page, the status Stop and action
   rows, questions) depend on the sticky process-wide `rich.buttons_available()` flag; a refusal proven to
   be about the row (the same blocks without it pass) or naming buttons sets `mark_buttons_unavailable`,
@@ -931,7 +1017,11 @@ name; a new temp dir needs its own `.gitignore` line).
   `media_root` (`data/<uid>`): in the rich tier they are uploaded with the message as `tg://photo?id=`
   media, in every other tier the caption stays in the text and the file is sent as a photo/video after
   it. Unresolvable images (missing, outside the workspace, too big) are replaced by their caption. Escape
-  user/LLM text embedded in Markdown with `bot.ui.escape_markdown`. Invite/admin replies use HTML.
+  user/LLM text embedded in Markdown with `bot.ui.escape_markdown`. Invite/admin replies use HTML. Zone
+  names carry `_` (`America/New_York`): the reminders pages and `/timezone` escape them outside bold spans
+  (`_zone_line`, `_format_time`, `snooze_text`, `timezone_overview`) and leave them bare inside `*…*`
+  (`timezone_set_text`), where legacy Markdown takes `_` literally and a `\` would show; button labels are
+  plain text (`tests/test_reminders_ui.py::test_zone_names_with_underscores_are_escaped_on_every_page`).
 - Keyboards: `InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=..., callback_data=...)]])`
   (keyword arguments are mandatory in aiogram).
 - Every content handler: track_message_received → `submit(message, Job(...))`. The job function
@@ -954,9 +1044,18 @@ name; a new temp dir needs its own `.gitignore` line).
   `/profile` sends the profile as pages of ≤ `PAGE_CHARS` (4000 UTF-16 units; the file may hold 8 KB),
   sections packed whole; the Refresh/Keep-it callbacks edit ONE message and therefore show `render_one`
   (the first page plus "… N more entries not shown here").
-- Reminders: created only by the agent tool `schedule_reminder` (via `reminders_store.add`); fired
-  by `bot/jobs.py`. All reads/writes go through `reminders_store.update()` (per-user lock, atomic
-  rename), including the `/reminders` UI.
+- Reminders: created only by the agent tool `schedule_reminder` (via `reminders_store.add`; `➕ New` in
+  `/reminders` only explains that); fired by `bot/jobs.py`. All reads/writes go through
+  `reminders_store.update()` (per-user lock, atomic rename), including the `/reminders` UI (delay, edit
+  text, snooze, delete, toggle). Times are stored in UTC and shown in the user's zone everywhere
+  (`timezones.format_local`; "Times in UTC. Set your zone with /timezone." when unknown); the list shows the
+  active (`pending`/`processing`) reminders grouped "⏰ Reminders" (type user) then "🤖 Tasks" (type agent),
+  soonest first, 5 per page; the detail page adds "On: Mon, Tue, …" for `weekdays`, the last run (quiet or
+  answered, quiet runs so far) for tasks and "Snoozed copy" for `snoozed_from`. `⏰ +1h` / `📅 +1d` push the
+  time from its scheduled time, or from now when that is past (a completed one-shot becomes pending again).
+  Snooze (`snooze_time`: N minutes from now, or "tomorrow" = 09:00 local, `SNOOZE_TOMORROW_HOUR`) re-schedules
+  a one-shot in place and gives a periodic reminder a one-off `type: user` copy with `snoozed_from`, so the
+  series does not drift; the fired message is edited into `snooze_text` (no keyboard).
 - Logging: `logging.getLogger(__name__)` in the `bot` package; `agents/main.py` is still
   `print`-only and dumps every API response and tool result to stdout. Nothing writes log files.
 
@@ -967,15 +1066,10 @@ name; a new temp dir needs its own `.gitignore` line).
 - The README's feature list was realigned with the code in the v3 wave: there are no SSH or Shodan tools
   (SSH is only possible via `run_shell_script` inside the sandbox, where openssh-client is installed, with
   `network_enabled`), the accepted image formats are `image_utils.IMAGE_EXTENSIONS`, the invite default is 3.
-  The README describes wave 3 (timezone, reminders UI, proactive tasks, error recovery) as "coming next".
 - `.env.example` says `INVITE_LIMIT=5`; code default is 3. It also still lists `BROWSER_SERVICE_URL` (unused)
   and the obsolete `MAX_AGENT_*_ITERATIONS`.
 
 ## Known pitfalls (do not "fix" casually without checking callers)
-
-Wave 3 of the v3 feature set (timezone + reminders UI + proactive scheduled tasks, F5/F11, and error
-recovery with Retry, F2; see `docs/design-v3.md`) is landing in this tree right now: the reminders, timezone,
-agent-reminder and error-path statements in this file describe the pre-wave-3 code and will be updated with it.
 
 - The iteration counter `cicles` counts individual `tool_use` blocks (a whole batch is added at once,
   so it can overshoot the limit by one batch) while the `for` loop counts API round-trips; hitting
@@ -994,6 +1088,29 @@ agent-reminder and error-path statements in this file describe the pre-wave-3 co
   file name in images/videos/downloads. Sandbox-patched tools rely on the container mount instead.
 - `check_reminders` skips users `auth.is_authorized` rejects (blocked or removed); their reminders
   stay `pending` and fire once they are authorized again.
+- A pending `✏️ Edit text` (`reminders_ui._pending_edits`: in memory, keyed by chat id, so forum topics share
+  it) swallows the user's next plain text for up to 5 minutes (`EDIT_TIMEOUT`) as the new reminder text: it
+  never reaches the agent, even while a turn is running (the handler is not a queue job). Voice notes, photos
+  and commands are unaffected; `/reminders` and `✖️ Cancel edit` clear it, other commands do not; a restart
+  forgets it (`reminders_ui.reset()` in tests).
+- `set_user_timezone` writes `settings.json` but not the running turn's `user_settings` dict, and the
+  `<context>` block was rendered at turn start: the model keeps seeing "User timezone: unknown" until the next
+  turn. `schedule_reminder` in the same turn is fine because `UserInteractions._user_zone()` re-reads
+  `UserSettings` on every call. The same holds for `/timezone` pressed while a turn runs.
+- Snoozing a periodic reminder adds a separate one-off `type: user` reminder (`snoozed_from`, its own id, no
+  `weekdays`) and leaves the series alone: deleting or disabling the series does not remove the copy, which
+  has its own row in `/reminders`. Snoozing a completed one-shot makes it `pending` again.
+- `timezones.valid_zone` consults `ALIASES` first ("Turkey" → `Europe/Istanbul`, "Japan" → `Asia/Tokyo`, "la" →
+  `America/Los_Angeles`) and only then the case- and separator-insensitive table of `available_timezones()`,
+  which on Debian's tzdata (the bot image) includes the backward links ("GB", "Egypt", "US/Eastern", …): a link
+  without an alias is accepted and stored as given. The table is `lru_cache`d for the process (a tzdata update
+  needs a restart); `reminders_store.zone_or_utc` falls back to UTC with a warning for a stored name this host
+  does not know. `to_utc` takes a trailing `Z`/`±HH:MM` as given, so a model that writes UTC times with a `Z`
+  is not shifted twice.
+- Quiet scheduled runs still cost: `track_message_sent`, the tool calls and the usage rows are recorded before
+  `run_turn` looks at the marker, and the turn is stored in memory (see "Memory semantics"), so an hourly quiet
+  task grows the transcript until `prune` summarizes it. The `agent_response` of a periodic task is overwritten
+  by every run; `quiet_runs` only ever grows.
 - Cancellation cannot interrupt a tool call already inside a worker thread; the turn only ends when
   that call returns (sandbox containers run to their own timeout).
 - `stats_ui.py` imports `stats` at module level, so importing `bot.handlers` creates `data/stats.db`
@@ -1072,8 +1189,7 @@ agent-reminder and error-path statements in this file describe the pre-wave-3 co
   prompt after selection, then `FOLLOW_UPS_GUIDE` when `follow_ups` is on, then the providers'
   `<capabilities>` block (none of it to the subagent prompt); the `generall-ai-*` prompts still say nothing
   about formatting, pictures or the profile themselves.
-- Roadmap and design notes for transcript / prompt caching / subagents: `docs/agent-roadmap.md`; the v3
-  feature wave (its contract and package designs): `docs/design-v3.md`.
+- Roadmap and design notes for transcript / prompt caching / subagents: `docs/agent-roadmap.md`.
 - Status edits are coalesced: while one edit is in flight further progress updates are dropped (the
   next one carries newer state), so a batch of parallel tool calls cannot storm the message. A rejected
   rich *progress* payload only disables rich progress after `MAX_PROGRESS_FAILURES`; `finish()` always
@@ -1095,13 +1211,42 @@ agent-reminder and error-path statements in this file describe the pre-wave-3 co
   The only edits are boundaries that strip every thinking block (`transcript.strip_thinking`): `prune` above
   `max_context_tokens` (clear old tool results to `CLEARED_MARKER` and old image/document blocks to the
   `*_CLEARED_MARKER` texts, then summarize the oldest half into one `<earlier_conversation_summary>` user
-  message, down to `PRUNE_TARGET_RATIO` of the budget), and a change of `transcript.prefix_fingerprint`
+  message, down to `PRUNE_TARGET_RATIO` of the budget), a change of `transcript.prefix_fingerprint`
   (model, static system prompt or tool definitions, e.g. a new image preference, prompt type, rich-messages or
   follow-ups toggle, a mode switch to/from speed, an MCP server change, new provider notes, a new tool or a
-  deploy). Any new code that edits stored history must strip thinking the same way. Safety net:
+  deploy), and the API refusing the stored blocks anyway (`AgentAnthropic.history_edited`, next bullet). Any
+  new code that edits stored history must strip thinking the same way. Safety net:
   `models.thinking_binding` adds `block_binding.prefix_mismatch_behavior` (`THINKING_PREFIX_MISMATCH`) on the
   beta client; `log_input_transformations` prints any block the API dropped (that means something still edits
   history), and a refused beta is switched off for the process.
+- **Stale thinking recovery** (`AgentAnthropic._stream_message`): a 400 that names thinking blocks, signatures
+  or a prefix mismatch (`is_thinking_mismatch`; the binding-beta refusal is a different 400 handled inside
+  `_stream_once`) is retried ONCE with the thinking blocks of the first `prefix_len` messages removed
+  (`_without_thinking` on a copy; `prefix_len` is set by `generate_response` to the number of messages the turn
+  started with, `None` = the whole request for direct calls). This turn's own assistant blocks are kept on
+  purpose: the API wants the last tool-calling assistant message to keep its thinking. `history_edited` then
+  makes every later call of the turn strip the prefix first, and `_generate_with_transcript` runs
+  `strip_thinking(transcript.messages)` BEFORE appending the turn, so stored == sent. A second mismatch, or a
+  prefix with nothing to strip (legacy mode reloads text-only messages), propagates. A turn that fails after
+  the strip leaves the stored blocks in place and the next turn repeats the strip-and-retry. Any new code that
+  strips history must keep this prefix-only rule; `tests/test_stream_retry.py` pins it.
+- **What is and is not retried**: only the loop's calls and the forced final call go through `_stream_message`.
+  It retries `anthropic.APIError` subclasses that `is_transient_error` accepts (RateLimitError, APIStatusError
+  ≥ 500 or `overloaded`, APIConnectionError incl. timeouts) three times (2, 5, 12 s; a numeric Retry-After
+  header wins up to 30 s); a raw `httpx` exception the SDK did not wrap, a `CancelledError`, 401/403/404/413
+  and any other 400 propagate at once. The Haiku side calls (classifier, topic/summary, quick answers,
+  transcript summaries), the judge, the critique, `describe_*` and the embeddings have no retry. The note
+  reaches `on_recovery` only where `ChainOfThoughtAgent.generate_response` wired it (the user's turn,
+  transcript AND legacy mode: status step `recovering`); a subagent child (`SubagentTools._child`) retries
+  silently, and a failing hook is logged, never fatal. A retry after a mid-stream failure replays the whole
+  stream: `forward_event` resets its text/thinking accumulators on `message_start`, so the draft (and the
+  partial answer on Stop) is not doubled; keep that reset if the closure is refactored. The usage of the
+  failed attempt is not counted (`trace.add_usage` sees only the final message).
+- Retry on an error record replays `prompt_blocks or prompt` even when the failure came after the agent had
+  answered (TTS, the Telegram send, the summary edit): that answer is already in the transcript, so the user
+  gets a second turn on the same prompt. `friendly_error` matches by class first: an `APIConnectionError` wins
+  over the status checks, a 413 is "too large" whatever its text, and the "(trace <uuid>)" suffix is the id of
+  the `logger.exception` line.
 - Subagents share the parent's `TurnBudget`: the child gets `min(max_tool_calls, remaining)` and its used calls
   are charged to the parent afterwards; a child never persists a transcript and runs with judge/critique off.
   It inherits the registered providers (vision, profile, MCP, web, document) but not `run_subagent`.
@@ -1155,8 +1300,27 @@ agent-reminder and error-path statements in this file describe the pre-wave-3 co
   `bot/handlers/__init__.py`; copy the nearest existing handler; a user command also goes into
   `commands.COMMANDS` (menu + /help); add the family to `ROUTING` in `tests/test_cross_features.py`.
 - **Add a turn button**: an action name, label and `_CALLBACK_RE` alternative in `bot/turn_actions.py`
-  (`record_actions` decides when it shows), and a handler in `handlers/turn_actions_ui.py`: on `router` when it
-  only reads the stored record, on `turn_router` (quota checked) when it starts an agent turn.
+  (`record_actions` decides when it shows; an error record gets Retry only), and a handler in
+  `handlers/turn_actions_ui.py`: on `router` when it only reads the stored record, on `turn_router` (quota
+  checked) when it starts an agent turn.
+- **Add a reminder button action**: a button in `reminders_ui._info_keyboard` (detail page) or
+  `jobs.snooze_keyboard` (fired reminders) with callback `reminder_<action>_<id>[_<value>]` (the action carries
+  no underscore: `reminder_button` splits `"_", 2` and `rpartition`s the value off the payload), an `elif action
+  ==` branch in `reminder_button` that mutates through `reminders_store.update()` (never `load` + `save`), times
+  through `timezones` (store UTC, show `format_local`, escape the zone name in legacy Markdown), a row in
+  `tests/test_cross_features.py::ROUTING` and a test in `tests/test_reminders_ui.py`.
+- **Add a time zone alias or picker entry**: `timezones.ALIASES` (key = lower case without spaces, `_` or `-`,
+  see `_key`; value = the canonical IANA name; aliases win over the tz database, which is how backward links
+  such as "Turkey" stay out of `settings.json`) or `COMMON_ZONES` (the /timezone picker; buttons are indexed,
+  so append rather than reorder); `tests/test_timezones.py::test_every_alias_and_common_zone_is_a_real_zone`
+  checks that each resolves on this host.
+- **Change what is retried or how an error reads**: inside the loop, `agents/main.py` (`STREAM_RETRY_DELAYS`,
+  `MAX_RETRY_AFTER`, `is_transient_error`, `transient_reason`, `retry_delay`, `is_thinking_mismatch`; tests in
+  `tests/test_stream_retry.py`); what the user reads, `bot/agent_runner.friendly_error` and the `ERROR_*`
+  constants (`tests/test_error_recovery.py`); which buttons a failed turn gets, `turn_actions.record_actions`
+  (`record.error` → Retry only). A call that should recover must go through `AgentAnthropic._stream_message`.
+- **Add a line to the `<context>` block**: `ChainOfThoughtAgent._render_context` (per turn, never the static
+  prompt); the local-time line reads `self.user_settings` through `timezones.zone_of`.
 - **Add a media type**: a `_run_<kind>(bot, message, user_id, limit, ctx)` job plus an
   `@router.message(F.<kind>)` handler in `messages.py` that tracks and `submit`s it.
 - **Add a background job**: an `async` loop started from `bot/app.py:on_startup` and appended to

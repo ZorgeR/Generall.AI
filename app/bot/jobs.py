@@ -5,7 +5,7 @@ buttons (``reminder_snooze_<id>_<minutes|tomorrow>``, handled in ``handlers/remi
 Agent reminders are marked ``processing`` and submitted to the user's queue, so they never
 run concurrently with that user's own messages.
 
-Proactive tasks (docs/design-v3.md, F11): an agent reminder runs ``run_turn`` with a framing
+Proactive tasks: an agent reminder runs ``run_turn`` with a framing
 prompt (``task_prompt``: the task text, its id and the user's local time) and
 ``quiet_marker=QUIET_MARKER``. There is no separate announcement: the status message of the
 turn is enough, and a run that answers exactly ``<no_update/>`` leaves nothing behind (the

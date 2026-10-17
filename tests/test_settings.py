@@ -104,7 +104,7 @@ def test_presets_apply_detect_and_round_trip(tmp_path):
     again.set("judge", True, "enabled")
     assert apply_preset(again, "DEEP") is True  # names are case-insensitive
     assert (again.get("mode", "type"), again.get("thinking", "enabled"), again.get("tools", "max_iteration")) == ("intelligence", True, 40)
-    assert again.get("judge", "enabled") is False  # Deep switches the judge off (docs/design-v3.md, F6)
+    assert again.get("judge", "enabled") is False  # Deep switches the judge off
     assert current_preset(UserSettings("5", base_dir=str(tmp_path))) == "deep"
 
     assert apply_preset(again, "balanced") is True

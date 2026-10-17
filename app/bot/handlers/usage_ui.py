@@ -1,4 +1,4 @@
-"""``/usage``: the user's own usage (docs/design-v3.md, F4). Router on ``ui`` (auth, no quota).
+"""``/usage``: the user's own usage. Router on ``ui`` (auth, no quota).
 
 One legacy-Markdown message (``bot.ui.answer_md``, plain fallback): a header, a monospace block
 whose lines stay within ``stats_report.LINE_WIDTH`` so a phone does not wrap them, and a hint that

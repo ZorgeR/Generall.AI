@@ -1,4 +1,4 @@
-"""VisionTools: let the agent look at images and documents in the workspace (docs/design-v3.md, F7).
+"""VisionTools: let the agent look at images and documents in the workspace.
 
 Pictures and PDFs the user sends reach the agent as real image / document blocks in the
 message itself (``bot/handlers/messages.py``). This provider covers everything else: a file

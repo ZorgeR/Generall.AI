@@ -1,4 +1,4 @@
-"""Time zones: the user's zone and local-time helpers (docs/design-v3.md, F5).
+"""Time zones: the user's zone and local-time helpers.
 
 The user's zone is the setting ``timezone.name`` (an IANA name; "" = unknown, and times are
 shown in UTC until it is set). It is set by ``/timezone`` (``bot/handlers/commands.py``), by a

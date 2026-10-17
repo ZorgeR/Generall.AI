@@ -1,4 +1,4 @@
-"""/timezone (command, picker, location) and the upgraded /reminders UI (docs/design-v3.md, F5).
+"""/timezone (command, picker, location) and the upgraded /reminders UI.
 
 Handlers are called directly with real aiogram ``Message`` objects whose Telegram calls are
 mocks; the store lives under tmp_path and settings are read from the tmp_path cwd.

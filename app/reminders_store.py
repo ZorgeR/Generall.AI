@@ -6,7 +6,7 @@ each other's writes.
 
 Reminder record shape (the ``processing_since`` field is used while an agent reminder is
 queued/running; ``timezone``, ``weekdays`` and the ``last_result`` / ``quiet_runs`` fields came
-with the v3 wave, docs/design-v3.md F5/F11)::
+with the v3 wave)::
 
     {id, user_id, text, time (ISO UTC), type: "user"|"agent", status: "pending"|"processing"|"completed"|"failed",
      created_at, is_periodic, period_type, period_interval, last_triggered, next_trigger,

@@ -1,4 +1,4 @@
-"""Prompt and tool-result content blocks (docs/design-v3.md, "Shared hub changes").
+"""Prompt and tool-result content blocks.
 
 A prompt reaching the agent is a string or a list of blocks. Handlers describe media with
 small ``media_ref`` blocks (a path, a kind, a title); ``materialize`` turns them into the

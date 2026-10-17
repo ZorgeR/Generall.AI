@@ -94,7 +94,7 @@ def log_input_transformations(response) -> None:
         print(f"WARNING: the API changed {len(entries)} thinking block(s) in the request: {described}")
 
 
-# ---- automatic recovery inside the loop (docs/design-v3.md, F2) --------------------------
+# ---- automatic recovery inside the loop --------------------------
 # A failed API call is retried by AgentAnthropic._stream_message when the failure is the
 # provider's or the network's: after these delays (seconds), so three extra attempts in all.
 STREAM_RETRY_DELAYS = (2.0, 5.0, 12.0)
@@ -225,7 +225,7 @@ class AgentAnthropic:
         self.thinking = False
         self.max_tool_result_chars = None  # tool results are cut to this before the model sees them
         self.limit_reached = False     # the last generate_response ran out of tool budget (bot offers Continue)
-        self.extra_providers = []      # [(provider, blocking)] added with register_provider (docs/design-v3.md)
+        self.extra_providers = []      # [(provider, blocking)] added with register_provider
         self.on_recovery = None        # optional coroutine(note): told about every automatic retry (the status line)
         self.history_edited = False    # a request only went through without its thinking blocks: the stored prefix is stale
         self.prefix_len = None         # messages this turn started from (stored history + question): a thinking strip touches only these
@@ -886,7 +886,7 @@ class ChainOfThoughtAgent:
         self.short_term_memory_path.mkdir(parents=True, exist_ok=True)
         
         if model_type == "anthropic":
-            # Mode (docs/design-v3.md, F3): speed = the fast model runs the whole tool loop with
+            # Mode: speed = the fast model runs the whole tool loop with
             # light thinking (request_options_for gives it no effort/thinking parameters);
             # intelligence = the main model thinks deeply whatever the thinking toggle says;
             # auto (and any unknown value) = the main model, thinking as set, and the quick-answer
@@ -906,7 +906,7 @@ class ChainOfThoughtAgent:
             self.agent.user_interactions = self.user_interactions
             self.subagents = SubagentTools(self.agent, self.user_settings)
             self.agent.subagents = self.subagents
-            # Providers added in the v3 wave (docs/design-v3.md): registered, not slotted.
+            # Providers added in the v3 wave: registered, not slotted.
             self.vision_tools = VisionTools(user_id, sender)
             self.agent.register_provider(self.vision_tools)
             self.profile_tools = ProfileTools(user_id)
@@ -1134,7 +1134,7 @@ User message: {question}"""
 
         Part of the static system prompt (so of the cache prefix and the transcript fingerprint):
         providers put instructions about their tools here instead of editing the prompts above.
-        Per-turn text never belongs here (docs/design-v3.md)."""
+        Per-turn text never belongs here."""
         providers = [getattr(self.agent, slot, None) for slot in self._PROVIDER_SLOTS]
         providers += [p for p, _blocking in getattr(self.agent, "extra_providers", [])]
         notes = [str(getattr(p, "prompt_notes", "") or "").strip() for p in providers if p is not None]
@@ -1225,7 +1225,7 @@ User message: {question}"""
 
     def _render_context(self, recent: list[str], hits: list[str], profile: str = "") -> str:
         """The ``<context>`` block: UTC time, the user's local time (or the hint that the zone is
-        unknown, so the agent asks once and saves it with ``set_user_timezone``; docs/design-v3.md F5),
+        unknown, so the agent asks once and saves it with ``set_user_timezone``),
         then the memory lines and the profile."""
         from bot import timezones  # stdlib-only helpers, no import-time side effects
 
@@ -1313,7 +1313,7 @@ User message: {question}"""
         ts = self.user_settings.get("transcript", {})
         if update_status:
             await update_status(step="initial", details="Loading transcript", iteration=0, critique=0)
-        transcript = transcript_store.load(self.user_id, self.thread_id)
+        transcript = await asyncio.to_thread(transcript_store.load, self.user_id, self.thread_id)  # may hold base64 media
         if not transcript.messages and not transcript_store.exists(self.user_id, self.thread_id):
             legacy = self._load_legacy_dialog_history()
             if legacy:
@@ -1394,7 +1394,7 @@ User message: {question}"""
                 keep_tool_results_turns=int(ts.get("keep_tool_results_turns", 3)),
                 summarize=self._summarize_messages,
             )
-            transcript_store.save(transcript)
+            await asyncio.to_thread(transcript_store.save, transcript)
             print(f"Transcript saved: {len(transcript.messages)} messages (~{estimate_tokens(transcript.messages)} tokens), prune={stats}")
         except Exception as e:  # noqa: BLE001
             print(f"WARNING: failed to save transcript: {e}")
@@ -1867,7 +1867,7 @@ You have been asked to answer a query given sources. Consider the following when
             dialog_history = []
 
         # Route: classify complexity to decide fast vs full path
-        complexity = await self._classify_complexity(question, dialog_history)
+        complexity = await self._decide_complexity(question, dialog_history)  # mode setting applies to the legacy path too
         
         response = None
         

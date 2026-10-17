@@ -1,4 +1,4 @@
-"""``/mcp`` and the ``mcp_`` buttons (docs/design-v3.md, F12). Router on ``ui`` (auth, no quota).
+"""``/mcp`` and the ``mcp_`` buttons. Router on ``ui`` (auth, no quota).
 
 The user connects MCP servers whose tools the agent then gets as ``mcp_<server>_<tool>``
 (``agents/mcp_tools.py``); the records live in ``bot.mcp_store``. One legacy-Markdown page

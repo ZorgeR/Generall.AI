@@ -1,4 +1,4 @@
-"""``/profile`` and the ``profile_`` buttons (docs/design-v3.md, F8). Router on ``ui`` (auth, no quota).
+"""``/profile`` and the ``profile_`` buttons. Router on ``ui`` (auth, no quota).
 
 Legacy-Markdown messages (``bot.ui.answer_md``, plain fallback) showing ``data/<uid>/profile.md``
 as the agent keeps it (``bot.profile.ProfileStore``): sections in bold, entries as bullets, every

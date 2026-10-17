@@ -283,7 +283,7 @@ class ToolIntegrator:
 
         The web search and the deep research are API calls, and the long-term memory search reads
         the user's conversation summaries, profile and transcript (JSON and Markdown under
-        data/<uid>/) in the bot process, where it has the parsers for them (docs/design-v3.md, F9).
+        data/<uid>/) in the bot process, where it has the parsers for them.
         The sandbox version used to grep *.txt files, which that memory never had.
 
         Args:

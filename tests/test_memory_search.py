@@ -1,4 +1,4 @@
-"""memory_search runs on the host over the user's real long-term memory (docs/design-v3.md, F9):
+"""memory_search runs on the host over the user's real long-term memory:
 conversation files, the profile and the transcript text view, newest first; the sandbox patch is gone."""
 import json
 import os

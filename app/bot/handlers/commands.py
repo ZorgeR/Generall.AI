@@ -4,7 +4,7 @@
 button (``bot_commands``, registered at startup by ``bot.app``) and the command section
 of ``/help`` are both rendered from it. Admin-only commands are not in it.
 
-``/timezone`` (docs/design-v3.md, F5) shows the saved zone and local time with a picker of
+``/timezone`` shows the saved zone and local time with a picker of
 ``timezones.COMMON_ZONES`` (``tz_set_<index>`` buttons) and the other ways to set it (share a
 location, type a name); ``/timezone <name>`` validates with ``timezones.valid_zone`` (IANA names,
 any capitalization, big-city aliases) and saves settings ``timezone.name``.

@@ -33,8 +33,15 @@ GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bo
 - **📝 Documents out**: the agent writes PDF, DOCX, XLSX, Markdown or HTML files from Markdown (`create_document`) and sends them to you
 - **🌐 Web reading and headless browsing**: pages are reduced to their readable content; JavaScript-heavy sites are
   rendered by a headless Chromium inside the sandbox (`browse_webpage`), with an optional screenshot
-- **⏰ Reminder System**: Create and manage reminders in natural language for specific times, one-off or periodic
-- **📅 Task Scheduling**: Schedule agent tasks that run later and report back
+- **⏰ Reminder System**: reminders in natural language, one-off or periodic (down to "every weekday"), in your
+  local time; `/reminders` groups them, pushes one by +1h / +1d, edits its text, and a reminder that fires comes
+  with snooze buttons (10 min, 1 h, tomorrow 09:00)
+- **📅 Task Scheduling**: scheduled agent tasks that run later and report back, or stay quiet when there is
+  nothing new to tell you
+- **🕒 Your time zone**: `/timezone` (a picker, a city name or a shared location), or just tell the bot where you
+  are; it asks once when it does not know, and then shows times and schedules reminders in your local time
+- **🔁 Retry on errors**: a failed answer ends with a plain-language reason (rate limit, overloaded provider,
+  network, request too large) and a Retry button; transient provider errors are retried behind the scenes first
 - **🔒 Secure Container System**: Run unsafe commands in isolated Docker containers
 - **💻 Terminal Access**: Execute system commands securely through the bot interface
 - **📦 Package Management**: Install and run packages in a secure containerized environment
@@ -62,8 +69,6 @@ GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bo
   - Admins have unlimited invite generation capability
   - Track invite usage and user access via admin commands
   - Automatically notify admins when new users join
-- **🔜 Coming next**: local time zones (`/timezone`) with reminders shown and edited in local time from `/reminders`,
-  proactive scheduled tasks that stay quiet when there is nothing new, and a Retry button on failed turns
 
 ## ⚙️ How memory work
 
@@ -383,13 +388,24 @@ The bot can:
 - **🔒 Secure Execution**: All code runs in isolated containers for security
 - **📋 Code Editing**: Iteratively improve code based on requirements and feedback
 
+### 🕒 Time zone
+
+Times are shown, and reminders scheduled, in your local time once the bot knows your zone. Set it with
+`/timezone` (a picker of common zones, or `/timezone Europe/Berlin`; city and country names such as
+`/timezone Kyiv` work too), by sharing your location (needs the optional `timezonefinder` package on the
+server, otherwise the bot asks for the name), or simply by telling the bot where you live: it saves the zone
+itself and asks once when it does not know. Until then everything is in UTC.
+
 ### ⏰ Reminder and Task System
 
-Ask in natural language ("remind me tomorrow at 9 to call the dentist", "every Monday at 8 summarize the
-AI news") and the agent schedules a reminder or a periodic task; `/reminders` lists them with pause and
-delete buttons. Times are in UTC today. Coming next: your local time zone (`/timezone`), creating and
-editing reminders from `/reminders`, snooze buttons, and scheduled tasks that stay quiet when there is
-nothing new to report.
+Ask in natural language ("remind me tomorrow at 9 to call the dentist", "every weekday at 8 check the AI news
+and message me only if something important happened") and the agent schedules a reminder or a periodic task
+in your local time; daily tasks can be limited to certain weekdays. `/reminders` lists ⏰ Reminders and
+🤖 Tasks with local times; each one has ⏰ +1h / 📅 +1d, ✏️ Edit text (type the new text as your next message),
+⏸ Disable and ❌ Delete, and ➕ New explains how to create one. A reminder that fires comes with snooze buttons
+(10 min, 1 h, tomorrow 09:00); snoozing a repeating reminder adds a one-off copy and leaves the series alone.
+A scheduled task runs the agent with your task as its instructions; when it finds nothing new or worth telling
+you, nothing is sent at all, and `/reminders` shows how many runs stayed quiet.
 
 ## 💻 System Requirements
 
@@ -444,7 +460,8 @@ nothing new to report.
    source .venv/bin/activate  # On Windows: .venv\Scripts\activate
    ```
 
-3. Install the dependencies:
+3. Install the dependencies (optionally `pip install timezonefinder` too, so that a shared Telegram location sets
+   the user's time zone; without it the bot asks for the zone name):
    ```bash
    pip install -r app/requirements.txt
    ```
@@ -556,15 +573,18 @@ parentheses; see the commented block in `.env.example`):
 2. Send text messages, voice recordings, photos, videos or documents; reply to or forward messages to give context
 3. The bot will process your input and respond accordingly
 4. Use `/settings` to pick a preset (Fast / Balanced / Deep) and customize the bot's behavior
-5. Use `/reminders` to manage your reminders, `/profile` to see what the bot remembers about you,
-   `/usage` for your last 30 days, `/mcp` to connect tool servers
+5. Use `/timezone` (or share your location) so times and reminders are in your local time; `/reminders` to
+   manage reminders and scheduled tasks (push, edit, snooze), `/profile` to see what the bot remembers about
+   you, `/usage` for your last 30 days, `/mcp` to connect tool servers
 6. Use `/cancel` to stop the task that is running and clear your queue
 7. Use `/settings` → Rich Messages to switch between rich and classic formatting
 8. While the agent works, the "Thinking…" message lists the tool calls as they run (✅ done, ⏳ running,
    ❌ failed, with a short argument preview and duration); tools requested together run in parallel.
    When the answer arrives the status is shortened into a **turn summary** kept above it: expandable
    tool calls (arguments and results), the model's thinking, tokens used, cached share and estimated
-   cost. `/settings` → Turn Summary turns it off (the status is then deleted).
+   cost. `/settings` → Turn Summary turns it off (the status is then deleted). If a turn fails, the status
+   says why in plain words (rate limit, overloaded provider, network problem, request too large) with a
+   🔁 Retry button; rate limits, overloads and connection errors are retried automatically before that.
 9. Admins see token usage and estimated cost per user and in total in `/stats`: a dashboard image
    (messages per day by type, cost per day, top tools, top spenders or a user's hours of activity) and
    a compact text view with bars, a daily sparkline and changes against the previous 30 days.
@@ -627,6 +647,10 @@ touched, and a concurrency group runs deploys one at a time.
   secure-container:<hash>`); the first start after such a change takes several minutes
 - **🔌 An MCP tool answers "unreachable"**: check the URL and token with `/mcp` (the last error is shown
   there) and `/mcp refresh <name>` after fixing the server
+- **🕒 Sharing a location answers "I can't tell the time zone"**: the optional `timezonefinder` package is not
+  installed (a commented line in `app/requirements.txt`); install it, or set the zone with `/timezone <city>`
+- **❌ "The AI provider is rate-limiting us" / "is overloaded"**: the bot already retried three times with
+  backoff; wait a moment and press 🔁 Retry under the message
 
 ## 📄 License
 

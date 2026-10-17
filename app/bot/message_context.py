@@ -1,4 +1,4 @@
-"""Reply and forward context for the agent (docs/design-v3.md, F1).
+"""Reply and forward context for the agent.
 
 Telegram keeps "this replies to that message", "the user quoted this part of it" and
 "this was forwarded from there" in message metadata; the agent used to get the user's

@@ -35,7 +35,7 @@ DEFAULT_SETTINGS: dict[str, dict[str, Any]] = {
     # The model may end an answer with a <follow_ups> block; it is removed from the text and
     # shown as buttons under the answer. Off = the instruction is not added to the prompt.
     "follow_ups": {"enabled": True},
-    # Quick answers vs. deep work (docs/design-v3.md, F3): auto = the fast-model classifier picks the
+    # Quick answers vs. deep work: auto = the fast-model classifier picks the
     # quick path or the full agent per message; speed = always the fast model; intelligence = always
     # the full agent with deep thinking.
     "mode": {"type": "auto"},
@@ -51,7 +51,7 @@ DEFAULT_SETTINGS: dict[str, dict[str, Any]] = {
 SYSTEM_PROMPT_TYPES = ("generall-ai-v2", "generall-ai-v1", "perplexity-deep-research", "perplexity-r1")
 MODE_TYPES = ("auto", "speed", "intelligence")
 
-# Presets (docs/design-v3.md, F6): one tap sets the few values that decide speed vs. depth.
+# Presets: one tap sets the few values that decide speed vs. depth.
 # {(category, key): value}; "balanced" is the defaults. Applied with apply_preset, recognized with
 # current_preset (every key must match exactly; anything else is a custom state with no preset).
 # Deep also turns the judge off: deep thinking already checks the answer, a second pass only costs.

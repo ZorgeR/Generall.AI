@@ -16,7 +16,7 @@ with what it refers to.
 Photos and PDFs are not described beforehand: the image job and the document job
 build a block prompt (``agents.content``: one text block, then an ``image_ref`` per
 picture or a ``document_ref`` for a PDF within the limits) and the agent sees the
-media itself (docs/design-v3.md, F7). Text, docx, xlsx and json documents go in as
+media itself. Text, docx, xlsx and json documents go in as
 extracted text; a PDF too large to attach falls back to the description path.
 """
 from __future__ import annotations
@@ -215,7 +215,7 @@ async def draft_stopped(event: MessageGenerationStopped, user_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# location → time zone (docs/design-v3.md, F5); the agent never sees locations
+# location → time zone; the agent never sees locations
 # ---------------------------------------------------------------------------
 LOCATION_NO_FINDER = (
     "I can't tell the time zone from a location on this server.\n"

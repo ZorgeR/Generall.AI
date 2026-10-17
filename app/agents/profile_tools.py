@@ -1,4 +1,4 @@
-"""ProfileTools: the agent-managed user profile and notes (docs/design-v3.md, F8).
+"""ProfileTools: the agent-managed user profile and notes.
 
 Four small tools over ``bot.profile.ProfileStore`` (``data/<uid>/profile.md``): read, add, remove,
 replace. They run in the bot process (file I/O in a worker thread), never sandboxed, and are

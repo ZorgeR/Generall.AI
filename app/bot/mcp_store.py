@@ -1,4 +1,4 @@
-"""MCP server configuration and the cached tool lists (docs/design-v3.md, F12).
+"""MCP server configuration and the cached tool lists.
 
 Two sources of servers, both read by ``agents.mcp_tools.MCPTools`` at turn start without any network:
 

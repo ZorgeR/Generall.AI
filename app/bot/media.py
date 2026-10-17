@@ -49,7 +49,7 @@ VIDEO_EXTENSIONS = [".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".3gp"]
 LARGE_TEXT_THRESHOLD = 100_000
 
 # A PDF reaches the agent as a real document block when it is within these limits; larger
-# ones are extracted to text (docs/design-v3.md, F7).
+# ones are extracted to text.
 PDF_MAX_BYTES = 20 * 1024 * 1024
 PDF_MAX_PAGES = 100
 

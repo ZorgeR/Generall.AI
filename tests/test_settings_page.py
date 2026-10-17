@@ -310,7 +310,7 @@ def test_advanced_toggle_hides_the_power_settings():
     with pytest.raises(AssertionError):
         row_of(basic_page, "🧩 Personality prompt")
     assert row_of(full_page, "🧩 Personality prompt")
-    # the hidden ones are exactly the power settings of the design (docs/design-v3.md, F6)
+    # the hidden ones are exactly the power settings of the design
     assert {(c.category, c.key) for c in ADVANCED} == {
         ("transcript", "max_context_tokens"), ("transcript", "keep_tool_results_turns"),
         ("summarization_history", "size"), ("dialog_history", "enabled"), ("dialog_history", "size"),

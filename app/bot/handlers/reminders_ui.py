@@ -1,7 +1,7 @@
 """/reminders command and the ``reminder_*`` / ``reminders_*`` inline keyboard family.
 
 Ported from the python-telegram-bot implementation and upgraded in the v3 wave
-(docs/design-v3.md, F5). Every callback string of the old UI still works (``reminders_page_<n>``,
+. Every callback string of the old UI still works (``reminders_page_<n>``,
 ``reminder_info_<id>``, ``reminder_delete_<id>``, ``reminder_toggle_<id>``, ``reminders_summary``,
 ``noop``) and the 5-per-page pagination stays. New:
 

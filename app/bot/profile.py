@@ -1,4 +1,4 @@
-"""The user's profile and notes: ``data/<uid>/profile.md`` (docs/design-v3.md, F8).
+"""The user's profile and notes: ``data/<uid>/profile.md``.
 
 One Markdown file per user that the agent maintains with the ``user_profile_*`` tools
 (``agents/profile_tools.py``) and the user reads with ``/profile``::

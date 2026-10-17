@@ -1,4 +1,4 @@
-"""MCPTools: the tools of the user's connected MCP servers as agent tools (docs/design-v3.md, F12).
+"""MCPTools: the tools of the user's connected MCP servers as agent tools.
 
 Servers and their cached tool lists come from ``bot.mcp_store`` (the user's ``data/<uid>/mcp.json``
 plus the admin's servers). Nothing touches the network at turn start: ``tools_schema`` is built once
