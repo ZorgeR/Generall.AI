@@ -16,39 +16,54 @@ GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bo
 
 ## ✨ Features
 
-- **🔄 Multimodal Support**: Process and respond to text, voice messages, images, PDFs, and other document types
+- **🔄 Multimodal Support**: Process and respond to text, voice messages, photos, videos, PDFs and other document types
 - **🎤 Voice Processing**: Transcribe voice messages and generate voice responses with customizable voices via ElevenLabs
-- **🖼️ Image Analysis**: Describe and analyze images using state-of-the-art vision models
-- **📸 Multiple Photo Processing**: Analyze multiple images simultaneously to describe, compare differences, and redraw content
+- **👁️ Photos and PDFs seen directly**: pictures and PDFs reach the model as real image and document blocks, no
+  description step in between; the agent can look at any file in your workspace again (`view_image`,
+  `read_document`) or ask a second model for another opinion (`describe_image`)
+- **📸 Multiple Photo Processing**: Send an album and the agent sees every picture at once to describe, compare or redraw
+- **🖼️ More image formats**: JPG, HEIC, PNG, WebP, GIF and BMP, as photos or as files
+- **💬 Replies and forwards understood**: reply to a message (yours or the bot's), quote a part of it, or forward a
+  post, and the agent knows what you mean
 - **🎨 Image Generation**: Create new images based on text descriptions or modifications of existing images
-  - **🔄 Generate with DALL-E 3**: Create single images with OpenAI's DALL-E 3 model
-  - **✨ Multimodal Generation with Gemini**: Generate stories with matching images using Google's Gemini model
-  - **🖌️ Image-to-Image Transformation**: Edit and transform existing images with powerful AI editing capabilities
-- **📄 Document Processing**: Extract and analyze content from PDFs and other documents with deep understanding of the content
-- **⏰ Reminder System**: Create and manage reminders with natural language processing for both specific times and contextual events
-- **📅 Task Scheduling**: Schedule tasks to execute based on specific times or event triggers like "after a match ends"
+  - **🔄 Generate with gpt-image**: Create single images and variants with OpenAI's gpt-image models (`best` / `fast` engines)
+  - **✨ Multimodal Generation with Gemini**: Generate stories with matching images using Google's Gemini image models (`story` engine)
+  - **🖌️ Image-to-Image Transformation**: Edit one picture or compose several into one, including photos you sent earlier
+- **📄 Document Processing**: PDFs are read as documents; DOCX, XLSX, JSON, text and code files are extracted and handed to the agent
+- **📝 Documents out**: the agent writes PDF, DOCX, XLSX, Markdown or HTML files from Markdown (`create_document`) and sends them to you
+- **🌐 Web reading and headless browsing**: pages are reduced to their readable content; JavaScript-heavy sites are
+  rendered by a headless Chromium inside the sandbox (`browse_webpage`), with an optional screenshot
+- **⏰ Reminder System**: Create and manage reminders in natural language for specific times, one-off or periodic
+- **📅 Task Scheduling**: Schedule agent tasks that run later and report back
 - **🔒 Secure Container System**: Run unsafe commands in isolated Docker containers
 - **💻 Terminal Access**: Execute system commands securely through the bot interface
 - **📦 Package Management**: Install and run packages in a secure containerized environment
 - **📁 File Sharing**: Send files directly to users through Telegram
 - **📱 SMS Messaging**: Send SMS text messages to phone numbers via Twilio integration
-- **⚙️ Customizable Settings**: Fine-tune the assistant's behavior through an interactive settings menu
+- **⚙️ Customizable Settings**: `/settings` with three presets (⚡ Fast, ⚖️ Balanced, 🧠 Deep), a mode setting
+  (quick answers vs. deep work) and an Advanced toggle for the power settings
 - **🧠 Persistent Memory**: Maintain conversation context across sessions
+- **👤 Profile memory**: the agent keeps a short profile of durable facts about you (name, city, preferences, projects)
+  that you can see and clear with `/profile`; say "remember that …" or "forget …"
+- **🔌 MCP servers**: connect your own Model Context Protocol tool servers with `/mcp` and the agent uses their tools
+- **❓ /help and a command menu**: `/help` lists what the bot can do, the commands and example prompts; the commands
+  show up in Telegram's "/" menu
+- **📊 /usage**: your own usage for the last 30 days (actions, tokens, estimated cost, reminders, workspace size)
 - **🔌 Advanced Agent Architecture**: Powered by a modular agent system with specialized tools for different tasks
 - **💾 Memory Management**: Smart conversation history handling with summarization capabilities
 - **🔍 Web Search**: Search the web for up-to-date information using multiple providers (Perplexity, Tavily)
 - **🧩 Reasoning Systems**: Multiple stages of reasoning with critique and judge mechanisms
 - **☁️ Cloud Storage**: Upload and manage files on S3-compatible storage
-- **💻 Code Execution**: Write and execute Python and Bash scripts in secure environments
+- **💻 Code Execution**: Write and execute Python and Bash scripts in secure environments (SSH to your own servers is
+  possible from the sandbox shell with network enabled; there is no dedicated SSH tool)
 - **💬 In-Process Communication**: Send Telegram messages, files, or reactions directly during thinking operations through tool-based interactions, not just as final bot output
-- **🔒 SSH Connections**: Securely connect to remote servers via SSH to perform system administration tasks and retrieve information
-- **🔍 Shodan API Integration**: Leverage Shodan's powerful internet scanning capabilities to gather intelligence on networks, devices, and potential security issues
-- **🛠️ Advanced Tools & Techniques**: Utilize specialized cybersecurity, networking, and data analysis tools for comprehensive assessments and operations
 - **🎟️ Invite System**: Control access through user invites with admin oversight
-  - Users can create and share limited invite codes (5 per user)
+  - Users can create and share limited invite codes (3 per user by default, `INVITE_LIMIT`)
   - Admins have unlimited invite generation capability
   - Track invite usage and user access via admin commands
   - Automatically notify admins when new users join
+- **🔜 Coming next**: local time zones (`/timezone`) with reminders shown and edited in local time from `/reminders`,
+  proactive scheduled tasks that stay quiet when there is nothing new, and a Retry button on failed turns
 
 ## ⚙️ How memory work
 
@@ -57,9 +72,17 @@ GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bo
   agent remembers what it looked up and did. Large tool results are capped, results older than a few turns
   are cleared, and when the transcript grows past the configured context size the oldest part is summarized.
   A new forum topic starts with an empty transcript. Settings: `/settings` → Transcript.
-- **Long-term memory**: after each turn a short summary and an embedding of the exchange are stored. On the next
+- **Long-term memory**: after each turn a short summary and an embedding of the exchange are stored
+  (`text-embedding-3-small`, cosine similarity; a model change rebuilds the index by itself). On the next
   question the most recent summaries and the semantically closest earlier conversations are injected as a
-  memory block, so the agent can recall things from weeks ago even after the transcript was pruned.
+  memory block, so the agent can recall things from weeks ago even after the transcript was pruned. The agent
+  can also search this memory by keyword (`memory_search`) before saying it does not remember something.
+- **Profile**: durable facts about you (About, Preferences, dated Notes) live in a small profile the agent
+  maintains itself and sees whenever it changed. `/profile` shows it and can forget everything; "remember
+  that …" and "forget …" work in conversation.
+- **Pictures in memory**: the photos and PDFs you send stay in the transcript as the model saw them; old ones
+  are replaced by a short marker when space is needed, and the files themselves stay in your workspace so the
+  agent can look at them again.
 - **Files**: everything the agent downloads, generates or writes lives in the user's workspace on disk and
   persists between sessions (`data/<chat id>/`).
 - **Subagents**: for large research or independent sub-tasks the agent can delegate to subagents with a fresh
@@ -93,7 +116,7 @@ Bot: "I'll research the latest developments in quantum computing and prepare a c
 User: "Connect to my production server at ssh://user@example.com and check disk usage on all volumes."
 
 Bot: "I'll connect to your production server and check the disk usage."
-     [Establishes secure SSH connection]
+     [Runs ssh from the sandbox shell with network enabled, using the key you uploaded to your workspace]
      [Executes df -h command]
      [Formats results in a readable table]
      "Here's the current disk usage on your production server:
@@ -184,7 +207,7 @@ Share this link: https://t.me/YourBotName?start=invite_a1b2c3d4
 Or use this command:
 /invite a1b2c3d4
 
-Invites remaining: 4/5"
+Invites remaining: 2/3"
 
 [Later, when someone uses the invite]
 
@@ -223,8 +246,9 @@ to see it there.
 
 Answers are sent as **rich Telegram messages** (Bot API 10.1): real GitHub-flavored Markdown with
 headings, tables, task lists, fenced code blocks, block quotes and LaTeX math, rendered natively by
-the Telegram app. While the answer is being generated (with `STREAMING_ENABLED=true`) the draft
-streams with live formatting and the model's thinking shows in Telegram's "Thinking…" block.
+the Telegram app. While the answer is being generated the draft streams with live formatting and the
+model's thinking shows in Telegram's "Thinking…" block (streaming is on by default;
+`STREAMING_ENABLED=false` makes answers arrive whole).
 
 Pictures can appear inside the answer: the agent writes `![caption](images/photo.jpg)` for an image
 it generated, a photo you sent or a downloaded file (or an https image URL) and it renders inline at
@@ -235,20 +259,80 @@ Turn them off if your Telegram app is too old and shows "unsupported message"; t
 classic Markdown formatting. If the Bot API server (the `telegram-bot-api` sidecar) is older than
 10.1 the bot detects it once and falls back to MarkdownV2 formatting (tables as monospace blocks).
 
+### 💬 Replies, quotes and forwards
+
+Reply to any message to tell the agent what you mean ("translate this", "make it shorter"), quote a part
+of a message to point at it, or forward a post from a channel or a contact for the agent to read. The
+agent gets who wrote the referenced message (you, the assistant, a channel), when, and its text or
+caption; nothing is downloaded from it, so reply with the file itself when you want a picture or a
+document looked at again.
+
+### ⚡ Fast, Balanced and Deep
+
+The first row of `/settings` is a preset: **⚡ Fast** (the fast model answers everything, light
+reasoning, fewer tool calls), **⚖️ Balanced** (the default: a classifier gives quick questions a quick
+answer and sends everything else through the full agent with deep reasoning) and **🧠 Deep** (always the
+full agent with deep reasoning and more tool calls). Under it, "Quick answers vs. deep work" is the mode
+alone, and the **⚙️ Advanced** toggle reveals the power settings (memory window, summaries, critique and
+judge rounds, personality prompt, image variants). `/usage` hints at Fast when cost matters.
+
+### ❓ /help, /usage and the command menu
+
+`/help` lists what the bot can do, every command with a one-line description, a few tips and example
+prompts; the same commands appear in Telegram's "/" menu. `/usage` shows your own last 30 days:
+actions against your quota, requests, answers, tool calls, tokens in/out with the cached share, the
+estimated cost and a 7-day cost sparkline, active reminders and the size of your workspace.
+
+### 👤 Profile memory
+
+The agent keeps `profile.md` in your workspace: **About**, **Preferences** and dated **Notes**, a few
+short entries each (8 KB at most, the oldest notes make room). It saves durable facts quietly as they come
+up and reads the profile automatically; `/profile` shows it, with a button to forget everything, and
+"remember that I prefer metric units" / "forget my old address" edit it in conversation.
+
+### 🔌 MCP servers
+
+Connect any Model Context Protocol server over streamable HTTP (or legacy SSE):
+`/mcp add <name> <url> [token] [sse]`, `/mcp remove <name>`, `/mcp refresh`, `/mcp` to list servers with
+their tool counts and ✅/⬜ toggles. The server's tools become `mcp_<server>_<tool>` for the agent, text
+and image results included. An administrator can offer servers to every user through a JSON file
+(`MCP_SERVERS_FILE`). Changing the server set resets the stored reasoning once; the conversation stays.
+
+### 🌐 Web reading and headless browsing
+
+`download_webpage` returns the readable main content of a page (navigation and footers stripped) and can
+save it to a file. For pages that need JavaScript the agent uses `browse_webpage`: a headless Chromium
+inside the sandbox loads the page with network enabled, extracts the text and the first links and can
+take a screenshot the agent then looks at.
+
+### 📝 Documents out
+
+Ask for a report, a table or a brief as a file: `create_document` renders Markdown to **PDF**, **DOCX**,
+**XLSX** (tables and CSV blocks become sheets), Markdown or HTML, saves it under your workspace's
+`documents/` and sends it to you. PDF, DOCX and XLSX are rendered inside the sandbox.
+
 ### 🎤 Voice Settings
 Customize voice parameters including voice model selection, stability, clarity, and style. The bot can both listen to your voice messages and respond with generated voice using ElevenLabs.
 
-### 📄 PDF Processing
-Upload PDFs to extract and analyze content. The bot can understand complex documents, summarize contents, answer questions about the document, and provide insights.
+### 📄 Photos and documents
+
+Photos are shown to the model as they are (a downscaled copy; the full-resolution file stays in your
+workspace for edits), so it can read text, compare several pictures or describe a scene without a
+separate description step. PDFs up to 100 pages / 20 MB are attached as documents the model reads itself;
+larger PDFs are analyzed and summarized first. DOCX, XLSX, JSON and text/code files are extracted and
+handed to the agent, long ones with a pointer to `read_file` for the rest. Later in the conversation the
+agent can open any workspace file again with `view_image` / `read_document`, or ask another model's
+opinion with `describe_image`.
 
 ### 🎨 Advanced Image Generation and Transformation
 
 GenerALL.AI offers multiple powerful image generation and transformation capabilities:
 
-#### 📸 DALL-E 3 Image Generation
-Generate high-quality single images with OpenAI's DALL-E 3 model, with customizable parameters:
-- Control image size and quality
-- Detailed prompt capabilities
+#### 📸 gpt-image generation
+Generate high-quality images and variants with OpenAI's gpt-image models (`GPT_IMAGE_MODEL` for `best`,
+`GPT_IMAGE_MODEL_FAST` for `fast`), with customizable parameters:
+- Control image size, aspect ratio and quality (`auto` through `max`)
+- Several variants per request (capped in `/settings` → Images)
 - Supports art styles, photography styles, and concept visualization
 
 #### ✨ Multimodal Generation with Gemini
@@ -279,14 +363,15 @@ The bot can extract content, analyze structure, and help you understand the info
 
 ### 🎬 Supported Media File Types
 GenerALL.AI supports processing and analysis of various media formats including:
-- **Images**: JPG, JPEG, PNG, GIF*, BMP*, WEBP*
-- **Audio**: Telegram Voice Message, mp3*, ogg*
-- **Video**: -/-
+- **Images**: JPG, JPEG, HEIC, HEIF, PNG, WEBP, GIF, BMP (as Telegram photos or as files; everything is
+  kept as JPEG in your workspace, transparency flattened on white)
+- **Audio**: Telegram voice messages (transcribed); audio files (mp3, ogg, …) are saved to your workspace for the agent
+- **Video**: Telegram videos and video notes, and files with MP4, MOV, AVI, MKV, WEBM, M4V, 3GP extensions
 
 The bot can:
-- **Images**: Analyze content, detect objects, read text (OCR), and describe scenes
-- **Audio**: Transcribe speech, analyze audio content, and detect language and answer using voice generation
-- **Video**: -/-
+- **Images**: Analyze content, detect objects, read text (OCR), compare pictures and describe scenes; the model sees the picture itself
+- **Audio**: Transcribe speech, answer using voice generation
+- **Video**: Describe key frames and transcribe the audio track
 
 
 ### 💻 Code Execution Capabilities
@@ -299,6 +384,12 @@ The bot can:
 - **📋 Code Editing**: Iteratively improve code based on requirements and feedback
 
 ### ⏰ Reminder and Task System
+
+Ask in natural language ("remind me tomorrow at 9 to call the dentist", "every Monday at 8 summarize the
+AI news") and the agent schedules a reminder or a periodic task; `/reminders` lists them with pause and
+delete buttons. Times are in UTC today. Coming next: your local time zone (`/timezone`), creating and
+editing reminders from `/reminders`, snooze buttons, and scheduled tasks that stay quiet when there is
+nothing new to report.
 
 ## 💻 System Requirements
 
@@ -313,9 +404,9 @@ The bot can:
 
 - Telegram Bot Token
 - Anthropic API Key (for Claude Sonnet 5.5 and Haiku 5.5)
-- OpenAI API Key (for GPT-6.1 / GPT-6, Whisper and embeddings)
+- OpenAI API Key (for GPT-6.1 / GPT-6, gpt-image, Whisper and embeddings)
 - ElevenLabs API Key (for voice synthesis)
-- Google API Key (for Gemini image generation/transformation)
+- Google API Key (for Gemini image generation and Veo video)
 
 ## 📥 Installation
 
@@ -408,15 +499,17 @@ The application is configured via environment variables in the `.env` file. Key 
 Every model name lives in `app/models.py` and can be overridden from `.env` (defaults in
 parentheses; see the commented block in `.env.example`):
 
-- `ANTHROPIC_MODEL` (`claude-sonnet-5-5`): agent loop, judge, final compile, document and image
-  description. `ANTHROPIC_EFFORT` (`high`) is sent as `output_config.effort` on every call.
-- `ANTHROPIC_MODEL_FAST` (`claude-haiku-5-5`): topic/summary, complexity classifier, quick answers.
-- `OPENAI_MODEL` (`gpt-6.1-sol`): critique and GPT vision on photos. `VIDEO_FRAMES_MODEL`
+- `ANTHROPIC_MODEL` (`claude-sonnet-5-5`): agent loop, judge, final compile, the document fallbacks and
+  `describe_image`. `ANTHROPIC_EFFORT` (`high`) is sent as `output_config.effort` when deep reasoning is on.
+- `ANTHROPIC_MODEL_FAST` (`claude-haiku-5-5`): topic/summary, complexity classifier, quick answers, and the
+  whole agent loop in the Fast preset (mode `speed`).
+- `OPENAI_MODEL` (`gpt-6.1-sol`): critique and the `describe_image` second opinion. `VIDEO_FRAMES_MODEL`
   (`gpt-6-luna`): video frame description. Both are reasoning models and get
   `OPENAI_REASONING_EFFORT` (`high`).
-- `WHISPER_MODEL` (`whisper-1`), `EMBEDDING_MODEL` (`text-embedding-ada-002`, with
-  `EMBEDDING_DIMENSION` `1536`), `TTS_MODEL` (`eleven_multilingual_v2`).
-- `GEMINI_IMAGE_MODEL_FLASH`, `GEMINI_IMAGE_MODEL_PRO`, `GPT_IMAGE_MODEL`, `DALLE_MODEL`,
+- `WHISPER_MODEL` (`whisper-1`), `EMBEDDING_MODEL` (`text-embedding-3-small`, with
+  `EMBEDDING_DIMENSION` `1536`; changing the model rebuilds every user's index in the background),
+  `TTS_MODEL` (`eleven_multilingual_v2`).
+- `GPT_IMAGE_MODEL`, `GPT_IMAGE_MODEL_FAST`, `GEMINI_IMAGE_MODEL_FLASH`, `GEMINI_IMAGE_MODEL_PRO`,
   `VEO_MODEL`, `PERPLEXITY_MODEL`: image, video and deep-research models.
 
 ### ⚙️ Concurrency
@@ -426,6 +519,15 @@ parentheses; see the commented block in `.env.example`):
 - `THREAD_POOL_SIZE`: worker threads for blocking work such as Docker waits and HTTP SDK calls (default: 32)
 - `TURN_TIMEOUT_SECONDS`: hard limit for one message or scheduled task (default: 1800)
 - `DROP_PENDING_UPDATES`: discard messages that arrived while the bot was down (default: true)
+- `STREAMING_ENABLED`: stream partial answers as Telegram drafts (default: true)
+
+### 🔌 MCP servers for everyone
+
+- `MCP_SERVERS_FILE` (default `data/mcp_servers.json`): an optional, hand-edited JSON file
+  `{"servers": [{"name", "url", "transport": "http"|"sse", "headers": {...}, "enabled": true}]}` whose
+  servers are offered to every user (read-only in `/mcp`; users add their own with `/mcp add`). The bot
+  keeps the discovered tools next to it in `<name>.cache.json`, refreshed at startup and by the admin's
+  `/mcp refresh`.
 
 ### ☁️ S3 Storage Configuration
 
@@ -450,11 +552,12 @@ parentheses; see the commented block in `.env.example`):
 
 ## 📝 Usage
 
-1. Start a conversation with your bot on Telegram
-2. Send text messages, voice recordings, images, or documents
+1. Start a conversation with your bot on Telegram; `/help` lists what it can do and a few things to try
+2. Send text messages, voice recordings, photos, videos or documents; reply to or forward messages to give context
 3. The bot will process your input and respond accordingly
-4. Use `/settings` to customize the bot's behavior
-5. Use `/reminders` to manage your reminders
+4. Use `/settings` to pick a preset (Fast / Balanced / Deep) and customize the bot's behavior
+5. Use `/reminders` to manage your reminders, `/profile` to see what the bot remembers about you,
+   `/usage` for your last 30 days, `/mcp` to connect tool servers
 6. Use `/cancel` to stop the task that is running and clear your queue
 7. Use `/settings` → Rich Messages to switch between rich and classic formatting
 8. While the agent works, the "Thinking…" message lists the tool calls as they run (✅ done, ⏳ running,
@@ -519,6 +622,11 @@ touched, and a concurrency group runs deploys one at a time.
 - **✨ Answers arrive as "unsupported message"**: update the Telegram app, or turn Rich Messages off in `/settings`
 - **✨ Answers have no headings/tables and the log says rich messages are not supported**: the
   `telegram-bot-api` sidecar is older than Bot API 10.1; run `docker compose pull telegram-bot-api && docker compose up -d`
+- **🌐 `browse_webpage` or PDF rendering fail with import errors inside the sandbox**: the sandbox image is
+  rebuilt automatically at startup when its Dockerfile or requirements changed (the log says `Building image
+  secure-container:<hash>`); the first start after such a change takes several minutes
+- **🔌 An MCP tool answers "unreachable"**: check the URL and token with `/mcp` (the last error is shown
+  there) and `/mcp refresh <name>` after fixing the server
 
 ## 📄 License
 

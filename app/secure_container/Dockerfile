@@ -108,8 +108,9 @@ RUN echo "===> INSTALLING PYTHON REQUIREMENTS" && \
 
 # Headless Chromium for scripts/browse.py (web reading) and scripts/render_document.py (PDF).
 # Browsers go to a shared, world-readable path instead of root's home so the non-root runner
-# finds them; --with-deps installs the shared libraries Chromium needs. NOTE: the bot never
-# rebuilds an existing image, so delete "secure-container:latest" after changing this file.
+# finds them; --with-deps installs the shared libraries Chromium needs. NOTE: the bot
+# tags the image with a hash of this file, entrypoint.sh and requirements.txt, so a change here
+# is rebuilt on the next startup by itself (container_manager.image_build_fingerprint).
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
 RUN echo "===> INSTALLING PLAYWRIGHT CHROMIUM" && \
     python -m playwright install --with-deps chromium && \
