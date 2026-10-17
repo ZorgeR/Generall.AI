@@ -1,6 +1,16 @@
 import json
 
-from bot.settings import DEFAULT_SETTINGS, UserSettings
+from bot.settings import (
+    DEFAULT_SETTINGS,
+    ITERATION_MAX,
+    ITERATION_MIN,
+    MODE_TYPES,
+    PRESET_NAMES,
+    SETTINGS_PRESETS,
+    UserSettings,
+    apply_preset,
+    current_preset,
+)
 
 
 def test_defaults_are_present_for_new_user(tmp_path):
@@ -58,3 +68,69 @@ def test_rich_messages_default_on_and_backfilled_for_old_files(tmp_path):
     assert s.get("rich_messages", "enabled") is True
     s.set("rich_messages", False, "enabled")
     assert UserSettings("9", base_dir=str(tmp_path)).get("rich_messages", "enabled") is False
+
+
+# ---- presets (F6) and the mode / ui keys (F3, F6) ----------------------------------
+def test_mode_and_ui_defaults():
+    assert DEFAULT_SETTINGS["mode"] == {"type": "auto"}
+    assert DEFAULT_SETTINGS["ui"] == {"advanced": False}
+    assert MODE_TYPES == ("auto", "speed", "intelligence")
+
+
+def test_presets_are_well_formed():
+    assert PRESET_NAMES == ("fast", "balanced", "deep")
+    for name, values in SETTINGS_PRESETS.items():
+        assert values[("mode", "type")] in MODE_TYPES, name
+        assert isinstance(values[("thinking", "enabled")], bool), name
+        assert ITERATION_MIN <= values[("tools", "max_iteration")] <= ITERATION_MAX, name
+        for (category, key) in values:
+            assert key in DEFAULT_SETTINGS[category], (name, category, key)
+    # Balanced is the defaults: a new user already has it.
+    assert all(DEFAULT_SETTINGS[c][k] == v for (c, k), v in SETTINGS_PRESETS["balanced"].items())
+
+
+def test_presets_apply_detect_and_round_trip(tmp_path):
+    s = UserSettings("5", base_dir=str(tmp_path))
+    s.set("image", "fast", "engine")  # an unrelated choice a preset must leave alone
+    assert current_preset(s) == "balanced"
+
+    assert apply_preset(s, "fast") is True
+    assert (s.get("mode", "type"), s.get("thinking", "enabled"), s.get("tools", "max_iteration")) == ("speed", False, 10)
+    assert s.get("image", "engine") == "fast"
+    again = UserSettings("5", base_dir=str(tmp_path))  # persisted in one save
+    assert current_preset(again) == "fast"
+    assert apply_preset(again, "fast") is False  # already active: nothing changed
+
+    assert apply_preset(again, "DEEP") is True  # names are case-insensitive
+    assert (again.get("mode", "type"), again.get("thinking", "enabled"), again.get("tools", "max_iteration")) == ("intelligence", True, 40)
+    assert current_preset(UserSettings("5", base_dir=str(tmp_path))) == "deep"
+
+    assert apply_preset(again, "balanced") is True
+    assert UserSettings("5", base_dir=str(tmp_path)).as_dict() == {**DEFAULT_SETTINGS, "image": {**DEFAULT_SETTINGS["image"], "engine": "fast"}}
+
+
+def test_a_custom_state_matches_no_preset_and_unknown_presets_change_nothing(tmp_path):
+    s = UserSettings("6", base_dir=str(tmp_path))
+    s.set("tools", 11, "max_iteration")
+    assert current_preset(s) is None
+    before = s.as_dict()
+    assert apply_preset(s, "turbo") is False
+    assert apply_preset(s, None) is False
+    assert s.as_dict() == before
+    # every key must match: one differing value is a custom state
+    s.set("tools", 40, "max_iteration")
+    s.set("mode", "intelligence", "type")
+    assert current_preset(s) == "deep"
+    s.set("thinking", False, "enabled")
+    assert current_preset(s) is None
+
+
+def test_apply_preset_repairs_a_hand_edited_category(tmp_path):
+    user_dir = tmp_path / "8"
+    user_dir.mkdir()
+    (user_dir / "settings.json").write_text(json.dumps({"mode": "speed", "tools": {"max_iteration": "lots"}}))
+    s = UserSettings("8", base_dir=str(tmp_path))
+    assert current_preset(s) is None
+    assert apply_preset(s, "fast") is True
+    assert UserSettings("8", base_dir=str(tmp_path)).get("mode", "type") == "speed"
+    assert current_preset(UserSettings("8", base_dir=str(tmp_path))) == "fast"

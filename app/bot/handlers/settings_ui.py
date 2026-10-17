@@ -757,13 +757,13 @@ async def settings_button(callback: CallbackQuery) -> None:
     if control is not None and (
         (control.kind == "number" and _to_int(value) is None) or (control.kind == "cycle" and not value)
     ):
-        await _show_choice_menu(message, control)
+        await _show_choice_menu(message, control, user_settings)
         return
     apply_setting(user_settings, category, action, value)
     await menu(message, user_settings)
 
 
-async def _show_choice_menu(message: Message, control: Control) -> None:
+async def _show_choice_menu(message: Message, control: Control, user_settings: UserSettings) -> None:
     """The keyboards' choice list for one number / choice (e.g. ``settings_tools_iteration``)."""
     if control.token == "image":
         await show_image_choice_menu(message, control.action)
@@ -771,6 +771,8 @@ async def _show_choice_menu(message: Message, control: Control) -> None:
         await show_transcript_choice_menu(message, control.action)
     elif control.token == "semantic":
         await show_semantic_max_results_menu(message)
+    elif control.token == "mode":
+        await show_mode_menu(message, user_settings)  # its menu is the choice list
     elif control.action == "size":
         await show_size_input_menu(message, control.token)
     elif control.action == "iteration":
@@ -992,6 +994,28 @@ async def show_thinking_menu(message: Message, user_settings: UserSettings) -> N
     )
 
 
+async def show_mode_menu(message: Message, user_settings: UserSettings) -> None:
+    """Quick answers vs. deep work: one button per mode (``settings_mode_set_<value>``)."""
+    current = user_settings.get("mode", "type")
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(
+            text=f"{'✅' if mode == current else '○'} {mode.title()}",
+            callback_data=f"settings_mode_set_{mode}",
+        )]
+        for mode in MODE_TYPES
+    ]
+    rows.append([_back_button()])
+    lines = "\n".join(f"• *{mode.title()}*: {MODE_DESCRIPTIONS[mode]}" for mode in MODE_TYPES)
+    await edit_md(
+        message,
+        "*Mode Settings*\n\n"
+        f"Current: *{current}*\n\n"
+        f"{lines}\n\n"
+        "Quick answers vs. deep work:",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
 async def show_rich_menu(message: Message, user_settings: UserSettings) -> None:
     """Show rich messages settings menu."""
     enabled = user_settings.get("rich_messages", "enabled")
@@ -1175,6 +1199,7 @@ _LEGACY_MENUS: dict[str, Callable[[Message, UserSettings], Awaitable[None]]] = {
     "tools": show_tools_menu,
     "semantic": show_semantic_menu,
     "thinking": show_thinking_menu,
+    "mode": show_mode_menu,
     "rich": show_rich_menu,
     "image": show_image_menu,
     "trace": show_trace_menu,

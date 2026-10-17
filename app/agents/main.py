@@ -93,8 +93,9 @@ def log_input_transformations(response) -> None:
         )
         print(f"WARNING: the API changed {len(entries)} thinking block(s) in the request: {described}")
 
-# Streaming config
-streaming_enabled = os.getenv("STREAMING_ENABLED", "false").lower() == "true"
+# Streaming config: on by default (STREAMING_ENABLED=false turns the drafts off); bot/config.py
+# reads the same variable for the Telegram side, so the two defaults must agree.
+streaming_enabled = os.getenv("STREAMING_ENABLED", "true").lower() == "true"
 print(f"Agent streaming_enabled: {streaming_enabled} (env: {os.getenv('STREAMING_ENABLED', 'not set')})")
 
 # Appended to every system prompt so the model knows how its answer is rendered
@@ -757,6 +758,14 @@ class ChainOfThoughtAgent:
         self.short_term_memory_path.mkdir(parents=True, exist_ok=True)
         
         if model_type == "anthropic":
+            # Mode (docs/design-v3.md, F3): speed = the fast model runs the whole tool loop with
+            # light thinking (request_options_for gives it no effort/thinking parameters);
+            # intelligence = the main model thinks deeply whatever the thinking toggle says;
+            # auto (and any unknown value) = the main model, thinking as set, and the quick-answer
+            # classifier (_decide_complexity) picks the path per message.
+            self.mode = self._mode_of(self.user_settings)
+            if self.mode == "speed":
+                model = ANTHROPIC_MODEL_FAST
             self.agent = AgentAnthropic(model, user_id=user_id)
             self.agent.file_ops = self.file_ops
             self.agent.search_tools = self.search_tools
@@ -780,7 +789,12 @@ class ChainOfThoughtAgent:
             self.agent.register_provider(self.web_tools, blocking=True)
             self.document_tools = DocumentTools(user_id, sender)
             self.agent.register_provider(self.document_tools, blocking=True)
-            self.agent.thinking = self.user_settings.get("thinking").get("enabled", False)
+            if self.mode == "speed":
+                self.agent.thinking = False
+            elif self.mode == "intelligence":
+                self.agent.thinking = True
+            else:
+                self.agent.thinking = bool(self.user_settings.get("thinking").get("enabled", False))
         else:
             raise ValueError("Currently only Anthropic models are supported with the new tool pattern")
 
@@ -1134,10 +1148,20 @@ User message: {question}"""
         with open(self.short_term_memory_path / self._get_memory_filename("dialog_history.json"), "w", encoding="utf-8") as f:
             json.dump(history[-size:], f, indent=2, ensure_ascii=False)
 
+    @staticmethod
+    def _mode_of(user_settings: dict | None) -> str:
+        """The user's ``mode.type``: "auto", "speed" or "intelligence"; anything else (an unknown
+        value, a missing category, no settings at all) behaves as auto."""
+        category = user_settings.get("mode") if isinstance(user_settings, dict) else None
+        value = category.get("type") if isinstance(category, dict) else None  # a hand-edited file may hold anything
+        mode = str(value or "auto").strip().lower()
+        return mode if mode in ("speed", "intelligence") else "auto"
+
     async def _decide_complexity(self, question: str, history_view: list, *, has_media: bool = False) -> str:
         """Quick fast-model answer or the full agent for this turn. A prompt with pictures or
-        documents always takes the full agent (the quick path is text-only)."""
-        if has_media:
+        documents always takes the full agent (the quick path is text-only), and so does every
+        turn in speed and intelligence mode: only auto asks the classifier."""
+        if has_media or self._mode_of(getattr(self, "user_settings", None)) != "auto":
             return "complex"
         return await self._classify_complexity(question, history_view)
 

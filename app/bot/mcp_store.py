@@ -121,13 +121,14 @@ def new_server(name: str, url: str, token: str | None = None, transport: str | N
 def normalize(raw: Any, *, admin: bool = False) -> dict | None:
     """A record with every key present, or None when the entry has no usable name or URL.
 
-    Hand-edited admin entries are forgiven: an invalid name or URL is logged and skipped,
-    everything else gets its default."""
+    An invalid name, URL or transport is logged and the entry skipped, everything else gets its
+    default. The https policy applied when a server is added (``new_server``); a stored URL only has
+    to be an http(s) URL with a host, so the admin's own plain-http servers survive a reload."""
     if not isinstance(raw, dict):
         return None
     try:
         name = validate_name(raw.get("name", ""))
-        url = validate_url(raw.get("url", ""), admin=admin)
+        url = validate_url(raw.get("url", ""), admin=True)
         transport = validate_transport(raw.get("transport"))
     except ValueError as e:
         logger.warning("Skipping MCP server entry %r: %s", raw.get("name"), e)
