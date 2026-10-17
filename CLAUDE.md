@@ -854,12 +854,14 @@ Edited through `/settings` (`bot/handlers/settings_ui.py`). With rich messages o
 available) it is ONE rich page: a bold "Preset" paragraph with ONE row `⚡ Fast · ⚖️ Balanced · 🧠 Deep`
 (the active one "✅ …", callback `setp_preset_<name>`) and the `⚙️ Advanced ✅/⬜` toggle (`setp_ui_advanced`,
 `Control ADVANCED` in `CONTROLS` but in no section), then four collapsible sections (Memory, Agent, Replies,
-Images) built from `SECTIONS` (`Control(token, action, category, key, kind toggle|number|cycle, name, hint, …,
+Images) built from `SECTIONS` (`Control(token, action, category, key, kind toggle|number|choice, name, hint, …,
 advanced=False)`), each setting a bold paragraph with a friendly name ("🎛 Quick answers vs. deep work" for
 mode, "Deep reasoning", "Tool calls per answer", "Remember this chat in full", "Memory window",
 "Completeness check", "Second opinion rewrite (GPT)", "Personality prompt", …; tests address rows by these
-names) plus a row of buttons inside the message (toggle "✅ On"/"⬜ Off", number "−  value  +", choice
-"<current> ▸" cycling); `Control.advanced` rows (transcript sizes, summaries size, dialog, reasoning,
+names) plus button rows inside the message (`control_rows`: toggle "✅ On"/"⬜ Off", number "−  value  +",
+choice = one button per option, the current one "✅ …" and not tappable, spread over rows by `split_rows`
+so labels stay readable on a phone, with `CHOICE_LABELS` for values that make poor button text, e.g. the
+system prompt types); `Control.advanced` rows (transcript sizes, summaries size, dialog, reasoning,
 short-term memory, semantic max, critique, judge, system prompt, image variants/metadata) are hidden while
 `ui.advanced` is off (`visible_controls`). A tap applies and edits the page in place with that section open.
 Its callback_data is `setp_<token>_<action>[_<value>]`, `setp_sysprompt_<type>`, `setp_preset_<name>`,

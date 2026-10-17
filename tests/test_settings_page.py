@@ -108,6 +108,24 @@ def row_of(blocks, name):
     raise AssertionError(f"no setting named {name!r}")
 
 
+def rows_of(blocks, name):
+    """Every button row that follows the paragraph whose bold name is ``name`` (a choice may take several)."""
+    flat = list(walk(blocks))
+    for i, block in enumerate(flat):
+        if isinstance(block, InputRichBlockParagraph) and isinstance(block.text, list) and block.text[0].text == name:
+            rows = []
+            for nxt in flat[i + 1:]:
+                if not isinstance(nxt, InputRichBlockButtons):
+                    break
+                rows.append(nxt)
+            return rows
+    raise AssertionError(f"no setting named {name!r}")
+
+
+def choice_buttons(blocks, name):
+    return [b for row in rows_of(blocks, name) for b in row.buttons]
+
+
 def names_on(blocks):
     """The bold names of the settings (and the Preset paragraph) in page order."""
     return [b.text[0].text for b in walk(blocks) if isinstance(b, InputRichBlockParagraph) and isinstance(b.text, list)]
@@ -158,14 +176,24 @@ def test_page_layout_for_defaults():
     assert sections[3].summary == "🎨 Images · auto · auto · 2K · ×4"
     assert sections[4].summary == "🌐 Browser · on · screenshots ✅ · logins ✅"
     assert not any(d.is_open for d in sections)  # a fresh /settings: all closed
-    # Every setting is a bold paragraph followed by its button row.
+    # Every setting is a bold paragraph followed by its button row(s): a choice may take several.
+    us = UserSettings(str(USER))
     for section in sections:
-        kinds = [type(b) for b in section.blocks]
-        assert kinds == [InputRichBlockParagraph, InputRichBlockButtons] * (len(kinds) // 2)
-        assert isinstance(section.blocks[0].text[0], RichTextBold)
-    # The presets row plus one row per everyday setting; Advanced on shows every setting.
-    assert len(rows(blocks)) == 1 + len(BASIC)
-    assert len(rows(su.settings_page_blocks(with_values(SHOW_ALL)))) == 1 + len(SECTION_CONTROLS)
+        groups, current = [], None
+        for block in section.blocks:
+            if isinstance(block, InputRichBlockParagraph):
+                current = [block]
+                groups.append(current)
+            else:
+                assert isinstance(block, InputRichBlockButtons) and current is not None
+                current.append(block)
+        assert all(len(g) >= 2 and isinstance(g[0].text[0], RichTextBold) for g in groups)
+    # The presets row plus each everyday setting's rows; Advanced on shows every setting.
+    def row_count(controls, settings):
+        return sum(len(su.control_rows(c, settings)) for c in controls)
+
+    assert len(rows(blocks)) == 1 + row_count(BASIC, us)
+    assert len(rows(su.settings_page_blocks(with_values(SHOW_ALL)))) == 1 + row_count(SECTION_CONTROLS, us)
     assert len(su.CONTROLS) == len(SECTION_CONTROLS) + 1  # + the Advanced toggle itself
 
 
@@ -256,34 +284,56 @@ def test_number_row_for_an_off_list_value_shows_the_real_value():
     assert (minus.callback_data, label.text, plus.disabled is not None) == ("setp_transcript_ctx_300000", "400k", True)
 
 
-def test_cycle_wraps_around():
-    assert su.next_choice(("a", "b", "c"), "a") == "b"
-    assert su.next_choice(("a", "b", "c"), "c") == "a"
-    assert su.next_choice(("a", "b", "c"), "zzz") == "a"
+def test_choices_are_one_button_each_with_the_current_one_checked():
     blocks = su.settings_page_blocks(with_values({("image", "quality"): "max", ("system_prompt", "type"): SYSTEM_PROMPT_TYPES[-1], **SHOW_ALL}))
-    (quality,) = row_of(blocks, "✨ Image quality").buttons
-    assert (quality.text, quality.callback_data) == ("max ▸", "setp_image_quality_auto")
-    (prompt,) = row_of(blocks, "🧩 Personality prompt").buttons
-    assert (prompt.text, prompt.callback_data) == (f"{SYSTEM_PROMPT_TYPES[-1]} ▸", f"setp_sysprompt_{SYSTEM_PROMPT_TYPES[0]}")
-    (engine,) = row_of(blocks, "🖌 Image engine").buttons
-    assert engine.callback_data == "setp_image_engine_best"  # auto -> best (sorted IMAGE_BACKENDS)
+    quality = choice_buttons(blocks, "✨ Image quality")
+    assert [b.text for b in quality] == ["auto", "low", "medium", "high", "xhigh", "✅ max"]
+    assert quality[-1].disabled is not None and quality[-1].callback_data is None  # the current one is not tappable
+    assert [b.callback_data for b in quality[:-1]] == [f"setp_image_quality_{q}" for q in ("auto", "low", "medium", "high", "xhigh")]
+    assert [len(r.buttons) for r in rows_of(blocks, "✨ Image quality")] == [3, 3]  # six choices: 3 + 3
+
+    engine = choice_buttons(blocks, "🖌 Image engine")
+    assert [b.text for b in engine] == ["✅ auto", "best", "fast", "story"]  # every engine visible, one row
+    assert len(rows_of(blocks, "🖌 Image engine")) == 1
+    assert [b.callback_data for b in engine[1:]] == ["setp_image_engine_best", "setp_image_engine_fast", "setp_image_engine_story"]
+
+    prompts = choice_buttons(blocks, "🧩 Personality prompt")
+    assert [b.callback_data for b in prompts if b.callback_data] == [f"setp_sysprompt_{t}" for t in SYSTEM_PROMPT_TYPES[:-1]]
+    assert prompts[-1].text == f"✅ {su.CHOICE_LABELS[('system_prompt', 'type')][SYSTEM_PROMPT_TYPES[-1]]}"
+
+
+def test_an_unknown_stored_choice_leaves_every_button_tappable():
+    blocks = su.settings_page_blocks(with_values({("image", "size"): "8K"}))
+    sizes = choice_buttons(blocks, "📐 Image size")
+    assert [b.text for b in sizes] == ["1K", "2K", "4K"] and all(b.callback_data for b in sizes)
+
+
+def test_split_rows_keeps_rows_narrow_and_even():
+    assert su.split_rows(["auto", "best", "fast", "story"]) == [4]
+    assert su.split_rows(["auto", "low", "medium", "high", "xhigh", "max"]) == [3, 3]
+    assert su.split_rows(["a" * 30, "b"]) == [1, 1]  # a long label gets its own row
+    assert su.split_rows(["x"] * 9) == [3, 3, 3]
+    assert su.split_rows([]) == []
 
 
 MODE_NAME = "🎛 Quick answers vs. deep work"
 
 
-def test_mode_control_cycles_through_the_modes():
+def test_mode_choices_set_each_mode():
     us = UserSettings(str(USER))
-    seen = []
-    for _ in MODE_TYPES:
-        (button,) = row_of(su.settings_page_blocks(us), MODE_NAME).buttons
-        seen.append(button.text)
+    for mode in MODE_TYPES:
+        buttons = choice_buttons(su.settings_page_blocks(us), MODE_NAME)
+        assert [b.text.removeprefix("✅ ") for b in buttons] == list(MODE_TYPES)
+        (checked,) = [b for b in buttons if b.callback_data is None]
+        assert checked.text == f"✅ {us.get('mode', 'type')}"
+        (button,) = [b for b in buttons if b.callback_data and b.callback_data.endswith(f"_{mode}")] or [None]
+        if button is None:  # already the current mode
+            continue
         token, action, value = su.parse_page_callback(button.callback_data)
-        assert (token, action) == ("mode", "set") and value in MODE_TYPES
+        assert (token, action, value) == ("mode", "set", mode)
         assert su.apply_setting(us, token, action, value) is True
-        assert UserSettings(str(USER)).get("mode", "type") == value
-    assert seen == [f"{mode} ▸" for mode in MODE_TYPES]
-    assert us.get("mode", "type") == MODE_TYPES[0]  # wrapped around
+        assert UserSettings(str(USER)).get("mode", "type") == mode
+    assert us.get("mode", "type") == MODE_TYPES[-1]
     assert su.MODE_HINT in su.CONTROLS[("mode", "set")].hint
     assert "intelligence" in su.section_summary(su.SECTIONS[1], with_values({("mode", "type"): "intelligence"}))
 

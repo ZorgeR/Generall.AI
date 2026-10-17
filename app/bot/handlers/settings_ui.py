@@ -98,6 +98,18 @@ SEMANTIC_MAX_RESULTS_CHOICES = (1, 3, 5, 7, 10, 15, 20)
 CONTEXT_TOKEN_CHOICES = (50000, 100000, 120000, 150000, 200000, 300000)
 KEEP_TOOL_RESULTS_CHOICES = (1, 2, 3, 5, 10)
 
+# Button text of a choice on the settings page, when the stored value is not readable as is.
+CHOICE_LABELS: dict[tuple[str, str], dict[str, str]] = {
+    ("system_prompt", "type"): {
+        "generall-ai-v2": "GenerALL v2",
+        "generall-ai-v1": "GenerALL v1",
+        "perplexity-deep-research": "Deep research",
+        "perplexity-r1": "Perplexity R1",
+    },
+}
+CHOICE_ROW_BUTTONS = 4  # at most this many choice buttons side by side ...
+CHOICE_ROW_CHARS = 42  # ... and buttons share a row's width, so the longest label × buttons stays under this
+
 SYSTEM_PROMPT_DESCRIPTIONS: dict[str, str] = {
     "generall-ai-v2": "Generall.AI v2 system prompt.",
     "generall-ai-v1": "Generall.AI v1 system prompt.",
@@ -178,8 +190,9 @@ class Control:
     """One changeable value, addressed the way callbacks address it: ``token`` + ``action``.
 
     ``kind`` is ``toggle`` (flip a bool), ``number`` (any integer, clamped by ``clamp`` as the
-    keyboards always did; ``choices`` are only the −/+ steps of the page) or ``cycle`` (one of
-    ``choices``, in order). ``name``/``hint`` are the page's paragraph (friendly words, not the
+    keyboards always did; ``choices`` are only the −/+ steps of the page) or ``choice`` (one of
+    ``choices``: the page shows every choice as its own button, the current one checked). ``name``/``hint``
+    are the page's paragraph (friendly words, not the
     JSON key). ``advanced`` controls are on the page only while ``ui.advanced`` is on.
     """
 
@@ -272,7 +285,7 @@ SECTIONS: tuple[Section, ...] = (
                 SEMANTIC_MAX_RESULTS_CHOICES, UserSettings.validate_semantic_max_results, advanced=True),
     ), _memory_state),
     Section("agent", "🤖 Agent", (
-        Control("mode", "set", "mode", "type", "cycle",
+        Control("mode", "set", "mode", "type", "choice",
                 "🎛 Quick answers vs. deep work", MODE_HINT, MODE_TYPES),
         Control("thinking", "toggle", "thinking", "enabled", "toggle",
                 "🤔 Deep reasoning", "think longer before answering; off = faster, lighter answers"),
@@ -289,8 +302,8 @@ SECTIONS: tuple[Section, ...] = (
                 "⚖️ Completeness check", "re-prompts until the answer is complete", advanced=True),
         Control("judge", "iteration", "judge", "max_iteration", "number",
                 "Check rounds", "max re-prompts", ITERATION_CHOICES, UserSettings.validate_iteration, advanced=True),
-        Control("system_prompt", "set", "system_prompt", "type", "cycle",
-                "🧩 Personality prompt", "tap to switch", SYSTEM_PROMPT_TYPES, advanced=True),
+        Control("system_prompt", "set", "system_prompt", "type", "choice",
+                "🧩 Personality prompt", "the system prompt the assistant follows", SYSTEM_PROMPT_TYPES, advanced=True),
     ), _agent_state),
     Section("replies", "💬 Replies", (
         Control("rich", "toggle", "rich_messages", "enabled", "toggle",
@@ -301,11 +314,11 @@ SECTIONS: tuple[Section, ...] = (
                 "🧭 Suggested next questions", "as buttons under answers"),
     ), _replies_state),
     Section("images", "🎨 Images", (
-        Control("image", "engine", "image", "engine", "cycle",
+        Control("image", "engine", "image", "engine", "choice",
                 "🖌 Image engine", "auto/best strongest, fast quicker, story for narratives", tuple(sorted(IMAGE_BACKENDS))),
-        Control("image", "quality", "image", "quality", "cycle",
+        Control("image", "quality", "image", "quality", "choice",
                 "✨ Image quality", "effort per image; auto lets the provider decide", tuple(IMAGE_QUALITIES)),
-        Control("image", "size", "image", "size", "cycle",
+        Control("image", "size", "image", "size", "choice",
                 "📐 Image size", "resolution tier", tuple(IMAGE_SIZES)),
         Control("image", "variants", "image", "max_variants", "number",
                 "🔢 Images per request", "the most alternatives one request may produce",
@@ -522,12 +535,28 @@ def step_values(choices: Sequence[int], current: int) -> tuple[int | None, int |
     return lower, higher
 
 
-def next_choice(choices: Sequence[Any], current: Any) -> Any:
-    """The choice after ``current``, wrapping around; the first one when ``current`` is unknown."""
-    if current in choices:
-        return choices[(list(choices).index(current) + 1) % len(choices)]
-    return choices[0]
+def choice_label(control: Control, value: Any) -> str:
+    return CHOICE_LABELS.get((control.category, control.key), {}).get(str(value), _clip(value))
 
+
+def split_rows(labels: Sequence[str], max_buttons: int = CHOICE_ROW_BUTTONS, max_chars: int = CHOICE_ROW_CHARS) -> list[int]:
+    """How many buttons go on each row: as few rows as fit, then spread evenly (six choices become
+    3 + 3, not 4 + 2), keeping the order. Buttons in a row share its width, so a row fits when its
+    longest label (with the "✅ " of the checked one) times its button count stays under ``max_chars``."""
+    count = len(labels)
+    for rows in range(1, count + 1):
+        base, extra = divmod(count, rows)
+        sizes = [base + (1 if i < extra else 0) for i in range(rows)]
+        start, fits = 0, True
+        for size in sizes:
+            widest = max(len(label) for label in labels[start:start + size]) + 2
+            if size > max_buttons or (size > 1 and widest * size > max_chars):
+                fits = False
+                break
+            start += size
+        if fits:
+            return sizes
+    return [1] * count
 
 def _disabled(text: str) -> RichMessageButton:
     return RichMessageButton(text=text, disabled=DisabledButton())
@@ -539,8 +568,14 @@ def _step_button(text: str, control: Control, target: int | None) -> RichMessage
     return RichMessageButton(text=text, callback_data=page_callback(control, target))
 
 
-def control_row(control: Control, user_settings: UserSettings) -> InputRichBlockButtons:
-    """The button row of one setting, showing its current value."""
+def control_rows(control: Control, user_settings: UserSettings) -> list[InputRichBlockButtons]:
+    """The button row(s) of one setting, showing its current value.
+
+    A toggle is one button, a number is "−  value  +", a choice is one button per choice (several
+    rows when they do not fit one), the current one checked and not tappable, so every option is
+    visible and one tap picks it. A stored value that is not in the list (an older choice, a
+    hand-edited file) leaves every button tappable.
+    """
     current = user_settings.get(control.category, control.key)
     if control.kind == "toggle":
         button = RichMessageButton(
@@ -548,19 +583,25 @@ def control_row(control: Control, user_settings: UserSettings) -> InputRichBlock
             style="success" if current else None,
             callback_data=page_callback(control),
         )
-        return InputRichBlockButtons(buttons=[button])
+        return [InputRichBlockButtons(buttons=[button])]
     if control.kind == "number":
         value = _number(user_settings, control.category, control.key)
         lower, higher = step_values(control.choices, value)
-        return InputRichBlockButtons(buttons=[
+        return [InputRichBlockButtons(buttons=[
             _step_button("−", control, lower),
             _disabled(control.label(value)),
             _step_button("+", control, higher),
-        ])
-    shown = _clip(current) if current not in (None, "") else "—"
-    return InputRichBlockButtons(buttons=[
-        RichMessageButton(text=f"{shown} ▸", callback_data=page_callback(control, next_choice(control.choices, current)))
-    ])
+        ])]
+    labels = [choice_label(control, choice) for choice in control.choices]
+    buttons = [
+        _disabled(f"✅ {label}") if choice == current else RichMessageButton(text=label, callback_data=page_callback(control, choice))
+        for choice, label in zip(control.choices, labels)
+    ]
+    rows, start = [], 0
+    for size in split_rows(labels):
+        rows.append(InputRichBlockButtons(buttons=buttons[start:start + size]))
+        start += size
+    return rows
 
 
 def _control_paragraph(control: Control) -> InputRichBlockParagraph:
@@ -610,7 +651,7 @@ def settings_page_blocks(user_settings: UserSettings, *, open_section: str | Non
         inner: list = []
         for control in visible_controls(section, user_settings):
             inner.append(_control_paragraph(control))
-            inner.append(control_row(control, user_settings))
+            inner.extend(control_rows(control, user_settings))
         summary = section_summary(section, user_settings)
         if sections:
             is_open = True if section.id == open_section else None
@@ -776,7 +817,7 @@ async def settings_button(callback: CallbackQuery) -> None:
     # change (or a no-op for an unknown action) followed by the category's menu.
     control = CONTROLS.get((category or "", action or ""))
     if control is not None and (
-        (control.kind == "number" and _to_int(value) is None) or (control.kind == "cycle" and not value)
+        (control.kind == "number" and _to_int(value) is None) or (control.kind == "choice" and not value)
     ):
         await _show_choice_menu(message, control, user_settings)
         return
