@@ -8,6 +8,10 @@ the new message is processed as its own turn once the queue reaches it.
 button stop the running job and clear the queue; the Stop button in a turn's
 status (``queue_stop_<job token>``) and Telegram's Stop button on its streaming
 draft (a ``stopped_message_generation`` update) stop only that job.
+
+Every job puts the reply / forward preamble (``bot.message_context``) in front of
+its prompt, so a reply to an earlier message or a forwarded post reaches the agent
+with what it refers to.
 """
 from __future__ import annotations
 
@@ -26,6 +30,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from bot import media
 from bot.agent_runner import THINKING, run_turn
+from bot.message_context import with_reference
 from bot.queue import STOP_CALLBACK_PREFIX, Job, JobContext, SubmitResult, job_id_from_token
 from bot.runtime import queue
 from bot.sender import ChatSender
@@ -49,6 +54,11 @@ def _stats():
 
 def _thread_id(message: Message) -> int | None:
     return message.message_thread_id if message.is_topic_message else None
+
+
+def _bot_id(bot: Bot) -> int | None:
+    """``Bot.id`` (from the token); None for the bot stand-ins of the tests."""
+    return getattr(bot, "id", None)
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -182,7 +192,7 @@ async def draft_stopped(event: MessageGenerationStopped, user_id: str) -> None:
 # ---------------------------------------------------------------------------
 async def _run_text(bot: Bot, message: Message, user_id: str, limit: int | None, ctx: JobContext) -> None:
     await run_turn(
-        bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=message.text or "",
+        bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=with_reference(message.text or "", message, _bot_id(bot)),
         thread_id=_thread_id(message), reply_to_message_id=message.message_id, ctx=ctx, limit=limit,
     )
 
@@ -214,7 +224,7 @@ async def _run_voice(bot: Bot, message: Message, user_id: str, limit: int | None
         shown = transcription[:512] + "..." if len(transcription) > 1500 else transcription
         await sender.edit_text(status, f"🎙️ *Transcription:*\n{shown}")
         await run_turn(
-            bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=transcription,
+            bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=with_reference(transcription, message, _bot_id(bot)),
             thread_id=_thread_id(message), reply_to_message_id=message.message_id, ctx=ctx, limit=limit, speak=True,
         )
     except asyncio.CancelledError:
@@ -309,7 +319,7 @@ async def _run_video(bot: Bot, message: Message, user_id: str, limit: int | None
                 label = media.FRAME_LABELS[i] if i < len(media.FRAME_LABELS) else f"frame {i + 1}"
                 lines.append(f"  - Frame at {label}: {sp}")
             parts.append("Video screenshots saved:\n" + "\n".join(lines))
-        prompt = "\n\n".join(parts)
+        prompt = with_reference("\n\n".join(parts), message, _bot_id(bot))
 
         await run_turn(
             bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=prompt,
@@ -357,7 +367,7 @@ async def _run_audio(bot: Bot, message: Message, user_id: str, limit: int | None
             prompt += f"\nUser message: {caption}"
         await sender.edit_text(status, "🎵 *Audio saved, processing...*")
         result = await run_turn(
-            bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=prompt,
+            bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=with_reference(prompt, message, _bot_id(bot)),
             thread_id=_thread_id(message), reply_to_message_id=message.message_id, ctx=ctx, limit=limit,
         )
         if result is not None:
@@ -437,7 +447,7 @@ async def _run_images(
         )
         await sender.edit_text(status, "🤖 *Processing...*")
         result = await run_turn(
-            bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=prompt,
+            bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=with_reference(prompt, message, _bot_id(bot)),
             thread_id=_thread_id(message), reply_to_message_id=message.message_id, ctx=ctx, limit=limit,
         )
         if result is not None:
@@ -552,7 +562,7 @@ async def _run_document(bot: Bot, message: Message, user_id: str, limit: int | N
         )
         await sender.edit_text(status, "🤖 *Processing...*")
         result = await run_turn(
-            bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=prompt,
+            bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=with_reference(prompt, message, _bot_id(bot)),
             thread_id=_thread_id(message), reply_to_message_id=message.message_id, ctx=ctx, limit=limit,
         )
         if result is not None:

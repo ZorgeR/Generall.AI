@@ -1,11 +1,16 @@
-"""/start, /invite, /listusers and /voice."""
+"""/start, /help, /invite, /listusers and /voice, plus the command menu.
+
+``COMMANDS`` is the one list of user commands: the menu Telegram shows behind the "/"
+button (``bot_commands``, registered at startup by ``bot.app``) and the command section
+of ``/help`` are both rendered from it. Admin-only commands are not in it.
+"""
 from __future__ import annotations
 
 import logging
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot.auth import auth
 from bot.config import config
@@ -17,6 +22,20 @@ public_router = Router(name="public")  # reachable without authorization
 admin_router = Router(name="admin-commands")
 voice_router = Router(name="voice")
 
+# (command, menu description): descriptions are limited to 256 characters by Telegram.
+COMMANDS: tuple[tuple[str, str], ...] = (
+    ("start", "Welcome and a few things to try"),
+    ("help", "What I can do, the commands and example prompts"),
+    ("settings", "How I work: fast / balanced / deep, memory, replies, images"),
+    ("usage", "Your usage over the last 30 days"),
+    ("reminders", "Your reminders and scheduled tasks"),
+    ("profile", "What I remember about you"),
+    ("timezone", "Set your time zone, e.g. /timezone Europe/Berlin"),
+    ("voice", "Choose the voice of spoken replies"),
+    ("mcp", "Connect MCP tool servers"),
+    ("cancel", "Stop the current task and clear the queue"),
+)
+
 WELCOME_AUTHORIZED = (
     "👋 Welcome to Generall.AI bot! Use me to get AI assistance.\n\n"
     "You can send me messages, voices, images, media groups, pdfs, and more to analyze. "
@@ -26,6 +45,60 @@ WELCOME_UNAUTHORIZED = (
     "👋 Welcome! This bot requires an invitation to use.\n\n"
     "If you have an invite code, please use:\n<code>/invite YOUR_CODE_HERE</code>"
 )
+START_EXAMPLES = (
+    "What happened in AI news this week? Give me the three most important items",
+    "Send me a photo and ask: what is in it and where was it taken?",
+    "Remind me tomorrow at 9 to call the dentist",
+)
+START_AUTHORIZED = (
+    WELCOME_AUTHORIZED
+    + "\n\n✍️ *Try:*\n"
+    + "\n".join(f"• {example}" for example in START_EXAMPLES)
+    + "\n\nSend /help for everything I can do and /settings to tune how I work."
+)
+HELP_UNAUTHORIZED = (
+    "👋 This bot is invite-only.\n\n"
+    "To get access, ask someone who already uses it for an invite: they create one with /invite "
+    "and get a link to share with you. Open the link, or send the code it contains as\n"
+    "`/invite YOUR_CODE`\n\n"
+    "Once you are in, /help shows what I can do."
+)
+HELP_EXAMPLES = (
+    "Research the latest news about solid-state batteries and summarize it with sources",
+    "Reply to one of my answers with: translate this to Spanish",
+    "Send a spreadsheet with the caption: make a chart of the monthly totals",
+    "Write a Python script that renames the photos in my workspace by date, and run it",
+    "Generate a logo for a bakery called Crumbs, minimal style, two variants",
+    "Every weekday at 8, check the weather in Berlin and tell me if I need an umbrella",
+)
+HELP_ABOUT = (
+    "🤖 *What I can do*\n"
+    "• Chat by text or voice; when you speak, I answer with voice too\n"
+    "• Look at photos, read documents (PDF, DOCX, XLSX, TXT, JSON) and watch videos\n"
+    "• Research the web and read pages\n"
+    "• Write and run code, work with the files in your workspace and send them back\n"
+    "• Generate and edit images, make short videos\n"
+    "• Set reminders and scheduled tasks that report back to you\n"
+    "• Remember: conversation memory plus a profile of durable facts about you\n\n"
+    "💡 *Tips*\n"
+    "• Reply to a message, or quote a part of it, to tell me what you mean; forward messages for me to read\n"
+    "• Press 🛑 Stop in the status message or send /cancel to stop a running task\n"
+    "• Say \"remember that ...\" or \"forget ...\" to manage what I know about you"
+)
+
+
+def bot_commands() -> list[BotCommand]:
+    """The command menu registered with ``set_my_commands`` at startup."""
+    return [BotCommand(command=name, description=description) for name, description in COMMANDS]
+
+
+def help_text(authorized: bool) -> str:
+    """The ``/help`` message (legacy Markdown; ``answer_md`` falls back to plain text)."""
+    if not authorized:
+        return HELP_UNAUTHORIZED
+    commands = "\n".join(f"/{name} — {description}" for name, description in COMMANDS if name != "start")
+    examples = "\n".join(f"• {example}" for example in HELP_EXAMPLES)
+    return f"{HELP_ABOUT}\n\n⌨️ *Commands*\n{commands}\n\n✍️ *Try*\n{examples}"
 
 
 async def _invite_link(bot: Bot, code: str) -> str:
@@ -75,9 +148,15 @@ async def start_command(message: Message, bot: Bot, command: CommandObject) -> N
         await _redeem_invite(message, bot, user_id, args[len("invite_"):])
         return
     if auth.is_authorized(user_id):
-        await message.answer(WELCOME_AUTHORIZED)
+        await answer_md(message, START_AUTHORIZED)
     else:
         await message.answer(WELCOME_UNAUTHORIZED, parse_mode="HTML")
+
+
+@public_router.message(F.text, Command("help"))
+async def help_command(message: Message) -> None:
+    """Public: someone without access learns how the invite flow works."""
+    await answer_md(message, help_text(auth.is_authorized(str(message.chat.id))))
 
 
 @public_router.message(F.text, Command("invite"))

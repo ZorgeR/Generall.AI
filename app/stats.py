@@ -584,6 +584,85 @@ class StatsTracker:
             )
             return cursor.fetchone()["count"]
 
+    # ---- the user's own /usage view (bot/handlers/usage_ui.py) ---------------
+    def get_user_usage_summary(self, user_id: str, days: int = 30, *, daily_days: int = 7) -> Dict[str, Any]:
+        """Everything ``/usage`` shows one user about the last ``days`` days, in three queries.
+
+        ``actions`` is every ``stats_events`` row (what the action limit counts); ``requests`` /
+        ``answers`` / ``tool_calls`` / ``media_described`` / ``albums`` split it by event type.
+        Tokens, API calls and cost are sums over ``usage_events``; ``models`` has one row per
+        model (costliest first, ``tokens`` = every token processed) and ``daily`` one entry per
+        UTC day for the last ``daily_days`` days, oldest first. Blocking SQLite: call it via
+        ``asyncio.to_thread``.
+        """
+        uid = str(user_id)
+        cutoff = self._get_cutoff_timestamp(days)
+        first_day = self._day_start(daily_days - 1)
+        with self._get_connection() as conn:
+            ev = conn.execute(
+                "SELECT COUNT(*) AS actions, SUM(event_type = 'message_received') AS requests, "
+                "SUM(event_type = 'message_sent') AS answers, SUM(event_type = 'tool_used') AS tool_calls, "
+                "SUM(event_type = 'describe_used') AS media_described, SUM(event_type = 'media_group') AS albums "
+                "FROM stats_events WHERE user_id = ? AND timestamp >= ?",
+                (uid, cutoff),
+            ).fetchone()
+            models = conn.execute(
+                "SELECT model, SUM(api_calls) AS api_calls, SUM(input_tokens) AS input_tokens, "
+                "SUM(output_tokens) AS output_tokens, SUM(cache_read_tokens) AS cache_read_tokens, "
+                "SUM(cache_write_tokens) AS cache_write_tokens, SUM(cost_usd) AS cost_usd "
+                "FROM usage_events WHERE user_id = ? AND timestamp >= ? GROUP BY model ORDER BY cost_usd DESC, model",
+                (uid, cutoff),
+            ).fetchall()
+            daily_rows = conn.execute(
+                "SELECT substr(timestamp, 1, 10) AS day, SUM(cost_usd) AS cost_usd, "
+                "SUM(input_tokens + cache_read_tokens + cache_write_tokens) AS prompt_tokens, SUM(output_tokens) AS output_tokens "
+                "FROM usage_events WHERE user_id = ? AND timestamp >= ? GROUP BY day",
+                (uid, first_day.isoformat()),
+            ).fetchall()
+        summary: Dict[str, Any] = {"user_id": uid, "days": days}
+        summary.update({k: int(ev[k] or 0) for k in ("actions", "requests", "answers", "tool_calls", "media_described", "albums")})
+        token_keys = ("api_calls", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+        summary.update({k: 0 for k in token_keys})
+        summary["cost_usd"] = 0.0
+        summary["models"] = []
+        for r in models:
+            row = {k: int(r[k] or 0) for k in token_keys}
+            row["model"] = r["model"]
+            row["tokens"] = row["input_tokens"] + row["output_tokens"] + row["cache_read_tokens"] + row["cache_write_tokens"]
+            row["cost_usd"] = float(r["cost_usd"] or 0.0)
+            summary["models"].append(row)
+            for k in token_keys:
+                summary[k] += row[k]
+            summary["cost_usd"] += row["cost_usd"]
+        by_day = {r["day"]: r for r in daily_rows}
+        summary["daily"] = []
+        for i in range(daily_days):
+            day = (first_day + timedelta(days=i)).date().isoformat()
+            r = by_day.get(day)
+            summary["daily"].append({
+                "date": day,
+                "cost_usd": float(r["cost_usd"] or 0.0) if r else 0.0,
+                "prompt_tokens": int(r["prompt_tokens"] or 0) if r else 0,
+                "output_tokens": int(r["output_tokens"] or 0) if r else 0,
+            })
+        return summary
+
+    def get_user_workspace_size(self, user_id: str, base_dir: str = "data") -> Dict[str, int]:
+        """File count and bytes under ``<base_dir>/<user_id>``: every file, hidden and temporary ones included.
+
+        Symlinks count with their own size and are never followed, so a link out of the workspace
+        cannot inflate it. A missing directory is an empty workspace. Blocking: run it in a worker thread.
+        """
+        root = os.path.join(base_dir, str(user_id))
+        files = size = 0
+        for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+            for name in filenames:
+                files += 1
+                try:
+                    size += os.lstat(os.path.join(dirpath, name)).st_size
+                except OSError:
+                    pass  # vanished between listing and stat: counted, size unknown
+        return {"files": files, "bytes": size}
 
 # Global singleton instance
 stats_tracker = StatsTracker()
