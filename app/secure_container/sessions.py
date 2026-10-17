@@ -13,8 +13,11 @@ afterwards, so nothing but the workspace files survived between two commands. No
 * a **browser** container (``browser-<uid>-<hex>``): ``scripts/browser_server.py`` (copied into
   ``data/_sandbox/<uid>/browser/`` before each start, so a script change needs no image rebuild)
   driving a persistent Chromium profile, reached over a unix socket with one JSON line each way.
-  It sees only ``data/_sandbox/<uid>/browser`` (profile, socket) and the workspace's ``downloads/``;
-  the shell container never sees the profile, so commands cannot read the cookies.
+  It sees only ``data/_sandbox/<uid>/browser`` (profile, socket, its own ``downloads/``); the bot
+  moves each finished download into the workspace's ``downloads/`` (``move_download``) and the
+  shell container never sees the profile, so commands cannot read the cookies. No path inside the
+  workspace is mounted into the browser: the sandbox controls its links, and Docker resolves a
+  bind-mount source on the host.
 
 Both run as ``runner`` with ``init``, ``oom_score_adj`` 800 (the kernel kills sandboxes before the
 bot), no swap beyond their memory limit, a pid limit and labels ``generall.sandbox`` /
@@ -49,6 +52,7 @@ stopping, so a user's concurrent tool calls share one container and never start 
 """
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -56,6 +60,7 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import threading
 import time
@@ -134,7 +139,8 @@ WORKSPACE = "/home/runner/workspace"
 BROWSER_MOUNT = "/run/browser"
 BROWSER_SOCKET = f"{BROWSER_MOUNT}/ctl/browser.sock"
 BROWSER_PROFILE = f"{BROWSER_MOUNT}/profile"
-BROWSER_DOWNLOADS = f"{WORKSPACE}/downloads"
+BROWSER_DOWNLOADS = f"{BROWSER_MOUNT}/downloads"  # the browser's own; finished files are moved into the workspace
+DOWNLOAD_MAX_BYTES = 512 * 1024 * 1024           # a larger download is refused (deleted) instead of moved
 BROWSER_VIEWPORT = "1280x800"
 BROWSER_SERVER_SCRIPT = Path(__file__).parent / "scripts" / "browser_server.py"
 BROWSER_START_TIMEOUT = 40.0      # seconds to wait for the server's _ping after docker run
@@ -265,10 +271,171 @@ def package_key(manager: str, token: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def _package_tokens(path: Path) -> list[str]:
+# --------------------------------------------------------------------------- link-safe file helpers
+# The bot runs as root in a privileged container with the Docker socket, while the sandbox (the
+# workspace data/<uid>) and the browser (data/_sandbox/<uid>/browser) can put a symlink anywhere
+# they write. Everything the bot does inside those trees goes through these helpers, which never
+# follow a link: a chmod, copy or read through one would act on the link's target, as root.
+
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+
+
+def real_dir(path: Path, mode: int | None = 0o777) -> Path:
+    """Make ``path`` a real directory (a link or file in its place is unlinked) and set ``mode``
+    through an ``O_NOFOLLOW`` descriptor. The parents must be trusted (bot-created)."""
+    path = Path(path)
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        st = os.lstat(path)
+    except FileNotFoundError:
+        st = None
+    if st is not None and not stat.S_ISDIR(st.st_mode):
+        os.unlink(path)
+        st = None
+    if st is None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.mkdir(path)
+        except FileExistsError:
+            pass
+    fd = os.open(path, os.O_RDONLY | _DIRECTORY | _NOFOLLOW)
+    try:
+        if mode is not None:
+            os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+    return path
+
+
+def read_regular(path: Path, limit: int = 1024 * 1024) -> str | None:
+    """The text of ``path`` when it is a regular file (never through a link, never a FIFO)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | _NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
     except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            return f.read(limit).decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def write_new_file(directory: Path, name: str, data: bytes, mode: int) -> None:
+    """Replace ``directory/name`` with a new regular file holding ``data``; whatever was there (a
+    link, a file, a directory) is removed first and nothing is ever followed."""
+    dir_fd = os.open(directory, os.O_RDONLY | _DIRECTORY | _NOFOLLOW)
+    try:
+        try:
+            os.unlink(name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+        except IsADirectoryError:
+            shutil.rmtree(Path(directory) / name)
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, mode, dir_fd=dir_fd)
+        try:
+            _write_all(fd, data)
+            os.fchmod(fd, mode)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+
+
+def move_download(src_dir: Path, dst_dir: Path, name: str, max_bytes: int | None = None) -> str:
+    """Move a finished download from the browser's own folder into the workspace's downloads/.
+
+    Neither side is trusted: the source must be a regular file (opened ``O_NOFOLLOW``), the target
+    is created ``O_EXCL | O_NOFOLLOW`` relative to a descriptor of the real ``dst_dir``. A taken
+    name becomes ``stem-2.ext``, ``stem-3.ext`` ... Returns the final name; raises ``OSError`` or
+    ``ValueError`` with a readable reason (the source is deleted either way)."""
+    max_bytes = DOWNLOAD_MAX_BYTES if max_bytes is None else max_bytes
+    too_big = (f"the file is larger than {max_bytes // (1024 * 1024)} MB" if max_bytes >= 1024 * 1024
+               else f"the file is larger than {max_bytes} bytes")
+    name = os.path.basename(str(name or ""))
+    if not name or name in (".", ".."):
+        raise ValueError("no file name")
+    src_fd = os.open(src_dir, os.O_RDONLY | _DIRECTORY | _NOFOLLOW)
+    try:
+        try:
+            fd_in = os.open(name, os.O_RDONLY | _NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=src_fd)
+        except OSError as e:
+            try:
+                os.unlink(name, dir_fd=src_fd)  # a link planted in its place goes too
+            except OSError:
+                pass
+            if e.errno == errno.ELOOP:
+                raise ValueError("the download is not a regular file") from e
+            raise ValueError(f"the downloaded file is missing ({e.strerror or e})") from e
+        try:
+            st = os.fstat(fd_in)
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError("the download is not a regular file")
+            if st.st_size > max_bytes:
+                raise ValueError(too_big)
+            real_dir(dst_dir, 0o777)
+            dst_fd = os.open(dst_dir, os.O_RDONLY | _DIRECTORY | _NOFOLLOW)
+            try:
+                final, fd_out = _create_unique(dst_fd, name)
+                try:
+                    copied = 0
+                    while True:
+                        chunk = os.read(fd_in, 1 << 20)
+                        if not chunk:
+                            break
+                        copied += len(chunk)
+                        if copied > max_bytes:
+                            raise ValueError(too_big)
+                        _write_all(fd_out, chunk)
+                    os.fchmod(fd_out, 0o666)
+                except BaseException:
+                    os.close(fd_out)
+                    fd_out = -1
+                    try:
+                        os.unlink(final, dir_fd=dst_fd)
+                    except OSError:
+                        pass
+                    raise
+                finally:
+                    if fd_out >= 0:
+                        os.close(fd_out)
+            finally:
+                os.close(dst_fd)
+        finally:
+            os.close(fd_in)
+            try:
+                os.unlink(name, dir_fd=src_fd)
+            except OSError:
+                pass
+    finally:
+        os.close(src_fd)
+    return final
+
+
+def _create_unique(dir_fd: int, name: str) -> tuple[str, int]:
+    stem, ext = os.path.splitext(name)
+    for n in range(1, 1000):
+        candidate = name if n == 1 else f"{stem}-{n}{ext}"
+        try:
+            return candidate, os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o666, dir_fd=dir_fd)
+        except FileExistsError:
+            continue
+    raise ValueError("no free file name in downloads/")
+
+
+def _package_tokens(path: Path) -> list[str]:
+    text = read_regular(path)
+    if text is None:
         return []
     tokens: list[str] = []
     for line in text.splitlines():
@@ -304,10 +471,7 @@ def add_persisted_packages(user_dir: Path, manager: str, packages: Iterable[str]
     with _package_locks_guard:
         lock = _package_locks.setdefault(str(path), threading.Lock())
     with lock:
-        try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
-            lines = []
+        lines = (read_regular(path) or "").splitlines()
         existing = set(_package_tokens(path))
         added = [p for p in packages if p not in existing]
         if not added:
@@ -321,12 +485,10 @@ def add_persisted_packages(user_dir: Path, manager: str, packages: Iterable[str]
         lines = [line for line in lines if keep(line)] + added
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
-        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        # mode set on the new file itself before it takes the name: a chmod by path afterwards
+        # would follow a link the sandbox swapped in meanwhile
+        write_new_file(path.parent, tmp.name, ("\n".join(lines) + "\n").encode("utf-8"), 0o666)
         os.replace(tmp, path)
-        try:
-            os.chmod(path, 0o666)
-        except OSError:
-            pass
         return added
 
 
@@ -845,11 +1007,12 @@ class SessionManager:
 
     @staticmethod
     def _writable(path: Path) -> Path:
-        path.mkdir(parents=True, exist_ok=True)
+        """A real directory the containers' non-root runner can write (never through a link)."""
         try:
-            os.chmod(path, 0o777)  # the containers' non-root runner writes here
-        except OSError:
-            pass
+            real_dir(path, 0o777)
+        except OSError as e:
+            logger.warning("Could not prepare %s: %s", path, e)
+            Path(path).mkdir(parents=True, exist_ok=True)
         return path
 
     # ---- starting and stopping containers ----------------------------------------------------
@@ -928,11 +1091,12 @@ class SessionManager:
         browser_dir = self._writable(self._browser_dir(uid))
         self._writable(browser_dir / "ctl")
         profile = self._writable(browser_dir / "profile")
-        self._writable(self._user_dir(uid))
-        self._writable(self._user_dir(uid) / "downloads")
-        script = browser_dir / "browser_server.py"
-        shutil.copyfile(BROWSER_SERVER_SCRIPT, script)
-        os.chmod(script, 0o644)
+        self._writable(browser_dir / "downloads")
+        self._sweep_downloads(uid)  # files finished but never reported before the last browser closed
+        try:
+            write_new_file(browser_dir, "browser_server.py", BROWSER_SERVER_SCRIPT.read_bytes(), 0o644)
+        except OSError as e:
+            raise SessionStartError(f"The browser could not start: {e}") from e
         stale = [self._socket_path(uid)] + list(profile.glob("Singleton*"))
         for path in stale:  # a killed Chromium leaves its profile locks behind
             try:
@@ -946,10 +1110,9 @@ class SessionManager:
                 self.image_ref,
                 command=browser_command(remember, SESSION_IDLE_SECONDS),
                 name=name,
-                volumes={
-                    self._host(SANDBOX_DIR, uid, "browser"): {"bind": BROWSER_MOUNT, "mode": "rw"},
-                    self._host(uid, "downloads"): {"bind": BROWSER_DOWNLOADS, "mode": "rw"},
-                },
+                # only its own folder: never a path inside the workspace, whose links the sandbox
+                # controls and Docker would resolve on the host
+                volumes={self._host(SANDBOX_DIR, uid, "browser"): {"bind": BROWSER_MOUNT, "mode": "rw"}},
                 security_opt=["no-new-privileges"],
                 **self._run_kwargs(BROWSER, uid, BROWSER_MEM_MB),
             )
@@ -1135,8 +1298,49 @@ class SessionManager:
                 self._release(session, touch=activity)
             if action == "_shutdown":
                 self._discard(session)
+            if isinstance(answer, dict) and answer.get("ok"):
+                self._collect_downloads(uid, answer)
             return answer
         return {"ok": False, "error": BROWSER_DIED}
+
+    def _collect_downloads(self, uid: str, answer: dict) -> None:
+        """Move the downloads an answer reports as completed into the workspace's downloads/ and
+        fix their ``path`` (a taken name gets a suffix); one that cannot be moved is reported as
+        ``download_failed``. Never raises."""
+        content = answer.get("content")
+        if not isinstance(content, list):
+            return
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "browser_state":
+                continue
+            for change in block.get("state_changes") or []:
+                if not isinstance(change, dict) or change.get("type") != "download_completed":
+                    continue
+                name = os.path.basename(str(change.get("path") or ""))
+                try:
+                    final = move_download(self._browser_dir(uid) / "downloads", self._user_dir(uid) / "downloads", name)
+                except (OSError, ValueError) as e:
+                    logger.warning("Could not move the download %r of %s: %s", name, uid, e)
+                    reason = getattr(e, "strerror", None) or str(e)
+                    error = f"the download could not be saved: {reason}"[:500]
+                    kept = {k: change[k] for k in ("download_id", "url") if k in change}
+                    change.clear()
+                    change.update({"type": "download_failed", **kept, "error": error})
+                    continue
+                change["path"] = f"downloads/{final}"
+
+    def _sweep_downloads(self, uid: str) -> None:
+        """Move leftovers of an earlier browser (finished, never reported) into the workspace."""
+        private = self._browser_dir(uid) / "downloads"
+        try:
+            names = os.listdir(private)
+        except OSError:
+            return
+        for name in names:
+            try:
+                move_download(private, self._user_dir(uid) / "downloads", name)
+            except (OSError, ValueError) as e:
+                logger.info("Dropped the leftover download %r of %s: %s", name, uid, e)
 
     def _control(self, session: Session, action: str, timeout: float) -> dict | None:
         """A control request to a running browser (no start, no activity); None when it failed.

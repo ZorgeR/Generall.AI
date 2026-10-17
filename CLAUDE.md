@@ -744,10 +744,16 @@ pip) and replayed once at every session start; a file the model writes with `cre
   is the one whose tables hold Docker's chains. Result `on` / `off` / `failed` in `server_status()`; with
   `required` a failed filter refuses every start.
 - **Browser container** `browser-<uid>-<hex>` (`BROWSER_MEM_MB` 1536 MB, `no-new-privileges`, same network):
-  mounts only `data/_sandbox/<uid>/browser` → `/run/browser` (`ctl/browser.sock`, `profile/`) and
-  `data/<uid>/downloads`, so the shell never sees the cookies and the browser never sees the rest of the
-  workspace. At each start `scripts/browser_server.py` is copied in, `ctl/` and `profile/` are made 0o777,
-  a stale socket and Chromium's `Singleton*` locks are removed, and the manager waits up to 40 s for `_ping`.
+  mounts only `data/_sandbox/<uid>/browser` → `/run/browser` (`ctl/browser.sock`, `profile/`, its own
+  `downloads/`), so the shell never sees the cookies and the browser never sees the workspace. No workspace
+  path is ever a mount source: the sandbox controls the links there, and Docker resolves a bind-mount source on
+  the host. Each `download_completed` an answer reports is moved by `browser_call` (`_collect_downloads` →
+  `move_download`: source a regular file opened `O_NOFOLLOW`, target created `O_EXCL | O_NOFOLLOW` in the real
+  workspace `downloads/`, a taken name gets `-2`, `-3`, at most `DOWNLOAD_MAX_BYTES` 512 MB) and its `path`
+  rewritten; one that cannot be moved becomes `download_failed`. Leftovers are swept in at the next start. At
+  each start `scripts/browser_server.py` is written in fresh, `ctl/`, `profile/` and `downloads/` are made real
+  0o777 directories, a stale socket and Chromium's `Singleton*` locks are removed, and the manager waits up to
+  40 s for `_ping`.
   The server runs with `--idle-seconds` = the idle timeout + 60 and exits by itself after that.
   `browser.remember` off = a throwaway profile. `close` / `forget_browser_profile` / the reaper ask it to
   `_shutdown` first so the cookies are written.
@@ -792,7 +798,11 @@ pip) and replayed once at every session start; a file the model writes with `cre
   `create_document` and the whole browser toolset (its own container). `list_files`, `read_file`,
   `create_file`, downloads, zip, S3, `memory_search`, the vision/profile tools, md/html rendering, MCP calls,
   `browser_confirm` / `browser_show_screenshot` / `sandbox_status` and every API-backed tool run in the bot
-  container, which is privileged with the Docker socket mounted. The shell session keeps `sudo` for apt;
+  container, which is privileged with the Docker socket mounted, so every bot-side file operation inside
+  `data/<uid>` or `data/_sandbox/<uid>` (both writable by a container) goes through the link-safe helpers of
+  `sessions.py` (`real_dir`, `read_regular`, `write_new_file`, `move_download`) or `agents.paths`
+  (`ensure_real_dir`, `regular_files`, `resolve_under`): a chmod, copy or read that followed a planted link
+  would act on its target as root. The shell session keeps `sudo` for apt;
   the browser container has `no-new-privileges`; neither can reach private addresses while the egress filter
   is on.
 
@@ -812,7 +822,8 @@ data/
                                     written at startup (mcp-admin-refresh) and by the admin's /mcp refresh
   _sandbox/<chat_id>/browser/       the browser container's mount (/run/browser), outside the user's workspace: ctl/browser.sock
                                     (the control socket), profile/ (Chromium's persistent profile: cookies and logins; deleted by
-                                    🧹 Forget browser logins), browser_server.py (copied in at each start)
+                                    🧹 Forget browser logins), downloads/ (in progress; finished files move to the workspace),
+                                    browser_server.py (written in at each start)
   <chat_id>/
     settings.json                   per-user settings (see table); merged over defaults on load, unknown keys preserved
     profile.md                      agent-managed profile: "## About", "## Preferences", "## Notes" (entries "- ...", Notes dated
@@ -859,7 +870,7 @@ data/
                                     documents/ also holds create_document outputs <name>.<md|html|pdf|docx|xlsx> (-2, -3 on a clash)
                                     and the transient render sources .render_<hex>.html|.md
     downloads/                      download_file / download_webpage(save_to_file) / create_zip_archive outputs, screenshot_<hex>.png
-                                    (browse_webpage), files the interactive browser downloads (mounted into the browser container)
+                                    (browse_webpage), files the interactive browser downloaded (moved here by the bot)
     installed_packages.txt, installed_python_packages.txt   the persisted apt / pip names (install_package), one per line,
                                     replayed at every session start
     temp_code_<hex>.py, temp_script_<hex>.sh,

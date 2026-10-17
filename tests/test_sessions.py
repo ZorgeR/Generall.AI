@@ -834,7 +834,7 @@ def test_browser_start_command_mounts_and_files(env, monkeypatch):
     browser = env.docker.of_kind("browser")[0]
     assert browser.command == [
         "python", "/run/browser/browser_server.py", "--socket", "/run/browser/ctl/browser.sock",
-        "--profile", "/run/browser/profile", "--downloads", "/home/runner/workspace/downloads",
+        "--profile", "/run/browser/profile", "--downloads", "/run/browser/downloads",
         "--idle-seconds", "1860", "--viewport", "1280x800",
     ]
     run = browser.kwargs
@@ -843,16 +843,11 @@ def test_browser_start_command_mounts_and_files(env, monkeypatch):
     assert run["security_opt"] == ["no-new-privileges"] and run["oom_score_adj"] == 800 and run["pids_limit"] == 512
     assert run["labels"] == {"generall.sandbox": "browser", "generall.user": "7"}
     assert run["network"] == "generall-sandbox"
-    assert run["volumes"] == {
-        str(browser_dir): {"bind": "/run/browser", "mode": "rw"},
-        str(env.base / "7" / "downloads"): {"bind": "/home/runner/workspace/downloads", "mode": "rw"},
-    }
-    # the shell's workspace is not mounted: commands never see the cookies and vice versa
-    assert str(env.base / "7") not in run["volumes"]
+    # only its own folder: nothing inside the workspace, whose links the sandbox controls
+    assert run["volumes"] == {str(browser_dir): {"bind": "/run/browser", "mode": "rw"}}
     assert (browser_dir / "browser_server.py").read_text() == env.script.read_text()
-    for sub in ("", "ctl", "profile"):
+    for sub in ("", "ctl", "profile", "downloads"):
         assert oct((browser_dir / sub).stat().st_mode & 0o777) == "0o777", sub
-    assert oct((env.base / "7" / "downloads").stat().st_mode & 0o777) == "0o777"
     assert sorted(p.name for p in (browser_dir / "profile").iterdir()) == ["Default"]  # stale locks gone
     server = browser.server
     assert server.actions() == ["_ping", "navigate"]
@@ -1350,3 +1345,104 @@ def test_code_tools_network_flag_is_described_as_ignored():
     assert "persistent sandbox" in tool["description"]
     assert tool["input_schema"]["properties"]["network_enabled"]["description"] == ti_module.NETWORK_ENABLED_DESCRIPTION
     assert Code("7").execute_tool("execute_python", {"code": "print(1)", "network_enabled": True}) == ("7", "print(1)", 120, True)
+
+
+# ---- links planted by the sandbox or the browser are never followed (the bot is root) -----------
+def test_browser_start_replaces_planted_links_and_never_touches_their_targets(env, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.chmod(outside, 0o700)
+    victim = tmp_path / "victim.py"
+    victim.write_text("original")
+    os.chmod(victim, 0o600)
+    browser_dir = env.base / "_sandbox" / "7" / "browser"
+    browser_dir.mkdir(parents=True)
+    for name in ("ctl", "profile", "downloads"):
+        (browser_dir / name).symlink_to(outside)
+    (browser_dir / "browser_server.py").symlink_to(victim)
+    answer = env.m.browser_call("7", {"action": "navigate", "input": {"url": "example.com"}})
+    assert answer["ok"] is True
+    for name in ("ctl", "profile", "downloads"):
+        assert (browser_dir / name).is_dir() and not (browser_dir / name).is_symlink(), name
+    script = browser_dir / "browser_server.py"
+    assert not script.is_symlink() and script.read_text() == env.script.read_text()
+    assert (outside.stat().st_mode & 0o777) == 0o700 and list(outside.iterdir()) == []
+    assert victim.read_text() == "original" and (victim.stat().st_mode & 0o777) == 0o600
+
+
+def _completed(name, did="d1"):
+    return {"ok": True, "content": [
+        {"type": "text", "text": "Clicked."},
+        {"type": "browser_state", "tabs": [{"tab_id": "tab-1", "title": "t", "url": "https://x", "active": True}],
+         "state_changes": [{"type": "download_completed", "download_id": did, "url": "https://x/f",
+                            "path": f"downloads/{name}", "size_bytes": 5}]},
+    ]}
+
+
+def test_finished_downloads_move_into_the_workspace_with_a_free_name(env):
+    private = env.base / "_sandbox" / "7" / "browser" / "downloads"
+    private.mkdir(parents=True)
+    workspace = env.base / "7" / "downloads"
+    workspace.mkdir(parents=True)
+    (workspace / "report.pdf").write_text("older file")
+    (private / "report.pdf").write_text("hello")
+    answer = _completed("report.pdf")
+    env.m._collect_downloads("7", answer)
+    change = answer["content"][1]["state_changes"][0]
+    assert change["type"] == "download_completed" and change["path"] == "downloads/report-2.pdf"
+    assert (workspace / "report-2.pdf").read_text() == "hello" and (workspace / "report.pdf").read_text() == "older file"
+    assert (workspace / "report-2.pdf").stat().st_mode & 0o777 == 0o666
+    assert not (private / "report.pdf").exists()
+
+
+def test_a_download_that_is_a_link_or_too_big_is_reported_failed(env, tmp_path, monkeypatch):
+    secret = tmp_path / "secret.env"
+    secret.write_text("TOKEN=abc")
+    private = env.base / "_sandbox" / "7" / "browser" / "downloads"
+    private.mkdir(parents=True)
+    (private / "keys.txt").symlink_to(secret)  # planted by a compromised browser
+    answer = _completed("keys.txt")
+    env.m._collect_downloads("7", answer)
+    change = answer["content"][1]["state_changes"][0]
+    assert change["type"] == "download_failed" and change["download_id"] == "d1" and change["url"] == "https://x/f"
+    assert "not a regular file" in change["error"] and "path" not in change
+    assert not (env.base / "7" / "downloads" / "keys.txt").exists() and secret.read_text() == "TOKEN=abc"
+
+    assert not os.path.lexists(private / "keys.txt")  # the planted link is gone too
+
+    monkeypatch.setattr(sessions, "DOWNLOAD_MAX_BYTES", 3)
+    (private / "big.bin").write_bytes(b"12345")
+    answer = _completed("big.bin", "d2")
+    env.m._collect_downloads("7", answer)
+    change = answer["content"][1]["state_changes"][0]
+    assert change["type"] == "download_failed" and "larger than 3 bytes" in change["error"]
+    assert not (private / "big.bin").exists() and not (env.base / "7" / "downloads" / "big.bin").exists()
+
+
+def test_a_linked_workspace_downloads_folder_is_replaced_not_followed(env, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    private = env.base / "_sandbox" / "7" / "browser" / "downloads"
+    private.mkdir(parents=True)
+    (private / "a.txt").write_text("a")
+    (env.base / "7").mkdir(parents=True, exist_ok=True)
+    (env.base / "7" / "downloads").symlink_to(outside)  # ln -s by the model in the sandbox
+    answer = _completed("a.txt")
+    env.m._collect_downloads("7", answer)
+    assert answer["content"][1]["state_changes"][0]["path"] == "downloads/a.txt"
+    assert not (env.base / "7" / "downloads").is_symlink() and (env.base / "7" / "downloads" / "a.txt").read_text() == "a"
+    assert list(outside.iterdir()) == []
+
+
+def test_package_files_are_never_read_or_chmodded_through_a_link(tmp_path):
+    secret = tmp_path / "secret"
+    secret.write_text("curl\n")
+    os.chmod(secret, 0o600)
+    user = tmp_path / "7"
+    user.mkdir()
+    (user / "installed_packages.txt").symlink_to(secret)
+    assert sessions.persisted_packages(user)["apt"] == []
+    assert sessions.add_persisted_packages(user, "apt", ["jq"]) == ["jq"]
+    saved = user / "installed_packages.txt"
+    assert not saved.is_symlink() and saved.read_text() == "jq\n" and saved.stat().st_mode & 0o777 == 0o666
+    assert secret.read_text() == "curl\n" and secret.stat().st_mode & 0o777 == 0o600
