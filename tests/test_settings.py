@@ -101,8 +101,10 @@ def test_presets_apply_detect_and_round_trip(tmp_path):
     assert current_preset(again) == "fast"
     assert apply_preset(again, "fast") is False  # already active: nothing changed
 
+    again.set("judge", True, "enabled")
     assert apply_preset(again, "DEEP") is True  # names are case-insensitive
     assert (again.get("mode", "type"), again.get("thinking", "enabled"), again.get("tools", "max_iteration")) == ("intelligence", True, 40)
+    assert again.get("judge", "enabled") is False  # Deep switches the judge off (docs/design-v3.md, F6)
     assert current_preset(UserSettings("5", base_dir=str(tmp_path))) == "deep"
 
     assert apply_preset(again, "balanced") is True
@@ -121,6 +123,9 @@ def test_a_custom_state_matches_no_preset_and_unknown_presets_change_nothing(tmp
     s.set("tools", 40, "max_iteration")
     s.set("mode", "intelligence", "type")
     assert current_preset(s) == "deep"
+    s.set("judge", True, "enabled")  # Deep means judge off
+    assert current_preset(s) is None
+    s.set("judge", False, "enabled")
     s.set("thinking", False, "enabled")
     assert current_preset(s) is None
 

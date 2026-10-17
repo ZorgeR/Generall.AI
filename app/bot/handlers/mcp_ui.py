@@ -2,8 +2,9 @@
 
 The user connects MCP servers whose tools the agent then gets as ``mcp_<server>_<tool>``
 (``agents/mcp_tools.py``); the records live in ``bot.mcp_store``. One legacy-Markdown page
-(``bot.ui.answer_md`` / ``edit_md``, plain fallback), every user-derived string escaped and URLs shown
-without user info, query or token::
+(``bot.ui.answer_md`` / ``edit_md``, plain fallback), every user-derived string escaped (server names
+are ``[a-z0-9_-]`` and go raw only inside code spans, where legacy Markdown honours no escapes) and URLs
+shown without user info, query or token::
 
     /mcp                         the list: name, transport, ✅/⬜, tool count, last error;
                                  admin servers marked 🏢 and read-only
@@ -11,7 +12,8 @@ without user info, query or token::
                                  validate, connect once to list the tools (the count or the error is
                                  reported, the server is saved either way so a refresh can fix it);
                                  the token is kept as a bearer header and the command message is
-                                 deleted (best effort) so it does not stay in the chat
+                                 deleted (best effort) before anything else, even when the name or
+                                 URL is rejected, so the token does not stay in the chat
     /mcp remove <name>           /mcp refresh [name]          /mcp help
 
 Buttons under the list, per user server: toggle (``mcp_toggle_<name>``), refresh
@@ -47,7 +49,7 @@ EMPTY = "No MCP servers yet."
 HELP = (
     "🔌 *MCP servers*\n\n"
     "Connect a service that speaks the Model Context Protocol and its tools become mine:\n\n"
-    "`/mcp add <name> <url> [token] [sse]` — connect a server (name: lowercase letters, digits, - or _; "
+    "`/mcp add <name> <url> [token] [sse]` — connect a server (name: lowercase letters, digits, `-` or `_`; "
     "https URL; the token becomes a Bearer header; add `sse` for a legacy SSE endpoint)\n"
     "`/mcp remove <name>` — forget a server\n"
     "`/mcp refresh [name]` — rediscover the tools\n"
@@ -159,10 +161,11 @@ async def show_list(message: Message, user_id: str, *, edit: bool) -> None:
 
 
 def added_text(server: dict) -> str:
-    name = escape_markdown(server["name"])
+    raw = server["name"]  # [a-z0-9_-]: safe inside a code span, where escapes would show as backslashes
+    name = escape_markdown(raw)
     if server.get("error"):
         return (f"⚠️ Saved *{name}*, but it could not be reached: {escape_markdown(server['error'])}\n\n"
-                f"Check the URL and token (`/mcp add {name} <url> [token]` replaces it) or try `/mcp refresh {name}` later.")
+                f"Check the URL and token (`/mcp add {raw} <url> [token]` replaces it) or try `/mcp refresh {raw}` later.")
     count = len(server.get("tools") or [])
     if not count:
         return f"✅ Connected *{name}*, but it offers no tools."
@@ -210,18 +213,22 @@ async def mcp_command(message: Message, command: CommandObject, user_id: str) ->
     elif action == "refresh":
         await refresh_command(message, user_id, args[1:])
     else:
-        await answer_md(message, f"Unknown subcommand `{escape_markdown(action)}`.\n\n{HELP}")
+        await answer_md(message, f"Unknown subcommand \"{escape_markdown(action)}\".\n\n{HELP}")
 
 
 async def add_command(message: Message, user_id: str, args: list[str]) -> None:
     try:
         name, url, token, transport = parse_add(args)
+    except ValueError as e:
+        await answer_md(message, f"❌ {e}")  # our own usage line, with its code span
+        return
+    if token:
+        await delete_quietly(message)  # the token must not stay in the chat, whatever the validation says
+    try:
         server = mcp_store.new_server(name, url, token, transport, admin=auth.is_admin(user_id))
     except ValueError as e:
         await answer_md(message, f"❌ {escape_markdown(str(e))}")
         return
-    if token:
-        await delete_quietly(message)  # the token must not stay in the chat
     admin_names = {s["name"] for s in await asyncio.to_thread(mcp_store.load_admin)}
     if server["name"] in admin_names:
         await answer_md(message, f"❌ *{escape_markdown(server['name'])}* is a shared server; pick another name.")

@@ -405,13 +405,16 @@ class SearchTools:
             if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
                 continue
             topic = "current conversation" if path.name == "transcript.json" else path.name.replace("_transcript.json", "").replace("_", " ")
-            timestamp = str(data.get("updated") or "")[:19].replace("T", " ")
+            # Messages before the first context block are the OLDEST content (the summary prune
+            # leaves on top, a transcript seeded from dialog_history.json): the file's creation time,
+            # or nothing (sorted last), never its last update. A turn's own context block carries its time.
+            timestamp = str(data.get("created") or "")[:19].replace("T", " ")
             for message in data["messages"]:
                 if not isinstance(message, dict) or is_tool_result_message(message):
                     continue
                 content = message.get("content")
                 if message.get("role") == "user" and isinstance(content, list):
-                    for block in content:  # the turn's own context block carries its time
+                    for block in content:
                         if is_context_block(block):
                             m = _CONTEXT_TIME_RE.search(block["text"])
                             if m:

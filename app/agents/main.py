@@ -290,7 +290,9 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                     "content": [{"type": "text", "text": judge_prompt}]
                 }],
                 max_tokens=2048,  # adaptive thinking counts against this; the verdict itself is one word
-                **anthropic_request_options(thinking=False),
+                # Judged by the loop's model: in speed mode that is the fast model, which takes
+                # no effort/thinking parameters (request_options_for gives it none).
+                **request_options_for(self.model, False),
                 system="You are AI assistant as a judge, and you must respond with ONLY 'Yes' or 'No'. You task is to judge if the response is complete and correct and relevant to the user question."
             )
 

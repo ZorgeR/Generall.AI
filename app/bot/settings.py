@@ -54,10 +54,14 @@ MODE_TYPES = ("auto", "speed", "intelligence")
 # Presets (docs/design-v3.md, F6): one tap sets the few values that decide speed vs. depth.
 # {(category, key): value}; "balanced" is the defaults. Applied with apply_preset, recognized with
 # current_preset (every key must match exactly; anything else is a custom state with no preset).
+# Deep also turns the judge off: deep thinking already checks the answer, a second pass only costs.
 SETTINGS_PRESETS: dict[str, dict[tuple[str, str], Any]] = {
     "fast": {("mode", "type"): "speed", ("thinking", "enabled"): False, ("tools", "max_iteration"): 10},
     "balanced": {("mode", "type"): "auto", ("thinking", "enabled"): True, ("tools", "max_iteration"): 20},
-    "deep": {("mode", "type"): "intelligence", ("thinking", "enabled"): True, ("tools", "max_iteration"): 40},
+    "deep": {
+        ("mode", "type"): "intelligence", ("thinking", "enabled"): True, ("tools", "max_iteration"): 40,
+        ("judge", "enabled"): False,
+    },
 }
 PRESET_NAMES = tuple(SETTINGS_PRESETS)
 

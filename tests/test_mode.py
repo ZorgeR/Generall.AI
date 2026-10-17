@@ -179,15 +179,22 @@ class FakeStream:
 
 
 class FakeClient:
+    """The loop's ``messages.stream`` and the judge's ``messages.create``, scripted in call order."""
+
     def __init__(self, script):
         self.script = list(script)
-        self.requests = []
-        self.messages = SimpleNamespace(stream=lambda **kw: self._stream(kw))
+        self.requests = []  # the loop's stream requests
+        self.created = []  # the judge's create requests
+        self.messages = SimpleNamespace(stream=lambda **kw: self._stream(kw), create=self._create)
         self.beta = SimpleNamespace(messages=SimpleNamespace(stream=lambda **kw: self._stream(kw)))
 
     def _stream(self, kwargs):
         self.requests.append(copy.deepcopy(kwargs))
         return FakeStream(self.script.pop(0))
+
+    async def _create(self, **kwargs):
+        self.created.append(copy.deepcopy(kwargs))
+        return self.script.pop(0)
 
 
 def answer(text):
@@ -197,9 +204,18 @@ def answer(text):
     )
 
 
-async def run_turn(agents_main, monkeypatch, user_settings):
+async def run_turn(agents_main, monkeypatch, user_settings, script=None):
+    """One transcript-mode turn on a fake client; returns the loop's single request."""
+    client = await run_turn_client(agents_main, monkeypatch, user_settings, script)
+    (request,) = client.requests
+    return request
+
+
+async def run_turn_client(agents_main, monkeypatch, user_settings, script=None, classify=never):
+    """Runs the turn and returns the fake client (loop requests in ``requests``, judge calls in
+    ``created``). ``classify`` stands in for the Haiku classifier; the default fails if it runs."""
     agent = agents_main.ChainOfThoughtAgent(user_id="42", user_settings=user_settings)
-    client = FakeClient([answer("done")])
+    client = FakeClient(script or [answer("done")])
     agent.agent.client = client
 
     async def no_save(*args, **kwargs):
@@ -210,14 +226,13 @@ async def run_turn(agents_main, monkeypatch, user_settings):
 
     monkeypatch.setattr(agents_main, "streaming_enabled", False)
     monkeypatch.setattr(agents_main, "_thinking_binding_refused", False)
-    monkeypatch.setattr(agent, "_classify_complexity", never)
+    monkeypatch.setattr(agent, "_classify_complexity", classify)
     monkeypatch.setattr(agent, "_save_conversation", no_save)
     monkeypatch.setattr(agent, "_semantic_hits", no_hits)
     monkeypatch.setattr(agent, "_recent_summaries", lambda limit: [])
     response, _ = await agent.generate_response("what time is it?")
     assert response == "done"
-    (request,) = client.requests
-    return request
+    return client
 
 
 async def test_speed_mode_runs_the_tool_loop_on_the_fast_model(agents_main, monkeypatch):
@@ -234,3 +249,33 @@ async def test_intelligence_mode_thinks_deeply_with_the_toggle_off(agents_main, 
     assert request["thinking"]["display"] == "summarized"
     assert request["output_config"]["effort"] == models.ANTHROPIC_EFFORT
     assert request["max_tokens"] == models.ANTHROPIC_MAX_TOKENS
+
+
+async def test_speed_mode_judge_asks_the_fast_model_plainly(agents_main, monkeypatch):
+    """The completeness check runs on the loop's model. With the fast model that call must
+    carry no effort/thinking parameters either, or it fails and judge_response silently
+    accepts every answer (its exception path returns True)."""
+    user_settings = settings("speed")
+    user_settings["judge"]["enabled"] = True
+    client = await run_turn_client(agents_main, monkeypatch, user_settings, script=[answer("done"), answer("Yes")])
+    (judge_request,) = client.created
+    assert judge_request["model"] == models.ANTHROPIC_MODEL_FAST
+    assert "thinking" not in judge_request and "output_config" not in judge_request
+    assert judge_request["max_tokens"] >= 1 and "Response: done" in judge_request["messages"][0]["content"][0]["text"]
+    assert not client.script, "the judge's verdict was consumed: the check ran"
+
+
+async def complex_(question, history):
+    return "complex"
+
+
+async def test_auto_mode_judge_keeps_light_thinking_on_the_main_model(agents_main, monkeypatch):
+    user_settings = settings("auto")
+    user_settings["judge"]["enabled"] = True
+    client = await run_turn_client(
+        agents_main, monkeypatch, user_settings, script=[answer("done"), answer("Yes")], classify=complex_,
+    )
+    (judge_request,) = client.created
+    assert judge_request["model"] == models.ANTHROPIC_MODEL
+    assert judge_request["output_config"]["effort"] == models.ANTHROPIC_EFFORT_LIGHT
+    assert judge_request["thinking"]["display"] == "omitted"

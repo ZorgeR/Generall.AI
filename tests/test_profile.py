@@ -378,6 +378,79 @@ async def test_refresh_reads_the_file_again(ui):
     assert "• Metric units" in message.edit_text.await_args.args[0]
 
 
+def big_profile(store):
+    """A profile just under MAX_BYTES (About, Preferences, as many ~600-char Notes as fit): the
+    store accepts it, one Telegram message (4096 characters) cannot show it."""
+    store.add(USER, "About", "Name: Anna_Maria, lives in Lisbon")
+    store.add(USER, "Preferences", "Short answers, *metric* units")
+    i = 0
+    while store.load(USER).size() + 640 <= MAX_BYTES:
+        i += 1
+        saved = store.add(USER, "Notes", f"Note {i:02d}: " + ("lorem ipsum " * 48).strip(), today=TODAY)
+        assert not saved.rotated and not saved.duplicate
+    profile = store.load(USER)
+    assert MAX_BYTES - 700 < profile.size() <= MAX_BYTES and len(profile.entries("Notes")) == i >= 10
+    return profile
+
+
+def test_render_pages_packs_sections_whole_and_marks_continuations():
+    profile = parse("## About\n- a1\n- a2\n\n## Preferences\n- p1\n\n## Notes\n- n1\n- n2\n- n3\n")
+    assert profile_ui.render_pages(profile) == [profile_ui.render(profile)]  # it fits: one message, as before
+    first = f"{profile_ui.HEADER}\n\n*About*\n• a1\n• a2"
+    limit = profile_ui._FOOTER_RESERVE + profile_ui._utf16_len(first)  # About fits exactly, Preferences does not
+    assert profile_ui.render_pages(profile, limit) == [
+        first,
+        "*Preferences*\n• p1\n\n*Notes*\n• n1",  # a new section opens a page without "(continued)"
+        f"*Notes*{profile_ui.CONTINUED}\n• n2\n• n3\n\n{profile_ui.HINT}",
+    ]
+    assert profile_ui.render_one(profile, limit) == f"{first}\n\n{profile_ui.MORE.format(n=4)}\n\n{profile_ui.HINT}"
+    assert profile_ui.render_one(profile) == profile_ui.render(profile)
+    empty = parse("")
+    assert profile_ui.render_pages(empty) == [profile_ui.render(empty)] and "empty" in profile_ui.render_one(empty)
+
+
+def test_render_pages_splits_a_profile_near_the_cap_without_cutting_entries(store):
+    profile = big_profile(store)
+    assert len(profile_ui.render(profile)) > 4096  # the reviewer's case: one message cannot carry it
+    pages = profile_ui.render_pages(profile)
+    assert len(pages) >= 2 and all(profile_ui._utf16_len(p) <= profile_ui.PAGE_CHARS for p in pages)
+    assert pages[0].startswith(profile_ui.HEADER) and pages[-1].endswith(profile_ui.HINT)
+    assert profile_ui.HINT not in "".join(pages[:-1]) and all(not p.startswith(profile_ui.HEADER) for p in pages[1:])
+    bullets = [line for p in pages for line in p.splitlines() if line.startswith("• ")]
+    expected = [f"• {profile_ui.escape_markdown(e)}" for entries in profile.sections.values() for e in entries]
+    assert bullets == expected  # every entry once, in order, whole
+    assert "\n*Notes*\n• " in pages[0] and pages[1].startswith(f"*Notes*{profile_ui.CONTINUED}\n• ")
+
+
+async def test_profile_command_sends_a_big_profile_in_pages_with_the_buttons_on_the_last(ui):
+    profile = big_profile(ui)
+    pages = profile_ui.render_pages(profile)
+    message = make_message()
+    await profile_ui.profile_command(message, user_id=USER)
+    calls = message.answer.await_args_list
+    assert [c.args[0] for c in calls] == pages and len(pages) >= 2
+    assert all(c.kwargs["parse_mode"] == "Markdown" and len(c.args[0]) <= 4096 for c in calls)
+    assert [c.kwargs.get("reply_markup") is not None for c in calls] == [False] * (len(pages) - 1) + [True]
+    assert _buttons(calls[-1].kwargs["reply_markup"]) == ["profile_refresh", "profile_clear"]
+
+
+async def test_refresh_shows_one_page_of_a_big_profile_and_counts_the_rest(ui):
+    profile = big_profile(ui)
+    message = make_message()
+    await profile_ui.profile_button(make_callback("profile_refresh", message), user_id=USER)
+    message.edit_text.assert_awaited_once()
+    text, kw = message.edit_text.await_args.args[0], message.edit_text.await_args.kwargs
+    assert profile_ui._utf16_len(text) <= 4096 and text.startswith(profile_ui.HEADER) and text.endswith(profile_ui.HINT)
+    shown = sum(1 for line in text.splitlines() if line.startswith("• "))
+    total = sum(len(entries) for entries in profile.sections.values())
+    assert 0 < shown < total and profile_ui.MORE.format(n=total - shown) in text
+    assert _buttons(kw["reply_markup"]) == ["profile_refresh", "profile_clear"]
+    assert message.answer.await_count == 0  # edited in place, no extra messages
+
+    await profile_ui.profile_button(make_callback("profile_cancel", message), user_id=USER)  # "Keep it" shows the same page
+    assert message.edit_text.await_args.args[0] == text
+
+
 async def test_unknown_profile_callbacks_and_inaccessible_messages_are_ignored(ui):
     message = make_message()
     await profile_ui.profile_button(make_callback("profile_something", message), user_id=USER)

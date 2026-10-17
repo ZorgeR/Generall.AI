@@ -14,6 +14,7 @@ from secure_container.tool_integrator import ToolIntegrator
 
 USER = "42"
 TOOL_ONLY = "zqxtoolresultonly"  # appears in a tool result only: never a hit
+SUMMARY = "<earlier_conversation_summary>\nEarlier the user asked about apiary hives and got frame sizes.\n</earlier_conversation_summary>"
 
 
 def conversation(folder: Path, ts: str, topic: str, **fields) -> None:
@@ -44,8 +45,10 @@ def workspace(tmp_path, monkeypatch):
     transcripts = root / "transcripts"
     transcripts.mkdir()
     transcript = {
-        "version": 1, "user_id": USER, "thread_id": None, "updated": "2026-10-16T08:00:05+00:00",
+        "version": 1, "user_id": USER, "thread_id": None,
+        "created": "2026-10-14T07:00:00+00:00", "updated": "2026-10-16T08:00:05+00:00",
         "messages": [
+            {"role": "user", "content": [{"type": "text", "text": SUMMARY}]},  # what prune leaves on top
             {"role": "user", "content": [
                 {"type": "text", "text": "<context>\nCurrent time in UTC+0: 2026-10-16 08:00:00\n<memory>\n• [x] Lisbon context line\n</memory>\n</context>"},
                 {"type": "text", "text": "Remind me about the Lisbon flights tomorrow"},
@@ -62,8 +65,13 @@ def workspace(tmp_path, monkeypatch):
     }
     (transcripts / "transcript.json").write_text(json.dumps(transcript), encoding="utf-8")
     (transcripts / "topic_7_transcript.json").write_text(json.dumps({
-        "version": 1, "user_id": USER, "thread_id": 7, "updated": "2026-10-12T10:00:00+00:00",
+        "version": 1, "user_id": USER, "thread_id": 7,
+        "created": "2026-10-11T09:30:00+00:00", "updated": "2026-10-12T10:00:00+00:00",
         "messages": [{"role": "user", "content": [{"type": "text", "text": "In this topic we talk about beekeeping only"}]}],
+    }), encoding="utf-8")
+    (transcripts / "topic_9_transcript.json").write_text(json.dumps({  # an old file: no created, seeded plain strings
+        "version": 1, "user_id": USER, "thread_id": 9, "updated": "2026-10-16T09:00:00+00:00",
+        "messages": [{"role": "user", "content": "Seeded legacy question about an apiary"}, {"role": "assistant", "content": "ok"}],
     }), encoding="utf-8")
     return root
 
@@ -109,8 +117,22 @@ def test_profile_notes_and_topic_transcripts_are_searched(tools):
     (note_hit,) = [h for h in found if h["source"] == "profile"]
     assert note_hit["field"] == "Notes" and note_hit["timestamp"] == "2026-10-10 00:00:00"  # a dated note is as old as its date
     (topic_hit,) = [h for h in found if h["source"] == "transcript"]
-    assert topic_hit["topic"] == "topic 7" and topic_hit["timestamp"] == "2026-10-12 10:00:00"  # the file's update time
+    # no context block before it: the oldest content of that file, stamped with its creation time, not its last update
+    assert topic_hit["topic"] == "topic 7" and topic_hit["timestamp"] == "2026-10-11 09:30:00"
     assert all(h["timestamp"] <= "2026-10-16 08:00:00" for h in found)
+
+
+def test_messages_before_the_first_context_block_are_the_oldest(tools):
+    """The summary prune leaves on top and a seeded transcript's plain strings precede every
+    context block: they take the file's `created` time ("" without one: sorted last), never
+    `updated`, which would put the oldest content first."""
+    summary_hit, legacy_hit = hits(tools.memory_search("apiary"))
+    assert summary_hit["topic"] == "current conversation" and summary_hit["timestamp"] == "2026-10-14 07:00:00"
+    assert summary_hit["snippet"].startswith("<earlier_conversation_summary>")
+    assert legacy_hit["topic"] == "topic 9" and legacy_hit["timestamp"] == "" and legacy_hit["field"] == "user"
+    mixed = hits(tools.memory_search("apiary | Lisbon flights"))
+    assert [h["timestamp"] for h in mixed][:3] == ["2026-10-16 08:00:00", "2026-10-16 08:00:00", "2026-10-14 07:00:00"]
+    assert mixed[-1] is not None and mixed[-1]["timestamp"] == ""  # the undated legacy message comes last
 
 
 def test_alternatives_case_and_the_cap(tools):

@@ -299,6 +299,45 @@ def test_error_reason_unwraps_groups_and_names_empty_exceptions():
     assert len(mt.error_reason(RuntimeError("x" * 1000))) == mt.MAX_REASON_CHARS
 
 
+def http_status_error(url: str, status: int = 401):
+    """The real httpx error of a refused request: its message embeds the full URL, query string included."""
+    import httpx
+
+    response = httpx.Response(status, request=httpx.Request("GET", url))
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        return e
+    raise AssertionError("raise_for_status accepted the status")
+
+
+def test_error_reason_hides_query_strings_and_the_httpx_hint():
+    """An SSE server refusing with 401 names the URL; a key passed in its query must not come back."""
+    exc = http_status_error("http://127.0.0.1:9/sse?api_key=URLSECRET")
+    reason = mt.error_reason(exc)
+    assert reason == "HTTPStatusError: Client error '401 Unauthorized' for url 'http://127.0.0.1:9/sse'"
+    assert mt.error_reason(ExceptionGroup("g", [exc])) == reason
+    redacted = mt.redact_urls("a https://u:pw@h.example.com:8443/x?k=s#f, 'http://localhost:3000/mcp?t=1' and https://plain.example.com/p.")
+    assert redacted == "a https://h.example.com:8443/x, 'http://localhost:3000/mcp' and https://plain.example.com/p."
+
+
+async def test_url_secrets_never_reach_the_user_the_store_or_the_model(tools, wired, monkeypatch):
+    provider, srv = tools
+    recorded = []
+    monkeypatch.setattr(mcp_store, "record_error", lambda uid, s, err: recorded.append(err))
+
+    async def refused():
+        raise http_status_error("http://127.0.0.1:9/sse?api_key=URLSECRET")
+
+    monkeypatch.setattr(wired.session, "initialize", refused)
+    with pytest.raises(mt.MCPUnreachable) as info:
+        await provider.discover(srv)
+    assert "URLSECRET" not in str(info.value) and "401 Unauthorized" in str(info.value)
+    result = await provider.execute_tool("mcp_demo_echo", {})
+    assert result.startswith("Error: MCP server demo unreachable: HTTPStatusError") and "URLSECRET" not in result
+    assert recorded == [srv["error"]] and "URLSECRET" not in srv["error"] and "127.0.0.1:9/sse" in srv["error"]
+
+
 # ---- the real client over an in-memory server ---------------------------------------------------
 @pytest.fixture
 def memory_server(monkeypatch):

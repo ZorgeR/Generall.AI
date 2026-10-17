@@ -442,6 +442,15 @@ ROUTING = {
     "voice_rachel": "commands.voice_button",
     "stats_back_main": "stats_ui.stats_button",
     "usage_refresh": "usage_ui.usage_button",
+    "profile_refresh": "profile_ui.profile_button",
+    "profile_clear_yes": "profile_ui.profile_button",
+    "mcp_toggle_github": "mcp_ui.mcp_button",
+    "mcp_rm_github": "mcp_ui.mcp_button",
+    "mcp_refreshall": "mcp_ui.mcp_button",
+    "setp_preset_fast": "settings_ui.settings_page_button",
+    "setp_ui_advanced": "settings_ui.settings_page_button",
+    "settings_preset_fast": "settings_ui.settings_button",
+    "settings_mode_set_speed": "settings_ui.settings_button",
 }
 
 

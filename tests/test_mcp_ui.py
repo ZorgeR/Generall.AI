@@ -1,6 +1,7 @@
 """/mcp and the mcp_ buttons (F12): bot/handlers/mcp_ui.py with a fake Message/CallbackQuery and a fake discovery."""
 import asyncio
 import json
+import re
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -119,6 +120,27 @@ async def test_add_rejects_bad_names_urls_and_missing_arguments(wired):
     assert wired.calls == [] and mcp_store.load_user(USER) == []
 
 
+async def test_add_deletes_a_message_with_a_token_even_when_validation_rejects_it(wired):
+    for args, expected in ((f"add Bad.Name {URL} ghp_secret", "name must be"), ("add x http://example.com/mcp ghp_secret", "Only https")):
+        message = await mcp(args)
+        message.delete.assert_awaited_once()  # the token must not stay in the chat, rejected or not
+        text, _ = answered(message)
+        assert text.startswith("❌") and expected in text and "ghp_secret" not in text, (args, text)
+    assert wired.calls == [] and mcp_store.load_user(USER) == []
+
+
+async def test_added_text_keeps_raw_names_inside_code_spans(wired):
+    wired.error = "connection refused"
+    message = await mcp(f"add my_srv {URL}")
+    text, _ = edited(message)
+    assert text.startswith("⚠️ Saved *my\\_srv*")  # escaped in the bold entity
+    assert "`/mcp add my_srv <url> [token]`" in text and "`/mcp refresh my_srv`" in text  # raw in code spans
+    assert "my\\_srv" not in text.replace("*my\\_srv*", "")  # the escaped spelling only inside the bold entity
+    wired.error = None
+    text, _ = edited(await mcp(f"add my_srv {URL}"))
+    assert text.startswith("✅ Connected *my\\_srv*: 1 tool")
+
+
 async def test_admin_may_add_plain_http_but_nobody_takes_a_shared_name(wired, tmp_path):
     message = await mcp("add intern http://intranet.corp/mcp", user_id=ADMIN)
     assert edited(message)[0].startswith("✅") and mcp_store.load_user(ADMIN)[0]["url"] == "http://intranet.corp/mcp"
@@ -169,8 +191,17 @@ async def test_empty_list_and_help_and_unknown_subcommand(wired):
     assert mcp_ui.EMPTY in text and kw["reply_markup"] is None
     text, _ = answered(await mcp("help"))
     assert text == mcp_ui.HELP and "/mcp add <name> <url> [token] [sse]" in text
-    text, _ = answered(await mcp("frobnicate"))
-    assert text.startswith("Unknown subcommand `frobnicate`") and mcp_ui.HELP in text
+    text, _ = answered(await mcp("fro`b*nicate"))  # user text: escaped, never inside a code span
+    assert text.startswith('Unknown subcommand "fro\\`b\\*nicate".') and mcp_ui.HELP in text
+
+
+def test_help_is_balanced_legacy_markdown():
+    """Telegram rejects an odd number of _ or * outside code spans ("can't find end of the entity") and
+    answer_md would then strip every mark; HELP goes out as written, so its marks must pair up."""
+    outside_code = re.sub(r"`[^`\n]*`", "", mcp_ui.HELP)
+    assert "`" not in outside_code
+    assert outside_code.count("_") % 2 == 0 and outside_code.count("*") % 2 == 0
+    assert "[" not in outside_code  # a bare [ starts a link entity in legacy Markdown
 
 
 async def test_remove_command(wired, tmp_path):

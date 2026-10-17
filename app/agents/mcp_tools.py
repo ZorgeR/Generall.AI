@@ -15,7 +15,9 @@ Results: text content becomes the joined text; an image becomes a base64 ``image
 API types only), so the result is a list of blocks when there is an image; an embedded resource its
 text or ``[resource <uri>]``; ``isError`` → ``Error: <text>``. ``execute_tool`` never raises: an
 unreachable server is ``Error: MCP server <name> unreachable: <reason>``, recorded in the store (best
-effort) so ``/mcp`` shows it.
+effort) so ``/mcp`` shows it. The reason goes to the user, the store and the transcript, so every URL
+in it is shown as ``mcp_store.display_url`` shows it: httpx embeds the full request URL, query string
+and all, in its status errors, and a key passed in the query must not leak that way.
 
 The mcp package is imported lazily (it costs almost a second) inside ``open_transport`` and
 ``client_session``, which tests replace with fakes. mcp 1.x and 2.x differ in attribute names
@@ -166,15 +168,32 @@ def convert_result(result: Any) -> str | list[dict]:
     return _joined_text(blocks) or "(the tool returned empty text)"
 
 
+_URL_RE = re.compile(r"https?://[^\s'\"<>]+")
+_HTTPX_HINT_RE = re.compile(r"\s*For more information check:.*$", re.S)  # httpx appends an MDN link to status errors
+
+
+def redact_urls(message: str) -> str:
+    """Every URL in ``message`` reduced to scheme, host and path (``mcp_store.display_url``): no user
+    info, query or fragment, so a key in the query string never reaches the user or the transcript.
+    Punctuation right after a URL (``..., url.`` or ``(url)``) stays as it was."""
+
+    def one(match: re.Match) -> str:
+        url = match.group(0).rstrip(".,;:)]")
+        return mcp_store.display_url(url) + match.group(0)[len(url):]
+
+    return _URL_RE.sub(one, message)
+
+
 def error_reason(exc: BaseException) -> str:
-    """A short plain reason: the first leaf of an ExceptionGroup, the class name when the message is empty."""
+    """A short plain reason: the first leaf of an ExceptionGroup, the class name when the message is
+    empty, URLs without their query string."""
     seen = 0
     while isinstance(exc, BaseExceptionGroup) and exc.exceptions and seen < 10:  # anyio task groups wrap failures
         exc = exc.exceptions[0]
         seen += 1
     if isinstance(exc, asyncio.TimeoutError):
         return "timed out"
-    message = str(exc).strip()
+    message = redact_urls(_HTTPX_HINT_RE.sub("", str(exc))).strip()
     name = type(exc).__name__
     reason = message if message and message.lower() != name.lower() else name
     if message and name not in ("MCPError", "McpError", "MCPUnreachable", "RuntimeError", "ValueError", "Exception"):
