@@ -34,6 +34,7 @@ import re
 from contextlib import asynccontextmanager
 from typing import Any
 
+from agents import content
 from bot import mcp_store
 
 logger = logging.getLogger(__name__)
@@ -128,7 +129,11 @@ def convert_content(items: Any) -> list[dict]:
         elif kind == "image":
             mime = str(_field(item, "mime_type", "mimeType", default="") or "").lower()
             data = _field(item, "data", default="")
-            if mime in SUPPORTED_IMAGE_TYPES and data:
+            if mime in SUPPORTED_IMAGE_TYPES and data and len(str(data)) > content.MAX_IMAGE_BYTES:
+                # The API refuses the whole request for one image over its limit (the base64 data).
+                megabytes = len(str(data)) * 3 / 4 / (1024 * 1024)
+                blocks.append({"type": "text", "text": f"[image {mime} omitted: too large to show ({megabytes:.1f} MB)]"})
+            elif mime in SUPPORTED_IMAGE_TYPES and data:
                 blocks.append({"type": "image", "source": {"type": "base64", "media_type": mime, "data": str(data)}})
             else:
                 blocks.append({"type": "text", "text": f"[image {mime or 'of unknown type'} omitted: not displayable]"})
@@ -319,7 +324,20 @@ class MCPTools:
                 raise
             raise MCPUnreachable(error_reason(e)) from None
 
+    async def _check_host(self, server: dict) -> None:
+        """A user's server must be on a public address, checked after DNS before every connection:
+        the bot runs on the host network, and the record may come straight from ``mcp.json``, which
+        the sandbox can write. The admin's servers (shared or their own) are trusted."""
+        if server.get("admin"):
+            return
+        from bot.auth import auth  # bot/auth has no import-time side effects
+
+        if auth.is_admin(self.user_id):
+            return
+        await asyncio.to_thread(mcp_store.check_public_host, str(server.get("url") or ""))
+
     async def _discover(self, server: dict, timeout: float) -> list[dict]:
+        await self._check_host(server)
         tools: list[dict] = []
         async with open_session(server, timeout) as session:
             cursor = None
@@ -353,6 +371,7 @@ class MCPTools:
         return result
 
     async def _call(self, server: dict, remote: str, args: dict, timeout: float) -> str | list:
+        await self._check_host(server)
         async with open_session(server, timeout) as session:
             result = await session.call_tool(remote, dict(args))
         return convert_result(result)

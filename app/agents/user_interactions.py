@@ -56,6 +56,9 @@ class UserInteractions:
         """
         self.user_id = user_id
         self.sender = sender
+        # the zone set_user_timezone accepted this turn, recorded before its save finishes, so a
+        # schedule_reminder of the same (concurrent) tool batch uses it
+        self._zone_override: str | None = None
         self.voice_manager = VoiceManager()
         self.elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
 
@@ -339,7 +342,10 @@ class UserInteractions:
             return f"Error setting reaction {emoji}: {str(e)}"
 
     def _user_zone(self):
-        """The user's saved zone (``timezone.name``), read fresh so a zone set this turn counts."""
+        """The zone set_user_timezone accepted this turn (even while its save still runs), else the
+        user's saved zone (``timezone.name``), read fresh so a zone set by /timezone counts."""
+        if self._zone_override:
+            return timezones.zone_named(self._zone_override)
         try:
             return timezones.zone_of(UserSettings(self.user_id))
         except Exception as e:  # noqa: BLE001 - a settings read must not break a tool call
@@ -358,9 +364,13 @@ class UserInteractions:
         def _save() -> None:
             UserSettings(self.user_id).set("timezone", zone_name, "name")
 
+        # Before the first await: the tool calls of one message run concurrently, and a
+        # schedule_reminder next to this call must not read the settings before the save lands.
+        previous, self._zone_override = self._zone_override, zone_name
         try:
             await asyncio.to_thread(_save)
         except Exception as e:  # noqa: BLE001
+            self._zone_override = previous
             return f"Error saving the time zone: {e}"
         zone = timezones.zone_named(zone_name)
         return f"Time zone saved: {zone_name}. The user's local time is now {timezones.format_local(datetime.now(timezone.utc), zone)}."
@@ -388,6 +398,10 @@ class UserInteractions:
                     return f"Error: unknown time zone {timezone_name!r}. Use an IANA name such as Europe/Berlin."
                 zone = timezones.zone_named(zone_label)
             else:
+                # Yield once first: every call of the tool batch is already scheduled, so a
+                # set_user_timezone that comes after this call in the same message records its
+                # zone (synchronously, before its own first await) before we read it.
+                await asyncio.sleep(0)
                 zone = self._user_zone()
             try:
                 reminder_datetime = timezones.to_utc(reminder_time, zone)

@@ -2,6 +2,7 @@
 import asyncio
 import importlib
 import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -274,6 +275,58 @@ def test_download_webpage_uses_the_extractor_and_keeps_save_to_file(file_ops_mod
     assert ops.download_webpage("https://nope").startswith("Error downloading webpage: dns")
 
 
+@pytest.fixture
+def ops_in_data(file_ops_module, tmp_path, monkeypatch):
+    """A real FileOperations for user 111 under tmp_path/data (cwd), next to user 222's files."""
+    monkeypatch.chdir(tmp_path)
+    victim = tmp_path / "data" / "222"
+    victim.mkdir(parents=True)
+    (victim / "settings.json").write_text('{"keep": true}', encoding="utf-8")
+    ops = file_ops_module.FileOperations("111")
+    (ops.base_path / "a.txt").write_text("hello", encoding="utf-8")
+    page = SimpleNamespace(text=HTML, raise_for_status=lambda: None,
+                           iter_content=lambda chunk_size: iter([b"payload"]))
+    monkeypatch.setattr(file_ops_module.requests, "get", lambda url, **kw: page)
+    return SimpleNamespace(ops=ops, data=tmp_path / "data", victim=victim, outside=tmp_path / "outside.txt")
+
+
+def files_outside_user_111(data: Path) -> set[str]:
+    return {str(p.relative_to(data)) for p in data.rglob("*") if p.is_file() and not p.is_relative_to(data / "111")}
+
+
+def test_download_webpage_and_zip_names_never_leave_the_workspace(ops_in_data):
+    """The model's filename / archive_name keep only their base name: `..` or an absolute path lands in downloads/."""
+    env, ops = ops_in_data, ops_in_data.ops
+    before = files_outside_user_111(env.data)
+
+    saved = ops.download_webpage("https://example.com/x", save_to_file=True, filename="../../222/settings.json")
+    assert saved.startswith("Webpage content saved to downloads/settings.json")
+    assert (env.victim / "settings.json").read_text(encoding="utf-8") == '{"keep": true}'
+    saved = ops.download_webpage("https://example.com/x", save_to_file=True, filename=str(env.outside))
+    assert saved.startswith("Webpage content saved to downloads/outside.txt") and not env.outside.exists()
+    assert ops.download_webpage("https://example.com/x", save_to_file=True, filename="..").startswith("Error")
+
+    zipped = ops.create_zip_archive(["a.txt"], archive_name="../../222/evil")
+    assert "Path: downloads/evil.zip" in zipped and (ops.base_path / "downloads" / "evil.zip").is_file()
+    assert "Path: downloads/abs.zip" in ops.create_zip_archive(["a.txt"], archive_name=str(env.data / "222" / "abs"))
+    assert ops.download_file("https://example.com/f", filename="../../222/f.bin").endswith("downloads/f.bin")
+
+    assert files_outside_user_111(env.data) == before  # nothing written next to another user's files
+
+
+def test_a_planted_link_in_downloads_is_refused_before_anything_is_written(ops_in_data):
+    """downloads/ is writable from the sandbox: a link there pointing outside must not be written through."""
+    env, ops = ops_in_data, ops_in_data.ops
+    env.outside.write_text("original", encoding="utf-8")
+    for name in ("page.txt", "f.bin", "bundle.zip"):
+        os.symlink(env.outside, ops.base_path / "downloads" / name)
+
+    assert ops.download_webpage("https://example.com/x", save_to_file=True, filename="page.txt").startswith("Error")
+    assert ops.download_file("https://example.com/f", filename="f.bin").startswith("Error")
+    assert ops.create_zip_archive(["a.txt"], archive_name="bundle").startswith("Error")
+    assert env.outside.read_text(encoding="utf-8") == "original"
+
+
 # ---- browse.py (the sandbox side) ------------------------------------------------------------------
 @pytest.fixture
 def browse_module(monkeypatch):
@@ -325,3 +378,90 @@ def test_browse_script_emits_one_ascii_json_line(browse_module, capsys):
 def test_browse_script_extract_text_prefers_trafilatura_then_the_body(browse_module):
     assert browse_module.extract_text(HTML, "fallback body").startswith("Sentence number 0") or "Sentence number 0" in browse_module.extract_text(HTML, "fallback body")
     assert browse_module.extract_text("<html><body></body></html>", "fallback body") == "fallback body"
+
+
+class FakePage:
+    """Just enough of a Playwright page for browse.browse(); the screenshot and title may fail."""
+
+    def __init__(self, screenshot_error=None, title_error=None):
+        self.screenshot_error, self.title_error = screenshot_error, title_error
+        self.url = "https://e.com/final"
+
+    def on(self, *a):
+        pass
+
+    def goto(self, url, **kw):
+        pass
+
+    def wait_for_load_state(self, *a, **kw):
+        pass
+
+    def wait_for_timeout(self, ms):
+        pass
+
+    def content(self):
+        return "<html><body></body></html>"
+
+    def inner_text(self, selector, **kw):
+        return "Text the browser already read"
+
+    def evaluate(self, script, arg):
+        return [["Home", "https://e.com/"]]
+
+    def screenshot(self, path, **kw):
+        if self.screenshot_error:
+            raise self.screenshot_error
+        Path(path).write_bytes(b"\x89PNG")
+
+    def title(self):
+        if self.title_error:
+            raise self.title_error
+        return "Fake title"
+
+
+def use_fake_playwright(monkeypatch, page):
+    import types
+
+    browser = SimpleNamespace(new_context=lambda **kw: SimpleNamespace(new_page=lambda: page), close=lambda: None)
+
+    class Playwright:
+        def __enter__(self):
+            return SimpleNamespace(chromium=SimpleNamespace(launch=lambda **kw: browser))
+
+        def __exit__(self, *exc):
+            return False
+
+    sync_api = types.ModuleType("playwright.sync_api")
+    sync_api.sync_playwright = Playwright
+    package = types.ModuleType("playwright")
+    package.sync_api = sync_api
+    monkeypatch.setitem(sys.modules, "playwright", package)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+
+
+def _browse(browse_module, capsys, *args):
+    assert browse_module.main(["https://e.com", *args]) == 0
+    return json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+
+def test_browse_script_takes_the_screenshot_when_asked(browse_module, monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    use_fake_playwright(monkeypatch, FakePage())
+    data = _browse(browse_module, capsys, "--screenshot", "downloads/s.png", "--wait-ms", "0")
+    assert data["error"] is None and data["screenshot"] == "downloads/s.png" and (tmp_path / "downloads" / "s.png").exists()
+    assert data["title"] == "Fake title" and "already read" in data["text"] and data["links"] == [["Home", "https://e.com/"]]
+
+
+def test_a_failed_screenshot_keeps_the_page_that_was_read(browse_module, monkeypatch, tmp_path, capsys):
+    """A screenshot timing out on web fonts used to replace the whole result with the error."""
+    monkeypatch.chdir(tmp_path)
+    use_fake_playwright(monkeypatch, FakePage(
+        screenshot_error=TimeoutError("page.screenshot: Timeout 10000ms exceeded. waiting for fonts to load"),
+        title_error=RuntimeError("Execution context was destroyed"),
+    ))
+    data = _browse(browse_module, capsys, "--screenshot", "downloads/s.png", "--wait-ms", "0")
+    assert data["error"] is None and data["screenshot"] is None and data["title"] is None
+    assert "already read" in data["text"] and data["final_url"] == "https://e.com/final" and data["links"]
+    # the host then reports the text with "Screenshot: not saved"
+    formatted = WebTools("7")._format(data, "downloads/s.png", 20_000)
+    assert "already read" in formatted and "Screenshot: not saved" in formatted

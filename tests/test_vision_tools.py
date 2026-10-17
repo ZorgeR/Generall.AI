@@ -59,7 +59,22 @@ async def test_view_image_downscales_and_reports_the_real_dimensions(workspace):
         assert img.format == "JPEG" and img.size == (1024, 512)
     assert result[0]["source"]["media_type"] == "image/jpeg"
     assert result[1] == {"type": "text", "text": "images/cat.png · 2000x1000 px (shown at 1024x512)"}
-    assert len(base64.standard_b64decode(result[0]["source"]["data"])) <= content.MAX_IMAGE_BYTES
+    assert len(result[0]["source"]["data"]) <= content.MAX_IMAGE_BYTES  # the API's limit is on the base64 data
+
+
+async def test_view_image_reencodes_a_file_whose_base64_is_over_the_limit(workspace, monkeypatch):
+    """A PNG within max_px and under MAX_IMAGE_BYTES on disk, but over it as base64 (the API's
+    measure): passing it through would fail the whole request, so it is re-encoded to fit."""
+    import os
+
+    noise = Image.frombytes("RGB", (120, 120), os.urandom(120 * 120 * 3))
+    path = workspace / "images" / "noise.png"
+    noise.save(path, format="PNG")
+    size = path.stat().st_size
+    monkeypatch.setattr(content, "MAX_IMAGE_BYTES", size + 100)  # the file fits, its base64 does not
+    block, text = await VisionTools(USER).view_image("images/noise.png", max_px=2048)
+    assert block["source"]["media_type"] == "image/jpeg" and len(block["source"]["data"]) <= content.MAX_IMAGE_BYTES
+    assert text["text"].startswith("images/noise.png · 120x120 px")
 
 
 async def test_view_image_passes_a_small_png_through_unchanged(workspace):

@@ -1252,7 +1252,7 @@ def test_one_off_fallback_runs_through_bash_on_the_filtered_network(container_ma
     # run_script stays a plain one-off command with no bash wrapper and no package replay
     (container_manager.base_data_path / "7" / "installed_packages.txt").write_text("jq\n")
     container_manager.run_script("7", "browse.py", ["https://x"], timeout=75, network_enabled=True, mem_limit="1g")
-    assert isinstance(runs[2]["command"], str) and runs[2]["command"].startswith("python /home/runner/workspace/temp_tool_")
+    assert isinstance(runs[2]["command"], str) and runs[2]["command"].startswith("python -I /home/runner/workspace/temp_tool_")
     assert runs[2]["mem_limit"] == "1g"
 
 

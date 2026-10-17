@@ -34,7 +34,7 @@ def test_run_script_copies_quotes_and_cleans_up(manager, monkeypatch):
 
     def fake_run_one_shot(user_id, command, timeout=60, network_enabled=False, mem_limit=None, **kw):
         parts = shlex.split(command)
-        copied = manager.base_data_path / user_id / Path(parts[1]).name
+        copied = manager.base_data_path / user_id / Path(parts[2]).name
         calls.append(SimpleNamespace(
             user_id=user_id, parts=parts, timeout=timeout, network_enabled=network_enabled, mem_limit=mem_limit,
             existed=copied.exists(), content=copied.read_text() if copied.exists() else None, kw=kw,
@@ -51,9 +51,9 @@ def test_run_script_copies_quotes_and_cleans_up(manager, monkeypatch):
     call = calls[0]
     assert call.user_id == "7" and call.timeout == 75 and call.network_enabled is True and call.mem_limit == "1g"
     assert call.kw == {"replay_packages": False}  # bundled scripts need no saved packages
-    assert call.parts[0] == "python"
-    assert call.parts[1].startswith("/home/runner/workspace/temp_tool_") and call.parts[1].endswith(".py")
-    assert call.parts[2:] == ["https://x.y/?a=1&b=2", "--screenshot", "downloads/s p.png"]  # shell-safe quoting
+    assert call.parts[:2] == ["python", "-I"]  # isolated: workspace files never shadow the script's imports
+    assert call.parts[2].startswith("/home/runner/workspace/temp_tool_") and call.parts[2].endswith(".py")
+    assert call.parts[3:] == ["https://x.y/?a=1&b=2", "--screenshot", "downloads/s p.png"]  # shell-safe quoting
     # the copy existed with the real script's content while the command ran, and is gone afterwards
     assert call.existed and call.content == (cm_module.SCRIPTS_DIR / "browse.py").read_text()
     assert list((manager.base_data_path / "7").glob("temp_tool_*")) == []
@@ -62,11 +62,42 @@ def test_run_script_copies_quotes_and_cleans_up(manager, monkeypatch):
 def test_run_script_defaults_and_unique_names(manager, monkeypatch):
     names = []
     monkeypatch.setattr(manager, "run_one_shot", lambda uid, cmd, timeout=60, network_enabled=False, mem_limit=None, **kw:
-                        names.append((shlex.split(cmd)[1], timeout, network_enabled, mem_limit)) or "")
+                        names.append((shlex.split(cmd)[2], timeout, network_enabled, mem_limit)) or "")
     for _ in range(3):
         manager.run_script("7", "render_document.py")
     assert len({n[0] for n in names}) == 3  # concurrent calls must not share a file name
     assert all(n[1:] == (90, False, None) for n in names)
+
+
+def test_workspace_files_named_like_stdlib_modules_do_not_break_the_bundled_scripts(manager, monkeypatch):
+    """The script's directory is the user's workspace, where the model writes files. A ``json.py`` or
+    ``typing.py`` there used to replace the real module, so every pdf/docx/xlsx render and every
+    browse died before printing its JSON line. The command is run here for real, with the container
+    path mapped to the workspace on disk."""
+    import subprocess
+    import sys
+
+    from agents.web_tools import last_json_line
+
+    user_dir = manager.base_data_path / "7"
+    user_dir.mkdir(parents=True)
+    for module in ("json", "typing", "random", "copy", "zipfile"):
+        (user_dir / f"{module}.py").write_text(f"raise SystemExit('planted {module}.py was imported')\n")
+    (user_dir / "in.md").write_text("# Title\n\n| a | b |\n|---|---|\n| 1 | 2 |\n")
+
+    def run_locally(user_id, command, timeout=60, network_enabled=False, mem_limit=None, **kw):
+        parts = shlex.split(command)
+        assert parts[0] == "python"
+        parts = [sys.executable] + [p.replace("/home/runner/workspace/", f"{user_dir}/") for p in parts[1:]]
+        done = subprocess.run(parts, cwd=user_dir, capture_output=True, text=True, timeout=60)
+        return BANNER + done.stdout + done.stderr
+
+    monkeypatch.setattr(manager, "run_one_shot", run_locally)
+    for fmt in ("docx", "xlsx"):
+        logs = manager.run_script("7", "render_document.py", ["--format", fmt, "--input", "in.md", "--output", f"out.{fmt}"])
+        data = last_json_line(logs)
+        assert data and data["error"] is None and data["output"] == f"out.{fmt}", logs
+        assert (user_dir / f"out.{fmt}").stat().st_size > 0
 
 
 def test_run_script_cleans_up_when_run_command_raises(manager, monkeypatch):

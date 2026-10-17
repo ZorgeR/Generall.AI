@@ -148,10 +148,50 @@ def test_a_corrupt_or_odd_file_is_tolerated(store, caplog):
 
 def test_writes_are_atomic(store):
     store.add(USER, "About", "Name: Anna")
-    assert not store.path(USER).with_suffix(".md.tmp").exists()
+    assert [p.name for p in store.path(USER).parent.iterdir()] == ["profile.md"]  # no tmp file left behind
+    assert store.path(USER).stat().st_mode & 0o777 == 0o644
     store.clear(USER)
     assert not store.path(USER).exists()
     store.clear(USER)  # idempotent
+
+
+@pytest.mark.parametrize("target", ["outside", "sibling", "environ"])
+async def test_a_linked_profile_is_never_followed(store, tmp_path, caplog, target):
+    """data/<uid> is the sandbox's workspace: `ln -s /proc/self/environ profile.md` (or a link to
+    another user's profile) must not put that file into the <context> block, user_profile_read or
+    /profile. The link reads as an empty profile and the next write replaces the link itself."""
+    secret = tmp_path / "outside.env"
+    secret.write_text("## About\n- TELEGRAM_BOT_TOKEN=123:supersecret\n", encoding="utf-8")
+    store.add("999", "About", "Victim lives at 12 Secret Street")
+    path = store.path(USER)
+    path.parent.mkdir(parents=True)
+    os.symlink({"outside": str(secret), "sibling": "../999/profile.md", "environ": "/proc/self/environ"}[target], path)
+
+    assert store.text(USER) == "" and store.load(USER).is_empty() and "Unreadable profile" in caplog.text
+    assert (await ProfileTools(USER, store).execute_tool("user_profile_read", {})).startswith("The profile is empty.")
+    store.add(USER, "About", "Name: Anna")
+    assert not path.is_symlink() and store.load(USER).entries("About") == ["Name: Anna"]
+    assert secret.read_text(encoding="utf-8").endswith("supersecret\n")  # the target was not written either
+    assert store.load("999").entries("About") == ["Victim lives at 12 Secret Street"]
+
+
+def test_a_planted_tmp_link_is_not_written_through(store, tmp_path):
+    """The old fixed tmp name (profile.md.tmp) as a link to a file the bot can write: a profile
+    write must not land in that file."""
+    victim = tmp_path / "victim.txt"
+    victim.write_text("untouched", encoding="utf-8")
+    store.path(USER).parent.mkdir(parents=True)
+    os.symlink(str(victim), store.path(USER).with_suffix(".md.tmp"))
+    store.add(USER, "About", "Name: Anna")
+    assert victim.read_text(encoding="utf-8") == "untouched"
+    assert store.load(USER).entries("About") == ["Name: Anna"] and not store.path(USER).is_symlink()
+
+
+def test_a_fifo_profile_does_not_hang_the_read(store):
+    path = store.path(USER)
+    path.parent.mkdir(parents=True)
+    os.mkfifo(path)
+    assert store.text(USER) == ""  # returns at once: not a regular file
 
 
 # ---- the tools -----------------------------------------------------------------
@@ -305,6 +345,54 @@ def test_render_context_without_a_profile_is_unchanged(agent):
     assert plain == agent._render_context(["• a"], ["• b"], "")
     assert plain.endswith("<memory>\nRecent conversations (newest first):\n• a\n\nRelated earlier conversations (semantic search):\n• b\n</memory>\n</context>")
     assert agent._render_context([], []).count("\n") == 3  # UTC time and the timezone line only
+
+
+async def test_the_legacy_path_sends_the_context_block_too(agent, monkeypatch):
+    """Transcript off ("Remember this chat in full"): the static <capabilities> notes still
+    promise a <context> block with the local time, the zone and the profile, so the legacy user
+    turn carries one (its memory stays in the legacy prompt) and the quick path the same text;
+    the stored short-term memory keeps the bare question, never a stale block."""
+    P.profile_store.add(USER, "About", "Name: Kenji")
+    settings = agent.user_settings
+    settings["transcript"]["enabled"] = False
+    settings["semantic_search"]["enabled"] = False  # no embeddings call
+    settings["timezone"]["name"] = "Asia/Tokyo"
+    sent: list[list[dict]] = []
+    complexity = ["complex"]
+
+    async def classify(question, history=None):
+        return complexity[0]
+
+    async def no_save(*args, **kwargs):
+        return ""
+
+    async def loop(messages, **kwargs):
+        sent.append(copy.deepcopy(messages))
+        thread = [{"role": m["role"], "content": [{"type": "text", "text": m["content"]}]} for m in messages]
+        return "answer", thread + [{"role": "assistant", "content": [{"type": "text", "text": "answer"}]}]
+
+    async def quick(context_memory, system_context, question, on_text_chunk=None):
+        sent.append(copy.deepcopy(context_memory))
+        return "quick", [{"role": "user", "content": [{"type": "text", "text": question}]},
+                         {"role": "assistant", "content": [{"type": "text", "text": "quick"}]}]
+
+    monkeypatch.setattr(agent, "_classify_complexity", classify)
+    monkeypatch.setattr(agent, "_save_conversation", no_save)
+    monkeypatch.setattr(agent.agent, "generate_response", loop)
+    monkeypatch.setattr(agent, "_simple_response", quick)
+
+    assert (await agent.generate_response("remind me in 2 hours"))[0] == "answer"
+    stored = [(m["role"], b["text"]) for m in agent._load_short_term_memory() for b in m["content"]]
+    assert not any("<context>" in t for _, t in stored)
+    assert [r for r, t in stored if t.endswith("remind me in 2 hours")] == ["user"]  # the full agent's turn, bare
+
+    complexity[0] = "simple"
+    assert (await agent.generate_response("thanks"))[0] == "quick"
+    for request, asked in zip(sent, ("remind me in 2 hours", "thanks")):
+        turn = request[-1]["content"]
+        assert turn.startswith("<context>\nCurrent time in UTC+0: ") and "\nLocal time (Asia/Tokyo): " in turn
+        assert profile_tags(turn) and "- Name: Kenji" in turn and "<memory>" not in turn
+        assert turn.endswith(asked)
 
 
 # ---- /profile ------------------------------------------------------------------

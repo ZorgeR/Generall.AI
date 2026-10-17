@@ -10,6 +10,17 @@ import agents.mcp_tools as mt
 from bot import mcp_store
 
 USER = "42"
+REAL_RESOLVE = mcp_store._resolve
+
+
+@pytest.fixture(autouse=True)
+def no_dns(monkeypatch):
+    """The connect-time host check resolves the server's name: here no name resolves (no network in tests)."""
+
+    def unresolvable(host, port):
+        raise OSError("Name or service not known")
+
+    monkeypatch.setattr(mcp_store, "_resolve", unresolvable)
 
 
 def server(name="demo", *, tools=None, enabled=True, admin=False, **over):
@@ -226,6 +237,18 @@ async def test_execute_tool_returns_blocks_when_there_is_an_image(tools, wired):
     ]
 
 
+def test_an_image_over_the_api_limit_becomes_a_note(monkeypatch):
+    """The API refuses the whole request when one image's base64 data is over its limit."""
+    from agents import content
+
+    monkeypatch.setattr(content, "MAX_IMAGE_BYTES", 8)
+    items = [SimpleNamespace(type="image", mime_type="image/png", data="QUJDREVG"),  # 8 chars: fits
+             SimpleNamespace(type="image", mime_type="image/png", data="QUJDREVGRw==")]  # 12 chars: too large
+    fits, note = mt.convert_content(items)
+    assert fits == {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJDREVG"}}
+    assert note["type"] == "text" and note["text"].startswith("[image image/png omitted: too large to show (")
+
+
 async def test_execute_tool_converts_resources_and_structured_content(tools, wired):
     provider, _ = tools
     wired.session.results["res"] = result(
@@ -407,16 +430,75 @@ def test_names_are_lowercased_and_validated(store):
             mcp_store.validate_name(bad)
 
 
-def test_urls_require_https_except_localhost_or_admin(store):
+def test_users_need_https_to_a_public_host_the_admin_does_not(store):
+    """The bot runs on the host network: a user's "localhost" would be the server's own services."""
     assert mcp_store.validate_url("https://api.example.com/mcp") == "https://api.example.com/mcp"
-    assert mcp_store.validate_url("http://localhost:3000/mcp") == "http://localhost:3000/mcp"
-    assert mcp_store.validate_url("http://127.0.0.1/mcp") == "http://127.0.0.1/mcp"
-    assert mcp_store.validate_url("http://internal.corp/mcp", admin=True) == "http://internal.corp/mcp"
-    for bad in ("http://example.com/mcp", "ftp://x/y", "example.com/mcp", "", "https://"):
+    assert mcp_store.validate_url("https://93.184.215.14/mcp") == "https://93.184.215.14/mcp"
+    for admin_only in ("http://internal.corp/mcp", "http://localhost:3000/mcp", "http://127.0.0.1/mcp", "https://10.0.0.5/mcp"):
+        assert mcp_store.validate_url(admin_only, admin=True) == admin_only
+    for plain in ("http://example.com/mcp", "http://localhost:3000/mcp", "http://127.0.0.1:8081/"):
+        with pytest.raises(ValueError, match="Only https"):
+            mcp_store.validate_url(plain)
+    for local in ("https://localhost/mcp", "https://LOCALHOST./mcp", "https://api.localhost/mcp", "https://127.0.0.1:8081/",
+                  "https://[::1]/mcp", "https://10.0.0.5/mcp", "https://192.168.1.2/", "https://172.16.0.1/",
+                  "https://169.254.169.254/latest", "https://100.64.0.1/", "https://0.0.0.0/", "https://[::ffff:127.0.0.1]/",
+                  "https://[fe80::1]/", "https://[fd00::1]/", "https://224.0.0.1/"):
+        with pytest.raises(ValueError, match="public address"):
+            mcp_store.validate_url(local)
+    for bad in ("ftp://x/y", "example.com/mcp", "", "https://"):
         with pytest.raises(ValueError):
             mcp_store.validate_url(bad)
     with pytest.raises(ValueError):
         mcp_store.validate_transport("websocket")
+
+
+def test_check_public_host_resolves_the_name(store, monkeypatch):
+    answers = {"public.example": ["93.184.215.14", "2606:2800:21f:cb07:6820:80da:af6b:8b2c"],
+               "rebound.example": ["127.0.0.1"], "mixed.example": ["93.184.215.14", "10.1.2.3"]}
+
+    def resolve(host, port):
+        if host not in answers:
+            raise OSError("Name or service not known")
+        return answers[host]
+
+    monkeypatch.setattr(mcp_store, "_resolve", resolve)
+    mcp_store.check_public_host("https://public.example/mcp")
+    mcp_store.check_public_host("https://unknown.example/mcp")  # does not resolve: the connection fails on its own
+    for url in ("https://rebound.example/mcp", "https://mixed.example:8443/mcp", "http://localhost:3000/", "https://10.0.0.5/"):
+        with pytest.raises(ValueError, match="public address"):
+            mcp_store.check_public_host(url)
+    monkeypatch.setattr(mcp_store, "_resolve", REAL_RESOLVE)
+    with pytest.raises(ValueError, match="public address"):  # numeric spellings resolve without DNS
+        mcp_store.check_public_host("https://2130706433/")
+
+
+async def test_a_users_server_is_checked_before_every_connection(wired, monkeypatch):
+    """Discovery and calls refuse a user's server whose name resolves to a local address, even one
+    written straight into mcp.json; the admin's servers (shared or their own) are not checked."""
+    from bot.auth import auth
+
+    resolved: list[str] = []
+
+    def resolve(host, port):
+        resolved.append(host)
+        return ["127.0.0.1"]
+
+    monkeypatch.setattr(mcp_store, "_resolve", resolve)
+    recorded: list = []
+    monkeypatch.setattr(mcp_store, "record_error", lambda uid, s, err: recorded.append(err))
+    record = server("evil", tools=[{"name": "probe", "description": "", "input_schema": {}}])
+    with pytest.raises(mt.MCPUnreachable, match="public address"):
+        await mt.MCPTools(USER, servers=[]).discover(record)
+    result = await mt.MCPTools(USER, servers=[record]).execute_tool("mcp_evil_probe", {})
+    assert result.startswith("Error: MCP server evil unreachable: The server must be on a public address")
+    assert wired.transports == [] and resolved == ["evil.example.com", "evil.example.com"]  # never connected
+    assert recorded == [result.split("unreachable: ", 1)[1]]  # shown by /mcp like any connection error
+
+    shared = server("corp", admin=True, tools=[{"name": "probe", "description": "", "input_schema": {}}])
+    assert await mt.MCPTools(USER, servers=[]).discover(shared) == []
+    monkeypatch.setattr(auth, "admin_id", USER)  # the admin's own servers are trusted too
+    assert await mt.MCPTools(USER, servers=[]).discover(record) == []
+    assert resolved == ["evil.example.com", "evil.example.com"] and len(wired.transports) == 2
 
 
 def test_new_server_stores_the_token_as_a_bearer_header_and_never_renders_it(store):

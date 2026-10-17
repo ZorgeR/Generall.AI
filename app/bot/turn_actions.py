@@ -15,8 +15,9 @@ half-typed opening tag, so it never flickers on screen.
 Every turn is saved as a small record (``data/<uid>/turns/<id>.json``, plus
 ``<id>.reasoning.txt`` when there is a reasoning transcript), newest ``MAX_TURNS``
 per user. A turn that failed is saved too, with ``error`` set and no answer, so
-its Retry button can replay the prompt. The buttons carry only the turn id
-(``turn_<action>_<id>`` and ``turn_fu_<id>_<index>``), so a press loads the
+its Retry button can replay the prompt; a scheduled task's record keeps its
+``quiet_marker``, so a Retry that has nothing to report stays quiet too. The
+buttons carry only the turn id (``turn_<action>_<id>`` and ``turn_fu_<id>_<index>``), so a press loads the
 record: Retry re-runs the stored prompt, Continue asks the agent to finish a turn
 that hit the tool budget, Listen reads the answer aloud, Reasoning sends the
 transcript file on demand (it is no longer sent after every turn). A record that
@@ -150,6 +151,7 @@ class TurnRecord:
     has_reasoning: bool = False
     prompt_blocks: list | None = None  # the prompt as content blocks (media refs, agents.content) when it had media
     error: str | None = None  # the turn failed with this plain-language reason: only Retry applies, response is ""
+    quiet_marker: str | None = None  # a scheduled task's "nothing to say" answer: Retry runs with it again
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -175,6 +177,7 @@ class TurnRecord:
             has_reasoning=data.get("has_reasoning") is True,
             prompt_blocks=[b for b in prompt_blocks if isinstance(b, dict)] if isinstance(prompt_blocks, list) and prompt_blocks else None,
             error=str(data["error"]) if data.get("error") else None,
+            quiet_marker=data["quiet_marker"] if isinstance(data.get("quiet_marker"), str) and data["quiet_marker"] else None,
         )
 
 

@@ -3,6 +3,8 @@ requirements file rebuilds it on the next startup; nobody has to delete the old 
 import importlib
 from types import SimpleNamespace
 
+import pytest
+
 cm = importlib.import_module("secure_container.container_manager")
 
 
@@ -94,3 +96,43 @@ def test_changed_context_builds_retags_latest_and_prunes_the_old_image(tmp_path,
     new = images.existing["secure-container:abc123def456"]
     assert ("secure-container", "latest") in new.tagged
     assert images.removed == ["sha256:old"]
+
+
+class FailingBuildImages(FakeImages):
+    def build(self, *, path, tag, rm, forcerm):
+        self.built.append(tag)
+        raise cm.docker.errors.BuildError("cdn.playwright.dev: connection reset", [])
+
+
+def _constructed(monkeypatch, images, tmp_path):
+    """A real ContainerManager() against a fake Docker client (the constructor runs _ensure_image_exists)."""
+    monkeypatch.setattr(cm.docker, "from_env", lambda: SimpleNamespace(images=images))
+    return cm.ContainerManager(base_data_path=str(tmp_path / "data"), host_data_path=str(tmp_path / "data"))
+
+
+def test_a_failed_build_runs_on_the_previous_image_instead_of_stopping_the_bot(monkeypatch, tmp_path):
+    """A new content tag whose build fails (network, a removed package) used to raise out of the
+    constructor, and main_bot exited: no chat at all although the last good image was on disk."""
+    monkeypatch.setattr(cm, "_FAILED_BUILDS", set())
+    old = FakeImage("sha256:old", ["secure-container:latest"])
+    images = FailingBuildImages({"secure-container:latest": old})
+    first = _constructed(monkeypatch, images, tmp_path)
+    tag = cm.image_build_fingerprint()
+    assert images.built == [f"secure-container:{tag}"]
+    assert first.image_tag == cm.IMAGE_LATEST_TAG and images.removed == []
+    # the second instance (SecureToolWrapper's) does not start another multi-minute build
+    second = _constructed(monkeypatch, images, tmp_path)
+    assert second.image_tag == cm.IMAGE_LATEST_TAG and len(images.built) == 1
+    # sandboxed calls then run on secure-container:latest
+    runs = []
+    container = SimpleNamespace(wait=lambda timeout=None: {"StatusCode": 0}, logs=lambda: b"ok", remove=lambda force=False: None)
+    second.docker_client = SimpleNamespace(containers=SimpleNamespace(
+        run=lambda **kw: runs.append(kw) or container, get=lambda name: container))
+    assert second.run_command("7", "true") == "ok" and runs[0]["image"] == "secure-container:latest"
+
+
+def test_a_failed_build_without_any_previous_image_still_fails_startup(monkeypatch, tmp_path):
+    monkeypatch.setattr(cm, "_FAILED_BUILDS", set())
+    images = FailingBuildImages({})
+    with pytest.raises(cm.docker.errors.BuildError):
+        _constructed(monkeypatch, images, tmp_path)

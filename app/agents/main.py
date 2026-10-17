@@ -941,10 +941,16 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         })
         
         try:
+            # The loop's tool definitions go out unchanged: they belong to the prefix every
+            # thinking block (and the cache) is bound to, and dropping them would make each block
+            # of the request stale. tool_choice "none" (allowed with thinking, outside that
+            # prefix) is what keeps the model from calling a tool.
             final_kwargs = {
                 "model": self.model,
                 "messages": self._request_messages(processed_messages),
                 "system": system,
+                "tools": self.get_tools_schema(),
+                "tool_choice": {"type": "none"},
                 "max_tokens": max_tokens_for(self.model, self.thinking),
                 **request_options_for(self.model, self.thinking),
             }
@@ -1375,6 +1381,17 @@ User message: {question}"""
             parts.append(profile)  # <profile fingerprint="..."> ... </profile> (agents.profile_tools.profile_block)
         return "<context>\n" + "\n".join(parts) + "\n</context>"
 
+    async def _legacy_context(self) -> str:
+        """The ``<context>`` block of a legacy-mode turn (transcript off): UTC and local time and
+        the profile (``profile.enabled``), which the static ``<capabilities>`` notes promise. No
+        memory lines: the legacy prompt carries the summaries and the semantic hits itself."""
+        profile = ""
+        if (self.user_settings.get("profile") or {}).get("enabled", True):
+            text = await asyncio.to_thread(profile_store.text, self.user_id)
+            if text.strip():
+                profile = profile_block(text, profile_fingerprint(text))
+        return self._render_context([], [], profile)
+
     async def _summarize_messages(self, old: list[dict]) -> str:
         """Fast-model summary of the oldest part of a transcript (used by transcript.prune)."""
         view = text_only_view(old)
@@ -1433,8 +1450,10 @@ User message: {question}"""
 
     async def _build_user_message(self, turn_context: str, blocks: list) -> dict:
         """The user turn exactly as sent: the <context> block first, then the prompt's blocks with
-        media refs materialized into base64 image/document blocks (file reads in a thread)."""
-        materialized = await asyncio.to_thread(prompt_content.materialize, blocks)
+        media refs materialized into base64 image/document blocks (file reads in a thread), each
+        ref confined to the user's workspace (a Retry re-reads refs stored long before)."""
+        workspace = Path("./data") / str(self.user_id)
+        materialized = await asyncio.to_thread(prompt_content.materialize, blocks, workspace)
         return {"role": "user", "content": [{"type": "text", "text": turn_context}, *materialized]}
 
     async def _generate_with_transcript(self, question: str, system_context: str, update_status=None, on_text_chunk=None, trace=None, question_blocks: list | None = None):
@@ -1972,8 +1991,10 @@ You have been asked to answer a query given sources. Consider the following when
                 if text:
                     context_memory.append({"role": message["role"], "content": text})
         
-        # Pass user message separately
-        user_question = [{"role": "user", "content": question}]
+        # Pass user message separately, behind the per-turn <context> block (times, profile) as
+        # in transcript mode; the quick path gets the same text. Memory keeps the bare question.
+        turn_text = f"{await self._legacy_context()}\n\n{question}"
+        user_question = [{"role": "user", "content": turn_text}]
         context_memory.extend(user_question)
 
         # formated json print of context_memory
@@ -2018,7 +2039,12 @@ You have been asked to answer a query given sources. Consider the following when
             )
             # remove first 2 messages from thread_messages array
             thread_messages = thread_messages[2:]
-        
+            # the stored turn is the bare question: a stale <context> block must not come back
+            # with the reasoning context (short_term_memory.json) next turn
+            for msg in thread_messages:
+                if msg.get("role") == "user" and self._get_msg_text(msg) == turn_text:
+                    msg["content"] = [{"type": "text", "text": question}]
+
         # print("\n========== Thread Messages: ==========")
         #print(json.dumps(thread_messages, indent=2, ensure_ascii=False))
         # print("\n========== Response: ==========")

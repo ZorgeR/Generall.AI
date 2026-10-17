@@ -11,6 +11,7 @@ thinking blocks, before the turn is appended, when a turn needed that.
 import asyncio
 import copy
 import importlib
+import json
 import os
 from types import SimpleNamespace
 
@@ -500,3 +501,49 @@ async def test_history_edited_alone_strips_the_store(agents_main, monkeypatch):
     untouched, _ = make_chain(agents_main, monkeypatch, with_tool("s3", "s4", "three"))
     await untouched.generate_response("third")
     assert stored_has_thinking()  # a normal turn keeps its blocks
+
+
+class BindingClient(FakeClient):
+    """An enforced account: each thinking block it returns is bound to the request's tool set
+    (with the model, system prompt and earlier messages, what preserved thinking compares; the
+    tool_choice is not part of it), and a request replaying a block under another tool set gets
+    the mismatch 400."""
+
+    def __init__(self, script, bound: dict):
+        super().__init__(script)
+        self.bound = bound  # signature -> the tool set it was minted under, shared across turns
+
+    def _stream(self, beta, kwargs):
+        tools = json.dumps(kwargs.get("tools"), sort_keys=True, default=str)
+        if any(self.bound.get(sig, tools) != tools for sig in signatures(kwargs)):
+            self.requests.append({"beta": beta, **copy.deepcopy(kwargs)})
+            return FakeStream(api_error(anthropic.BadRequestError, 400, MISMATCH))
+        stream = super()._stream(beta, kwargs)
+        if not isinstance(stream.outcome, BaseException):
+            self.bound.update({b.signature: tools for b in stream.outcome.content if b.type == "thinking"})
+        return stream
+
+
+async def test_the_forced_final_call_keeps_the_loops_tools(agents_main, monkeypatch, no_sleep):
+    """The budget is spent and the SYSTEM NOTICE call compiles the answer: it sends the loop's
+    tool definitions with tool_choice none, so every thinking block of the request (the stored
+    ones and this turn's) stays valid, the compiled answer arrives and the store keeps its
+    thinking. Without the tools the call was refused twice, the user got the unfinished
+    "let me check" and the stored blocks were stripped."""
+    bound: dict[str, str] = {}
+    first, _ = make_chain(agents_main, monkeypatch, [])
+    first.agent.client = BindingClient(with_tool("s1", "s2", "one"), bound)
+    assert (await first.generate_response("first"))[0] == "one"
+
+    second, _ = make_chain(agents_main, monkeypatch, [])
+    second.user_settings["tools"]["max_iteration"] = 1
+    client = BindingClient([reply(thinking("s3"), text("let me check"), tool_use("tu_s3"), stop="tool_use"), reply(thinking("s4"), text("compiled"))], bound)
+    second.agent.client = client
+    response, _ = await second.generate_response("second")
+    assert response == "compiled" and second.agent.limit_reached is True
+    loop, final = client.requests  # nothing refused, nothing retried
+    assert final["tools"] == loop["tools"] and final["tools"]
+    assert loop["tool_choice"] == {"type": "auto"} and final["tool_choice"] == {"type": "none"}
+    assert signatures(final) == ["s1", "s3"] and second.agent.history_edited is False
+    assert stored_signatures() == ["s1", "s3"]  # the compiled answer is stored text-only
+    assert T.message_text(stored().messages[-1]) == "compiled"

@@ -40,6 +40,7 @@ _TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")  # GF
 # written; ``_text_`` is deliberately NOT a style, snake_case identifiers are common in reports.
 _INLINE_RE = re.compile(r"(\*\*[^*]+\*\*|`[^`]+`|(?<!\w)\*[^*\s][^*]*\*(?!\w))")
 _NUMBER_CELL_RE = re.compile(r"^[-+]?(\d+(\.\d*)?|\.\d+)([eE][-+]?\d+)?$")
+MAX_NUMBER_DIGITS = 15  # Excel keeps 15 significant digits; longer digit strings are ids, kept as text
 _INVALID_SHEET_CHARS = re.compile(r"[\[\]:*?/\\]")
 
 _output_lock = threading.Lock()
@@ -168,10 +169,21 @@ def plain_text(text: str) -> str:
     return "".join(t for t, _ in inline_runs(text))
 
 
+def looks_like_identifier(raw: str) -> bool:
+    """Digits that are an identifier, not a quantity: a leading zero ("02134", "007"), an explicit
+    "+" ("+447911123456") or more than MAX_NUMBER_DIGITS significant digits (order/account numbers,
+    which Excel would round). Converting them would lose characters."""
+    if raw.startswith("+") or re.match(r"^-?0\d", raw):
+        return True
+    mantissa = re.split(r"[eE]", raw, maxsplit=1)[0]
+    return len(re.sub(r"\D", "", mantissa).lstrip("0")) > MAX_NUMBER_DIGITS
+
+
 def cell_value(text: str) -> Any:
-    """Numeric-looking cells become numbers so the sheet can be summed; the rest stays text."""
+    """Numeric-looking cells become numbers so the sheet can be summed; the rest stays text, and so
+    do identifiers that only look numeric (zip codes, phone numbers, long ids: looks_like_identifier)."""
     raw = plain_text(text).strip()
-    if _NUMBER_CELL_RE.match(raw):
+    if _NUMBER_CELL_RE.match(raw) and not looks_like_identifier(raw):
         try:
             return int(raw) if re.fullmatch(r"[-+]?\d+", raw) else float(raw)
         except ValueError:

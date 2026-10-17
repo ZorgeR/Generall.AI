@@ -52,6 +52,39 @@ def test_materialize_image_and_pdf(tmp_path):
     assert out[4]["type"] == "text" and "not found" in out[4]["text"]
 
 
+def test_materialize_with_a_base_reads_only_regular_files_inside_it(tmp_path):
+    """Retry re-materializes refs stored with the turn record, from directories the sandbox can
+    write: with ``base`` a ref that resolves outside the workspace or is no regular file is "not
+    found" and nothing outside is read; the host and absolute spellings inside it still work."""
+    base = tmp_path / "data" / "7"
+    (base / "images").mkdir(parents=True)
+    (base / "documents").mkdir()
+    (base / "images" / "a_v.jpg").write_bytes(JPEG)
+    (base / "documents" / "r.pdf").write_bytes(b"%PDF-1.4 mine")
+    outside = tmp_path / "data" / "9" / "documents"
+    outside.mkdir(parents=True)
+    (outside / "theirs.pdf").write_bytes(b"%PDF-1.4 theirs")
+    (base / "documents" / "linked.pdf").symlink_to(outside / "theirs.pdf")
+    (base / "images" / "dir.jpg").mkdir()
+
+    out = content.materialize([
+        content.image_ref(base / "images" / "a_v.jpg"),               # absolute, inside
+        content.document_ref(base / "documents" / "r.pdf"),
+        content.document_ref(base / "documents" / "linked.pdf"),      # a link out of the workspace
+        content.document_ref(base / ".." / "9" / "documents" / "theirs.pdf"),  # .. out of it
+        content.image_ref(base / "images" / "dir.jpg"),               # not a regular file
+    ], base=base)
+    assert out[0]["type"] == "image" and out[1]["type"] == "document"
+    assert base64.standard_b64decode(out[1]["source"]["data"]) == b"%PDF-1.4 mine"
+    for block in out[2:]:
+        assert block["type"] == "text" and "not found" in block["text"]
+    assert all("theirs" not in base64.standard_b64decode(b["source"]["data"]).decode("latin-1")
+               for b in out if b["type"] in ("image", "document"))
+
+    # without a base the path is read as given (callers that resolved it already)
+    assert content.materialize([content.document_ref(base / "documents" / "linked.pdf")])[0]["type"] == "document"
+
+
 def test_materialize_refuses_non_pdf_documents_and_huge_images(tmp_path, monkeypatch):
     doc = tmp_path / "a.docx"
     doc.write_bytes(b"x")
@@ -61,6 +94,19 @@ def test_materialize_refuses_non_pdf_documents_and_huge_images(tmp_path, monkeyp
     out = content.materialize([content.document_ref(doc), content.image_ref(big)])
     assert out[0]["type"] == "text" and "read_file" in out[0]["text"]
     assert out[1]["type"] == "text" and "too large" in out[1]["text"]
+
+
+def test_the_image_limit_is_on_the_base64_data(tmp_path, monkeypatch):
+    """The API measures its per-image limit on the base64 data (4/3 of the file): a file just under
+    MAX_IMAGE_BYTES would be refused with the whole request, so only <= 3/4 of it is attached."""
+    monkeypatch.setattr(content, "MAX_IMAGE_BYTES", 400)
+    fits, too_big = tmp_path / "fits.jpg", tmp_path / "big.jpg"
+    fits.write_bytes(JPEG.ljust(content.max_image_file_bytes(), b"\x00"))
+    too_big.write_bytes(JPEG.ljust(content.max_image_file_bytes() + 1, b"\x00"))
+    assert content.max_image_file_bytes() == 300
+    attached, refused = content.materialize([content.image_ref(fits), content.image_ref(too_big)])
+    assert attached["type"] == "image" and len(attached["source"]["data"]) <= content.MAX_IMAGE_BYTES
+    assert refused["type"] == "text" and "too large" in refused["text"] and "view_image" in refused["text"]
 
 
 def test_estimate_tokens_counts_media_by_kind():
@@ -179,12 +225,24 @@ def test_turn_record_keeps_prompt_blocks_round_trip():
 async def test_build_user_message_materializes_and_media_skips_quick_path(agent, monkeypatch, tmp_path):
     import agents.main as m
 
-    img = tmp_path / "p.jpg"
-    img.write_bytes(JPEG)
+    monkeypatch.chdir(tmp_path)
+    images = tmp_path / "data" / "1" / "images"
+    images.mkdir(parents=True)
+    (images / "p_v.jpg").write_bytes(JPEG)
+    other = tmp_path / "data" / "2" / "images"
+    other.mkdir(parents=True)
+    (other / "secret_v.jpg").write_bytes(JPEG)
+    (images / "link_v.jpg").symlink_to(other / "secret_v.jpg")
     cot = m.ChainOfThoughtAgent.__new__(m.ChainOfThoughtAgent)
-    msg = await cot._build_user_message("<context>\nt\n</context>", [content.text_block("q"), content.image_ref(img)])
+    cot.user_id = "1"
+    msg = await cot._build_user_message("<context>\nt\n</context>", [
+        content.text_block("q"), content.image_ref("data/1/images/p_v.jpg"),
+        content.image_ref("data/1/images/link_v.jpg"), content.image_ref("data/2/images/secret_v.jpg"),
+    ])
     assert msg["role"] == "user"
-    assert [b["type"] for b in msg["content"]] == ["text", "text", "image"]
+    assert [b["type"] for b in msg["content"]] == ["text", "text", "image", "text", "text"]
+    # another user's picture is never read, whether linked from the workspace or named directly
+    assert all("not found" in b["text"] for b in msg["content"][3:])
 
     async def classify(question, history):
         return "simple"

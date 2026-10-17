@@ -514,3 +514,76 @@ def test_every_callback_family_reaches_its_own_handler(tmp_path):
         assert found[data] and found[data][0] == expected, (data, found[data])
         extra = found[data][1:]
         assert extra in ([], ["turn_actions_ui.on_unknown"]), (data, found[data])
+
+
+# ---- message routing ----------------------------------------------------------------------
+# scenario -> (message spec, first handler in router order). "pending": the chat has a pending
+# ✏️ Edit text (reminders_ui._pending_edits), whose handler sits on the ui router before chat.
+MESSAGE_ROUTING = {
+    "plain text": ({"text": "hello"}, "messages.on_text"),
+    "text while an edit is pending": ({"text": "call mom", "pending": True}, "reminders_ui.reminder_edit_text"),
+    "location": ({"location": [52.52, 13.405]}, "messages.on_location"),
+    "/timezone": ({"text": "/timezone Berlin"}, "commands.timezone_command"),
+    "/reminders while an edit is pending": ({"text": "/reminders", "pending": True}, "reminders_ui.reminders_command"),
+    "/cancel while an edit is pending": ({"text": "/cancel", "pending": True}, "messages.cancel_command"),
+    "photo": ({"photo": True}, "messages.on_photo"),
+}
+
+
+def test_every_message_kind_reaches_its_own_handler(tmp_path):
+    """Like the callback routing above, for messages: the pending-edit handler must take a plain text
+    only while an edit is pending. Without its filter it would swallow every user's text (the ui
+    router runs before chat), and commands must pass it even while an edit is pending."""
+    code = (
+        "import asyncio, json, sys, time\n"
+        "from datetime import datetime, timezone\n"
+        "from types import SimpleNamespace\n"
+        "from aiogram.types import Chat, Location, Message, PhotoSize, User\n"
+        "from bot.handlers import build_root_router, reminders_ui\n"
+        "root = build_root_router()\n"
+        "def walk(r):\n"
+        "    for h in r.message.handlers:\n"
+        "        yield h\n"
+        "    for s in r.sub_routers:\n"
+        "        yield from walk(s)\n"
+        "handlers = list(walk(root))\n"
+        "bot = SimpleNamespace(id=999)\n"
+        "async def matches(spec):\n"
+        "    reminders_ui.reset()\n"
+        "    if spec.get('pending'):\n"
+        "        reminders_ui._pending_edits['42'] = ('abcd1234', time.monotonic() + 60)\n"
+        "    extra = {}\n"
+        "    if 'text' in spec:\n"
+        "        extra['text'] = spec['text']\n"
+        "    if 'location' in spec:\n"
+        "        extra['location'] = Location(latitude=spec['location'][0], longitude=spec['location'][1])\n"
+        "    if spec.get('photo'):\n"
+        "        extra['photo'] = [PhotoSize(file_id='f', file_unique_id='u', width=10, height=10)]\n"
+        "    msg = Message(message_id=1, date=datetime.now(timezone.utc), chat=Chat(id=42, type='private'),\n"
+        "                  from_user=User(id=42, is_bot=False, first_name='a'), **extra)\n"
+        "    out = []\n"
+        "    for h in handlers:\n"
+        "        ok, _ = await h.check(msg, bot=bot)\n"
+        "        if ok:\n"
+        "            out.append(h.callback.__module__.rsplit('.', 1)[-1] + '.' + h.callback.__name__)\n"
+        "    return out\n"
+        "async def main():\n"
+        "    specs = json.loads(sys.argv[1])\n"
+        "    return {name: await matches(spec) for name, spec in specs.items()}\n"
+        "print(json.dumps(asyncio.run(main())))\n"
+    )
+    env = {**os.environ, "PYTHONPATH": str(APP)}
+    for key in ("OPENAI_API_KEY", "GOOGLE_API_KEY", "TAVILY_API_KEY"):
+        env.setdefault(key, "x")
+    specs = {name: spec for name, (spec, _) in MESSAGE_ROUTING.items()}
+    out = subprocess.run(
+        [sys.executable, "-c", code, json.dumps(specs)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert out.returncode == 0, out.stderr
+    found = json.loads(out.stdout.strip().splitlines()[-1])
+    for name, (_, expected) in MESSAGE_ROUTING.items():
+        assert found[name] and found[name][0] == expected, (name, found[name])
+    # the pending-edit handler never sees a text when no edit is pending, nor a command when one is
+    for name in ("plain text", "/reminders while an edit is pending", "/cancel while an edit is pending"):
+        assert "reminders_ui.reminder_edit_text" not in found[name], (name, found[name])
