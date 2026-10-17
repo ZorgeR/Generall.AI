@@ -3,7 +3,18 @@ from __future__ import annotations
 
 from aiogram import Router
 
-from bot.handlers import commands, messages, questions_ui, reminders_ui, settings_ui, stats_ui, turn_actions_ui
+from bot.handlers import (
+    commands,
+    mcp_ui,
+    messages,
+    profile_ui,
+    questions_ui,
+    reminders_ui,
+    settings_ui,
+    stats_ui,
+    turn_actions_ui,
+    usage_ui,
+)
 from bot.handlers.middleware import AuthMiddleware
 
 
@@ -27,6 +38,9 @@ def build_root_router() -> Router:
     ui.include_router(commands.voice_router)
     ui.include_router(settings_ui.router)
     ui.include_router(reminders_ui.router)
+    ui.include_router(usage_ui.router)  # /usage
+    ui.include_router(profile_ui.router)  # /profile, profile_ buttons
+    ui.include_router(mcp_ui.router)  # /mcp, mcp_ buttons
     ui.include_router(messages.control_router)
     ui.include_router(questions_ui.router)  # ask_user_choice answers
     ui.include_router(turn_actions_ui.router)  # listen / reasoning file: no agent run, no quota

@@ -41,6 +41,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable
 
+from agents.content import estimate_block_tokens
+
 logger = logging.getLogger(__name__)
 
 TRANSCRIPT_VERSION = 1
@@ -188,7 +190,16 @@ def text_only_view(messages: list[dict]) -> list[dict]:
 
 
 def estimate_tokens(messages: list[dict]) -> int:
-    return int(len(json.dumps(messages, ensure_ascii=False)) / CHARS_PER_TOKEN)
+    """Rough size of the transcript in tokens. Image and document blocks count by kind
+    (agents.content), never by their base64 text, which would overstate a photo 40-fold."""
+    total = 0
+    for m in messages:
+        content = m.get("content") if isinstance(m, dict) else None
+        if isinstance(content, list):
+            total += sum(estimate_block_tokens(b) for b in content) + 4
+        else:
+            total += int(len(json.dumps(m, ensure_ascii=False, default=str)) / CHARS_PER_TOKEN)
+    return total
 
 
 def sanitize_turn(messages: list[dict], final_text: str) -> list[dict]:

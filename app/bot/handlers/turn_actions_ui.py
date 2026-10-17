@@ -136,7 +136,7 @@ async def on_reasoning(callback: CallbackQuery, bot: Bot, user_id: str) -> None:
 # a new agent turn: retry, continue, follow-up
 # ---------------------------------------------------------------------------
 async def _run_button_turn(
-    bot: Bot, user_id: str, chat_id: int, thread_id: int | None, prompt: str, reply_to: int,
+    bot: Bot, user_id: str, chat_id: int, thread_id: int | None, prompt: str | list, reply_to: int,
     limit: int | None, speak: bool, ctx: JobContext,
 ) -> None:
     await run_turn(
@@ -147,7 +147,7 @@ async def _run_button_turn(
 
 async def _start_turn(
     callback: CallbackQuery, bot: Bot, user_id: str, limit: int | None, message: Message,
-    record: turn_actions.TurnRecord, *, prompt: str, echo: str, label: str, speak: bool = False,
+    record: turn_actions.TurnRecord, *, prompt: str | list, echo: str, label: str, speak: bool = False,
 ) -> None:
     """Echo the press as a plain message and queue the turn on it, like a typed message."""
     await _answer(callback)
@@ -167,7 +167,7 @@ async def on_retry(callback: CallbackQuery, bot: Bot, user_id: str, limit: int |
     message, record, _ = pressed
     await _start_turn(
         callback, bot, user_id, limit, message, record,
-        prompt=record.prompt, echo=RETRY_ECHO, label="retry", speak=record.speak,
+        prompt=record.prompt_blocks or record.prompt, echo=RETRY_ECHO, label="retry", speak=record.speak,
     )
 
 

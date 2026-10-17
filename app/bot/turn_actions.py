@@ -138,7 +138,7 @@ def valid_turn_id(turn_id: Any) -> bool:
 @dataclass
 class TurnRecord:
     id: str
-    prompt: str  # exactly what run_turn received: Retry sends it again
+    prompt: str  # the text view of what run_turn received: Retry sends it again (or prompt_blocks)
     response: str  # the displayed answer (follow-ups removed): what Listen reads
     created: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
     speak: bool = False
@@ -147,6 +147,7 @@ class TurnRecord:
     follow_ups: list[str] = field(default_factory=list)
     reasoning_caption: str = DEFAULT_REASONING_CAPTION
     has_reasoning: bool = False
+    prompt_blocks: list | None = None  # the prompt as content blocks (media refs, agents.content) when it had media
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -158,6 +159,7 @@ class TurnRecord:
             return None
         thread_id = data.get("thread_id")
         follow_ups = data.get("follow_ups")
+        prompt_blocks = data.get("prompt_blocks")
         return cls(
             id=data["id"],
             prompt=str(data.get("prompt") or ""),
@@ -169,6 +171,7 @@ class TurnRecord:
             follow_ups=[str(s) for s in follow_ups if isinstance(s, str) and s] if isinstance(follow_ups, list) else [],
             reasoning_caption=str(data.get("reasoning_caption") or DEFAULT_REASONING_CAPTION),
             has_reasoning=data.get("has_reasoning") is True,
+            prompt_blocks=[b for b in prompt_blocks if isinstance(b, dict)] if isinstance(prompt_blocks, list) and prompt_blocks else None,
         )
 
 

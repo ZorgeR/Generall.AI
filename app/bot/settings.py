@@ -35,9 +35,18 @@ DEFAULT_SETTINGS: dict[str, dict[str, Any]] = {
     # The model may end an answer with a <follow_ups> block; it is removed from the text and
     # shown as buttons under the answer. Off = the instruction is not added to the prompt.
     "follow_ups": {"enabled": True},
+    # Quick answers vs. deep work (docs/design-v3.md, F3): auto = the fast-model classifier picks the
+    # quick path or the full agent per message; speed = always the fast model; intelligence = always
+    # the full agent with deep thinking.
+    "mode": {"type": "auto"},
+    # IANA zone name of the user ("" = unknown: times are shown in UTC until the user or the agent sets it).
+    "timezone": {"name": ""},
+    # Agent-managed profile and notes (data/<uid>/profile.md) injected into the context block.
+    "profile": {"enabled": True},
 }
 
 SYSTEM_PROMPT_TYPES = ("generall-ai-v2", "generall-ai-v1", "perplexity-deep-research", "perplexity-r1")
+MODE_TYPES = ("auto", "speed", "intelligence")
 
 SIZE_MIN, SIZE_MAX = 1, 50
 CONTEXT_TOKENS_MIN, CONTEXT_TOKENS_MAX = 20000, 400000

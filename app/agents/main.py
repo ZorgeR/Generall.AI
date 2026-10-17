@@ -37,6 +37,7 @@ from models import (
 )
 from agents.trace import TurnBudget
 from agents.subagent import SubagentTools
+from agents import content as prompt_content
 from agents.transcript import (
     MEMORY_BULLET,
     cap_text,
@@ -162,6 +163,7 @@ class AgentAnthropic:
         self.thinking = False
         self.max_tool_result_chars = None  # tool results are cut to this before the model sees them
         self.limit_reached = False     # the last generate_response ran out of tool budget (bot offers Continue)
+        self.extra_providers = []      # [(provider, blocking)] added with register_provider (docs/design-v3.md)
 
     async def critique_response(self, question: str, answer: str, dialog_history: list = [], trace=None) -> str:
         """
@@ -292,6 +294,14 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             print(f"Error in judge: {str(e)}")
             return True
 
+    def register_provider(self, provider, *, blocking: bool = False) -> None:
+        """Add a tool provider after the named slots (deterministic order = registration order).
+
+        ``blocking`` providers have a synchronous ``execute_tool`` and run in a worker thread;
+        the others are awaited. Tool names must be globally unique (first match wins).
+        """
+        self.extra_providers.append((provider, bool(blocking)))
+
     def get_tools_schema(self):
         """Get combined tools schema from all tool providers"""
         tools = []
@@ -315,6 +325,8 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             tools.extend(self.user_interactions.tools_schema)
         if self.subagents:
             tools.extend(self.subagents.tools_schema)
+        for provider, _blocking in self.extra_providers:
+            tools.extend(provider.tools_schema)
         if self.allowed_tools is not None:
             tools = [t for t in tools if t["name"] in self.allowed_tools]
         return tools
@@ -347,8 +359,12 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             return await self.user_interactions.execute_tool(tool_name, tool_args)
         elif self.subagents and tool_name in [t["name"] for t in self.subagents.tools_schema]:
             return await self.subagents.execute_tool(tool_name, tool_args)
-        else:
-            return f"Unknown tool: {tool_name}"
+        for provider, blocking in self.extra_providers:
+            if tool_name in [t["name"] for t in provider.tools_schema]:
+                if blocking:
+                    return await asyncio.to_thread(provider.execute_tool, tool_name, tool_args)
+                return await provider.execute_tool(tool_name, tool_args)
+        return f"Unknown tool: {tool_name}"
 
     @staticmethod
     def _request_messages(messages: list) -> list:
@@ -398,8 +414,12 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
 
         async def run_one(block):
             call = trace.start(block.name, block.input, depth=self.trace_depth) if trace is not None else None
+            blocks = None  # a provider may return content blocks (text + images) instead of a string
             try:
-                text = str(await self.execute_tool(block.name, block.input))
+                raw = await self.execute_tool(block.name, block.input)
+                if isinstance(raw, list):
+                    blocks = raw
+                text = prompt_content.result_preview(raw) if blocks is not None else str(raw)
                 is_error = False
             except asyncio.CancelledError:
                 raise
@@ -409,11 +429,16 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 # tools report their own failures as "Error ..." text; show those as failed too
                 call.done(text, ok=not is_error and not text.lstrip().lower().startswith("error"))
             # cut before the model sees it, so the stored transcript holds exactly what was sent
-            text = cap_text(text, self.max_tool_result_chars)
-            print(f"Tool name: {block.name}\nTool result: {text}")
+            if blocks is not None:
+                content_value = prompt_content.cap_blocks(blocks, self.max_tool_result_chars)
+                print(f"Tool name: {block.name}\nTool result: {cap_text(text, self.max_tool_result_chars)}")
+            else:
+                text = cap_text(text, self.max_tool_result_chars)
+                content_value = text
+                print(f"Tool name: {block.name}\nTool result: {text}")
             if refresh is not None:
                 await refresh(f"{block.name} finished")
-            result = {"type": "tool_result", "tool_use_id": block.id, "content": text}
+            result = {"type": "tool_result", "tool_use_id": block.id, "content": content_value}
             if is_error:
                 result["is_error"] = True
             return result
@@ -788,7 +813,7 @@ Response: {response}"""
             "summary": summary,
             "question": question,
             "response": response,
-            "full_history": messages
+            "full_history": prompt_content.strip_media(messages),  # pictures stay in the transcript, not here
         }
         
         file_path = self.conversations_path / f"conversation_{timestamp}_{topic}.json"
@@ -1058,7 +1083,20 @@ User message: {question}"""
         with open(self.short_term_memory_path / self._get_memory_filename("dialog_history.json"), "w", encoding="utf-8") as f:
             json.dump(history[-size:], f, indent=2, ensure_ascii=False)
 
-    async def _generate_with_transcript(self, question: str, system_context: str, update_status=None, on_text_chunk=None, trace=None):
+    async def _decide_complexity(self, question: str, history_view: list, *, has_media: bool = False) -> str:
+        """Quick fast-model answer or the full agent for this turn. A prompt with pictures or
+        documents always takes the full agent (the quick path is text-only)."""
+        if has_media:
+            return "complex"
+        return await self._classify_complexity(question, history_view)
+
+    async def _build_user_message(self, turn_context: str, blocks: list) -> dict:
+        """The user turn exactly as sent: the <context> block first, then the prompt's blocks with
+        media refs materialized into base64 image/document blocks (file reads in a thread)."""
+        materialized = await asyncio.to_thread(prompt_content.materialize, blocks)
+        return {"role": "user", "content": [{"type": "text", "text": turn_context}, *materialized]}
+
+    async def _generate_with_transcript(self, question: str, system_context: str, update_status=None, on_text_chunk=None, trace=None, question_blocks: list | None = None):
         ts = self.user_settings.get("transcript", {})
         if update_status:
             await update_status(step="initial", details="Loading transcript", iteration=0, critique=0)
@@ -1085,9 +1123,11 @@ User message: {question}"""
             self.subagents.trace = trace
 
         history_view = text_only_view(transcript.messages)
-        complexity = await self._classify_complexity(question, history_view)
+        blocks = question_blocks if question_blocks is not None else prompt_content.normalize(question)
+        has_media = any(prompt_content.is_media_ref(b) for b in blocks)
+        complexity = await self._decide_complexity(question, history_view, has_media=has_media)
         # the context block is stored with the question: the transcript keeps what was sent
-        user_message = {"role": "user", "content": [{"type": "text", "text": turn_context}, {"type": "text", "text": question}]}
+        user_message = await self._build_user_message(turn_context, blocks)
         base_len = len(transcript.messages)
         response, new_messages = None, []
 
@@ -1148,15 +1188,20 @@ User message: {question}"""
             print(f"WARNING: failed to update dialog history: {e}")
         return response, new_messages
 
-    async def generate_response(self, question: str, update_status=None, on_text_chunk=None, trace=None) -> str:
+    async def generate_response(self, question, update_status=None, on_text_chunk=None, trace=None) -> str:
+        """``question`` is a string or a list of content blocks (agents.content: text blocks and
+        media refs). The text view drives the classifier, the memory and the legacy path; the
+        blocks become the user turn in transcript mode."""
         # image and video calls add their tokens and cost to the turn
         if self.image_tools is not None:
             self.image_tools.trace = trace
         if self.video_tools is not None:
             self.video_tools.trace = trace
+        received = f"Message received time in UTC+0: {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}\n\n"
+        question_blocks = prompt_content.with_prefix(prompt_content.normalize(question), received)
+        question = prompt_content.prompt_text(question_blocks)  # text view for everything below
         print(f"\n=== Starting Chain of Thought for Question: {question} ===")
         print(f"Thread ID: {self.thread_id or 'None (no topic)'}")
-        question = f"Message received time in UTC+0: {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}\n\n{question}"
         
         system_context_generall_ai_v1 = f"""You are a persistent agent (state is automaticly saved and loaded from disk between different sessions) with long-term memory capabilities through file operations, web search, code execution, terminal commands, and more tools.
 
@@ -1454,7 +1499,7 @@ You have been asked to answer a query given sources. Consider the following when
             system_context += FOLLOW_UPS_GUIDE
 
         if (self.user_settings or {}).get("transcript", {}).get("enabled", True):
-            return await self._generate_with_transcript(question, system_context, update_status, on_text_chunk, trace)
+            return await self._generate_with_transcript(question, system_context, update_status, on_text_chunk, trace, question_blocks=question_blocks)
 
         # Search for relevant past conversations
         if self.user_settings.get("semantic_search").get("enabled"):

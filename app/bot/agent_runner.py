@@ -204,7 +204,7 @@ async def run_turn(
     bot: Bot,
     user_id: str,
     chat_id: int,
-    prompt: str,
+    prompt: str | list,
     thread_id: int | None = None,
     reply_to_message_id: int | None = None,
     ctx: JobContext | None = None,
@@ -214,14 +214,18 @@ async def run_turn(
     speak: bool = False,
     reasoning_caption: str = "Reasoning history.",
 ) -> TurnResult | None:
-    """Run the agent on ``prompt`` and deliver the result. Returns None after reporting an error.
+    """Run the agent on ``prompt`` (a string, or a list of content blocks built with
+    ``agents.content``: text and media refs) and deliver the result. Returns None after reporting an error.
 
     With ``ctx`` the status gets a Stop button for ``ctx.job`` and the drafts use
     ``ctx.job.id``; without it (no queue job) there is no Stop button. A successful
     turn is saved (``bot.turn_actions``) and gets its action and follow-up buttons.
     """
     from stats import stats_tracker
+    from agents import content as prompt_content  # no import-time side effects; after the patcher ran
 
+    prompt_text = prompt_content.prompt_text(prompt)
+    prompt_blocks = [dict(b) for b in prompt_content.normalize(prompt)] if isinstance(prompt, list) else None
     settings = UserSettings(user_id)
     settings.save()  # persist any defaults added since the file was written
     user_settings: dict[str, Any] = settings.as_dict()
@@ -286,7 +290,7 @@ async def run_turn(
             suggestions = []
         limit_reached = getattr(getattr(agent, "agent", None), "limit_reached", False) is True
         record = await save_turn(user_id, turn_actions.TurnRecord(
-            id=turn_actions.new_turn_id(), prompt=prompt, response=display, speak=speak, thread_id=thread_id,
+            id=turn_actions.new_turn_id(), prompt=prompt_text, prompt_blocks=prompt_blocks, response=display, speak=speak, thread_id=thread_id,
             limit_reached=limit_reached, follow_ups=suggestions, reasoning_caption=reasoning_caption,
         ), messages, settings)
 
