@@ -86,6 +86,15 @@ class FileOperations:
             raise ValueError(f"Path '{user_path}' {what}")
         return resolved
 
+    def _download_target(self, name: str) -> Path:
+        """``downloads/<name>`` for a file the tool writes: the base name only, so a ``..`` or
+        absolute name cannot leave the workspace, resolved like every path (a planted link that
+        points outside is refused before anything is opened). Raises ValueError."""
+        base = Path(str(name or "").replace("\\", "/")).name
+        if base in ("", ".", ".."):
+            raise ValueError(f"Invalid file name '{name}'")
+        return self._path(f"downloads/{base}")
+
     def _init_s3_client(self):
         """Initialize S3 client with environment variables"""
         try:
@@ -433,21 +442,20 @@ class FileOperations:
                 if not filename:
                     return "Could not determine filename from URL"
 
-            filename = Path(filename).name  # no directories: everything lands in downloads/
-            if not filename:
+            if not Path(filename).name:
                 return "Could not determine filename from URL"
-            file_path = self.downloads_path / filename
-            
+            file_path = self._download_target(filename)  # no directories: everything lands in downloads/
+
             # Download the file
             response = requests.get(url, stream=True, timeout=(10, 120))
             response.raise_for_status()  # Raise an error for bad status codes
-            
+
             # Save the file
             with open(file_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
-            
-            rel_path = str(file_path.relative_to(self.base_path))
+
+            rel_path = str(file_path.relative_to(self.base_path.resolve()))
 
             return f"File downloaded successfully to {rel_path}"
         except Exception as e:
@@ -475,11 +483,11 @@ class FileOperations:
                     if len(filename) > 100:  # Truncate if too long
                         filename = filename[:100] + ".txt"
                 
-                file_path = self.downloads_path / filename
+                file_path = self._download_target(filename)
                 with open(file_path, 'w', encoding='utf-8', newline='\n') as f:
                     f.write(text)
-                
-                rel_path = str(file_path.relative_to(self.base_path))
+
+                rel_path = str(file_path.relative_to(self.base_path.resolve()))
 
                 return f"Webpage content saved to {rel_path}\n\n. You can read full content of a file using it path. First {max_chars} characters of content for preview:\n{text[:max_chars]}..."
             
@@ -546,8 +554,8 @@ class FileOperations:
             if not archive_name.lower().endswith('.zip'):
                 archive_name += '.zip'
 
-            # Create archive in downloads directory
-            archive_path = self.downloads_path / archive_name
+            # Create archive in downloads directory (base name only, never outside the workspace)
+            archive_path = self._download_target(archive_name)
 
             # Check if all files exist first
             files_to_zip = []
@@ -570,7 +578,7 @@ class FileOperations:
             # List files included in archive
             included_files = "\n".join([f"- {rel_path}" for _, rel_path in files_to_zip])
 
-            archive_rel_path = str(archive_path.relative_to(self.base_path))
+            archive_rel_path = str(archive_path.relative_to(self.base_path.resolve()))
 
             return f"""ZIP archive created successfully
 Path: {archive_rel_path}

@@ -267,6 +267,7 @@ async def run_turn(
     speak: bool = False,
     reasoning_caption: str = "Reasoning history.",
     quiet_marker: str | None = None,
+    quiet_notice: str | None = None,
 ) -> TurnResult | None:
     """Run the agent on ``prompt`` (a string, or a list of content blocks built with
     ``agents.content``: text and media refs) and deliver the result. Returns None after reporting an error.
@@ -276,8 +277,10 @@ async def run_turn(
     turn is saved (``bot.turn_actions``) and gets its action and follow-up buttons.
 
     ``quiet_marker`` (scheduled tasks): an answer consisting of exactly that marker means the
-    agent has nothing worth saying; nothing is sent, the status message is removed and the
-    result carries ``quiet=True``.
+    agent has nothing worth saying; nothing is sent, the status message is removed (or, with
+    ``quiet_notice``, edited into that line: a turn the user started by a button expects some
+    reply) and the result carries ``quiet=True``. The marker is stored on the turn record, so
+    Retry runs with it again.
     """
     from stats import stats_tracker
     from agents import content as prompt_content  # no import-time side effects; after the patcher ran
@@ -347,14 +350,18 @@ async def run_turn(
         if not (user_settings.get("follow_ups") or {}).get("enabled", True):
             suggestions = []
         if quiet_marker and display.strip() == quiet_marker:
-            # Nothing to tell the user: no answer, no voice, no buttons; the status goes away too.
+            # Nothing to tell the user: no answer, no voice, no buttons; the status goes away too
+            # (or says so, when the user pressed a button and waits for a reply).
             status_final = True
-            await delete_quietly(status)
+            if quiet_notice:
+                await status_msg.set_text(quiet_notice)
+            else:
+                await delete_quietly(status)
             return TurnResult(response="", messages=messages, turn_id=None, quiet=True)
         limit_reached = getattr(getattr(agent, "agent", None), "limit_reached", False) is True
         record = await save_turn(user_id, turn_actions.TurnRecord(
             id=turn_actions.new_turn_id(), prompt=prompt_text, prompt_blocks=prompt_blocks, response=display, speak=speak, thread_id=thread_id,
-            limit_reached=limit_reached, follow_ups=suggestions, reasoning_caption=reasoning_caption,
+            limit_reached=limit_reached, follow_ups=suggestions, reasoning_caption=reasoning_caption, quiet_marker=quiet_marker,
         ), messages, settings)
 
         if speak and display:
@@ -410,7 +417,7 @@ async def run_turn(
         # status can carry a Retry button; when even that fails, the text goes out without buttons.
         record = await save_turn(user_id, turn_actions.TurnRecord(
             id=turn_actions.new_turn_id(), prompt=prompt_text, prompt_blocks=prompt_blocks, response="", speak=speak,
-            thread_id=thread_id, reasoning_caption=reasoning_caption, error=reason,
+            thread_id=thread_id, reasoning_caption=reasoning_caption, error=reason, quiet_marker=quiet_marker,
         ), [], settings)
         actions = turn_actions.record_actions(record) if record is not None else []
         await status_msg.fail(f"❌ {reason}", actions=actions)

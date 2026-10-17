@@ -10,7 +10,8 @@ prompt (``task_prompt``: the task text, its id and the user's local time) and
 ``quiet_marker=QUIET_MARKER``. There is no separate announcement: the status message of the
 turn is enough, and a run that answers exactly ``<no_update/>`` leaves nothing behind (the
 status is deleted). The record keeps ``agent_response`` (the marker when quiet),
-``last_result`` ("quiet" | "answered") and a ``quiet_runs`` counter.
+``last_result`` ("quiet" | "answered") and a ``quiet_runs`` counter. A task the user moved in
+``/reminders`` while it ran keeps that new time (the run is recorded, the series not stepped).
 """
 from __future__ import annotations
 
@@ -104,13 +105,19 @@ def _reschedule_or_complete(reminder: dict, now: datetime, response: str | None 
     else:
         reminder["status"] = "completed"
         reminder["completed_at"] = now.isoformat()
-    if response is not None:
-        reminder["agent_response"] = response
-        quiet = response.strip() == QUIET_MARKER
-        reminder["last_result"] = "quiet" if quiet else "answered"
-        if quiet:
-            reminder["quiet_runs"] = int(reminder.get("quiet_runs") or 0) + 1
+    _record_response(reminder, response)
     reminder.pop("processing_since", None)
+
+
+def _record_response(reminder: dict, response: str | None) -> None:
+    """The outcome of a scheduled task's run: agent_response, last_result, quiet_runs."""
+    if response is None:
+        return
+    reminder["agent_response"] = response
+    quiet = response.strip() == QUIET_MARKER
+    reminder["last_result"] = "quiet" if quiet else "answered"
+    if quiet:
+        reminder["quiet_runs"] = int(reminder.get("quiet_runs") or 0) + 1
 
 
 async def check_reminders(bot: Bot, queue: QueueManager) -> None:
@@ -205,7 +212,13 @@ async def run_agent_reminder(bot: Bot, user_id: str, reminder: dict, ctx: JobCon
         def _finalize(reminders: list[dict]) -> None:
             for r in reminders:
                 if str(r.get("id")) == str(reminder.get("id")):
-                    if response is None and not r.get("is_periodic"):
+                    if r.get("time") != reminder.get("time"):
+                        # Moved (⏰ +1h / 📅 +1d in /reminders) while this run was going: the new
+                        # time stands. Stepping from it would skip the run the user just asked for.
+                        r["status"] = "pending"
+                        r.pop("processing_since", None)
+                        _record_response(r, response)
+                    elif response is None and not r.get("is_periodic"):
                         r["status"] = "failed"
                         r.pop("processing_since", None)
                     else:

@@ -112,6 +112,47 @@ def test_skips_context_blocks_tool_results_thinking_and_media(tools):
     assert not any("Message received time" in h["snippet"] and h["source"] == "transcript" for h in hits(tools.memory_search("Lisbon")))
 
 
+def test_a_linked_profile_is_not_searched(tools, tmp_path):
+    """profile.md replaced by a link (the sandbox can write data/<uid>): the target is never read."""
+    secret = tmp_path / "outside.env"
+    secret.write_text("ANTHROPIC_API_KEY=sk-ant-leaked\n", encoding="utf-8")
+    profile = tmp_path / "data" / USER / "profile.md"
+    profile.unlink()
+    os.symlink(str(secret), profile)
+    assert tools.memory_search("sk-ant").startswith("No matches for")
+    assert not [h for h in hits(tools.memory_search("Lisbon")) if h["source"] == "profile"]
+
+
+@pytest.fixture
+def victim(tmp_path):
+    """Another user's memory next to data/42: what a link planted from the sandbox would point at."""
+    root = tmp_path / "data" / "999"
+    (root / "conversations").mkdir(parents=True)
+    conversation(root / "conversations", "20261002_080000", "bank", summary="The user's bank PIN is 4711.")
+    (root / "transcripts").mkdir()
+    (root / "transcripts" / "transcript.json").write_text(json.dumps({"created": "2026-10-01T00:00:00+00:00", "messages": [
+        {"role": "user", "content": [{"type": "text", "text": "my bank PIN is 4711"}]}]}), encoding="utf-8")
+    return root
+
+
+def test_linked_conversations_and_transcripts_are_not_searched(tools, workspace, victim):
+    """conversations/ and transcripts/ lie in the sandbox's workspace: a link there to another
+    user's file is never read by the host, and the user's own files are still searched."""
+    os.symlink(next((victim / "conversations").glob("*.json")), workspace / "conversations" / "conversation_20261003_000000_x.json")
+    os.symlink(victim / "transcripts" / "transcript.json", workspace / "transcripts" / "x_transcript.json")
+    os.mkfifo(workspace / "transcripts" / "fifo_transcript.json")  # never blocks the search
+    assert tools.memory_search("4711").startswith("No matches for")
+    assert {h["source"] for h in hits(tools.memory_search("lisbon"))} == {"conversation", "profile", "transcript"}
+
+
+def test_a_linked_conversations_or_transcripts_folder_is_not_searched(tools, workspace, victim):
+    for name in ("conversations", "transcripts"):
+        (workspace / name).rename(workspace / f"{name}_moved")
+        os.symlink(victim / name, workspace / name)
+    assert tools.memory_search("4711").startswith("No matches for")
+    assert {h["source"] for h in hits(tools.memory_search("lisbon"))} == {"profile"}
+
+
 def test_profile_notes_and_topic_transcripts_are_searched(tools):
     found = hits(tools.memory_search("beekeeping"))
     (note_hit,) = [h for h in found if h["source"] == "profile"]

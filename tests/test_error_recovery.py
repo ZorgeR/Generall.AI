@@ -397,6 +397,75 @@ async def test_retry_on_a_failed_media_turn_replays_the_blocks(monkeypatch):
     (job,) = queue.jobs
     await job.run(JobContext(job))
     assert turns[0]["prompt"] == blocks
+    assert turns[0]["quiet_marker"] is None and turns[0]["quiet_notice"] is None  # an ordinary turn: no marker
+
+
+def agent_answers(monkeypatch, outcomes: list) -> list:
+    """Each new agent takes the next outcome (an exception to raise, or the answer); returns the prompts seen."""
+    seen: list = []
+
+    class Agent:
+        def __init__(self, **kw):
+            self.agent = SimpleNamespace(limit_reached=False)
+
+        async def generate_response(self, prompt, update_status, on_text_chunk=None, trace=None):
+            seen.append(prompt)
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome, [{"role": "assistant", "content": [{"type": "text", "text": outcome}]}]
+
+    monkeypatch.setattr(agent_runner, "_agents", lambda: SimpleNamespace(ChainOfThoughtAgent=Agent))
+    return seen
+
+
+@pytest.mark.parametrize("rich_on", [True, False])
+@pytest.mark.parametrize("first", ["error", "answered"])
+async def test_retry_of_a_scheduled_task_stays_quiet(monkeypatch, rich_on, first):
+    """A scheduled task's turn (failed or answered) offers Retry; the retried run answering the quiet
+    marker must not show the marker as the answer: the status says "nothing new" instead, and no
+    record with the marker as its answer is stored (Listen would read the tag aloud)."""
+    from datetime import datetime, timezone
+
+    from bot.jobs import TASK_HEADER, task_prompt
+
+    UserSettings(USER).set("rich_messages", rich_on, "enabled")
+    prompt = task_prompt({"id": "abcd1234", "text": "check the news, tell me only if important"}, datetime.now(timezone.utc), None)
+    first_outcome = api_error(anthropic.OverloadedError, 529, "overloaded_error: Overloaded") if first == "error" else "Big news: X happened."
+    seen = agent_answers(monkeypatch, [first_outcome, agent_runner.QUIET_MARKER])
+    bot = FakeBot()
+    ctx = JobContext(Job(user_id=USER, label="scheduled agent task", run=None))
+    await run_turn(bot=bot, user_id=USER, chat_id=42, prompt=prompt, ctx=ctx, header=TASK_HEADER,
+                   quiet_marker=agent_runner.QUIET_MARKER)  # exactly like jobs.run_agent_reminder
+    (record,) = records()
+    assert record["quiet_marker"] == agent_runner.QUIET_MARKER
+    (retry_data,) = [d for _, kw in bot.calls for d in buttons(kw) if d.startswith("turn_retry_")]
+
+    queue = FakeQueue()
+    monkeypatch.setattr(chat_messages, "queue", queue)
+    await ui.on_retry(FakeCallback(retry_data, chat_message()), bot=bot, user_id=USER, limit=None)
+    (job,) = queue.jobs
+    bot.calls.clear()
+    await job.run(JobContext(job))
+    assert seen == [prompt, prompt]  # the framing prompt was replayed
+
+    shown = [str(kw["rich_message"].model_dump()) if kw.get("rich_message") is not None else kw.get("text") or ""
+             for name, kw in bot.calls if name in ("send_message", "send_rich_message", "edit_message_text")]
+    assert not any(agent_runner.QUIET_MARKER in text for text in shown), shown
+    last = bot.of("edit_message_text")[-1]
+    assert edit_text(last) == ui.QUIET_NOTICE and buttons(last) == []
+    assert bot.of("send_rich_message") == [] and bot.of("edit_message_reply_markup") == []
+    assert [r["id"] for r in records()] == [record["id"]]  # the quiet run stored nothing
+
+
+async def test_quiet_marker_round_trips_and_old_records_read_as_none():
+    record = TurnRecord(id=turn_actions.new_turn_id(), prompt="p", response="r", quiet_marker="<no_update/>")
+    await turn_actions.save(USER, record)
+    assert turn_actions.load(USER, record.id) == record
+    data = record.to_dict()
+    del data["quiet_marker"]
+    assert TurnRecord.from_dict(data).quiet_marker is None  # a record written before this field existed
+    assert TurnRecord.from_dict({**data, "quiet_marker": 7}).quiet_marker is None
 
 
 # ---- StatusMessage.fail -------------------------------------------------------------------

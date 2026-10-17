@@ -153,9 +153,10 @@ def prepare_downloaded_image_for_vision(source_path: str, target_path: str) -> N
 
 
 def _max_vision_bytes() -> int:
-    from agents.content import MAX_IMAGE_BYTES  # no agents import at module level in bot/
+    """The largest image file the API takes: its limit is on the base64 data, 4/3 of the file."""
+    from agents.content import max_image_file_bytes  # no agents import at module level in bot/
 
-    return MAX_IMAGE_BYTES
+    return max_image_file_bytes()
 
 
 def _fit_jpeg(img: Image.Image, max_px: int, max_bytes: int) -> tuple[bytes, tuple[int, int]]:

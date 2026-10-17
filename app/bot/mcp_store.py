@@ -13,8 +13,10 @@ Two sources of servers, both read by ``agents.mcp_tools.MCPTools`` at turn start
   "tools", "updated", "error"}]}``), filled at startup and by an admin's ``/mcp refresh``. Records
   returned from here carry ``"admin": True``.
 
-Validation: a name is ``^[a-z0-9][a-z0-9_-]{0,31}$`` (lower-cased first); a URL must be ``https://``,
-``http://`` only for localhost / 127.0.0.1 / [::1] or when the caller is the admin. A token is kept as
+Validation: a name is ``^[a-z0-9][a-z0-9_-]{0,31}$`` (lower-cased first); a user's URL must be
+``https://`` to a public host (no localhost, no loopback/private/link-local/reserved literal IP; a
+DNS name is resolved and checked by ``check_public_host`` before every connection); the admin may
+use ``http://`` and local or private hosts. A token is kept as
 ``headers["Authorization"] = "Bearer <token>"`` and never rendered back: ``describe_headers`` says
 "token set", ``display_url`` drops user info, query and fragment.
 
@@ -24,10 +26,12 @@ file is an empty server list, logged, never an error.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +48,7 @@ ENV_ADMIN_FILE = "MCP_SERVERS_FILE"
 TRANSPORTS = ("http", "sse")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+NOT_PUBLIC = "The server must be on a public address (not localhost or a private network)."
 MAX_ERROR_CHARS = 300
 
 _locks: dict[str, threading.Lock] = {}
@@ -81,16 +86,76 @@ def validate_name(name: str) -> str:
     return name
 
 
+def _is_public_address(address: str) -> bool:
+    """True for a globally routable unicast IP; False for loopback, private, link-local, reserved,
+    shared, unspecified and multicast ones (an IPv4-mapped IPv6 address is judged as IPv4)."""
+    try:
+        ip = ipaddress.ip_address(address.split("%", 1)[0])
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return ip.is_global and not ip.is_multicast
+
+
+def _is_local_host(host: str) -> bool:
+    """A name or literal IP that is not public: localhost and friends, or a non-public address."""
+    host = host.rstrip(".")
+    if host in LOCAL_HOSTS or host.endswith(".localhost"):
+        return True
+    try:
+        ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return False  # a DNS name: check_public_host resolves it before every connection
+    return not _is_public_address(host)
+
+
 def validate_url(url: str, *, admin: bool = False) -> str:
-    """The URL as given, or ValueError. https is required; http only for local hosts or the admin."""
+    """The URL as given, or ValueError. Users need https:// to a public host; the admin may use
+    http:// and local or private hosts (the bot runs on the host network, so "localhost" is the
+    server itself: a user must not reach its internal services through an MCP server)."""
     url = str(url or "").strip()
     parts = urlsplit(url)
     host = (parts.hostname or "").lower()
     if parts.scheme not in ("http", "https") or not host:
         raise ValueError("The URL must start with https:// and name a host.")
-    if parts.scheme == "http" and not admin and host not in LOCAL_HOSTS:
-        raise ValueError("Only https:// URLs are accepted (http:// is allowed for localhost only).")
+    if admin:
+        return url
+    if parts.scheme != "https":
+        raise ValueError("Only https:// URLs are accepted.")
+    if _is_local_host(host):
+        raise ValueError(NOT_PUBLIC)
     return url
+
+
+def check_public_host(url: str) -> None:
+    """ValueError when the URL's host is, or resolves to, an address that is not public.
+
+    Blocking (DNS): call in a worker thread. ``agents.mcp_tools`` runs it before every connection
+    to a user's server, so a name that resolves (or later re-resolves) to a local address and a
+    record written straight into ``mcp.json`` are refused too. A name that does not resolve
+    passes: the connection fails on its own.
+    """
+    parts = urlsplit(str(url or ""))
+    host = (parts.hostname or "").lower()
+    if not host or _is_local_host(host):
+        raise ValueError(NOT_PUBLIC)
+    try:
+        port = parts.port or (80 if parts.scheme == "http" else 443)
+    except ValueError:
+        port = 443
+    try:
+        addresses = _resolve(host, port)
+    except (OSError, UnicodeError):
+        return
+    if any(not _is_public_address(address) for address in addresses):
+        raise ValueError(NOT_PUBLIC)
+
+
+def _resolve(host: str, port: int) -> list[str]:
+    """Every address ``host`` resolves to (tests replace this). Blocking."""
+    return [str(info[4][0]) for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)]
 
 
 def validate_transport(transport: str | None) -> str:

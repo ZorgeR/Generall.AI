@@ -2,6 +2,7 @@
 schedule_reminder's local-time conversion and weekdays, calculate_next_trigger, the scheduler's
 framing prompt / quiet marker, and the snooze buttons on fired user reminders."""
 import datetime as dt
+import os
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -131,6 +132,44 @@ async def test_schedule_reminder_without_a_zone_is_utc(env):
     assert result == "Successfully scheduled user reminder for 2030-01-05 09:00 (UTC)"
     (stored,) = await env.load(USER)
     assert stored["time"] == "2030-01-05T09:00:00+00:00" and stored["timezone"] == ""
+
+
+@pytest.mark.parametrize("zone_first", [True, False])
+async def test_zone_set_in_the_same_tool_batch_is_used_by_schedule_reminder(env, monkeypatch, zone_first):
+    """One assistant message with set_user_timezone AND schedule_reminder runs them concurrently
+    (run_tool_batch); the reminder must be read in the new zone, whatever the block order."""
+    import importlib
+
+    for key in ("OPENAI_API_KEY", "GOOGLE_API_KEY", "TAVILY_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.setenv(key, os.environ.get(key) or "x")
+    agents_main = importlib.import_module("agents.main")
+    agent = agents_main.AgentAnthropic(user_id=None)
+    agent.user_interactions = tool()
+    zone = SimpleNamespace(type="tool_use", id="tz", name="set_user_timezone", input={"timezone": "Tokyo"})
+    remind = SimpleNamespace(type="tool_use", id="rem", name="schedule_reminder", input={
+        "reminder_text": "Call mom", "reminder_time": "2030-01-05 09:00", "reminder_type": "user"})
+    results = await agent.run_tool_batch([zone, remind] if zone_first else [remind, zone])
+
+    by_id = {r["tool_use_id"]: r["content"] for r in results}
+    assert by_id["tz"].startswith("Time zone saved: Asia/Tokyo")
+    assert by_id["rem"] == "Successfully scheduled user reminder for 2030-01-05 09:00 (Asia/Tokyo, UTC+9)"
+    (stored,) = await env.load(USER)
+    assert stored["time"] == "2030-01-05T00:00:00+00:00" and stored["timezone"] == "Asia/Tokyo"
+    assert UserSettings(USER).get("timezone", "name") == "Asia/Tokyo"
+
+
+async def test_a_failed_zone_save_is_not_used_by_later_reminders(env, monkeypatch):
+    ui = tool()
+
+    def broken_set(self, *args):
+        raise OSError("disk full")
+
+    with monkeypatch.context() as m:
+        m.setattr(UserSettings, "set", broken_set)
+        assert (await ui.execute_tool("set_user_timezone", {"timezone": "Tokyo"})).startswith("Error saving the time zone")
+    result = await ui.execute_tool("schedule_reminder", {
+        "reminder_text": "a", "reminder_time": "2030-01-05 09:00", "reminder_type": "user"})
+    assert result.endswith("(UTC)")
 
 
 async def test_schedule_reminder_errors(env):
@@ -297,6 +336,43 @@ async def test_one_shot_task_completes_and_a_failed_run_is_marked(env, monkeypat
     await jobs.run_agent_reminder(FakeBot(), USER, failed, ctx())
     stored = next(r for r in await env.load(USER) if r["id"] == failed["id"])
     assert stored["status"] == "failed" and "agent_response" not in stored
+
+
+@pytest.mark.parametrize("periodic", [True, False])
+@pytest.mark.parametrize("answered", [True, False])
+async def test_a_task_moved_while_it_runs_keeps_the_new_time(env, monkeypatch, periodic, answered):
+    """⏰ +1h pressed in /reminders while the task runs: finishing the run must neither step the
+    task on from the new time nor complete (or fail) it, or the run the user asked for never happens."""
+    from aiogram.types import Chat, Message
+
+    from bot.handlers import reminders_ui
+
+    monkeypatch.setattr(reminders_ui, "reminders_store", env)
+    started = datetime.now(timezone.utc) - timedelta(seconds=30)
+    fields = {"text": "News", "type": "agent", "status": "processing", "processing_since": started.isoformat(),
+              "time": started.isoformat()}
+    if periodic:
+        fields.update(is_periodic=True, period_type="daily", period_interval=1, next_trigger=started.isoformat())
+    reminder = await env.add(USER, fields)
+    snapshot = dict(reminder)  # what the scheduler queued
+    message = Message(message_id=7, date=datetime.now(timezone.utc), chat=Chat(id=42, type="private"), text="x")
+    object.__setattr__(message, "edit_text", AsyncMock(return_value=message))
+
+    async def run_turn(**kw):
+        await reminders_ui.delay_reminder(message, USER, reminder["id"], 60)  # the press, mid-run
+        return TurnResult(response="Here is the news", messages=[], turn_id="t") if answered else None
+
+    monkeypatch.setattr(jobs, "run_turn", run_turn)
+    await jobs.run_agent_reminder(FakeBot(), USER, snapshot, ctx())
+
+    (stored,) = await env.load(USER)
+    ahead = datetime.fromisoformat(stored["time"]) - datetime.now(timezone.utc)
+    assert timedelta(minutes=59) < ahead <= timedelta(minutes=60)  # the delayed run is still due in an hour
+    assert stored["status"] == "pending" and "processing_since" not in stored and "completed_at" not in stored
+    if answered:
+        assert stored["agent_response"] == "Here is the news" and stored["last_result"] == "answered"
+    else:
+        assert "agent_response" not in stored
 
 
 def test_task_prompt_is_the_framing_text():

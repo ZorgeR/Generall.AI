@@ -2,6 +2,7 @@
 import asyncio
 import importlib
 import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -272,6 +273,58 @@ def test_download_webpage_uses_the_extractor_and_keeps_save_to_file(file_ops_mod
 
     monkeypatch.setattr(file_ops_module.requests, "get", lambda url, **kw: (_ for _ in ()).throw(OSError("dns")))
     assert ops.download_webpage("https://nope").startswith("Error downloading webpage: dns")
+
+
+@pytest.fixture
+def ops_in_data(file_ops_module, tmp_path, monkeypatch):
+    """A real FileOperations for user 111 under tmp_path/data (cwd), next to user 222's files."""
+    monkeypatch.chdir(tmp_path)
+    victim = tmp_path / "data" / "222"
+    victim.mkdir(parents=True)
+    (victim / "settings.json").write_text('{"keep": true}', encoding="utf-8")
+    ops = file_ops_module.FileOperations("111")
+    (ops.base_path / "a.txt").write_text("hello", encoding="utf-8")
+    page = SimpleNamespace(text=HTML, raise_for_status=lambda: None,
+                           iter_content=lambda chunk_size: iter([b"payload"]))
+    monkeypatch.setattr(file_ops_module.requests, "get", lambda url, **kw: page)
+    return SimpleNamespace(ops=ops, data=tmp_path / "data", victim=victim, outside=tmp_path / "outside.txt")
+
+
+def files_outside_user_111(data: Path) -> set[str]:
+    return {str(p.relative_to(data)) for p in data.rglob("*") if p.is_file() and not p.is_relative_to(data / "111")}
+
+
+def test_download_webpage_and_zip_names_never_leave_the_workspace(ops_in_data):
+    """The model's filename / archive_name keep only their base name: `..` or an absolute path lands in downloads/."""
+    env, ops = ops_in_data, ops_in_data.ops
+    before = files_outside_user_111(env.data)
+
+    saved = ops.download_webpage("https://example.com/x", save_to_file=True, filename="../../222/settings.json")
+    assert saved.startswith("Webpage content saved to downloads/settings.json")
+    assert (env.victim / "settings.json").read_text(encoding="utf-8") == '{"keep": true}'
+    saved = ops.download_webpage("https://example.com/x", save_to_file=True, filename=str(env.outside))
+    assert saved.startswith("Webpage content saved to downloads/outside.txt") and not env.outside.exists()
+    assert ops.download_webpage("https://example.com/x", save_to_file=True, filename="..").startswith("Error")
+
+    zipped = ops.create_zip_archive(["a.txt"], archive_name="../../222/evil")
+    assert "Path: downloads/evil.zip" in zipped and (ops.base_path / "downloads" / "evil.zip").is_file()
+    assert "Path: downloads/abs.zip" in ops.create_zip_archive(["a.txt"], archive_name=str(env.data / "222" / "abs"))
+    assert ops.download_file("https://example.com/f", filename="../../222/f.bin").endswith("downloads/f.bin")
+
+    assert files_outside_user_111(env.data) == before  # nothing written next to another user's files
+
+
+def test_a_planted_link_in_downloads_is_refused_before_anything_is_written(ops_in_data):
+    """downloads/ is writable from the sandbox: a link there pointing outside must not be written through."""
+    env, ops = ops_in_data, ops_in_data.ops
+    env.outside.write_text("original", encoding="utf-8")
+    for name in ("page.txt", "f.bin", "bundle.zip"):
+        os.symlink(env.outside, ops.base_path / "downloads" / name)
+
+    assert ops.download_webpage("https://example.com/x", save_to_file=True, filename="page.txt").startswith("Error")
+    assert ops.download_file("https://example.com/f", filename="f.bin").startswith("Error")
+    assert ops.create_zip_archive(["a.txt"], archive_name="bundle").startswith("Error")
+    assert env.outside.read_text(encoding="utf-8") == "original"
 
 
 # ---- browse.py (the sandbox side) ------------------------------------------------------------------

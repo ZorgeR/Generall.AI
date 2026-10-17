@@ -323,3 +323,86 @@ def test_clear_writes_a_fresh_cosine_index(env):
     assert emb.index.ntotal == 0 and emb.items == []
     fresh = env.make()
     assert fresh.search_conversations("Q", k=1) == [] and fresh.stale is False
+
+
+# ---- inputs the API refuses: byte caps, byte-budgeted batches, per-item fallback -------------------------
+class RefusedInput(Exception):
+    """What openai.BadRequestError looks like to the module: a 400."""
+    status_code = 400
+
+
+class RefusingClient(FakeEmbeddingsClient):
+    """Refuses (400) a whole request when any input holds ``POISON``, like the API's 8191-token check."""
+
+    def create(self, *, model, input):
+        self.calls.append(list(input))
+        if any("POISON" in text for text in input):
+            raise RefusedInput("This model's maximum context length is 8191 tokens")
+        self.calls.pop()
+        return super().create(model=model, input=input)
+
+
+TELUGU = "తెలుగు భాషలో ఒక పొడవైన ప్రశ్న " * 200  # 3 bytes per character: far more tokens than characters
+
+
+def test_embedded_texts_and_queries_are_capped_by_bytes_at_a_character_boundary(env):
+    text = embeddings._embed_text(TELUGU, TELUGU, "topic", TELUGU)
+    assert len(text.encode("utf-8")) <= embeddings.EMBED_TEXT_BYTES
+    assert text.startswith("Topic: topic\nQuestion: తెలుగు") and "�" not in text
+    assert embeddings._embed_text("Q", "A") == "Question: Q\nAnswer: A"  # short ASCII texts unchanged
+    client = FakeEmbeddingsClient()
+    emb = env.make(client=client)
+    emb.add_conversation("Q", "A", "t")
+    emb.search_conversations(TELUGU * 5, k=1)
+    assert len(client.calls[-1][0].encode("utf-8")) <= embeddings.EMBED_TEXT_BYTES
+
+
+def test_rebuild_batches_stay_under_the_byte_budget():
+    texts = ["x" * embeddings.EMBED_TEXT_BYTES] * 70
+    spans = embeddings._batches(texts)
+    assert spans[0] == (0, embeddings.BATCH_BYTES // embeddings.EMBED_TEXT_BYTES) and spans[-1][1] == 70
+    for start, end in spans:
+        assert 0 < end - start <= embeddings.BATCH_SIZE
+        assert sum(len(t) for t in texts[start:end]) <= embeddings.BATCH_BYTES
+    assert embeddings._batches(["short"] * 70) == [(0, 64), (64, 70)]
+    assert embeddings._batches(["y" * (embeddings.BATCH_BYTES + 1), "z"]) == [(0, 1), (1, 2)]  # never an empty batch
+    assert embeddings._batches([]) == []
+
+
+def test_one_refused_conversation_is_skipped_and_the_rest_is_indexed(env):
+    """A single input the API refuses must not keep the whole index stale (and semantic memory off)."""
+    for i in range(5):
+        write_conversation(env.root, USER, f"20260101_00000{i}", f"t{i}", f"question about topic {i}", f"answer {i}")
+    write_conversation(env.root, USER, "20260101_000009", "bad", "POISON question", "answer")
+    write_legacy_index(env.root, USER)
+    client = RefusingClient()
+    emb = env.make(client=client)
+    emb._ensure_loaded()
+    assert emb.stale
+
+    outcome = emb.reindex(blocking=True)
+    assert outcome["ok"] is True and outcome["items"] == 5
+    assert [len(c) for c in client.calls] == [6, 1, 1, 1, 1, 1, 1]  # the batch, then one text at a time
+    fresh = env.make(client=FakeEmbeddingsClient())
+    fresh._ensure_loaded()  # what the next turn reads from disk
+    assert fresh.stale is False and len(fresh.items) == 5 and fresh.index.ntotal == 5
+    assert all("POISON" not in item["question"] for item in fresh.items)
+    assert fresh.search_conversations("question about topic 3", k=1)[0]["answer"] == "answer 3"
+
+
+def test_a_rebuild_failing_for_another_reason_still_fails_without_per_item_retries(env):
+    for i in range(3):
+        write_conversation(env.root, USER, f"20260101_00000{i}", f"t{i}", f"q{i}", f"a{i}")
+    client = FakeEmbeddingsClient(fail=True)  # network / quota: retrying item by item would only skip everything
+    outcome = env.make(client=client).reindex(blocking=True)
+    assert outcome["ok"] is False and "embeddings API down" in outcome["error"]
+
+
+def test_rebuild_never_reads_a_linked_conversation_file(env, tmp_path):
+    """conversations/ lies in the sandbox's workspace: a link to another user's conversation is not embedded."""
+    victim = write_conversation(env.root, "999", "20260101_000000", "secret", "my bank PIN is 4711", "noted")
+    write_conversation(env.root, USER, "20260101_000001", "mine", "my own question", "my answer")
+    os.symlink(victim, env.root / USER / "conversations" / "conversation_20260101_000002_x.json")
+    emb = env.make()
+    outcome = emb.reindex(blocking=True)
+    assert outcome["items"] == 1 and [item["question"] for item in emb.items] == ["my own question"]

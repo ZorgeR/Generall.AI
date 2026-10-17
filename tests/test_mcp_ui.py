@@ -112,7 +112,8 @@ async def test_add_without_a_token_keeps_the_message_and_accepts_the_sse_flag(wi
 
 async def test_add_rejects_bad_names_urls_and_missing_arguments(wired):
     for args, expected in ((f"add Bad.Name {URL}", "name must be"), ("add x http://example.com/mcp", "Only https"),
-                           ("add x", "Usage"), ("add", "Usage")):
+                           ("add x http://127.0.0.1:8081/", "Only https"), ("add x https://127.0.0.1:8081/", "public address"),
+                           ("add x https://localhost/mcp", "public address"), ("add x", "Usage"), ("add", "Usage")):
         message = await mcp(args)
         text, _ = answered(message)
         assert text.startswith("❌") and expected in text, (args, text)

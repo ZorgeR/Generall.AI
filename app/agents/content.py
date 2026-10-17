@@ -9,15 +9,18 @@ small reference form.
 A tool may likewise return a list of blocks (``text`` and ``image``) instead of a string;
 ``result_preview`` / ``cap_blocks`` give the trace text and the capped content for it.
 
-No imports from the rest of the agent package: ``agents.transcript`` imports the token
-estimates from here.
+No imports from the rest of the agent package except the stdlib-only ``agents.paths``:
+``agents.transcript`` imports the token estimates from here.
 """
 from __future__ import annotations
 
 import base64
 import json
 import os
+from pathlib import Path
 from typing import Any
+
+from agents.paths import resolve_under
 
 MEDIA_REF = "media_ref"
 API_MEDIA_TYPES = ("image", "document")
@@ -26,8 +29,13 @@ IMAGE_MEDIA_TYPES = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp",
 }
 PDF_MEDIA_TYPE = "application/pdf"
-MAX_IMAGE_BYTES = 5 * 1024 * 1024  # API limit per image
+MAX_IMAGE_BYTES = 5 * 1024 * 1024  # API limit per image, measured on its base64 data
 MAX_DOCUMENT_BYTES = 30 * 1024 * 1024  # under the 32 MB request limit
+
+
+def max_image_file_bytes() -> int:
+    """The largest image file whose base64 stays within ``MAX_IMAGE_BYTES`` (4 characters per 3 bytes)."""
+    return MAX_IMAGE_BYTES // 4 * 3
 
 CHARS_PER_TOKEN = 3.2  # same conservative figure as agents.transcript
 IMAGE_TOKENS = 1600  # an image at <= ~1.15 MP; the handlers downscale to 1024 px
@@ -129,18 +137,24 @@ def _b64(data: bytes) -> str:
     return base64.standard_b64encode(data).decode("ascii")
 
 
-def _materialize_one(block: dict) -> dict:
+def _materialize_one(block: dict, base: str | os.PathLike | None = None) -> dict:
     kind = block.get("kind")
     path = str(block.get("path") or "")
     title = str(block.get("title") or os.path.basename(path))
+    source = path  # what is read: the ref's path, or where it resolves inside ``base``
+    if base is not None:
+        resolved = resolve_under(Path(base), path, must_exist=True)
+        if resolved is None or not resolved.is_file():  # outside the workspace (.., a link out) or no file
+            return text_block(f"[{kind or 'file'} not found: {path}]")
+        source = str(resolved)
     try:
-        size = os.path.getsize(path)
+        size = os.path.getsize(source)
     except OSError:
         return text_block(f"[{kind or 'file'} not found: {path}]")
     if kind == "image":
-        if size > MAX_IMAGE_BYTES:
+        if size > max_image_file_bytes():
             return text_block(f"[image too large to show ({size // (1024 * 1024)} MB): {path}; use view_image, it downscales]")
-        with open(path, "rb") as f:
+        with open(source, "rb") as f:
             data = f.read()
         media_type = IMAGE_MEDIA_TYPES.get(os.path.splitext(path)[1].lower()) or _sniff_image_type(data)
         if media_type is None:
@@ -151,22 +165,26 @@ def _materialize_one(block: dict) -> dict:
             return text_block(f"[document: {title} at {path}; not a PDF, read it with read_file or read_document]")
         if size > MAX_DOCUMENT_BYTES:
             return text_block(f"[document too large to attach ({size // (1024 * 1024)} MB): {path}; read it with read_document]")
-        with open(path, "rb") as f:
+        with open(source, "rb") as f:
             data = f.read()
         return {"type": "document", "source": {"type": "base64", "media_type": PDF_MEDIA_TYPE, "data": _b64(data)}, "title": title}
     return text_block(f"[unsupported attachment: {path}]")
 
 
-def materialize(blocks: list[dict]) -> list[dict]:
+def materialize(blocks: list[dict], base: str | os.PathLike | None = None) -> list[dict]:
     """API blocks for ``blocks``: media refs become base64 image/document blocks, the rest is copied.
 
     Blocking (reads files): call in a worker thread. A file that cannot be embedded becomes a
-    text block saying why, so the model still learns the path.
+    text block saying why, so the model still learns the path. ``base`` (the user's
+    ``data/<uid>``) confines the refs to that workspace: Retry re-reads stored refs long after
+    the upload, from directories the sandbox can write, so a ref that resolves outside it
+    (``..``, a symlink out) or is not a regular file reads as not found. Without ``base`` the
+    path is read as given (callers that resolved it already).
     """
     out: list[dict] = []
     for b in blocks:
         if is_media_ref(b):
-            out.append(_materialize_one(b))
+            out.append(_materialize_one(b, base))
         elif isinstance(b, dict):
             out.append(dict(b))
     return out

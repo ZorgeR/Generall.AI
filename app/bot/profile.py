@@ -18,9 +18,12 @@ were written (``[YYYY-MM-DD] ``), which is how the cap rotates: when the file wo
 ``MAX_BYTES`` the oldest Notes go first, About and Preferences are never dropped.
 
 All methods are synchronous file I/O (callers use ``asyncio.to_thread``), serialized per user with a
-``threading.Lock`` and written atomically (tmp + ``os.replace``). A missing or corrupt file is never
-an error: the store starts fresh and logs. ``fingerprint(text)`` names a version of the file; the
-agent's ``<context>`` block repeats the profile only when that changed (``agents/main.py``).
+``threading.Lock`` and written atomically (a fresh tmp file + ``os.replace``). A missing or corrupt
+file is never an error: the store starts fresh and logs. The sandbox can write ``data/<uid>``, so a
+``profile.md`` that is a symbolic link (or not a regular file) reads as absent and is never followed
+(``read_regular_text``); the next write replaces the link itself. ``fingerprint(text)`` names a
+version of the file; the agent's ``<context>`` block repeats the profile only when that changed
+(``agents/main.py``).
 """
 from __future__ import annotations
 
@@ -28,6 +31,8 @@ import hashlib
 import logging
 import os
 import re
+import stat
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -162,6 +167,27 @@ def _find(entries: list[str], needle) -> int | None:
     return matches[0] if len(matches) == 1 else None
 
 
+def read_regular_text(path: Path) -> str:
+    """The UTF-8 text of ``path``; "" when there is no such file.
+
+    ``data/<uid>`` is the sandbox's workspace, so the file may have been replaced by a symbolic
+    link (to another user's profile, to ``/proc/self/environ``) or a FIFO: the last component is
+    never followed (``O_NOFOLLOW``) and anything but a regular file raises ``OSError``, so the
+    host never reads what the link points to. Bad UTF-8 raises ``UnicodeDecodeError``.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow and path.is_symlink():  # no O_NOFOLLOW on this platform
+        raise OSError(f"{path} is a symbolic link")
+    try:
+        fd = os.open(path, os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        return ""
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            raise OSError(f"{path} is not a regular file")
+        return f.read().decode("utf-8")
+
+
 class ProfileStore:
     def __init__(self, base_dir: str | Path = "data") -> None:
         self.base_dir = Path(base_dir)
@@ -177,10 +203,10 @@ class ProfileStore:
 
     # ---- reading ---------------------------------------------------------------
     def text(self, user_id: str) -> str:
-        """The file as it is, "" when there is none (or it cannot be read)."""
+        """The file as it is, "" when there is none (or it cannot be read, or is not a plain file)."""
         path = self.path(user_id)
         try:
-            return path.read_text(encoding="utf-8") if path.exists() else ""
+            return read_regular_text(path)
         except (OSError, UnicodeDecodeError) as e:
             logger.error("Unreadable profile %s (%s); treating it as empty", path, e)
             return ""
@@ -272,9 +298,18 @@ class ProfileStore:
                 logger.error("Could not delete profile %s: %s", path, e)
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".md.tmp")
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, path)
+        # A fresh tmp file (O_EXCL): a fixed name could be a link the sandbox planted, and writing
+        # through it would overwrite whatever it points to. os.replace then swaps the name itself.
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".profile.", suffix=".tmp")
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o644)  # mkstemp makes it 0600; keep it readable in the workspace as before
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp, path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
 
 
 profile_store = ProfileStore()

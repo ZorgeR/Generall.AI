@@ -39,12 +39,19 @@ import numpy as np
 from openai import OpenAI
 
 import models
+from agents.paths import regular_files
 
 logger = logging.getLogger(__name__)
 
 METADATA_VERSION = 2
 BATCH_SIZE = 64  # texts per embeddings.create call during a rebuild
 EMBED_TEXT_CHARS = 6000  # the embedded text (the model takes 8191 tokens)
+# Characters do not bound tokens (Telugu, Gujarati, dense CJK: > 8191 tokens in 6000 chars). A
+# byte-level BPE token covers at least one UTF-8 byte, so bytes do: every input stays under
+# EMBED_TEXT_BYTES (the search query too) and a rebuild call under BATCH_BYTES (the API caps one
+# request at 300k tokens over all its inputs).
+EMBED_TEXT_BYTES = 8000
+BATCH_BYTES = 250_000
 PART_CHARS = {"topic": 100, "question": 2500, "answer": 2500, "summary": 800}
 STORED_CHARS = 2000  # question / answer kept in metadata items
 AUTO_REINDEX = True  # a stale index schedules its own rebuild (tests switch it off)
@@ -160,7 +167,34 @@ def _embed_text(question: Any, answer: Any, topic: Any = None, summary: Any = No
     parts.append(f"Answer: {a[:PART_CHARS['answer']]}")
     if summary:
         parts.append(f"Summary: {str(summary)[:PART_CHARS['summary']]}")
-    return "\n".join(parts)[:EMBED_TEXT_CHARS]
+    return _cap_bytes("\n".join(parts)[:EMBED_TEXT_CHARS])
+
+
+def _cap_bytes(text: str, limit: int = EMBED_TEXT_BYTES) -> str:
+    """``text`` cut to at most ``limit`` UTF-8 bytes, at a character boundary."""
+    data = text.encode("utf-8")
+    return text if len(data) <= limit else data[:limit].decode("utf-8", errors="ignore")
+
+
+def _batches(texts: list[str]) -> list[tuple[int, int]]:
+    """``(start, end)`` slices of ``texts`` with at most BATCH_SIZE texts and BATCH_BYTES bytes each."""
+    spans: list[tuple[int, int]] = []
+    start = 0
+    while start < len(texts):
+        end, size = start, 0
+        while end < len(texts) and end - start < BATCH_SIZE:
+            size += len(texts[end].encode("utf-8"))
+            if end > start and size > BATCH_BYTES:
+                break
+            end += 1
+        spans.append((start, end))
+        start = end
+    return spans
+
+
+def _is_refused_input(error: Exception) -> bool:
+    """The API refused the request's content (a 400), as opposed to a network, quota or config failure."""
+    return getattr(error, "status_code", None) == 400
 
 
 def _normalize(matrix: np.ndarray) -> np.ndarray:
@@ -226,6 +260,27 @@ class ConversationEmbeddings:
             raise ValueError(
                 f"{self.model} returned {matrix.shape[-1]}-dim vectors but EMBEDDING_DIMENSION is {self.dimension}")
         return _normalize(matrix)
+
+    def _embed_batch(self, texts: list[str]) -> list[np.ndarray | None]:
+        """One vector (1×dim) per text for a rebuild; ``None`` for a text the API refuses.
+
+        A refused batch (400) is retried one text at a time and the texts still refused are
+        skipped with a log line, so one conversation cannot keep the whole index stale. Any
+        other failure (network, quota, wrong dimension) propagates and fails the rebuild.
+        """
+        try:
+            matrix = self._embed(texts)
+            return [matrix[i:i + 1] for i in range(len(texts))]
+        except Exception as e:  # noqa: BLE001 - only a refused input is handled here
+            if not _is_refused_input(e):
+                raise
+            if len(texts) == 1:
+                logger.warning("Embeddings of user %s: skipping a conversation the API refuses: %s", self.user_id, e)
+                return [None]
+        vectors: list[np.ndarray | None] = []
+        for text in texts:
+            vectors.extend(self._embed_batch([text]))
+        return vectors
 
     # -- loading --------------------------------------------------------------
     def _empty_index(self) -> faiss.Index:
@@ -336,7 +391,7 @@ class ConversationEmbeddings:
             self._ensure_loaded()
             if self.stale or not self.items:
                 return []
-            vector = self._embed([_clean_question(query) or str(query)])
+            vector = self._embed([_cap_bytes(_clean_question(query) or str(query))])
             with self._lock:
                 self._ensure_loaded()
                 if self.stale or not self.items:
@@ -409,14 +464,12 @@ class ConversationEmbeddings:
     def _conversation_records(self) -> list[tuple[dict[str, Any], str]]:
         """``(item, text to embed)`` per conversation file, oldest first, duplicates skipped."""
         records: list[tuple[dict[str, Any], str]] = []
-        if not self.conversations_dir.exists():
-            return records
         seen: set[str] = set()
-        for file in sorted(self.conversations_dir.glob("conversation_*.json")):
+        # links and non-regular files skipped: conversations/ lies in the sandbox's workspace
+        for file, raw in regular_files(self.conversations_dir, "conversation_*.json"):
             try:
-                with open(file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except (OSError, ValueError) as e:
+                data = json.loads(raw)
+            except ValueError as e:
                 logger.warning("Skipping unreadable conversation %s: %s", file.name, e)
                 continue
             if not isinstance(data, dict):
@@ -441,14 +494,16 @@ class ConversationEmbeddings:
             records = self._conversation_records()
             total = len(records)
             logger.info("Rebuilding the embeddings of user %s: %d conversations with %s", uid, total, self.model)
-            vectors: list[np.ndarray] = []
-            for start in range(0, total, BATCH_SIZE):
-                vectors.append(self._embed([text for _, text in records[start:start + BATCH_SIZE]]))
-                logger.info("Embeddings rebuild of user %s: %d/%d", uid, min(start + BATCH_SIZE, total), total)
+            texts = [text for _, text in records]
+            vectors: list[np.ndarray | None] = []
+            for start, end in _batches(texts):
+                vectors.extend(self._embed_batch(texts[start:end]))
+                logger.info("Embeddings rebuild of user %s: %d/%d", uid, end, total)
+            kept = [(item, vector) for (item, _), vector in zip(records, vectors) if vector is not None]
             index = self._empty_index()
-            if vectors:
-                index.add(np.vstack(vectors))
-            items = [item for item, _ in records]
+            if kept:
+                index.add(np.vstack([vector for _, vector in kept]))
+            items = [item for item, _ in kept]
             with self._lock:
                 with _registry_lock:
                     pending = _pending.pop(uid, [])

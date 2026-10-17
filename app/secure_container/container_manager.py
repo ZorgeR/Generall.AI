@@ -241,7 +241,7 @@ class ContainerManager:
         """Run one of the bundled sandbox scripts (``secure_container/scripts/``) for a user.
 
         The script is copied into the user's workspace under a unique temp name (tool calls
-        of one message run concurrently) and executed as ``python <file> <args>`` through
+        of one message run concurrently) and executed as ``python -I <file> <args>`` through
         :meth:`run_command`, so slots, mounts and the package prelude behave as for every
         sandboxed call. ``script_path`` is the bare file name of a bundled script (anything
         with a directory part, ``../`` included, is refused: the model never chooses what runs
@@ -261,7 +261,11 @@ class ContainerManager:
         try:
             shutil.copy(source, target_file)
             os.chmod(target_file, 0o755)
-            command = " ".join([f"python {file_in_container}"] + [shlex.quote(str(a)) for a in args])
+            # -I (isolated): the script's directory is the user's workspace, where the model writes
+            # files; without it a workspace json.py/random.py or a `pip install --user` copy of
+            # openpyxl/playwright would shadow what the script imports. The image installs the
+            # script dependencies system-wide, and PLAYWRIGHT_BROWSERS_PATH is not a PYTHON* variable.
+            command = " ".join([f"python -I {file_in_container}"] + [shlex.quote(str(a)) for a in args])
             return self.run_command(user_id, command, timeout, network_enabled, mem_limit)
         finally:
             try:

@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import json
 from models import PERPLEXITY_MODEL, PERPLEXITY_MODELS, PERPLEXITY_REASONING_MODEL
+from agents.paths import regular_files
 from agents.transcript import is_context_block, is_tool_result_message, message_text
 
 MEMORY_SEARCH_MAX_RESULTS = 20
@@ -350,15 +351,12 @@ class SearchTools:
         return raw
 
     def _conversation_hits(self, pattern: re.Pattern) -> list[dict]:
-        folder = self.base_path / "conversations"
         hits: list[dict] = []
-        if not folder.exists():
-            return hits
-        for path in folder.glob("conversation_*.json"):
+        # never through a link: data/<uid> is the sandbox's workspace (see agents.paths.regular_files)
+        for path, raw in regular_files(self.base_path / "conversations", "conversation_*.json"):
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except (OSError, json.JSONDecodeError):
+                data = json.loads(raw)
+            except json.JSONDecodeError:
                 continue
             if not isinstance(data, dict):
                 continue
@@ -371,12 +369,14 @@ class SearchTools:
         return hits
 
     def _profile_hits(self, pattern: re.Pattern) -> list[dict]:
+        from bot.profile import read_regular_text  # never follows a link the sandbox planted
+
         path = self.base_path / "profile.md"
-        if not path.exists():
-            return []
         try:
-            text = path.read_text(encoding="utf-8")
-            modified = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            text = read_regular_text(path)
+            if not text:
+                return []
+            modified = datetime.fromtimestamp(path.lstat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         except (OSError, UnicodeDecodeError):
             return []
         hits: list[dict] = []
@@ -392,15 +392,11 @@ class SearchTools:
         return hits
 
     def _transcript_hits(self, pattern: re.Pattern) -> list[dict]:
-        folder = self.base_path / "transcripts"
         hits: list[dict] = []
-        if not folder.exists():
-            return hits
-        for path in folder.glob("*transcript.json"):
+        for path, raw in regular_files(self.base_path / "transcripts", "*transcript.json"):  # links skipped
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except (OSError, json.JSONDecodeError):
+                data = json.loads(raw)
+            except json.JSONDecodeError:
                 continue
             if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
                 continue
