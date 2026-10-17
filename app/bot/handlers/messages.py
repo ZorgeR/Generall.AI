@@ -3,6 +3,11 @@
 Handlers validate quickly, enqueue a job on the user's queue and return.
 If the user already has a job running they get a busy notice immediately;
 the new message is processed as its own turn once the queue reaches it.
+
+``control_router`` (auth only) stops work: ``/cancel`` and the busy notice's
+button stop the running job and clear the queue; the Stop button in a turn's
+status (``queue_stop_<job token>``) and Telegram's Stop button on its streaming
+draft (a ``stopped_message_generation`` update) stop only that job.
 """
 from __future__ import annotations
 
@@ -17,11 +22,11 @@ from typing import Any
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageGenerationStopped
 
 from bot import media
 from bot.agent_runner import THINKING, run_turn
-from bot.queue import Job, JobContext, SubmitResult
+from bot.queue import STOP_CALLBACK_PREFIX, Job, JobContext, SubmitResult, job_id_from_token
 from bot.runtime import queue
 from bot.sender import ChatSender
 from bot.ui import answer_md, delete_quietly
@@ -118,6 +123,58 @@ async def cancel_button(callback: CallbackQuery, user_id: str) -> None:
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:  # noqa: BLE001
             pass
+
+
+# ---------------------------------------------------------------------------
+# Stop buttons of one turn: its status message and its streaming draft
+# ---------------------------------------------------------------------------
+STOP_STOPPING_TEXT = "🛑 Stopping…"
+STOP_TOO_LATE_TEXT = "Too late to stop: the answer is already being sent."
+STOP_FINISHED_TEXT = "This task has already finished."
+
+
+def _only_button(markup: InlineKeyboardMarkup | None, data: str | None) -> bool:
+    """True when ``markup`` is just the pressed button (a leftover Stop keyboard)."""
+    buttons = [b for row in markup.inline_keyboard for b in row] if markup is not None else []
+    return bool(buttons) and all(b.callback_data == data for b in buttons)
+
+
+@control_router.callback_query(F.data.startswith(STOP_CALLBACK_PREFIX))
+async def stop_button(callback: CallbackQuery, user_id: str) -> None:
+    """The status message's Stop: cancel that turn only; queued messages still run."""
+    job_id = job_id_from_token((callback.data or "")[len(STOP_CALLBACK_PREFIX):])
+    cancelled = job_id is not None and await queue.cancel_current(user_id, job_id, reason="user")
+    current = queue.status(user_id).current
+    running = job_id is not None and current is not None and current.id == job_id
+    if cancelled:
+        notice = STOP_STOPPING_TEXT
+    else:
+        # Still running but refused: the agent is done and the answer is being delivered.
+        notice = STOP_TOO_LATE_TEXT if running else STOP_FINISHED_TEXT
+    try:
+        await callback.answer(notice)
+    except Exception as e:  # noqa: BLE001 - the query may have expired
+        logger.debug("Could not answer the stop button: %s", e)
+    if (
+        not cancelled
+        and job_id is not None
+        and not running  # a still-running turn clears its own button
+        and isinstance(callback.message, Message)
+        and _only_button(callback.message.reply_markup, callback.data)
+    ):
+        # A status left behind by a turn that ended without its final edit (e.g. a restart).
+        # Any other keyboard (the turn buttons on a legacy answer) is left alone.
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@control_router.stopped_message_generation()
+async def draft_stopped(event: MessageGenerationStopped, user_id: str) -> None:
+    """Telegram's Stop button on a streaming draft; the draft id is the job id (see run_turn)."""
+    cancelled = await queue.cancel_current(user_id, job_id=event.draft_id, reason="user")
+    logger.info("Draft %s stopped by %s: %s", event.draft_id, user_id, "turn cancelled" if cancelled else "no matching turn")
 
 
 # ---------------------------------------------------------------------------

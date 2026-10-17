@@ -41,6 +41,10 @@ DRAFT_BYTE_LIMIT = 30000  # keep streaming drafts comfortably under the limit
 MDV2_MAX = 4096  # UTF-16 units per regular message
 
 _state: dict[str, object] = {"available": True, "reason": None}
+# Buttons inside rich messages (``InputRichBlockButtons``, the <tg-button-row> block). Sticky
+# like the flag above: when a rich payload is refused only because of its button blocks, the
+# callers retry without them (an inline keyboard instead) and every later message skips them.
+_buttons: dict[str, object] = {"available": True, "reason": None}
 
 
 # ---- availability flag ------------------------------------------------------
@@ -63,6 +67,20 @@ def reset() -> None:
     """Forget a previous 'unsupported' verdict (tests, or after upgrading the sidecar)."""
     _state["available"] = True
     _state["reason"] = None
+    _buttons["available"] = True
+    _buttons["reason"] = None
+
+
+def buttons_available() -> bool:
+    """Button rows inside rich messages are worth trying (rich support itself is a separate flag)."""
+    return bool(_buttons["available"]) and is_available()
+
+
+def mark_buttons_unavailable(reason: str) -> None:
+    if _buttons["available"]:
+        logger.warning("Buttons inside rich messages are not supported, using inline keyboards instead: %s", reason)
+    _buttons["available"] = False
+    _buttons["reason"] = reason
 
 
 def is_unsupported_error(error: BaseException) -> bool:
@@ -73,6 +91,19 @@ def is_unsupported_error(error: BaseException) -> bool:
         msg = str(error).lower()
         return "method" in msg and ("not found" in msg or "unknown" in msg)
     return False
+
+
+# 400s about where a message goes (chat, forum topic, rights), not about what it contains.
+_CHAT_ERROR_MARKERS = (
+    "chat not found", "thread not found", "topic_", "topic closed", "topic deleted",
+    "not enough rights", "have no rights", "chat_write_forbidden", "chat_restricted", "peer_id_invalid",
+)
+
+
+def is_chat_error(error: BaseException) -> bool:
+    """True when a refusal is about the destination chat, so no process-wide flag may follow from it."""
+    msg = str(error).lower()
+    return any(marker in msg for marker in _CHAT_ERROR_MARKERS)
 
 
 # ---- conversions ------------------------------------------------------------

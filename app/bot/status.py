@@ -7,6 +7,14 @@ expandable blocks; when the turn ends it is edited into a shortened summary
 and results, the model's summarized thinking, tokens and cost) instead of being
 deleted. Every rich edit falls back to the legacy-Markdown text version, so an
 old Bot API server or client still gets a readable status.
+
+A turn that runs as a queue job gets a Stop button while it runs: a button row
+at the end of the rich progress blocks, or an inline keyboard on the text
+version (and on rich edits once button rows were refused, see
+``rich.buttons_available``). The summary and the stopped/error notices carry no
+Stop button, so it disappears when the turn ends. Instead the summary can carry
+the turn's action buttons (Retry, Listen, … from ``bot/turn_actions.py``): a row
+at its end, with the same inline-keyboard fallbacks.
 """
 from __future__ import annotations
 
@@ -16,6 +24,9 @@ import re
 
 from aiogram.exceptions import TelegramBadRequest, TelegramNotFound
 from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputRichBlockButtons,
     InputRichBlockDetails,
     InputRichBlockList,
     InputRichBlockListItem,
@@ -25,6 +36,7 @@ from aiogram.types import (
     RichTextBold,
     RichTextCode,
     RichTextItalic,
+    RichMessageButton,
 )
 
 from bot import rich as rich_render
@@ -36,6 +48,7 @@ TRACE_LINES = 10  # most recent tool calls shown in the plain-text status
 LIVE_CALLS = 15  # in the rich progress view
 SUMMARY_CALLS = 40  # expandable entries in the final summary
 SUMMARY_BYTES = 28000  # keep the summary well under the 32 KB rich-message limit
+STOP_LABEL = "🛑 Stop"
 _ENTITY_UNSAFE = re.compile(r"[_*`\[]")
 _HEADER_MARKS = re.compile(r"[*_]")
 
@@ -143,6 +156,35 @@ def trace_summary(trace) -> str:
     return f"{text}\n{usage}" if usage else text
 
 
+# ---- the Stop button -----------------------------------------------------------
+def stop_button_row(callback_data: str) -> InputRichBlockButtons:
+    """The Stop button as a rich block (a <tg-button-row>), last block of the live status."""
+    return InputRichBlockButtons(buttons=[RichMessageButton(text=STOP_LABEL, style="danger", callback_data=callback_data)])
+
+
+def stop_keyboard(callback_data: str) -> InlineKeyboardMarkup:
+    """The same button as an inline keyboard: text status, or rich edits once button rows were refused."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=STOP_LABEL, style="danger", callback_data=callback_data)]]
+    )
+
+
+# ---- action buttons of a finished turn -------------------------------------------
+# An action is (label, callback_data, style or None); see bot.turn_actions.record_actions.
+def action_row(actions: list) -> InputRichBlockButtons:
+    """Callback buttons as one rich button row (1-8 buttons), e.g. at the end of the summary."""
+    return InputRichBlockButtons(buttons=[RichMessageButton(text=text, style=style, callback_data=data) for text, data, style in actions])
+
+
+def inline_buttons(actions: list) -> list[InlineKeyboardButton]:
+    """The same buttons as one inline-keyboard row."""
+    return [InlineKeyboardButton(text=text, style=style, callback_data=data) for text, data, style in actions]
+
+
+def actions_keyboard(actions: list) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[inline_buttons(actions)])
+
+
 # ---- rich versions -----------------------------------------------------------
 def _call_rich_line(call) -> list:
     from agents.trace import describe_args
@@ -156,7 +198,8 @@ def _call_rich_line(call) -> list:
     return parts
 
 
-def progress_blocks(header: str, quota: str, step, details, iteration, critique, trace) -> list:
+def progress_blocks(header: str, quota: str, step, details, iteration, critique, trace, stop_callback: str | None = None) -> list:
+    """Live status blocks; with ``stop_callback`` they end with the Stop button row."""
     blocks: list = [InputRichBlockParagraph(text=[RichTextBold(text=plain_header(header))])]
     meta = f"{quota.strip()} · " if quota and quota.strip() else ""
     blocks.append(InputRichBlockParagraph(text=[RichTextItalic(text=f"{meta}{step} · {details}")]))
@@ -171,6 +214,8 @@ def progress_blocks(header: str, quota: str, step, details, iteration, critique,
     usage = usage_text(trace)
     if usage:
         blocks.append(InputRichBlockParagraph(text=usage))
+    if stop_callback:
+        blocks.append(stop_button_row(stop_callback))
     return blocks
 
 
@@ -223,26 +268,48 @@ class StatusMessage:
     Progress updates are coalesced: while one edit is in flight the next one is
     dropped, because the update after it carries newer state anyway. That keeps a
     batch of parallel tool calls from firing a burst of edits at the same message.
+
+    ``stop_callback`` (callback data, e.g. ``queue_stop_<job token>``) adds the Stop
+    button to every progress edit; ``finish()`` and ``set_text()`` remove it.
     """
 
     MAX_PROGRESS_FAILURES = 2  # stop paying for rejected progress edits; finish() still tries
 
-    def __init__(self, sender, message, *, rich: bool, header: str) -> None:
+    def __init__(self, sender, message, *, rich: bool, header: str, stop_callback: str | None = None) -> None:
         self.sender = sender
         self.message = message
         self.header = header
+        self.stop_callback = stop_callback
         self.rich = bool(rich and message is not None and rich_render.is_available())
         self._lock = asyncio.Lock()
         self._progress_failures = 0
 
-    async def _edit_rich(self, blocks: list, *, progress: bool) -> bool:
-        """True when the message now shows ``blocks``. Never raises."""
+    async def _rich_edit(self, blocks: list, reply_markup: InlineKeyboardMarkup | None) -> None:
+        await self.sender.bot.edit_message_text(
+            chat_id=self.sender.chat_id,
+            message_id=self.message.message_id,
+            rich_message=InputRichMessage(blocks=blocks),
+            reply_markup=reply_markup,
+        )
+
+    async def _edit_rich(
+        self,
+        blocks: list,
+        *,
+        progress: bool,
+        reply_markup: InlineKeyboardMarkup | None = None,
+        buttons_fallback: InlineKeyboardMarkup | None = None,
+    ) -> bool:
+        """True when the message now shows ``blocks``. Never raises.
+
+        ``buttons_fallback``: ``blocks`` ends with a button row. If the edit is refused it
+        is retried once without the row and with this inline keyboard instead; when that
+        works, button rows are given up on for the process.
+        """
         if not self.rich or self.message is None:
             return False
         try:
-            await self.sender.bot.edit_message_text(
-                chat_id=self.sender.chat_id, message_id=self.message.message_id, rich_message=InputRichMessage(blocks=blocks)
-            )
+            await self._rich_edit(blocks, reply_markup)
             self._progress_failures = 0
             return True
         except TelegramNotFound as e:
@@ -251,6 +318,8 @@ class StatusMessage:
             self.rich = False
         except TelegramBadRequest as e:
             if is_not_modified(e):
+                return True
+            if buttons_fallback is not None and await self._edit_without_buttons(blocks[:-1], buttons_fallback, e):
                 return True
             if progress:
                 # This particular progress payload was refused; the summary is a
@@ -264,32 +333,75 @@ class StatusMessage:
             logger.warning("Rich status edit failed: %s", e)
         return False
 
+    async def _edit_without_buttons(self, blocks: list, keyboard: InlineKeyboardMarkup, error: Exception) -> bool:
+        """The edit with a button row was refused: the same blocks without it, the inline keyboard instead."""
+        try:
+            await self._rich_edit(blocks, keyboard)
+        except TelegramBadRequest as e:
+            if not is_not_modified(e):
+                logger.debug("Rich status refused without the button row too: %s", e)
+                return False
+        except Exception as e:  # noqa: BLE001 - the original error decides what happens next
+            logger.debug("Rich status retry without the button row failed: %s", e)
+            return False
+        # Only the button row was the problem: later edits use the inline keyboard right away.
+        rich_render.mark_buttons_unavailable(str(error))
+        self._progress_failures = 0
+        return True
+
     async def update(self, *, step, details, iteration, critique, trace, quota: str = "") -> None:
         if self.message is None or self._lock.locked():
             return  # an edit is already in flight; the next update carries newer state
         async with self._lock:
+            keyboard = stop_keyboard(self.stop_callback) if self.stop_callback else None
             if self.rich and self._progress_failures < self.MAX_PROGRESS_FAILURES:
-                if await self._edit_rich(progress_blocks(self.header, quota, step, details, iteration, critique, trace), progress=True):
+                row = keyboard is not None and rich_render.buttons_available()
+                blocks = progress_blocks(
+                    self.header, quota, step, details, iteration, critique, trace,
+                    stop_callback=self.stop_callback if row else None,
+                )
+                if row:
+                    edited = await self._edit_rich(blocks, progress=True, buttons_fallback=keyboard)
+                else:
+                    edited = await self._edit_rich(blocks, progress=True, reply_markup=keyboard)
+                if edited:
                     return
             await self.sender.edit_text(
-                self.message, progress_text(self.header, quota, step, details, iteration, critique, trace), fallback="strip"
+                self.message, progress_text(self.header, quota, step, details, iteration, critique, trace),
+                fallback="strip", reply_markup=keyboard,
             )
 
-    async def finish(self, trace, *, keep: bool) -> None:
-        """End of a successful turn: shorten into the summary, or delete."""
+    async def finish(self, trace, *, keep: bool, actions: list | None = None) -> bool:
+        """End of a successful turn: shorten into the summary (no Stop button), or delete.
+
+        ``actions`` ((label, callback_data, style) tuples) go on the summary: a button row
+        at its end; when the row is refused, the rich summary without it plus an inline
+        keyboard (and rows are given up on for the process); when rich fails entirely, the
+        text summary with the inline keyboard. Returns True when the actions were placed,
+        False when there were none, the status was deleted (``keep`` off) or no edit
+        worked, so the caller puts them under the answer instead.
+        """
         if self.message is None:
-            return
+            return False
         async with self._lock:
             if not keep:
                 await self.sender.delete([self.message])
-                return
+                return False
+            keyboard = actions_keyboard(actions) if actions else None
             # Always worth one rich attempt: the summary differs from every progress payload.
-            if self.rich and await self._edit_rich(summary_blocks(trace), progress=False):
-                return
-            await self.sender.edit_text(self.message, trace_summary(trace), fallback="strip")
+            if self.rich:
+                blocks = summary_blocks(trace)
+                if keyboard is not None and rich_render.buttons_available():
+                    edited = await self._edit_rich(blocks + [action_row(actions)], progress=False, buttons_fallback=keyboard)
+                else:
+                    edited = await self._edit_rich(blocks, progress=False, reply_markup=keyboard)
+                if edited:
+                    return keyboard is not None
+            edited_text = await self.sender.edit_text(self.message, trace_summary(trace), fallback="strip", reply_markup=keyboard)
+            return keyboard is not None and edited_text is not None
 
     async def set_text(self, text: str) -> None:
-        """Stopped / error notices."""
+        """Stopped / error notices (no Stop button)."""
         if self.message is None:
             return
         async with self._lock:

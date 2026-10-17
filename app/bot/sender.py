@@ -119,19 +119,30 @@ class ChatSender:
         # user untouched rather than with its underscores stripped.
         return await self.bot.send_message(text=text, reply_markup=reply_markup, **self._kw())
 
-    async def edit_text(self, message: Message, text: str, *, markdown: bool = True, fallback: str = "raw") -> Message | None:
+    async def edit_text(
+        self,
+        message: Message,
+        text: str,
+        *,
+        markdown: bool = True,
+        fallback: str = "raw",
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> Message | None:
         """Best-effort edit: never raises (status edits must not break a turn or a cancel).
 
         ``fallback`` decides what is shown when Telegram rejects the Markdown: ``"raw"`` keeps
         the text untouched (LLM output must not lose its underscores), ``"strip"`` removes
         the Markdown symbols (bot-authored status text, where raw asterisks look broken).
+        ``reply_markup`` goes with both attempts; an edit without one removes the message's
+        inline keyboard (how a finished status loses its Stop button).
         """
         text = text if text else "…"
         try:
             if markdown:
                 try:
                     return await self.bot.edit_message_text(
-                        chat_id=self.chat_id, message_id=message.message_id, text=text, parse_mode=LEGACY_MARKDOWN
+                        chat_id=self.chat_id, message_id=message.message_id, text=text, parse_mode=LEGACY_MARKDOWN,
+                        reply_markup=reply_markup,
                     )
                 except TelegramBadRequest as e:
                     if is_not_modified(e):
@@ -139,7 +150,9 @@ class ChatSender:
                     logger.warning("Markdown edit rejected (%s); sending %s text", e, fallback)
                     if fallback == "strip":
                         text = strip_markdown(text)
-            return await self.bot.edit_message_text(chat_id=self.chat_id, message_id=message.message_id, text=text)
+            return await self.bot.edit_message_text(
+                chat_id=self.chat_id, message_id=message.message_id, text=text, reply_markup=reply_markup
+            )
         except TelegramBadRequest as e:
             if not is_not_modified(e):
                 logger.warning("edit_text failed: %s", e)

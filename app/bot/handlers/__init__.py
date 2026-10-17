@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from aiogram import Router
 
-from bot.handlers import commands, messages, reminders_ui, settings_ui, stats_ui
+from bot.handlers import commands, messages, questions_ui, reminders_ui, settings_ui, stats_ui, turn_actions_ui
 from bot.handlers.middleware import AuthMiddleware
 
 
@@ -23,14 +23,20 @@ def build_root_router() -> Router:
     ui = Router(name="ui")
     ui.message.middleware(AuthMiddleware())
     ui.callback_query.middleware(AuthMiddleware())
+    ui.stopped_message_generation.middleware(AuthMiddleware())  # the Stop button on a streaming draft
     ui.include_router(commands.voice_router)
     ui.include_router(settings_ui.router)
     ui.include_router(reminders_ui.router)
     ui.include_router(messages.control_router)
+    ui.include_router(questions_ui.router)  # ask_user_choice answers
+    ui.include_router(turn_actions_ui.router)  # listen / reasoning file: no agent run, no quota
     root.include_router(ui)
 
     chat = Router(name="chat")
     chat.message.middleware(AuthMiddleware(check_limits=True))
+    # Retry / Continue / follow-up buttons start an agent turn, so they pass the quota check too.
+    chat.callback_query.middleware(AuthMiddleware(check_limits=True))
+    chat.include_router(turn_actions_ui.turn_router)
     chat.include_router(messages.router)
     root.include_router(chat)
 

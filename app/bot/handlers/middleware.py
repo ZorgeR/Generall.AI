@@ -10,7 +10,7 @@ import logging
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware
-from aiogram.types import CallbackQuery, Message, TelegramObject
+from aiogram.types import CallbackQuery, Message, MessageGenerationStopped, TelegramObject
 
 from bot.auth import auth
 from bot.limits import check_user_limits
@@ -28,6 +28,8 @@ def event_chat_id(event: TelegramObject) -> int | None:
         if event.message is not None:
             return event.message.chat.id
         return event.from_user.id if event.from_user else None
+    if isinstance(event, MessageGenerationStopped):
+        return event.chat.id
     return None
 
 

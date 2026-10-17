@@ -1,0 +1,499 @@
+"""bot/handlers/settings_ui.py: the rich /settings page, apply_setting and the keyboard fallback."""
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from aiogram.exceptions import TelegramBadRequest, TelegramNotFound
+from aiogram.methods import SendMessage
+from aiogram.types import (
+    Chat,
+    InputRichBlockButtons,
+    InputRichBlockDetails,
+    InputRichBlockParagraph,
+    InputRichMessage,
+    Message,
+    RichTextBold,
+)
+
+from bot import rich
+from bot.handlers import settings_ui as su
+from bot.settings import DEFAULT_SETTINGS, SYSTEM_PROMPT_TYPES, UserSettings
+from models import IMAGE_MAX_VARIANTS
+
+_M = SendMessage(chat_id=1, text="x")
+USER = 42
+
+
+def bad_request(msg="Bad Request: can't parse rich message"):
+    return TelegramBadRequest(method=_M, message=msg)
+
+
+@pytest.fixture(autouse=True)
+def _isolated(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # UserSettings writes data/<uid>/settings.json under the cwd
+    rich.reset()
+    monkeypatch.setitem(su._page_state, "flat", False)
+    yield
+    rich.reset()
+
+
+@pytest.fixture
+def ui(monkeypatch):
+    """Record the keyboard UI (answer_md / edit_md) instead of talking to Telegram."""
+    calls = []
+
+    async def answer_md(message, text, reply_markup=None):
+        calls.append(("answer_md", text, reply_markup))
+
+    async def edit_md(message, text, reply_markup=None):
+        calls.append(("edit_md", text, reply_markup))
+
+    monkeypatch.setattr(su, "answer_md", answer_md)
+    monkeypatch.setattr(su, "edit_md", edit_md)
+    return calls
+
+
+def make_message(*, thread_id=None, message_id=7):
+    return Message(
+        message_id=message_id,
+        date=datetime.now(timezone.utc),
+        chat=Chat(id=USER, type="supergroup" if thread_id else "private"),
+        message_thread_id=thread_id,
+        is_topic_message=True if thread_id else None,
+    )
+
+
+def make_callback(data, message=None):
+    return SimpleNamespace(data=data, message=message or make_message(), answer=AsyncMock())
+
+
+def make_bot(*, send_errors=(), edit_errors=()):
+    bot = SimpleNamespace()
+    bot.send_rich_message = AsyncMock(side_effect=list(send_errors) + [SimpleNamespace(message_id=100)])
+    bot.edit_message_text = AsyncMock(side_effect=list(edit_errors) + [SimpleNamespace(message_id=7)])
+    return bot
+
+
+def with_values(values):
+    """A UserSettings with raw (unsaved, unvalidated) values: {(category, key): value}."""
+    us = UserSettings(str(USER))
+    for (category, key), value in values.items():
+        us.settings.setdefault(category, {})[key] = value
+    return us
+
+
+def walk(blocks):
+    for block in blocks:
+        yield block
+        if isinstance(block, InputRichBlockDetails):
+            yield from walk(block.blocks)
+
+
+def rows(blocks):
+    return [b for b in walk(blocks) if isinstance(b, InputRichBlockButtons)]
+
+
+def details(blocks):
+    return [b for b in blocks if isinstance(b, InputRichBlockDetails)]
+
+
+def row_of(blocks, name):
+    """The button row that follows the paragraph whose bold name is ``name``."""
+    flat = list(walk(blocks))
+    for i, block in enumerate(flat):
+        if isinstance(block, InputRichBlockParagraph) and isinstance(block.text, list) and block.text[0].text == name:
+            return flat[i + 1]
+    raise AssertionError(f"no setting named {name!r}")
+
+
+EDGE_SETTINGS = [
+    {},  # defaults
+    {  # everything off, every number at its minimum
+        ("transcript", "enabled"): False, ("transcript", "max_context_tokens"): 20000, ("transcript", "keep_tool_results_turns"): 0,
+        ("summarization_history", "enabled"): False, ("summarization_history", "size"): 1,
+        ("dialog_history", "size"): 1, ("tools", "max_iteration"): 1, ("critique", "max_iteration"): 1,
+        ("semantic_search", "max_results"): 1, ("image", "max_variants"): 1, ("image", "metadata"): False,
+        ("follow_ups", "enabled"): False, ("rich_messages", "enabled"): False, ("trace", "keep_summary"): False,
+    },
+    {  # every number at its maximum, last choices
+        ("transcript", "max_context_tokens"): 400000, ("transcript", "keep_tool_results_turns"): 50,
+        ("summarization_history", "size"): 50, ("dialog_history", "size"): 50, ("tools", "max_iteration"): 300,
+        ("judge", "max_iteration"): 300, ("semantic_search", "max_results"): 20, ("image", "max_variants"): IMAGE_MAX_VARIANTS,
+        ("image", "engine"): "story", ("image", "quality"): "max", ("image", "size"): "4K",
+        ("system_prompt", "type"): SYSTEM_PROMPT_TYPES[-1],
+    },
+    {  # hand-edited garbage
+        ("tools", "max_iteration"): "lots", ("transcript", "max_context_tokens"): None, ("summarization_history", "size"): 4,
+        ("image", "engine"): "dall-e-" + "x" * 80, ("image", "quality"): "", ("system_prompt", "type"): "custom",
+        ("image", "max_variants"): 99,
+    },
+]
+
+
+# ---- rendering ---------------------------------------------------------------
+def test_page_layout_for_defaults():
+    blocks = su.settings_page_blocks(UserSettings(str(USER)))
+    assert blocks[0].text.text == "⚙️ Settings"
+    assert blocks[1].text.text == su.PAGE_HINT
+    sections = details(blocks)
+    assert [d.summary.split(" · ")[0] for d in sections] == ["🧠 Memory", "🤖 Agent", "💬 Replies", "🎨 Images"]
+    assert sections[0].summary == "🧠 Memory · transcript ✅ 120k · summaries ✅ 5"
+    assert sections[1].summary == "🤖 Agent · thinking ✅ · tools ✅ 20 · generall-ai-v2"
+    assert sections[2].summary == "💬 Replies · rich ✅ · summary ✅ · follow-ups ✅"
+    assert sections[3].summary == "🎨 Images · auto · auto · 2K · ×4"
+    assert not any(d.is_open for d in sections)  # a fresh /settings: all closed
+    # Every setting is a bold paragraph followed by its button row.
+    for section in sections:
+        kinds = [type(b) for b in section.blocks]
+        assert kinds == [InputRichBlockParagraph, InputRichBlockButtons] * (len(kinds) // 2)
+        assert isinstance(section.blocks[0].text[0], RichTextBold)
+    assert len(rows(blocks)) == len(su.CONTROLS)
+
+
+def test_only_the_open_section_is_open():
+    blocks = su.settings_page_blocks(UserSettings(str(USER)), open_section="replies")
+    assert [bool(d.is_open) for d in details(blocks)] == [False, False, True, False]
+
+
+def test_flat_layout_has_the_same_content_without_details():
+    us = UserSettings(str(USER))
+    flat = su.settings_page_blocks(us, sections=False)
+    assert not any(isinstance(b, InputRichBlockDetails) for b in flat)
+    headings = [b.text.text for b in flat if isinstance(b, InputRichBlockParagraph) and isinstance(b.text, RichTextBold)]
+    assert headings[1:] == [d.summary for d in details(su.settings_page_blocks(us))]
+    assert [r.model_dump() for r in rows(flat)] == [r.model_dump() for r in rows(su.settings_page_blocks(us))]
+
+
+@pytest.mark.parametrize("values", EDGE_SETTINGS)
+@pytest.mark.parametrize("sections", [True, False])
+def test_every_button_fits_parses_and_applies(values, sections):
+    us = with_values(values)
+    blocks = su.settings_page_blocks(us, open_section="memory", sections=sections)
+    page = InputRichMessage(blocks=blocks)
+    assert len(page.model_dump_json(exclude_none=True).encode()) < rich.RICH_BYTE_LIMIT // 2
+    assert len(list(walk(blocks))) < rich.RICH_BLOCK_LIMIT
+    for row in rows(blocks):
+        assert 1 <= len(row.buttons) <= su.ROW_BUTTON_LIMIT
+        for button in row.buttons:
+            assert button.text
+            if button.callback_data is None:
+                assert button.disabled is not None  # value labels and the −/+ at either end
+                continue
+            data = button.callback_data
+            assert data.startswith(su.PAGE_PREFIX) and len(data.encode()) <= su.CALLBACK_DATA_LIMIT
+            token, action, value = su.parse_page_callback(data)
+            assert (token, action) in su.CONTROLS
+            if token != "system_prompt" and value is not None:
+                assert "_" not in value
+            # Every button really changes something, each applied to the rendered state: apply_setting
+            # saves, so drop the file a previous button wrote or this would see that button's change.
+            Path(us.path).unlink(missing_ok=True)
+            fresh = with_values(values)
+            assert fresh.as_dict() == us.as_dict()
+            assert su.apply_setting(fresh, token, action, value), data
+
+
+def test_toggle_button():
+    us = with_values({("follow_ups", "enabled"): True, ("thinking", "enabled"): False})
+    blocks = su.settings_page_blocks(us)
+    on = row_of(blocks, "🧭 Follow-ups").buttons
+    off = row_of(blocks, "🤔 Thinking").buttons
+    assert [(b.text, b.style, b.callback_data) for b in on] == [("✅ On", "success", "setp_followups_toggle")]
+    assert [(b.text, b.style, b.callback_data) for b in off] == [("⬜ Off", None, "setp_thinking_toggle")]
+
+
+def test_number_row_steps_and_ends():
+    us = with_values({("tools", "max_iteration"): 1, ("judge", "max_iteration"): 300, ("transcript", "max_context_tokens"): 120000})
+    blocks = su.settings_page_blocks(us)
+    minus, label, plus = row_of(blocks, "Tool steps").buttons
+    assert minus.disabled is not None and minus.callback_data is None and minus.text == "−"
+    assert label.text == "1" and label.disabled is not None
+    assert plus.callback_data == "setp_tools_iteration_2"
+    minus, label, plus = row_of(blocks, "Judge rounds").buttons
+    assert minus.callback_data == "setp_judge_iteration_200" and label.text == "300" and plus.disabled is not None
+    minus, label, plus = row_of(blocks, "Max context").buttons
+    assert (minus.callback_data, label.text, plus.callback_data) == (
+        "setp_transcript_ctx_100000", "120k", "setp_transcript_ctx_150000")
+
+
+def test_step_values_snap_off_list_values_without_skipping():
+    choices = (1, 5, 10, 20)
+    assert su.step_values(choices, 5) == (1, 10)
+    assert su.step_values(choices, 1) == (None, 5)
+    assert su.step_values(choices, 20) == (10, None)
+    assert su.step_values(choices, 4) == (1, 5)  # off the list: nearest choice in each direction
+    assert su.step_values(choices, 7) == (5, 10)
+    assert su.step_values(choices, 0) == (None, 1)
+    assert su.step_values(choices, 99) == (20, None)
+
+
+def test_number_row_for_an_off_list_value_shows_the_real_value():
+    blocks = su.settings_page_blocks(with_values({("summarization_history", "size"): 4, ("transcript", "max_context_tokens"): 400000}))
+    minus, label, plus = row_of(blocks, "Summaries kept").buttons
+    assert (minus.callback_data, label.text, plus.callback_data) == ("setp_summarization_size_1", "4", "setp_summarization_size_5")
+    minus, label, plus = row_of(blocks, "Max context").buttons
+    assert (minus.callback_data, label.text, plus.disabled is not None) == ("setp_transcript_ctx_300000", "400k", True)
+
+
+def test_cycle_wraps_around():
+    assert su.next_choice(("a", "b", "c"), "a") == "b"
+    assert su.next_choice(("a", "b", "c"), "c") == "a"
+    assert su.next_choice(("a", "b", "c"), "zzz") == "a"
+    blocks = su.settings_page_blocks(with_values({("image", "quality"): "max", ("system_prompt", "type"): SYSTEM_PROMPT_TYPES[-1]}))
+    (quality,) = row_of(blocks, "✨ Quality").buttons
+    assert (quality.text, quality.callback_data) == ("max ▸", "setp_image_quality_auto")
+    (prompt,) = row_of(blocks, "🧩 System prompt").buttons
+    assert (prompt.text, prompt.callback_data) == (f"{SYSTEM_PROMPT_TYPES[-1]} ▸", f"setp_sysprompt_{SYSTEM_PROMPT_TYPES[0]}")
+    (engine,) = row_of(blocks, "🖌 Engine").buttons
+    assert engine.callback_data == "setp_image_engine_best"  # auto -> best (sorted IMAGE_BACKENDS)
+
+
+def test_parse_page_callback():
+    assert su.parse_page_callback("setp_tools_iteration_30") == ("tools", "iteration", "30")
+    assert su.parse_page_callback("setp_followups_toggle") == ("followups", "toggle", None)
+    assert su.parse_page_callback("setp_sysprompt_perplexity-deep-research") == ("system_prompt", "set", "perplexity-deep-research")
+    assert su.parse_page_callback("settings_tools_toggle") is None
+
+
+# ---- apply_setting -----------------------------------------------------------
+def test_apply_setting_toggles_and_persists():
+    us = UserSettings(str(USER))
+    assert su.apply_setting(us, "followups", "toggle") is True
+    assert su.apply_setting(us, "trace", "toggle", "ignored") is True
+    assert su.apply_setting(us, "image", "metadata") is True
+    again = UserSettings(str(USER))
+    assert again.get("follow_ups", "enabled") is False
+    assert again.get("trace", "keep_summary") is False
+    assert again.get("image", "metadata") is False
+
+
+@pytest.mark.parametrize("token, action, value, category, key, expected", [
+    ("summarization", "size", "999", "summarization_history", "size", 50),
+    ("dialog", "size", "0", "dialog_history", "size", 1),
+    ("tools", "iteration", "0", "tools", "max_iteration", 1),
+    ("critique", "iteration", "1000", "critique", "max_iteration", 300),
+    ("semantic", "max", "50", "semantic_search", "max_results", 20),
+    ("transcript", "ctx", "1", "transcript", "max_context_tokens", 20000),
+    ("transcript", "keep", "99", "transcript", "keep_tool_results_turns", 50),
+    ("transcript", "keep", "0", "transcript", "keep_tool_results_turns", 0),
+    ("image", "variants", "9", "image", "max_variants", IMAGE_MAX_VARIANTS),
+    ("image", "variants", "0", "image", "max_variants", 1),
+])
+def test_apply_setting_clamps(token, action, value, category, key, expected):
+    us = UserSettings(str(USER))
+    us.set(category, 2, key)  # start away from both ends, so every clamp is a change
+    assert su.apply_setting(us, token, action, value) is True
+    assert UserSettings(str(USER)).get(category, key) == expected
+
+
+@pytest.mark.parametrize("token, action, value", [
+    ("image", "engine", "dalle"),
+    ("image", "quality", "ultra"),
+    ("image", "size", "8K"),
+    ("system_prompt", "set", "evil"),
+    ("tools", "iteration", "abc"),
+    ("tools", "iteration", None),
+    ("tools", "explode", "1"),
+    ("nope", "toggle", None),
+    (None, None, None),
+    ("tools", "iteration", "20"),  # the current value: nothing changes
+    ("image", "engine", "auto"),
+])
+def test_apply_setting_rejects_unknown_and_unchanged(token, action, value):
+    us = UserSettings(str(USER))
+    before = us.as_dict()
+    assert su.apply_setting(us, token, action, value) is False
+    assert us.as_dict() == before
+
+
+def test_apply_setting_choices():
+    us = UserSettings(str(USER))
+    assert su.apply_setting(us, "image", "engine", "fast") is True
+    assert su.apply_setting(us, "system_prompt", "set", "perplexity-r1") is True
+    again = UserSettings(str(USER))
+    assert again.get("image", "engine") == "fast"
+    assert again.get("system_prompt", "type") == "perplexity-r1"
+
+
+def test_every_control_addresses_a_default_setting():
+    for (token, action), control in su.CONTROLS.items():
+        assert control.key in DEFAULT_SETTINGS[control.category], (token, action)
+        assert su.SECTION_OF_TOKEN[token] in {s.id for s in su.SECTIONS}
+
+
+# ---- /settings ---------------------------------------------------------------
+async def test_settings_command_sends_one_rich_page(ui):
+    bot = make_bot()
+    await su.settings_command(make_message(), bot)
+    assert ui == []
+    bot.send_rich_message.assert_awaited_once()
+    kw = bot.send_rich_message.await_args.kwargs
+    assert kw["chat_id"] == USER and "message_thread_id" not in kw
+    page = kw["rich_message"]
+    assert isinstance(page, InputRichMessage) and page.markdown is None and page.html is None
+    assert len(details(page.blocks)) == 4 and not any(d.is_open for d in details(page.blocks))
+
+
+async def test_settings_command_in_a_forum_topic(ui):
+    bot = make_bot()
+    await su.settings_command(make_message(thread_id=5), bot)
+    assert bot.send_rich_message.await_args.kwargs["message_thread_id"] == 5
+
+
+async def test_settings_command_retries_flat_and_remembers_it(ui):
+    bot = make_bot(send_errors=[bad_request()])
+    await su.settings_command(make_message(), bot)
+    assert ui == []
+    first, second = (c.kwargs["rich_message"] for c in bot.send_rich_message.await_args_list)
+    assert details(first.blocks) and not details(second.blocks)
+    assert su._page_state["flat"] is True and rich.buttons_available()
+    # The next page starts flat: one call, no sections.
+    bot = make_bot()
+    await su.settings_command(make_message(), bot)
+    bot.send_rich_message.assert_awaited_once()
+    assert not details(bot.send_rich_message.await_args.kwargs["rich_message"].blocks)
+
+
+async def test_settings_command_falls_back_to_the_keyboards(ui):
+    bot = make_bot(send_errors=[bad_request(), bad_request("Bad Request: unknown block type")])
+    await su.settings_command(make_message(), bot)
+    assert bot.send_rich_message.await_count == 2
+    assert not rich.buttons_available() and rich.is_available()
+    assert su._page_state["flat"] is False  # the sections were not what failed
+    assert [c[0] for c in ui] == ["answer_md"] and ui[0][1].startswith("*Settings Overview*")
+    # Buttons are off for the process now: straight to the keyboards.
+    bot = make_bot()
+    await su.settings_command(make_message(), bot)
+    bot.send_rich_message.assert_not_awaited()
+    assert [c[0] for c in ui] == ["answer_md", "answer_md"]
+
+
+async def test_settings_command_without_rich_support(ui):
+    bot = make_bot(send_errors=[TelegramNotFound(method=_M, message="Not Found")])
+    await su.settings_command(make_message(), bot)
+    assert not rich.is_available()
+    assert [c[0] for c in ui] == ["answer_md"]
+
+
+async def test_settings_command_rich_messages_off_uses_the_keyboards(ui):
+    UserSettings(str(USER)).set("rich_messages", False, "enabled")
+    bot = make_bot()
+    await su.settings_command(make_message(), bot)
+    bot.send_rich_message.assert_not_awaited()
+    text, keyboard = ui[0][1], ui[0][2]
+    assert "🧭 *Follow-ups*: ✅" in text
+    datas = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    assert "settings_followups" in datas and "settings_summarization" in datas
+
+
+# ---- page buttons ------------------------------------------------------------
+async def test_page_button_applies_and_edits_in_place(ui):
+    bot = make_bot()
+    cb = make_callback("setp_tools_iteration_30", make_message(message_id=55))
+    await su.settings_page_button(cb, bot)
+    cb.answer.assert_awaited_once()
+    assert UserSettings(str(USER)).get("tools", "max_iteration") == 30
+    kw = bot.edit_message_text.await_args.kwargs
+    assert (kw["chat_id"], kw["message_id"]) == (USER, 55)
+    sections = details(kw["rich_message"].blocks)
+    assert [bool(d.is_open) for d in sections] == [False, True, False, False]
+    assert "tools ✅ 30" in sections[1].summary
+    assert ui == []
+
+
+@pytest.mark.parametrize("data, open_index, check", [
+    ("setp_followups_toggle", 2, lambda s: s.get("follow_ups", "enabled") is False),
+    ("setp_sysprompt_perplexity-r1", 1, lambda s: s.get("system_prompt", "type") == "perplexity-r1"),
+    ("setp_image_size_4K", 3, lambda s: s.get("image", "size") == "4K"),
+    ("setp_summarization_size_10", 0, lambda s: s.get("summarization_history", "size") == 10),
+])
+async def test_page_button_opens_the_changed_section(ui, data, open_index, check):
+    bot = make_bot()
+    await su.settings_page_button(make_callback(data), bot)
+    assert check(UserSettings(str(USER)))
+    sections = details(bot.edit_message_text.await_args.kwargs["rich_message"].blocks)
+    assert [i for i, d in enumerate(sections) if d.is_open] == [open_index]
+
+
+async def test_page_button_not_modified_is_success(ui):
+    bot = make_bot(edit_errors=[bad_request("Bad Request: message is not modified")])
+    await su.settings_page_button(make_callback("setp_image_engine_dalle"), bot)  # rejected value: same page
+    bot.edit_message_text.assert_awaited_once()
+    assert ui == []
+
+
+async def test_page_button_edit_failure_sends_the_keyboards(ui):
+    bot = make_bot(edit_errors=[bad_request("Bad Request: message can't be edited")] * 2)
+    await su.settings_page_button(make_callback("setp_thinking_toggle"), bot)
+    assert bot.edit_message_text.await_count == 2  # sections, then flat
+    assert UserSettings(str(USER)).get("thinking", "enabled") is False  # the change itself is kept
+    assert [c[0] for c in ui] == ["answer_md"] and "🤔 *Thinking Status*: ❌" in ui[0][1]
+    assert rich.buttons_available() and su._page_state["flat"] is False  # an edit failure is about that message
+
+
+async def test_page_button_ignores_inaccessible_messages(ui):
+    bot = make_bot()
+    cb = SimpleNamespace(data="setp_thinking_toggle", message=None, answer=AsyncMock())
+    await su.settings_page_button(cb, bot)
+    cb.answer.assert_awaited_once()
+    bot.edit_message_text.assert_not_awaited()
+    assert UserSettings(str(USER)).get("thinking", "enabled") is True
+
+
+# ---- keyboards (old settings messages keep working) ---------------------------
+async def test_keyboard_toggle(ui):
+    await su.settings_button(make_callback("settings_thinking_toggle"))
+    assert UserSettings(str(USER)).get("thinking", "enabled") is False
+    assert ui[-1][0] == "edit_md" and ui[-1][1].startswith("*Thinking Status Settings*") and "Disabled" in ui[-1][1]
+
+
+async def test_keyboard_numbers(ui):
+    await su.settings_button(make_callback("settings_tools_iteration_7"))
+    assert UserSettings(str(USER)).get("tools", "max_iteration") == 7
+    assert ui[-1][1].startswith("*Tools Settings*")
+    await su.settings_button(make_callback("settings_tools_iteration"))  # no value: the choice list
+    assert ui[-1][1].startswith("*Select Tools Max Iterations*")
+    assert UserSettings(str(USER)).get("tools", "max_iteration") == 7
+    await su.settings_button(make_callback("settings_summarization_size_999"))
+    assert UserSettings(str(USER)).get("summarization_history", "size") == 50
+    await su.settings_button(make_callback("settings_transcript_ctx"))
+    assert ui[-1][1].startswith("*Max context (tokens)*")
+
+
+async def test_keyboard_image_choices(ui):
+    await su.settings_button(make_callback("settings_image_size"))
+    assert ui[-1][1].startswith("*Size*")  # image size is a choice list, not the history-size menu
+    await su.settings_button(make_callback("settings_image_size_4K"))
+    assert UserSettings(str(USER)).get("image", "size") == "4K" and ui[-1][1].startswith("*Image Settings*")
+    await su.settings_button(make_callback("settings_image_engine_dalle"))
+    assert UserSettings(str(USER)).get("image", "engine") == "auto" and ui[-1][1].startswith("*Image Settings*")
+
+
+async def test_keyboard_system_prompt(ui):
+    await su.settings_button(make_callback("settings_system_prompt"))
+    assert ui[-1][1].startswith("*System Prompt Settings*")
+    await su.settings_button(make_callback("settings_system_prompt_set_generall-ai-v1"))
+    assert UserSettings(str(USER)).get("system_prompt", "type") == "generall-ai-v1"
+    assert "Current Type: *generall-ai-v1*" in ui[-1][1]
+    await su.settings_button(make_callback("settings_system_prompt_set_bogus"))
+    assert UserSettings(str(USER)).get("system_prompt", "type") == "generall-ai-v1"
+
+
+async def test_keyboard_followups(ui):
+    await su.settings_button(make_callback("settings_followups"))
+    text, keyboard = ui[-1][1], ui[-1][2]
+    assert text.startswith("*Follow-up Suggestions*") and "buttons under answers" in text
+    assert keyboard.inline_keyboard[0][0].callback_data == "settings_followups_toggle"
+    await su.settings_button(make_callback("settings_followups_toggle"))
+    assert UserSettings(str(USER)).get("follow_ups", "enabled") is False
+    assert "Status: Disabled" in ui[-1][1]
+
+
+async def test_keyboard_main_and_unknown(ui):
+    await su.settings_button(make_callback("settings_main"))
+    assert ui[-1][1].startswith("*Settings Overview*")
+    count = len(ui)
+    await su.settings_button(make_callback("settings_bogus_toggle"))
+    assert len(ui) == count

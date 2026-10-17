@@ -6,6 +6,12 @@ users never wait for each other. Long jobs are bounded by a deadline, a global
 semaphore caps how many turns run at once, and ``cancel()`` implements
 ``/cancel``.
 
+Every job has a random id. The Stop buttons of a running turn (the one in its
+status message and Telegram's own button on its streaming draft, whose
+``draft_id`` is the job id) name that id, and ``cancel_current()`` stops the
+running job only when it is still the one the button belongs to: a late press
+never hits the next turn, and queued messages are kept.
+
 Jobs must be cooperative: they run as asyncio tasks, so blocking work inside
 them has to be offloaded with ``asyncio.to_thread``. A job that ignores
 cancellation cannot be stopped.
@@ -14,11 +20,31 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
+
+# Callback data of the Stop button on a running turn: "queue_stop_<Job.token>".
+STOP_CALLBACK_PREFIX = "queue_stop_"
+_JOB_ID_LIMIT = 2**31  # ids are 1 .. 2**31 - 1
+_TOKEN_RE = re.compile(r"[0-9a-f]{1,8}")
+
+
+def new_job_id() -> int:
+    """A random non-zero 31-bit id: a valid Telegram ``draft_id`` and short in callback data."""
+    return secrets.randbelow(_JOB_ID_LIMIT - 1) + 1
+
+
+def job_id_from_token(token: str | None) -> int | None:
+    """The inverse of ``Job.token``; None for anything that is not one (stale or forged callback data)."""
+    if not token or not _TOKEN_RE.fullmatch(token):
+        return None
+    value = int(token, 16)
+    return value if 0 < value < _JOB_ID_LIMIT else None
 
 
 @dataclass
@@ -29,10 +55,16 @@ class Job:
     created_at: float = field(default_factory=time.monotonic)
     progress: str = ""
     started_at: float | None = None  # set when the job actually starts (after the slot wait)
+    id: int = field(default_factory=new_job_id)  # also the draft_id of the turn's streaming drafts
 
     @property
     def elapsed(self) -> float:
         return time.monotonic() - self.started_at if self.started_at else 0.0
+
+    @property
+    def token(self) -> str:
+        """The id as lowercase hex, for callback data (see ``STOP_CALLBACK_PREFIX``)."""
+        return format(self.id, "x")
 
 
 class JobContext:
@@ -41,6 +73,9 @@ class JobContext:
     def __init__(self, job: Job) -> None:
         self.job = job
         self.cancel_reason: str | None = None
+        # Cleared by the job once its answer exists and is being delivered: from then on
+        # its Stop buttons (cancel_current) no longer apply; /cancel (cancel()) still does.
+        self.stoppable = True
 
     def set_progress(self, text: str) -> None:
         self.job.progress = text
@@ -134,11 +169,39 @@ class QueueManager:
         uq.pending.clear()
         cancelled = False
         if uq.current_task is not None and not uq.current_task.done():
-            if uq.context is not None:
-                uq.context.cancel_reason = reason
-            uq.current_task.cancel()
+            # A job already stopping (a Stop button, the deadline) is left to finish its
+            # cleanup: a second cancel would cut the partial answer and the "Stopped." edit.
+            if not uq.current_task.cancelling():
+                if uq.context is not None:
+                    uq.context.cancel_reason = reason
+                uq.current_task.cancel()
             cancelled = True
         return cancelled, dropped
+
+    async def cancel_current(self, user_id: str, job_id: int | None = None, reason: str = "user") -> bool:
+        """Cancel only the running (or slot-waiting) job; queued jobs stay and run next.
+
+        With ``job_id`` the job is cancelled only if it is still the running one, so a
+        Stop button pressed after its turn ended never stops the next turn. A job that
+        cleared ``ctx.stoppable`` (its answer is being delivered) is not cancelled, and a
+        job already being cancelled is not cancelled again. Returns True when the job is
+        (now or already) stopping; ``ctx.cancel_reason`` is set as in ``cancel()``.
+        """
+        uq = self._users.get(str(user_id))
+        if uq is None or uq.current is None or uq.current_task is None or uq.current_task.done():
+            return False
+        if job_id is not None and uq.current.id != job_id:
+            return False
+        if uq.context is not None and not uq.context.stoppable:
+            return False  # the answer is complete and being delivered; nothing left to stop
+        if uq.current_task.cancelling():
+            # Already stopping (e.g. the draft's Stop and the status's Stop both pressed):
+            # a second cancel would interrupt the job's cleanup (partial answer, "Stopped.").
+            return True
+        if uq.context is not None:
+            uq.context.cancel_reason = reason
+        uq.current_task.cancel()
+        return True
 
     async def shutdown(self) -> None:
         self._closed = True

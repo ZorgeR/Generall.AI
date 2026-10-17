@@ -148,6 +148,34 @@ class UserInteractions:
                     },
                     "required": ["file_content", "filename"]
                 }
+            },
+            {
+                "name": "ask_user_choice",
+                "description": "Ask the user to pick one option by tapping a button in Telegram and wait for the answer. Use it when you genuinely need the user's decision before continuing: to confirm an irreversible or outward-facing action the user did not explicitly ask for (sending an SMS, deleting files, uploading or publishing something, spending money), or to choose between a few clearly different ways to proceed. Do not use it for questions you can settle yourself, for open-ended questions (ask those in your reply), or when the user is unlikely to be present (scheduled agent tasks). It blocks until the user taps an option or the timeout passes.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The question shown above the buttons, short and self-contained (say what each choice will do)"
+                        },
+                        "options": {
+                            "type": "array",
+                            "description": "2-8 short button labels, e.g. [\"Send it\", \"Cancel\"]",
+                            "items": {"type": "string", "maxLength": 64},
+                            "minItems": 2,
+                            "maxItems": 8
+                        },
+                        "timeout_seconds": {
+                            "type": "integer",
+                            "description": "How long to wait for a tap, 30-900 seconds (default 300)",
+                            "minimum": 30,
+                            "maximum": 900,
+                            "default": 300
+                        }
+                    },
+                    "required": ["question", "options"]
+                }
             }
         ]
 
@@ -182,7 +210,35 @@ class UserInteractions:
                 tool_args["filename"],
                 tool_args.get("is_base64", False)
             )
+        elif tool_name == "ask_user_choice":
+            return await self._ask_user_choice(
+                tool_args.get("question"),
+                tool_args.get("options"),
+                tool_args.get("timeout_seconds")
+            )
         return f"Unknown tool: {tool_name}"
+
+    async def _ask_user_choice(self, question: Any, options: Any, timeout_seconds: Any = None) -> str:
+        """Ask a multiple-choice question with buttons and wait for the tap (see bot/questions.py)"""
+        from bot import questions
+
+        if self.sender is None or getattr(self.sender, "bot", None) is None:
+            return "Error: there is no Telegram chat to ask in."
+        try:
+            question = questions.clean_question(question)
+            choices = questions.clean_options(options)
+            timeout = questions.clamp_timeout(timeout_seconds)
+        except ValueError as e:
+            return f"Error: {e}"
+        try:
+            # Cancellation (/cancel, turn deadline) propagates: ask() marks the message and re-raises.
+            answer = await questions.ask(self.sender, question, choices, timeout)
+        except Exception as e:
+            logger.warning("ask_user_choice failed for %s: %s", self.user_id, e)
+            return f"Error: could not ask the user: {e}"
+        if answer is None:
+            return f"No answer within {timeout} seconds. Continue without it: take the safe default or ask in your final reply."
+        return f'User chose: "{answer}"'
 
     async def _send_user_message(self, message: str) -> str:
         """Send a message to the user via Telegram"""

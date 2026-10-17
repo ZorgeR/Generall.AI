@@ -9,8 +9,8 @@ wins and the discrepancy is listed under "README vs code".
 A single-process Python Telegram bot (aiogram 3, asyncio) that wraps a Claude
 tool-use agent. Users send text / voice / photos / video / audio / documents in
 Telegram; the bot turns media into a text prompt, runs a per-message agent loop
-with 31 tools (files, web search, code execution in a Docker sandbox,
-image/video generation, reminders, SMS, S3, TTS), persists multi-layer memory
+with 34 tools (files, web search, code execution in a Docker sandbox,
+image/video generation, reminders, SMS, S3, TTS, button questions), persists multi-layer memory
 per user on disk, and replies in Telegram. Claude drives the tool loop; OpenAI
 (`gpt-6.1-sol`) is only consulted by the optional critique step, which can force a
 rewrite. OpenAI, Google Gemini/Veo, Perplexity, Tavily, ElevenLabs, Twilio and
@@ -20,7 +20,9 @@ Every chat has its own job queue: messages are processed strictly in order per
 user, each as its own turn, and users never wait for each other. See "Queues".
 
 There is a small pytest suite (`tests/`, run with `pytest` from the repo root)
-covering the queue, settings, auth, reminder store, text splitting, the model settings module and the /stats views. There is
+covering the queue, settings and the /settings page, auth, reminder store, text splitting, the model settings
+module, the /stats views, the Stop buttons, the turn buttons, `ask_user_choice` and how these features meet
+(`tests/test_cross_features.py`). There is
 no CI, linter, formatter or type checking. Validate changes with the tests and
 the import smoke check at the end of this file.
 
@@ -35,17 +37,24 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
     app.py                  create_bot (local Bot API support), create_dispatcher, startup/shutdown hooks, run()
     config.py               Config dataclass from env (`config` singleton), validate()
     runtime.py              process-wide QueueManager instance + background task list
-    queue.py                QueueManager / Job / JobContext: per-user FIFO workers, deadline, /cancel, global cap
+    queue.py                QueueManager / Job / JobContext: per-user FIFO workers, deadline, global cap, /cancel
+                            (cancel) and the Stop buttons (cancel_current: the running job only, by Job.id)
     sender.py               ChatSender: the one object handlers AND tools use to send text/media/reactions;
                             send_markdown renders LLM answers as rich messages with tiered fallback
     rich.py                 rich-message helpers: split/convert (telegramify-markdown), inline media extraction,
-                            sticky "unsupported" flag
-    agent_runner.py         run_turn(): builds ChainOfThoughtAgent, status updates, streaming, voice reply, answer,
-                            reasoning file, token accounting (record_usage)
-    status.py               StatusMessage: rich status edited in place (progress blocks → end-of-turn summary with
-                            expandable tool calls, thinking, tokens/cost) with legacy-Markdown fallback
+                            sticky "unsupported" flag, sticky "buttons inside rich messages" flag, is_chat_error
+    agent_runner.py         run_turn(): builds ChainOfThoughtAgent, status updates (Stop button), streaming, voice
+                            reply, answer, turn record + buttons, partial answer on Stop, token accounting (record_usage)
+    turn_actions.py         buttons of a finished turn: <follow_ups> parsing, TurnRecord store (data/<uid>/turns/),
+                            turn_* callback data, action rows (Continue/Retry/Listen/Reasoning) and answer keyboard
+    questions.py            ask_user_choice backend: in-memory pending questions (Future per question), ask_*
+                            callback data, rich button rows / inline keyboard, timeout and cancel outcomes
+    status.py               StatusMessage: rich status edited in place (progress blocks + Stop button → end-of-turn
+                            summary with expandable tool calls, thinking, tokens/cost, action row) with legacy-Markdown
+                            fallback
     media.py                Whisper transcription, Claude/GPT image+document description, video frames, TTS, ffmpeg setup
-    streaming.py            throttled draft streaming (rich drafts + <tg-thinking> block, plain draft fallback)
+    streaming.py            throttled draft streaming (rich drafts + <tg-thinking> block, plain draft fallback);
+                            draft_id = Job.id with Telegram's Stop (can_stop), follow-ups block hidden, partial_text()
     auth.py                 AuthStore (`auth` singleton): allow/block lists + invite codes in data/userlist.json
     limits.py               check_user_limits() (rolling 30-day action quota via stats.db)
     settings.py             DEFAULT_SETTINGS + UserSettings (single source of truth)
@@ -60,9 +69,14 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
     handlers/
       __init__.py           build_root_router(): public → admin → ui → chat, middleware per router
       middleware.py         AuthMiddleware(require_admin, check_limits) injects user_id / limit kwargs
-      messages.py           text/voice/video/audio/photo(+albums)/document handlers, busy notice, /cancel
+      messages.py           text/voice/video/audio/photo(+albums)/document handlers, busy notice, /cancel,
+                            Stop buttons (queue_stop_ callback, stopped_message_generation update)
       commands.py           /start, /invite, /listusers, /voice
-      settings_ui.py        /settings inline keyboards
+      settings_ui.py        /settings: one rich page with buttons inside it (setp_ callbacks; SECTIONS of Controls,
+                            apply_setting shared with the keyboards), else the settings_ inline keyboards
+      turn_actions_ui.py    turn_ buttons: router (ui: Listen, Reasoning) + turn_router (chat, quota: Retry,
+                            Continue, follow-ups; they echo the press and queue a turn like a typed message)
+      questions_ui.py       ask_ buttons: resolve the pending question, edit it into its final state
       reminders_ui.py       /reminders inline keyboards
       stats_ui.py           admin /stats: dashboard photo + text view, users page, per-user view, limits, block;
                             display names cached 1 h (successful lookups only)
@@ -80,7 +94,7 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
                             models.IMAGE_BACKENDS table, plus generate_story_images
     video_tools.py          VideoTools: Google Veo 3.1 text→video, image→video, extend, interpolate
     user_interactions.py    UserInteractions: mid-run Telegram messages, TTS voice, reactions,
-                            schedule_reminder, send file from content
+                            schedule_reminder, send file from content, ask_user_choice (via bot/questions.py)
     embeddings.py           ConversationEmbeddings: OpenAI ada-002 + FAISS per user
     system_tools.py         SystemTools: apt/pip/service/network tools — NOT wired into the agent
     paths.py                resolve_under(): safe resolution of model-supplied paths inside data/<uid>
@@ -201,14 +215,26 @@ execution between host and sandbox.
 ## Queues, isolation and cancellation
 
 - `bot/queue.py` gives every chat a FIFO `asyncio.Queue` and a lazily started worker task. Handlers
-  only validate, enqueue a `Job(user_id, label, run)` and return within milliseconds.
+  only validate, enqueue a `Job(user_id, label, run)` and return within milliseconds. Every job gets a
+  random 31-bit `id` (`Job.token` = its hex): the draft id of its streaming drafts and the Stop callback.
 - If the user already has a running or queued job, `messages.notify_busy` immediately replies
   "⏳ I'm still working on your previous request (label, elapsed, step) …" with a Stop button
   (`queue_cancel` callback). The new message is processed later as its own turn, in order.
-- `/cancel` (and the Stop button) cancels the running task and drops the queue. Cancellation is
-  cooperative: handlers catch `CancelledError`, edit their status message to "🛑 Stopped." and re-raise.
-  A tool call already inside a worker thread (Docker, HTTP) cannot be interrupted; the turn ends when
-  the thread returns. Sandbox containers keep running until their own timeout.
+- `/cancel` (and the busy notice's button) is `QueueManager.cancel`: cancels the running task and drops
+  the queue. The Stop buttons of a turn are `cancel_current(user_id, job_id)`: the running job only, and
+  only while it is still the job the button names (queued messages run next). Two Stop buttons exist:
+  `queue_stop_<Job.token>` in the status message (rich button row, inline keyboard as fallback) and
+  Telegram's own Stop on the streaming draft, whose `draft_id` is `Job.id` (`can_stop`/`keep_on_stop`);
+  pressing it delivers a `stopped_message_generation` update. A user stop (Stop or /cancel) keeps the answer
+  streamed so far as a message marked "⏹ Stopped — partial answer, not saved to memory." (streaming on only).
+  `JobContext.stoppable` is cleared once the agent returned: Stop then answers "too late" and the
+  delivery runs to the end; /cancel still cancels, but a status that already became the answer/summary
+  is left as it is. Neither path cancels a task twice (`task.cancelling()`), so a second press or a
+  /cancel never cuts the first one's cleanup.
+- Cancellation is cooperative: handlers catch `CancelledError`, edit their status message to
+  "🛑 Stopped." and re-raise. A tool call already inside a worker thread (Docker, HTTP) cannot be
+  interrupted; the turn ends when the thread returns. Sandbox containers keep running until their own
+  timeout.
 - Isolation is real only because blocking work is off the event loop: `AgentAnthropic.execute_tool`
   runs synchronous providers (search, code, terminal, sms) via `asyncio.to_thread`; image/video tools
   wrap SDK calls in `to_thread` and poll with `asyncio.sleep`; media pre-processing uses `to_thread`
@@ -231,14 +257,16 @@ messages.on_text (bot/handlers/messages.py)      [AuthMiddleware(check_limits=Tr
 worker → _run_text → bot.agent_runner.run_turn(bot, user_id, chat_id, prompt, thread_id, reply_to, ctx, limit)
     sender = ChatSender(bot, chat_id, thread_id, reply_to_message_id)
     UserSettings(user_id).save() (persists backfilled defaults) → user_settings dict
-    status = sender.send_text("💭 *Thinking...*") wrapped in bot.status.StatusMessage; update_status() edits it
-    in place: in rich mode editMessageText(rich_message=blocks) (header, step, iterations, an open
-    details block with the last 15 tool calls, usage line); a rejected rich edit switches that status to
-    the legacy-Markdown text (last 10 calls), a 404 marks rich unsupported process-wide
+    status = sender.send_text("💭 *Thinking...*", Stop keyboard) wrapped in bot.status.StatusMessage; update_status()
+    edits it in place: in rich mode editMessageText(rich_message=blocks) (header, step, iterations, an open
+    details block with the last 15 tool calls, usage line, 🛑 Stop row `queue_stop_<job token>`); a rejected
+    rich edit switches that status to the legacy-Markdown text (last 10 calls, Stop as inline keyboard), a
+    404 marks rich unsupported process-wide. Drafts use draft_id = Job.id with Telegram's Stop
     agents.ChainOfThoughtAgent(model=models.ANTHROPIC_MODEL, user_id, sender, user_settings, thread_id)
     .generate_response(question, update_status, on_text_chunk)
        ├─ question = "Message received time in UTC+0: <ts>\n\n" + text     (stored everywhere in this form)
-       ├─ pick system prompt by settings.system_prompt.type (4 inline prompts; unknown → generall-ai-v2)
+       ├─ pick system prompt by settings.system_prompt.type (4 inline prompts; unknown → generall-ai-v2),
+       │     + RICH_/LEGACY_FORMATTING_GUIDE, + FOLLOW_UPS_GUIDE when follow_ups.enabled (<follow_ups> block)
        ├─ semantic_search: FAISS hits appended to the system prompt (to_thread; failure → skipped)
        ├─ context_memory = fixed intro pair
        │     + conversation summaries (summarization_history)   [reads data/<uid>/conversations/*.json]
@@ -254,23 +282,35 @@ worker → _run_text → bot.agent_runner.run_turn(bot, user_id, chat_id, prompt
        │        (run_tool_batch: asyncio.gather, is_error on exceptions, trace + status refresh per call),
        │        append ONE user msg of tool_results in block order, continue (cicles counts tool_use BLOCKS)
        │     gate fails → tool_use blocks silently dropped, text goes on to critique/judge/return
+       │        (budget spent → AgentAnthropic.limit_reached, which offers ▶️ Continue)
        │     else optional critique (OpenAI gpt-6.1-sol) / judge (Claude yes/no) re-prompts → return
-       │     for-loop exhausted → forced "SYSTEM NOTICE" final call without tools (same thinking mode)
+       │     for-loop exhausted → forced "SYSTEM NOTICE" final call without tools (same thinking mode;
+       │        limit_reached too)
        └─ strip pre-loaded context from thread_messages; persist memory inside try/except
           (a failed Haiku summary is logged, the answer is still returned) → (response, messages)
+    agent returned → drafts closed, ctx.stoppable = False, Stop removed from later status edits
     stats_tracker.track_message_sent
-    speak? → ElevenLabs TTS (to_thread) → sender.send_voice
     record_usage(): one usage_events row per model of the turn (tokens, cache, tool calls, cost estimate)
-    rich mode: sender.send_markdown(response) then status_msg.finish(trace, keep=trace.keep_summary):
-       the status is edited into the summary (headline, collapsible "Tool calls (N)" with one details
-       block per call: args JSON + result excerpt, collapsible "💭 Thinking", usage + ≈$cost), sized
-       under 28 KB; keep_summary off → deleted. Legacy mode: sender.send_markdown(response, edit=status)
+    turn_actions.parse_follow_ups(response) → (display, suggestions): the LAST <follow_ups> block is cut from
+       the visible answer (always) and becomes ≤4 suggestions (none when follow_ups is off)
+    save_turn(): TurnRecord(id 12 hex, prompt, display, speak, thread, limit_reached, follow_ups) +
+       reasoning text (if reasoning_context.enabled) → data/<uid>/turns/ (to_thread, newest 50 kept)
+    speak? → ElevenLabs TTS (to_thread) → sender.send_voice
+    rich mode: sender.send_markdown(display) then status_msg.finish(trace, keep, actions): the status is
+       edited into the summary (headline, collapsible "Tool calls (N)" with one details block per call:
+       args JSON + result excerpt, collapsible "💭 Thinking", usage + ≈$cost, then the action row), sized
+       under 28 KB; keep_summary off → deleted. Legacy mode: sender.send_markdown(display, edit=status)
        rich (default): split ≤32 KB → sendRichMessage(markdown) → on parse error rich HTML
        (telegramify-markdown) → on 404 sticky MarkdownV2 → legacy Markdown → raw; status deleted after
        legacy (rich_messages off): ≤4000 edit status in place; else new chunks + notice
-    send_reasoning_file (if reasoning_context.enabled; document from bytes): every block of the turn —
-       prompts, thinking, tool calls WITH their arguments, results and their errors
-    errors → status edited to "❌ An error occurred. Trace ID: …", returns None; CancelledError → "🛑 Stopped."
+    buttons (success only): actions = ▶️ Continue (limit_reached) · 🔁 Retry · 🔊 Listen (TTS key) · 📄 Reasoning
+       (stored); on the summary when it took them, else under the last answer message below the follow-up
+       rows (one per row). The reasoning file is sent only by its button; if save_turn failed it is sent
+       right away (send_reasoning_file) and the turn gets no buttons
+    returns TurnResult(response=display, messages, turn_id)
+    errors → status edited to "❌ An error occurred. Trace ID: …", no buttons, returns None
+    CancelledError → user stop before the agent returned: partial answer; status "🛑 Stopped." (user) /
+       "🛑 Cancelled." (deadline, shutdown), unless it already became the answer/summary; re-raised
 ```
 
 Media handlers (`_run_voice`, `_run_video`, `_run_audio`, `_run_images`, `_run_document` in
@@ -341,7 +381,7 @@ Effective tool list as the model sees it (after patching):
 | ImageTools | `generate_image` (no `images` → generate, one → edit, several → compose; engine `auto`/`best`/`fast`/`story`), `generate_story_images` | bot process (SDK calls in worker threads), never sandboxed, delivers each result itself as a document, once |
 | VideoTools | `video_generator`, `image_to_video_generator`, `video_from_reference_images`, `video_interpolation_generator`, `video_extension_generator` | bot process (Veo in worker threads, async polling up to 5 min) |
 | SMSTools | `send_sms` | bot process, worker thread |
-| UserInteractions | `send_user_telegram_message`, `send_voice_message`, `set_message_reaction`, `schedule_reminder`, `send_file_content_to_user_via_telegram` | bot process |
+| UserInteractions | `send_user_telegram_message`, `send_voice_message`, `set_message_reaction`, `schedule_reminder`, `send_file_content_to_user_via_telegram`, `ask_user_choice` (question + 2-8 option buttons, waits for the tap up to `timeout_seconds` 30..900, default 300; returns `User chose: "<option>"`, a no-answer notice or `Error: …`) | bot process |
 | SubagentTools | `run_subagent` (task, tools subset, model main/fast, max_tool_calls) | bot process: a fresh `AgentAnthropic` with the same providers, empty non-persisted context, budget slice of the parent's `TurnBudget`, trace depth 1; main agent only (a subagent has no `run_subagent`) |
 
 Unreachable: all 11 `SystemTools` tools (`install_package`, `run_shell_script` duplicates plus
@@ -404,6 +444,10 @@ data/
                                     max_context_tokens; atomic write
     embeddings/faiss_index.bin, metadata.json
                                     IndexFlatL2(1536) over "Question: ..\nAnswer: .." with text-embedding-ada-002
+    turns/<turn id>.json, <turn id>.reasoning.txt
+                                    one TurnRecord per successful turn (prompt, displayed answer, speak, thread_id,
+                                    limit_reached, follow_ups, has_reasoning) + its reasoning transcript; what the turn_
+                                    buttons load; newest 50 kept (pruned on save); atomic writes
     reminders/reminders.json        list of {id (8 hex), user_id, text, time (ISO UTC), type: user|agent,
                                     status: pending|processing|completed|failed, created_at, is_periodic, period_type,
                                     period_interval, last_triggered, next_trigger, enabled, [completed_at],
@@ -470,7 +514,7 @@ every `set`. `run_turn` saves once per turn so new defaults reach disk. Agent co
 |---|---|---|
 | `summarization_history` | enabled (true), size (5, 1..50) | conversation summaries in context |
 | `dialog_history` | enabled (true), size (10, 1..50) | rolling Q/A window |
-| `reasoning_context` | enabled (true) | reload last turn's blocks; also gates the reasoning file |
+| `reasoning_context` | enabled (true) | reload last turn's blocks; also gates the stored reasoning file and its 📄 button |
 | `short_term_memory` | enabled (true) | master switch for the three above |
 | `critique` | enabled (false), max_iteration (5, 1..300) | OpenAI critique re-prompts |
 | `judge` | enabled (false), max_iteration (5, 1..300) | Claude yes/no completeness re-prompts |
@@ -479,14 +523,23 @@ every `set`. `run_turn` saves once per turn so new defaults reach disk. Agent co
 | `thinking` | enabled (true) | on ("deep"): adaptive thinking, `display: summarized`, effort `ANTHROPIC_EFFORT` (high), max_tokens `ANTHROPIC_MAX_TOKENS` (64000); off ("light"): still adaptive, `display: omitted`, effort `ANTHROPIC_EFFORT_LIGHT` (low), max_tokens 16000. Never `disabled` (`models.anthropic_request_options` / `anthropic_max_tokens`) |
 | `rich_messages` | enabled (true) | answers as Telegram rich messages (native GFM); off = legacy Markdown v1 path; also selects the `<formatting>` prompt section and rich vs plain streaming drafts |
 | `image` | engine (`auto`), quality (`auto`), size (`2K`), max_variants (4), metadata (true) | defaults for `generate_image`; the agent may override engine/quality from the request, `max_variants` is a hard cap, `metadata` puts model/quality/size in the delivered file's caption |
-| `trace` | keep_summary (true) | end of turn: status shortened into the rich summary above the answer (expandable tool calls, thinking, tokens); off = deleted |
+| `trace` | keep_summary (true) | end of turn: status shortened into the rich summary above the answer (expandable tool calls, thinking, tokens, action buttons); off = deleted (actions go under the answer) |
+| `follow_ups` | enabled (true) | `FOLLOW_UPS_GUIDE` in the system prompt and follow-up buttons under the answer; off = neither (a block the model still writes is hidden anyway) |
 | `transcript` | enabled (true), max_context_tokens (120000, 20k..400k), keep_tool_results_turns (3), max_tool_result_chars (20000, applied when the tool returns, before the model sees it) | transcript mode (real conversation replayed as is); when on, `dialog_history`/`reasoning_context` are ignored for the prompt (dialog_history.json is still kept current) and `summarization_history.size` = recent summaries in the `<memory>` block |
 | `system_prompt` | type ("generall-ai-v2"; also generall-ai-v1, perplexity-deep-research, perplexity-r1) | prompt selection |
 
-Edited through `/settings` (`bot/handlers/settings_ui.py`). callback_data is
-`settings_<token>[_<action>[_<value>]]` parsed with a plain `split("_")`, where `<token>` is a short
-name, not the JSON key: summarization, dialog, reasoning, memory (= short_term_memory), critique,
-judge, tools, semantic, thinking, rich, transcript, trace, image, main. `system_prompt` is special-cased with `startswith`.
+Edited through `/settings` (`bot/handlers/settings_ui.py`). With rich messages on (and button rows
+available) it is ONE rich page: four collapsible sections (Memory, Agent, Replies, Images) built from
+`SECTIONS` (`Control(token, action, category, key, kind toggle|number|cycle, …)`), each setting a bold
+paragraph plus a row of buttons inside the message (toggle "✅ On"/"⬜ Off", number "−  value  +", choice
+"<current> ▸" cycling); a tap applies and edits the page in place with that section open. Its callback_data
+is `setp_<token>_<action>[_<value>]` and `setp_sysprompt_<type>`; a server that refuses sections gets the
+flat layout from then on, and a refused flat page (not a chat-specific error) switches button rows off.
+Otherwise the inline keyboards: callback_data `settings_<token>[_<action>[_<value>]]` parsed with a plain
+`split("_")`. In both, `<token>` is a short name, not the JSON key: summarization, dialog, reasoning,
+memory (= short_term_memory), critique, judge, tools, semantic, thinking, rich, transcript, trace, image,
+followups, main. `system_prompt` is special-cased with `startswith`. Both UIs change values only through
+`apply_setting(user_settings, token, action, value)` (same clamps and allowed choices).
 
 ## Models and external services
 
@@ -532,7 +585,7 @@ SearchTools and the embeddings `OpenAI` are per instance; ElevenLabs is per call
 | `INVITE_LIMIT` | commands | default 3 (`.env.example` says 5) |
 | `TELEGRAM_USE_LOCAL_API`, `TELEGRAM_LOCAL_API_URL` | bot/app | local Bot API server (compose sidecar); default URL `http://localhost:8081` |
 | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | compose only | for the `telegram-bot-api` sidecar |
-| `STREAMING_ENABLED` | bot/config AND agents/main (read independently, both after dotenv) | draft streaming: `send_rich_message_draft` in rich mode (thinking as `<tg-thinking>`), else `send_message_draft`; errors swallowed |
+| `STREAMING_ENABLED` | bot/config AND agents/main (read independently, both after dotenv) | draft streaming: `send_rich_message_draft` in rich mode (thinking as `<tg-thinking>`), else `send_message_draft`; errors swallowed; `draft_id` = the job id with `can_stop` (Telegram's Stop on the draft) |
 | `MAX_CONCURRENT_TURNS` (8), `TURN_TIMEOUT_SECONDS` (1800), `DROP_PENDING_UPDATES` (true) | bot/config | queue caps, see "Queues" |
 | `MAX_SANDBOX_CONTAINERS` (4) | secure_container/container_manager | concurrent sandbox containers |
 | `THREAD_POOL_SIZE` (32, min 8) | bot/app | size of the default executor used by `asyncio.to_thread` |
@@ -555,15 +608,28 @@ name; a new temp dir needs its own `.gitignore` line).
 
 - Routers and middleware (`bot/handlers/__init__.py`): `public` (/start, /invite: no auth),
   `admin` (/listusers, /stats: `AuthMiddleware(require_admin=True)`), `ui` (/voice, /settings,
-  /reminders, /cancel, `queue_cancel`: `AuthMiddleware()`), `chat` (content handlers:
-  `AuthMiddleware(check_limits=True)`). Handlers never check auth themselves; they receive `user_id`
-  (str chat id) and, in `chat`, `limit` as kwargs. Unknown `/commands` match nothing and are ignored.
+  /reminders, /cancel, `queue_cancel`, Stop, `ask_` answers, Listen/Reasoning: `AuthMiddleware()`, also on
+  the `stopped_message_generation` observer), `chat` (content handlers and the turn-starting buttons
+  Retry/Continue/follow-ups: `AuthMiddleware(check_limits=True)` on message AND callback_query). Handlers
+  never check auth themselves; they receive `user_id` (str chat id) and, in `chat`, `limit` as kwargs.
+  Unknown `/commands` match nothing and are ignored. Middleware is registered as inner middleware, so
+  it only runs for a handler whose filters matched. Polling uses `dp.resolve_used_update_types()`, which
+  must keep `stopped_message_generation` (Telegram's Stop on a draft) next to message and callback_query.
 - Commands: `/start [invite_<code>]`, `/invite [code]`, `/voice`, `/settings`, `/reminders`,
   `/cancel`, `/stats` (admin), `/listusers` (admin).
-- Callback prefixes: `voice_`, `settings_`, `reminder_`/`reminders_`, `noop`, `queue_cancel`, `stats_`.
-  A new keyboard family needs a unique prefix and a `@router.callback_query(F.data.startswith(...))`
-  handler on the router with the right middleware. Read the chat from `callback.message.chat.id`
-  and guard `isinstance(callback.message, Message)`.
+- Callback prefixes: `voice_`, `settings_`, `setp_` (settings page), `reminder_`/`reminders_`, `noop`,
+  `queue_cancel`, `queue_stop_<job token>` (Stop in the status), `ask_<qid>_<i>` (ask_user_choice),
+  `turn_<retry|cont|listen|reason>_<turn id>` / `turn_fu_<turn id>_<i>` (turn buttons; a `turn_` catch-all
+  answers "expired"), `stats_`. A new family needs a prefix that is not a prefix of (and does not start
+  with) any other, and a `@router.callback_query(F.data.startswith(...))` handler on the router with the
+  right middleware; `tests/test_cross_features.py::ROUTING` checks that every family reaches its own
+  handler in router order. Read the chat from `callback.message.chat.id` and guard
+  `isinstance(callback.message, Message)`. Answer the callback best-effort (an old query raises).
+- Buttons inside rich messages (`InputRichBlockButtons` rows: the settings page, the status Stop and action
+  rows, questions) depend on the sticky process-wide `rich.buttons_available()` flag; a refusal proven to
+  be about the row (the same blocks without it pass) or naming buttons sets `mark_buttons_unavailable`,
+  and from then on inline keyboards are used. `rich.is_chat_error(e)` (topic closed, no rights, chat not
+  found) must never set a process-wide flag.
 - Static UI text goes through `bot.ui.answer_md` / `edit_md` (legacy Markdown, plain fallback,
   "message is not modified" swallowed). LLM text goes through `ChatSender.send_markdown`, which in
   rich mode (`ChatSender(rich=True)`, set by `run_turn` from `rich_messages.enabled`) sends
@@ -579,7 +645,9 @@ name; a new temp dir needs its own `.gitignore` line).
   (keyword arguments are mandatory in aiogram).
 - Every content handler: track_message_received → `submit(message, Job(...))`. The job function
   signature is `(bot, message, user_id, limit, ..., ctx)` via `functools.partial`; it creates its own
-  `ChatSender`, its own status message, sets `ctx.set_progress(...)`, and calls `run_turn`.
+  `ChatSender`, its own status message, sets `ctx.set_progress(...)`, and calls `run_turn`. Retry /
+  Continue / follow-up buttons do the same: they post a short echo ("🔁 Retry", "💬 <suggestion>") and
+  queue the turn on it, so the busy notice and the reply-to work as for a typed message.
 - Action-limit accounting counts **every** `stats_events` row in 30 days: each received message,
   sent message, tool call, describe call and media group. A turn with 20 tool calls costs ~22 of the
   default 50. Any new `stats_tracker.track_*` call burns user quota.
@@ -620,7 +688,17 @@ name; a new temp dir needs its own `.gitignore` line).
 - Dead code: `JudgeResponse`, `tavily_client` in `agents/main.py`, `describe_document_openai` was removed.
 - `bot.rich` marks rich messages unsupported for the whole process on the first 404 from
   `sendRichMessage`/`sendRichMessageDraft`/a rich `editMessageText`; a wrong verdict (e.g. a transient 404) needs a restart.
-  `TelegramBadRequest` on a rich send is treated as "this text", not "this server".
+  `TelegramBadRequest` on a rich send is treated as "this text", not "this server". The "buttons inside
+  rich messages" flag is just as sticky: once set, every button row (settings page, Stop, actions,
+  questions) is an inline keyboard until a restart.
+- `ask_user_choice` blocks the user's queue while it waits (up to its timeout, 15 min at most): the user's
+  next messages get the busy notice and run after it; Stop or /cancel ends the wait ("🛑 Cancelled" on the
+  question). Pending questions live in memory, so after a restart a tap only gets "expired" and the buttons
+  are removed. All tool calls of one message run concurrently, so several questions can be open at once.
+- The `<follow_ups>` block is part of the model's answer and stays in everything stored from it (transcript,
+  dialog_history.json, summaries, FAISS, the reasoning file); it is only cut for display (`TurnResult.response`,
+  the turn record, TTS, drafts, the partial answer). Toggling `follow_ups` changes the static system prompt,
+  so the transcript fingerprint changes and stored thinking is stripped once, like the rich-messages toggle.
 - Anything the patcher rebinds imposes **its own signature** on the method. Adding a method to a tool
   class whose name a `patch_*` function targets silently replaces it; that is how image editing broke.
   `tests/test_image_tools.py` guards the image tools by asserting `tool_integrator.py` never names them.
@@ -630,7 +708,8 @@ name; a new temp dir needs its own `.gitignore` line).
   extensions are derived from the returned bytes, never asserted, and the inline-embed hint is only offered for
   formats `bot/rich.py` can actually inline.
 - `agents/main.py` appends `RICH_FORMATTING_GUIDE` / `LEGACY_FORMATTING_GUIDE` to every system
-  prompt after selection; the `generall-ai-*` prompts still say nothing about formatting themselves.
+  prompt after selection, then `FOLLOW_UPS_GUIDE` when `follow_ups` is on (not to the subagent prompt); the
+  `generall-ai-*` prompts still say nothing about formatting themselves.
 - Roadmap and design notes for transcript / prompt caching / subagents: `docs/agent-roadmap.md`.
 - Status edits are coalesced: while one edit is in flight further progress updates are dropped (the
   next one carries newer state), so a batch of parallel tool calls cannot storm the message. A rejected
@@ -654,7 +733,7 @@ name; a new temp dir needs its own `.gitignore` line).
   `max_context_tokens` (clear old tool results to `CLEARED_MARKER`, then summarize the oldest half into one
   `<earlier_conversation_summary>` user message, down to `PRUNE_TARGET_RATIO` of the budget), and a change of
   `transcript.prefix_fingerprint` (model, static system prompt or tool definitions, e.g. a new image preference,
-  prompt type, rich-messages toggle or a deploy). Any new code that edits stored history must strip thinking
+  prompt type, rich-messages or follow-ups toggle, a new tool or a deploy). Any new code that edits stored history must strip thinking
   the same way. Safety net: `models.thinking_binding` adds `block_binding.prefix_mismatch_behavior`
   (`THINKING_PREFIX_MISMATCH`) on the beta client; `log_input_transformations` prints any block the API
   dropped (that means something still edits history), and a refused beta is switched off for the process.
@@ -667,9 +746,10 @@ name; a new temp dir needs its own `.gitignore` line).
   the user), do the four wiring steps in `agents/main.py` (use `await` for async providers,
   `asyncio.to_thread` for blocking ones), decide host vs sandbox (`tool_integrator.py` /
   `SECURE_TOOL_METHODS`), keep the name unique, return a string.
-- **Add a user setting**: add the category to `DEFAULT_SETTINGS` in `bot/settings.py`, render it in
-  `settings_ui.py` (overview text, keyboard, `show_<cat>_menu`, `elif category ==` branch with the
-  short token), then read it in `agents/main.py` via the `user_settings` dict.
+- **Add a user setting**: add the category to `DEFAULT_SETTINGS` in `bot/settings.py`; in `settings_ui.py`
+  add a `Control` to a section of `SECTIONS` (gives the page row and `apply_setting` support) and, for the
+  keyboards, the overview line/button and a `show_<cat>_menu` registered in `_LEGACY_MENUS` under the short
+  token; then read it in `agents/main.py` via the `user_settings` dict.
 - **Add a memory source to the prompt**: extend `ChainOfThoughtAgent._request_context` (transcript mode); start
   each line with `transcript.MEMORY_BULLET` so a line already shown in this transcript is not repeated. Never
   put per-turn text into the static system prompt (it breaks the cache and strips every stored thinking block).
@@ -679,7 +759,11 @@ name; a new temp dir needs its own `.gitignore` line).
 - **Add a document extension**: `TEXT_EXTENSIONS`/`DOCUMENT_EXTENSIONS` and `describe_document` in
   `bot/media.py`; write a `describe_<kind>` following `describe_txt` including the `process_large_text` fallback.
 - **Add a slash command / callback family**: a handler on the router with the right middleware in
-  `bot/handlers/__init__.py`; copy the nearest existing handler.
+  `bot/handlers/__init__.py`; copy the nearest existing handler; add the family to `ROUTING` in
+  `tests/test_cross_features.py`.
+- **Add a turn button**: an action name, label and `_CALLBACK_RE` alternative in `bot/turn_actions.py`
+  (`record_actions` decides when it shows), and a handler in `handlers/turn_actions_ui.py`: on `router` when it
+  only reads the stored record, on `turn_router` (quota checked) when it starts an agent turn.
 - **Add a media type**: a `_run_<kind>(bot, message, user_id, limit, ctx)` job plus an
   `@router.message(F.<kind>)` handler in `messages.py` that tracks and `submit`s it.
 - **Add a background job**: an `async` loop started from `bot/app.py:on_startup` and appended to
