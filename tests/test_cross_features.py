@@ -441,6 +441,7 @@ ROUTING = {
     "noop": "reminders_ui.noop_button",
     "voice_rachel": "commands.voice_button",
     "stats_back_main": "stats_ui.stats_button",
+    "usage_refresh": "usage_ui.usage_button",
 }
 
 

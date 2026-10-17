@@ -229,7 +229,7 @@ plus active reminders and the workspace size (files, MB). Data from `stats.py`
 
 * `download_webpage` (host): `trafilatura.extract` (main content, tables as text) with the
   BeautifulSoup text as fallback; same save-to-file behaviour.
-* `browse_webpage(url, wait_for?, screenshot?)` (new provider `agents/web_tools.py`, blocking):
+* `browse_webpage(url, wait_ms?, screenshot?, max_chars?)` (new provider `agents/web_tools.py`, blocking):
   runs `app/secure_container/scripts/browse.py` inside the sandbox with network on
   (`ContainerManager.run_script(user_id, script_name, args, timeout, network_enabled=True)`,
   a new helper that copies a bundled script into the workspace under a unique temp name and
@@ -271,8 +271,8 @@ plus active reminders and the workspace size (files, MB). Data from `stats.py`
 becomes `IndexFlatIP` over L2-normalized vectors (cosine); `metadata.json` gains `model` and
 `version`. On load, a metadata model different from the configured one (or a legacy index
 without a tag) triggers a rebuild from `conversations/*.json` (question + answer + summary
-embedded as one text, timestamp and topic stored) in a worker thread; until it finishes the
-old index is used. Search returns `score` and skips near-duplicates (same question).
+embedded as one text, timestamp and topic stored) in a worker thread; until it finishes
+`search_conversations` returns no hits (vectors of another model are not comparable). Search returns `score` and skips near-duplicates (same question).
 
 ### F15 /help, command menu, /start
 

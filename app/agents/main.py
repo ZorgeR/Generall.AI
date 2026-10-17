@@ -40,6 +40,9 @@ from models import (
 from agents.trace import TurnBudget
 from agents.subagent import SubagentTools
 from agents import content as prompt_content
+from agents.mcp_tools import MCPTools
+from agents.profile_tools import ProfileTools
+from agents.vision_tools import VisionTools
 from agents.transcript import (
     MEMORY_BULLET,
     cap_text,
@@ -765,6 +768,13 @@ class ChainOfThoughtAgent:
             self.agent.user_interactions = self.user_interactions
             self.subagents = SubagentTools(self.agent, self.user_settings)
             self.agent.subagents = self.subagents
+            # Providers added in the v3 wave (docs/design-v3.md): registered, not slotted.
+            self.vision_tools = VisionTools(user_id, sender)
+            self.agent.register_provider(self.vision_tools)
+            self.profile_tools = ProfileTools(user_id)
+            self.agent.register_provider(self.profile_tools)
+            self.mcp_tools = MCPTools(user_id)
+            self.agent.register_provider(self.mcp_tools)
             self.web_tools = WebTools(user_id, sender)
             self.agent.register_provider(self.web_tools, blocking=True)
             self.document_tools = DocumentTools(user_id, sender)
@@ -797,19 +807,20 @@ Response: {response}"""
             messages=[{"role": "user", "content": [{"type": "text", "text": summary_prompt}]}],
             max_tokens=ANTHROPIC_MAX_TOKENS_FAST_SHORT
         )
-        embedding_task = asyncio.to_thread(
-            self.conversation_embeddings.add_conversation,
-            question=question,
-            answer=response,
-            timestamp=timestamp
-        )
-        
-        topic_response, summary_response, _ = await asyncio.gather(
-            topic_task, summary_task, embedding_task
-        )
+        topic_response, summary_response = await asyncio.gather(topic_task, summary_task)
         
         topic = anthropic_text(topic_response).strip()
         summary = anthropic_text(summary_response).strip()
+        # Embedded after the summary exists, so topic and summary are part of the vector text at once
+        # (not only after the next reindex); the embedding call is blocking HTTP, so off the loop.
+        await asyncio.to_thread(
+            self.conversation_embeddings.add_conversation,
+            question=question,
+            answer=response,
+            timestamp=timestamp,
+            topic=topic,
+            summary=summary,
+        )
         
         # Save to file
         conversation_data = {
@@ -969,6 +980,25 @@ User message: {question}"""
     # ------------------------------------------------------------------
     _TIME_BLOCK_RE = _re.compile(r"\n?<current_time>.*?</current_time>\n?", _re.S)
     _TIME_LINE_RE = _re.compile(r"^[ \t]*Current time in UTC\+0:.*$", _re.M)
+
+    _PROVIDER_SLOTS = (
+        "file_ops", "search_tools", "code_tools", "terminal_tools", "time_tools",
+        "image_tools", "video_tools", "sms_tools", "user_interactions", "subagents",
+    )
+
+    def _provider_notes(self) -> str:
+        """Static prompt text contributed by tool providers (``prompt_notes``), in tool order.
+
+        Part of the static system prompt (so of the cache prefix and the transcript fingerprint):
+        providers put instructions about their tools here instead of editing the prompts above.
+        Per-turn text never belongs here (docs/design-v3.md)."""
+        providers = [getattr(self.agent, slot, None) for slot in self._PROVIDER_SLOTS]
+        providers += [p for p, _blocking in getattr(self.agent, "extra_providers", [])]
+        notes = [str(getattr(p, "prompt_notes", "") or "").strip() for p in providers if p is not None]
+        notes = [n for n in notes if n]
+        if not notes:
+            return ""
+        return "\n<capabilities>\n" + "\n\n".join(notes) + "\n</capabilities>\n"
 
     def _static_system_prompt(self, system_context: str) -> str:
         """The selected prompt without anything that changes per turn, so the prefix can be cached."""
@@ -1503,6 +1533,7 @@ You have been asked to answer a query given sources. Consider the following when
             system_context += LEGACY_FORMATTING_GUIDE
         if ((self.user_settings or {}).get("follow_ups") or {}).get("enabled", True):
             system_context += FOLLOW_UPS_GUIDE
+        system_context += self._provider_notes()
 
         if (self.user_settings or {}).get("transcript", {}).get("enabled", True):
             return await self._generate_with_transcript(question, system_context, update_status, on_text_chunk, trace, question_blocks=question_blocks)
