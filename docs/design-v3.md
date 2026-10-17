@@ -244,7 +244,10 @@ plus active reminders and the workspace size (files, MB). Data from `stats.py`
   python-docx, xlsx with openpyxl from the Markdown tables / CSV blocks). Output under
   `documents/<filename>`; the tool sends the file to the user (like ImageTools) and returns
   the path.
-* Sandbox image: `playwright`, `trafilatura`, `markdown`, `python-docx`, `openpyxl` in
+* Sandbox image: tagged by the hash of its build context (`container_manager.image_build_fingerprint`
+  over Dockerfile, entrypoint.sh, requirements.txt), so a changed sandbox build is rebuilt on the
+  next startup by itself; `secure-container:latest` is re-pointed and older content tags removed.
+  `playwright`, `trafilatura`, `markdown`, `python-docx`, `openpyxl` in
   `secure_container/requirements.txt`; `playwright install --with-deps chromium` in the
   Dockerfile (as root, before `USER runner`, with `PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers`
   readable by runner). Container memory for browser runs: 1 GB (`run_script(mem_limit=...)`).

@@ -24,6 +24,32 @@ DEFAULT_MEM_LIMIT = "512m"
 # Scripts shipped with the bot that run_script() copies into a user's workspace and runs inside
 # the sandbox (browse.py: headless Chromium page reader; render_document.py: pdf/docx/xlsx).
 SCRIPTS_DIR = Path(__file__).parent / "scripts"
+IMAGE_NAME = "secure-container"
+# The files baked into the sandbox image. Scripts under scripts/ are copied into the workspace at
+# run time (run_script), so they are not part of the image and not of its tag.
+IMAGE_BUILD_FILES = ("Dockerfile", "entrypoint.sh", "requirements.txt")
+IMAGE_LATEST_TAG = "latest"  # alias kept for people: the content tag is what the bot runs
+
+
+def image_build_fingerprint(dockerfile_dir: Path | None = None) -> str:
+    """12 hex chars of the sandbox build context (IMAGE_BUILD_FILES): the image tag.
+
+    A deploy that changes the Dockerfile or the requirements gets a new tag, so
+    ``_ensure_image_exists`` builds the new image on the first startup instead of silently
+    keeping the old one (the ``latest`` tag used to be built once and never again)."""
+    import hashlib
+
+    directory = Path(dockerfile_dir) if dockerfile_dir is not None else Path(__file__).parent
+    digest = hashlib.sha256()
+    for name in IMAGE_BUILD_FILES:
+        path = directory / name
+        digest.update(name.encode("utf-8") + b"\0")
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(b"<missing>")
+        digest.update(b"\0")
+    return digest.hexdigest()[:12]
 
 # Set up logging
 logging.basicConfig(
@@ -48,8 +74,8 @@ class ContainerManager:
                            If None, will be auto-detected or use base_data_path
         """
         self.base_data_path = Path(base_data_path)
-        self.image_name = "secure-container"
-        self.image_tag = "latest"
+        self.image_name = IMAGE_NAME
+        self.image_tag = image_build_fingerprint()  # content hash: a changed build context = a rebuild
         self.container_prefix = "secure-container-"
         
         # Determine the host data path for volume mounting
@@ -100,8 +126,9 @@ class ContainerManager:
         try:
             self.docker_client.images.get(f"{self.image_name}:{self.image_tag}")
             logger.info(f"Image {self.image_name}:{self.image_tag} already exists")
+            return None
         except ImageNotFound:
-            logger.info(f"Building image {self.image_name}:{self.image_tag}")
+            logger.info(f"Building image {self.image_name}:{self.image_tag} (the build context changed or no image yet)")
             
             # Get the directory of the Dockerfile
             dockerfile_dir = Path(__file__).parent.absolute()
@@ -140,6 +167,7 @@ class ContainerManager:
                     forcerm=True
                 )
                 logger.info(f"Successfully built image {self.image_name}:{self.image_tag}")
+                self._retag_latest_and_prune()
                 return build_result
             except Exception as e:
                 logger.error(f"Failed to build image: {str(e)}")
@@ -148,6 +176,28 @@ class ContainerManager:
                     logger.error(f"Build stderr: {e.stderr}")
                 raise
     
+    def _retag_latest_and_prune(self):
+        """Point ``secure-container:latest`` at the new image and drop the older content-tagged
+        images (they only take disk). Best effort: a failure here never fails startup."""
+        current = f"{self.image_name}:{self.image_tag}"
+        try:
+            image = self.docker_client.images.get(current)
+            image.tag(self.image_name, IMAGE_LATEST_TAG, force=True)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Could not tag {current} as {IMAGE_LATEST_TAG}: {e}")
+            return
+        try:
+            for old in self.docker_client.images.list(name=self.image_name):
+                if old.id == image.id:
+                    continue
+                tags = [t for t in (old.tags or []) if t.startswith(f"{self.image_name}:")]
+                if not tags:
+                    continue
+                logger.info(f"Removing stale sandbox image {', '.join(tags)}")
+                self.docker_client.images.remove(old.id, force=True)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Could not prune old sandbox images: {e}")
+
     def ensure_user_directory(self, user_id):
         """
         Ensure the user directory exists.
