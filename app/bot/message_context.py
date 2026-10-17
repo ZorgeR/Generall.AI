@@ -8,7 +8,11 @@ content job puts in front of its prompt (``with_reference``).
 
 It is pure and cheap: only the text, caption and media kind of the referenced message are
 used (nothing is downloaded), so a reply to a photo names the photo but does not show it.
-A reply to one of the bot's own messages says so, so the agent knows which answer is meant.
+A reply to one of the bot's own messages says so, so the agent knows which answer is meant;
+the bot answers with rich messages, whose text lives in ``rich_message.blocks`` rather than
+``text``, so those blocks are flattened to plain text (thinking, buttons and the tool-call
+dumps of a turn summary left out). In a forum topic Telegram sets ``reply_to_message`` on
+every message to the topic's creation service message; that is not a reply and is ignored.
 """
 from __future__ import annotations
 
@@ -22,12 +26,22 @@ from aiogram.types import (
     MessageOriginChat,
     MessageOriginHiddenUser,
     MessageOriginUser,
+    RichBlockBlockQuotation,
+    RichBlockButtons,
+    RichBlockDetails,
+    RichBlockList,
+    RichBlockMathematicalExpression,
+    RichBlockTable,
+    RichBlockThinking,
 )
 
 QUOTE_LIMIT = 1500  # characters of the referenced message kept in the preamble
 TRUNCATED = " … (truncated)"
 ASSISTANT = "you (the assistant)"
 END_OF_REPLY = "[End of the replied-to message]"
+# Collapsible sections of the bot's own turn summary (bot/status.py): tool-call dumps and the
+# thinking transcript, not something the user means when replying to that message.
+SUMMARY_DETAILS_PREFIXES = ("Tool calls (", "🔧 Tools (", "💭 Thinking")
 
 
 def describe_reference(message: Message, bot_id: int | None) -> str:
@@ -56,10 +70,14 @@ def with_reference(prompt: str, message: Message, bot_id: int | None) -> str:
 # ---- replies -------------------------------------------------------------------------------
 def _describe_reply(message: Message, bot_id: int | None) -> str:
     reply = message.reply_to_message
+    if reply is not None and _is_topic_root(message, reply):
+        reply = None
     external = message.external_reply
     if reply is not None:
         header = f"[Replying to {_media_kind(reply) or 'a message'} from {_author(reply, message, bot_id)}, sent {_utc(reply.date)}]"
         text = reply.text or reply.caption or ""
+        if not text and reply.rich_message is not None:
+            text = _rich_text(reply.rich_message.blocks)
     elif external is not None:
         # A reply to a message of another chat: Telegram gives its origin and media, never its text.
         name, _signature = _origin_source(external.origin)
@@ -76,18 +94,33 @@ def _describe_reply(message: Message, bot_id: int | None) -> str:
     return "\n".join(lines)
 
 
+def _is_topic_root(message: Message, reply: Message) -> bool:
+    """True when ``reply`` is the forum topic's creation service message, not a real reply.
+
+    Every message in a forum topic carries it as ``reply_to_message`` (its id is the thread id).
+    """
+    if reply.forum_topic_created is not None:
+        return True
+    return bool(message.is_topic_message) and reply.message_id == message.message_thread_id
+
+
 def _author(reply: Message, message: Message, bot_id: int | None) -> str:
     user = reply.from_user
-    if user is not None:
-        if user.id == bot_id or (bot_id is None and user.is_bot):
-            return ASSISTANT
-        asker = message.from_user
-        if asker is not None and asker.id == user.id:
-            return f"{user.full_name} (the user)"
-        return user.full_name
-    if reply.sender_chat is not None:  # a channel post or an anonymous group admin
+    if user is not None and user.id == bot_id:
+        return ASSISTANT
+    if reply.sender_chat is not None:
+        # A channel post, a post auto-forwarded into the linked discussion group or an anonymous
+        # admin's message: ``from_user`` is then absent or a placeholder account ("Telegram",
+        # "GroupAnonymousBot"), the chat title is the real sender.
         return _chat_name(reply.sender_chat)
-    return "an unknown sender"
+    if user is None:
+        return "an unknown sender"
+    if bot_id is None and user.is_bot:
+        return ASSISTANT
+    asker = message.from_user
+    if asker is not None and asker.id == user.id:
+        return f"{user.full_name} (the user)"
+    return user.full_name
 
 
 def _media_kind(m: Any) -> str:
@@ -121,6 +154,63 @@ def _media_kind(m: Any) -> str:
         name = " ".join(p for p in (m.contact.first_name, m.contact.last_name) if p)
         return f"a contact: {name}" if name else "a contact"
     return ""
+
+
+# ---- rich messages -------------------------------------------------------------------------
+def _rich_text(blocks: list) -> str:
+    """The plain text of rich message blocks, one block per line; "" when nothing is readable.
+
+    Headings, paragraphs, lists (one line per item, with its label), code, tables (cells joined
+    with " | "), quotations, footers and media captions are kept. Thinking blocks, button rows
+    and the collapsible tool-call / thinking sections of a turn summary are dropped; other
+    details blocks contribute their summary and content.
+    """
+    lines: list[str] = []
+    for block in blocks:
+        if isinstance(block, (RichBlockThinking, RichBlockButtons)):
+            continue
+        if isinstance(block, RichBlockDetails):
+            summary = _flatten(block.summary).strip()
+            if summary.startswith(SUMMARY_DETAILS_PREFIXES):
+                continue
+            lines.extend(line for line in (summary, _rich_text(block.blocks)) if line)
+        elif isinstance(block, RichBlockList):
+            for item in block.items:
+                body = _rich_text(item.blocks)
+                label = (item.label or "").strip()
+                lines.append(f"{label} {body}".strip() if label else body)
+        elif isinstance(block, RichBlockBlockQuotation):
+            lines.append(_rich_text(block.blocks))
+            lines.append(_flatten(block.credit))
+        elif isinstance(block, RichBlockTable):
+            for row in block.cells:
+                lines.append(" | ".join(_flatten(cell.text).strip() for cell in row))
+            lines.append(_flatten(block.caption))
+        elif isinstance(block, RichBlockMathematicalExpression):
+            lines.append(block.expression)
+        else:  # paragraph, heading, pre, footer, quotations: ``text``; media blocks: ``caption``
+            lines.append(_flatten(getattr(block, "text", None)))
+            caption = getattr(block, "caption", None)
+            if caption is not None and getattr(caption, "text", None) is not None:
+                lines.append(_flatten(caption.text))
+    return "\n".join(line.strip() for line in lines if line and line.strip())
+
+
+def _flatten(node: Any) -> str:
+    """Plain text of a RichTextUnion: a str, a list of nodes or a styled node wrapping ``text``."""
+    if node is None:
+        return ""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, list):
+        return "".join(_flatten(n) for n in node)
+    if getattr(node, "alternative_text", None) is not None:  # custom emoji
+        return node.alternative_text
+    if getattr(node, "expression", None) is not None:  # inline math
+        return node.expression
+    if getattr(node, "button", None) is not None:  # an inline button: not text
+        return ""
+    return _flatten(getattr(node, "text", None))
 
 
 # ---- forwards ------------------------------------------------------------------------------

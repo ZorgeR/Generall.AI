@@ -39,7 +39,7 @@ def test_defaults(clean_models):
     assert m.OPENAI_REASONING_EFFORT == "high"
     assert m.OPENAI_REASONING_MODELS == {"gpt-6.1-sol", "gpt-6-luna"}
     assert m.WHISPER_MODEL == "whisper-1"
-    assert m.EMBEDDING_MODEL == "text-embedding-ada-002"
+    assert m.EMBEDDING_MODEL == "text-embedding-3-small"
     assert m.EMBEDDING_DIMENSION == 1536
     assert m.GEMINI_IMAGE_MODEL_FLASH == "gemini-3.1-flash-image-preview"
     assert m.GEMINI_IMAGE_MODEL_PRO == "gemini-3-pro-image-preview"

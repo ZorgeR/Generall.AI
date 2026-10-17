@@ -119,6 +119,114 @@ def test_reply_to_a_message_of_another_chat_uses_its_origin():
     assert describe_reference(m, BOT_ID) == f"[Replying to a photo from Bob, sent {REPLY_WHEN}, in another chat]\n{END_OF_REPLY}"
 
 
+# A forum topic: Telegram sets reply_to_message on EVERY message of a topic to the topic's creation
+# service message (message_id == message_thread_id), which is not a reply (reviewer defect 1).
+FORUM = {"id": -100, "type": "supergroup", "title": "Team", "is_forum": True}
+TOPIC_ROOT = {"message_id": 3, "date": REPLY_TS, "chat": FORUM, "from": ALICE,
+              "forum_topic_created": {"name": "Work", "icon_color": 7322096}}
+
+
+def topic_msg(**fields) -> Message:
+    return Message.model_validate({"message_id": 10, "date": TS, "chat": FORUM, "from": ALICE, "is_topic_message": True,
+                                   "message_thread_id": 3, **fields})
+
+
+def test_a_topic_message_is_not_a_reply_to_the_topic_service_message():
+    m = topic_msg(text="hi", reply_to_message=TOPIC_ROOT)
+    assert describe_reference(m, BOT_ID) == ""
+    assert with_reference("hi", m, BOT_ID) == "hi"
+
+
+def test_a_topic_message_whose_reply_is_the_thread_root_is_not_a_reply():
+    # Older servers / edited roots may omit forum_topic_created; the id match is enough.
+    root = {"message_id": 3, "date": REPLY_TS, "chat": FORUM, "from": ALICE}
+    assert describe_reference(topic_msg(text="hi", reply_to_message=root), BOT_ID) == ""
+
+
+def test_a_real_reply_inside_a_topic_is_described():
+    m = topic_msg(text="why?", reply_to_message={"message_id": 7, "date": REPLY_TS, "chat": FORUM, "from": BOB, "text": "Because."})
+    assert describe_reference(m, BOT_ID) == f"[Replying to a message from Bob, sent {REPLY_WHEN}]\nBecause.\n{END_OF_REPLY}"
+    # A forwarded message in a topic still describes the forward, not the topic root.
+    f = topic_msg(text="x", reply_to_message=TOPIC_ROOT, forward_origin=origin("user", sender_user=BOB))
+    assert describe_reference(f, BOT_ID) == f"[Forwarded from Bob ({REPLY_WHEN})]"
+
+
+# The bot answers with rich messages: no text/caption, the content is in rich_message.blocks (reviewer defect 2).
+def rich(blocks: list) -> dict:
+    return replied(**{"from": BOT}, rich_message={"blocks": blocks})
+
+
+def para(text) -> dict:
+    return {"type": "paragraph", "text": text}
+
+
+def test_reply_to_the_bots_rich_answer_quotes_its_text():
+    m = msg(text="shorter", reply_to_message=rich([para("Here is a long answer.")]))
+    assert describe_reference(m, BOT_ID) == (
+        f"[Replying to a message from {ASSISTANT}, sent {REPLY_WHEN}]\nHere is a long answer.\n{END_OF_REPLY}"
+    )
+
+
+def test_rich_answer_blocks_are_flattened_to_plain_text():
+    cell = {"align": "left", "valign": "top"}
+    m = msg(text="explain", reply_to_message=rich([
+        {"type": "heading", "text": "Plan", "size": 2},
+        para(["Here is ", {"type": "bold", "text": "the"}, " ", {"type": "url", "text": "answer", "url": "https://x"}]),
+        {"type": "list", "items": [{"label": "1.", "blocks": [para("first")]}, {"label": "•", "blocks": [para("second")]}]},
+        {"type": "pre", "text": "print(1)", "language": "python"},
+        {"type": "table", "cells": [[{**cell, "text": "A", "is_header": True}, {**cell, "text": "B"}],
+                                    [{**cell, "text": "1"}, {**cell, "text": "2"}]]},
+        {"type": "blockquote", "blocks": [para("quoted")], "credit": "Someone"},
+        {"type": "details", "summary": "More", "blocks": [para("extra")]},
+        para([{"type": "custom_emoji", "custom_emoji_id": "1", "alternative_text": "🙂"}, " done"]),
+        {"type": "divider"},
+    ]))
+    body = describe_reference(m, BOT_ID).split("\n")[1:-1]
+    assert body == ["Plan", "Here is the answer", "1. first", "• second", "print(1)", "A | B", "1 | 2", "quoted", "Someone",
+                    "More", "extra", "🙂 done"]
+
+
+def test_rich_summary_dumps_are_left_out_of_the_quote():
+    """Replying to a turn summary: thinking, buttons and the tool-call / thinking sections are not the answer."""
+    m = msg(text="again", reply_to_message=rich([
+        para([{"type": "bold", "text": "Done in 3 s"}, ": search_web"]),
+        {"type": "details", "summary": "Tool calls (1)", "blocks": [
+            {"type": "details", "summary": "🔍 search_web · 1 s", "blocks": [{"type": "pre", "text": "{\"query\": \"x\"}"}]}]},
+        {"type": "details", "summary": "💭 Thinking", "blocks": [para([{"type": "italic", "text": "secret plan"}])]},
+        {"type": "thinking", "text": "more secret"},
+        para("1.2k tokens · ≈$0.01"),
+        {"type": "buttons", "buttons": [{"text": "🔁 Retry", "callback_data": "turn_retry_abc"}]},
+    ]))
+    text = describe_reference(m, BOT_ID)
+    assert text.split("\n")[1:-1] == ["Done in 3 s: search_web", "1.2k tokens · ≈$0.01"]
+    for hidden in ("query", "secret", "Retry", "Tool calls", "Thinking"):
+        assert hidden not in text
+
+
+def test_long_rich_answer_is_truncated():
+    m = msg(text="tl;dr", reply_to_message=rich([para("x" * 1000), para("y" * 1000)]))
+    body = describe_reference(m, BOT_ID).split("\n", 1)[1].rsplit("\n", 1)[0]
+    assert body.endswith(TRUNCATED) and len(body) == QUOTE_LIMIT + len(TRUNCATED)
+
+
+# sender_chat is the real sender when from_user is a placeholder account (reviewer defect 3).
+def test_sender_chat_wins_over_placeholder_accounts():
+    group = {"id": -1, "type": "supergroup", "title": "Team"}
+    telegram = {"id": 777000, "is_bot": False, "first_name": "Telegram"}
+    auto_forward = {"message_id": 9, "date": REPLY_TS, "chat": group, "from": telegram,
+                    "sender_chat": {"id": -100, "type": "channel", "title": "Daily News"}, "text": "Markets up"}
+    assert describe_reference(msg(text="?", reply_to_message=auto_forward), BOT_ID).startswith(
+        f"[Replying to a message from Daily News, sent {REPLY_WHEN}]")
+    anonymous = {"id": 1087968824, "is_bot": True, "first_name": "Group", "username": "GroupAnonymousBot"}
+    admin_post = {"message_id": 9, "date": REPLY_TS, "chat": group, "from": anonymous, "sender_chat": group, "text": "Rule 1"}
+    for bot_id in (BOT_ID, None):  # even without a bot id the anonymous bot is not the assistant
+        header = describe_reference(msg(text="?", reply_to_message=admin_post), bot_id).split("\n")[0]
+        assert header == f"[Replying to a message from Team, sent {REPLY_WHEN}]"
+    # The assistant's own message still wins over any sender_chat.
+    own = {"message_id": 9, "date": REPLY_TS, "chat": group, "from": BOT, "sender_chat": group, "text": "My answer"}
+    assert ASSISTANT in describe_reference(msg(text="?", reply_to_message=own), BOT_ID)
+
+
 def test_forwarded_from_a_user():
     m = msg(text="hello", forward_origin=origin("user", sender_user=BOB))
     assert describe_reference(m, BOT_ID) == f"[Forwarded from Bob ({REPLY_WHEN})]"

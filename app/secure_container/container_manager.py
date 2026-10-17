@@ -4,6 +4,7 @@ import uuid
 import logging
 import tempfile
 import json
+import shlex
 import shutil
 import threading
 from pathlib import Path
@@ -15,6 +16,14 @@ import time
 # limited to 512 MB / one CPU; without a cap a burst of users could exhaust the host.
 MAX_SANDBOX_CONTAINERS = max(1, int(os.getenv("MAX_SANDBOX_CONTAINERS", "4") or "4"))
 _SANDBOX_SLOTS = threading.BoundedSemaphore(MAX_SANDBOX_CONTAINERS)
+
+# Memory limit of a sandbox container unless the caller asks for more (run_script(mem_limit=...)
+# for the headless browser and the PDF renderer, which need about 1 GB).
+DEFAULT_MEM_LIMIT = "512m"
+
+# Scripts shipped with the bot that run_script() copies into a user's workspace and runs inside
+# the sandbox (browse.py: headless Chromium page reader; render_document.py: pdf/docx/xlsx).
+SCRIPTS_DIR = Path(__file__).parent / "scripts"
 
 # Set up logging
 logging.basicConfig(
@@ -158,7 +167,7 @@ class ContainerManager:
         os.chmod(user_dir, 0o777)
         return user_dir
     
-    def run_command(self, user_id, command, timeout=60, network_enabled=False):
+    def run_command(self, user_id, command, timeout=60, network_enabled=False, mem_limit=None):
         """
         Run a command in a secure container for the specified user.
 
@@ -170,12 +179,46 @@ class ContainerManager:
             command: Command to run
             timeout: Timeout in seconds
             network_enabled: Whether to enable network access for the container
+            mem_limit: Docker memory limit for this container (e.g. "1g"); None = DEFAULT_MEM_LIMIT
 
         Returns:
             Command output
         """
         with _SANDBOX_SLOTS:
-            return self._run_command_in_slot(user_id, command, timeout, network_enabled)
+            return self._run_command_in_slot(user_id, command, timeout, network_enabled, mem_limit)
+
+    def run_script(self, user_id, script_path, args=(), timeout=90, network_enabled=False, mem_limit=None):
+        """Run one of the bundled sandbox scripts (``secure_container/scripts/``) for a user.
+
+        The script is copied into the user's workspace under a unique temp name (tool calls
+        of one message run concurrently) and executed as ``python <file> <args>`` through
+        :meth:`run_command`, so slots, mounts and the package prelude behave as for every
+        sandboxed call. ``script_path`` is the bare file name of a bundled script (anything
+        with a directory part, ``../`` included, is refused: the model never chooses what runs
+        here, but the tools must not be able to ship arbitrary files either); ``args`` are
+        quoted for the shell. The temp file is removed afterwards; the return value is the raw
+        container output (entrypoint banner first, so callers that expect JSON take the last
+        line that parses, see ``agents.web_tools.last_json_line``).
+        """
+        name = str(script_path or "")
+        if not name or Path(name).name != name:
+            return f"Error: sandbox script not found: {script_path}"
+        source = SCRIPTS_DIR / name
+        if not source.is_file():
+            return f"Error: sandbox script not found: {script_path}"
+        user_dir = self.ensure_user_directory(user_id)
+        target_file, file_in_container = self._workspace_file(user_dir, "temp_tool", ".py")
+        try:
+            shutil.copy(source, target_file)
+            os.chmod(target_file, 0o755)
+            command = " ".join([f"python {file_in_container}"] + [shlex.quote(str(a)) for a in args])
+            return self.run_command(user_id, command, timeout, network_enabled, mem_limit)
+        finally:
+            try:
+                if target_file.exists():
+                    target_file.unlink()
+            except Exception as e:
+                logger.error(f"Error removing temporary script {target_file}: {str(e)}")
 
     @staticmethod
     def _workspace_file(user_dir, prefix, suffix):
@@ -189,7 +232,7 @@ class ContainerManager:
         name = f"{prefix}_{uuid.uuid4().hex[:8]}{suffix}"
         return user_dir / name, f"/home/runner/workspace/{name}"
 
-    def _run_command_in_slot(self, user_id, command, timeout=60, network_enabled=False):
+    def _run_command_in_slot(self, user_id, command, timeout=60, network_enabled=False, mem_limit=None):
         # Ensure user directory exists
         user_dir = self.ensure_user_directory(user_id)
         
@@ -307,7 +350,7 @@ class ContainerManager:
                 remove=False,  # We'll remove it manually after getting logs
                 network_mode=network_mode,  # Network access based on parameter
                 cap_add=["SYS_PTRACE"] if "strace" in command else None,  # Add capabilities for strace if needed
-                mem_limit="512m",  # Limit memory to prevent resource exhaustion
+                mem_limit=mem_limit or DEFAULT_MEM_LIMIT,  # Limit memory to prevent resource exhaustion
                 cpu_quota=100000,  # Limit CPU usage (100% of one CPU)
                 cpu_period=100000
             )

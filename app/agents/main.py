@@ -12,6 +12,8 @@ from .image_tools import ImageTools
 from .video_tools import VideoTools
 from .sms_tools import SMSTools
 from .user_interactions import UserInteractions
+from .web_tools import WebTools
+from .document_tools import DocumentTools
 from .embeddings import ConversationEmbeddings
 from stats import stats_tracker
 from tavily import TavilyClient
@@ -763,6 +765,10 @@ class ChainOfThoughtAgent:
             self.agent.user_interactions = self.user_interactions
             self.subagents = SubagentTools(self.agent, self.user_settings)
             self.agent.subagents = self.subagents
+            self.web_tools = WebTools(user_id, sender)
+            self.agent.register_provider(self.web_tools, blocking=True)
+            self.document_tools = DocumentTools(user_id, sender)
+            self.agent.register_provider(self.document_tools, blocking=True)
             self.agent.thinking = self.user_settings.get("thinking").get("enabled", False)
         else:
             raise ValueError("Currently only Anthropic models are supported with the new tool pattern")

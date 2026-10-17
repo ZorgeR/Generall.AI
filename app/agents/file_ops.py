@@ -12,6 +12,48 @@ import asyncio
 
 load_dotenv()
 
+# trafilatura is imported on first use (it is heavy and optional): _TRAFILATURA caches the
+# module, or None when it is not installed. Tests set it to None to exercise the fallback.
+_UNSET = object()
+_TRAFILATURA = _UNSET
+# Below this many characters trafilatura's "main content" is distrusted (a cookie wall, a
+# teaser, an empty article shell) and the whole page text is returned instead.
+MIN_EXTRACTED_CHARS = 200
+
+
+def _trafilatura():
+    global _TRAFILATURA
+    if _TRAFILATURA is _UNSET:
+        try:
+            import trafilatura  # noqa: WPS433 - optional dependency
+
+            _TRAFILATURA = trafilatura
+        except Exception:  # noqa: BLE001 - missing or broken install: fall back to BeautifulSoup
+            _TRAFILATURA = None
+    return _TRAFILATURA
+
+
+def soup_text(html: str) -> str:
+    """The page's visible text, scripts and styles removed, blank lines dropped."""
+    soup = BeautifulSoup(html, 'html.parser')
+    for element in soup(["script", "style", "noscript"]):
+        element.decompose()
+    lines = (line.strip() for line in soup.get_text().splitlines())
+    return '\n'.join(line for line in lines if line)
+
+
+def extract_readable_text(html: str) -> str:
+    """Main content via trafilatura (tables kept) when it finds enough, else the whole page text."""
+    module = _trafilatura()
+    if module is not None:
+        try:
+            extracted = module.extract(html, include_tables=True)
+        except Exception:  # noqa: BLE001 - an extractor crash must not lose the page
+            extracted = None
+        if extracted and len(extracted.strip()) >= MIN_EXTRACTED_CHARS:
+            return extracted.strip()
+    return soup_text(html)
+
 class FileOperations:
     def __init__(self, user_id: str, sender=None):
         """
@@ -162,7 +204,7 @@ class FileOperations:
             },
             {
                 "name": "download_webpage",
-                "description": "Download a webpage and extract its text content",
+                "description": "Download a webpage and extract its readable text content (main article and tables; navigation and boilerplate removed). For pages that need JavaScript use browse_webpage.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -421,19 +463,8 @@ class FileOperations:
             response = requests.get(url, headers=headers, timeout=(10, 60))
             response.raise_for_status()
 
-            # Parse with BeautifulSoup
-            soup = BeautifulSoup(response.text, 'html.parser')
-
-            # Remove script and style elements
-            for script in soup(["script", "style"]):
-                script.decompose()
-
-            # Get text content
-            text = soup.get_text()
-            
-            # Clean up text: remove blank lines and excessive whitespace
-            lines = (line.strip() for line in text.splitlines())
-            text = '\n'.join(line for line in lines if line)
+            # Readable main content (trafilatura) with the plain page text as fallback
+            text = extract_readable_text(response.text)
 
             if save_to_file:
                 if not filename:
