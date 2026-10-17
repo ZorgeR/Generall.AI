@@ -517,9 +517,11 @@ async def test_follow_ups_guide_follows_the_setting(agents_main, monkeypatch, en
 
     monkeypatch.setattr(agent, "_generate_with_transcript", capture)
     await agent.generate_response("hi")
-    # right after the formatting guide, and only when the setting is on
+    # right after the formatting guide, and only when the setting is on; the providers'
+    # <capabilities> notes (ChainOfThoughtAgent._provider_notes) come after the guides
     tail = agents_main.RICH_FORMATTING_GUIDE + (agents_main.FOLLOW_UPS_GUIDE if enabled else "")
-    assert seen[0].endswith(tail) and (agents_main.FOLLOW_UPS_GUIDE in seen[0]) is enabled
+    before_notes = seen[0].split("\n<capabilities>")[0]
+    assert before_notes.endswith(tail) and (agents_main.FOLLOW_UPS_GUIDE in seen[0]) is enabled
     assert "follow_ups" not in SUBAGENT_SYSTEM  # subagents report to the main agent, never to the user
 
 

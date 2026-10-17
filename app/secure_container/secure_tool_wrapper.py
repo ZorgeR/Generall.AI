@@ -45,9 +45,6 @@ class SecureToolWrapper:
         "create_directory", # Directory creation
         "delete_directory", # Directory deletion
         
-        # Search operations
-        "memory_search",   # Search in memory files
-        
         # Image operations
         "_generate_image", # Image generation
         

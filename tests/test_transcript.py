@@ -75,7 +75,7 @@ async def test_prune_leaves_small_transcripts_alone_and_survives_summarizer_fail
     msgs = turn(1) + turn(2)
     before = json.dumps(msgs)
     stats = await T.prune(msgs, max_context_tokens=100000, keep_tool_results_turns=1, summarize=None)
-    assert stats == {"cleared": 0, "summarized": 0, "thinking_stripped": 0} and json.dumps(msgs) == before
+    assert stats == {"cleared": 0, "cleared_media": 0, "summarized": 0, "thinking_stripped": 0} and json.dumps(msgs) == before
 
     async def boom(old):
         raise RuntimeError("no model")

@@ -41,7 +41,8 @@ from agents.trace import TurnBudget
 from agents.subagent import SubagentTools
 from agents import content as prompt_content
 from agents.mcp_tools import MCPTools
-from agents.profile_tools import ProfileTools
+from agents.profile_tools import ProfileTools, last_shown_profile_fingerprint, profile_block, profile_store
+from agents.profile_tools import fingerprint as profile_fingerprint
 from agents.vision_tools import VisionTools
 from agents.transcript import (
     MEMORY_BULLET,
@@ -1046,15 +1047,19 @@ User message: {question}"""
             lines.append(f"{MEMORY_BULLET}[{conv.get('timestamp', '')}] Q: {q} / A: {a}")
         return lines
 
-    async def _request_context(self, question: str, update_status=None, shown: set[str] | None = None) -> tuple[str, str]:
-        """Per-turn context: time plus the long-term memory retrieved for this question.
+    async def _request_context(self, question: str, update_status=None, messages: list[dict] | None = None) -> tuple[str, str]:
+        """Per-turn context: time, the long-term memory retrieved for this question and the
+        user's profile (``data/<uid>/profile.md``, when ``profile.enabled``).
 
-        Returns ``(full, new)``. ``new`` leaves out the memory lines this transcript already
-        showed (``shown``); it is stored as the first block of the user turn, so what the
-        model saw stays in the history and the transcript stays append-only. ``full`` keeps
-        every line, for the quick text-only path, which never sees earlier context blocks.
+        Returns ``(full, new)``. ``new`` leaves out what this transcript (``messages``) already
+        showed: the memory lines of earlier context blocks and the profile when the version
+        last shown (``<profile fingerprint="...">``) is the current one; it is stored as the
+        first block of the user turn, so what the model saw stays in the history and the
+        transcript stays append-only. ``full`` keeps every line and the whole profile, for the
+        quick text-only path, which never sees earlier context blocks.
         """
         s = self.user_settings
+        messages = messages or []
         recent: list[str] = []
         hits: list[str] = []
         if s.get("summarization_history", {}).get("enabled", True) and s.get("short_term_memory", {}).get("enabled", True):
@@ -1063,13 +1068,21 @@ User message: {question}"""
             if update_status:
                 await update_status(step="initial", details="Searching memory", iteration=0, critique=0)
             hits = await self._semantic_hits(question, int(s.get("semantic_search", {}).get("max_results", 3)))
-        shown = shown or set()
+        shown = shown_memory_lines(messages)
         new_recent = [line for line in recent if line not in shown]
         new_hits = [line for line in hits if line not in shown]
-        return self._render_context(recent, hits), self._render_context(new_recent, new_hits)
+        profile = new_profile = ""
+        if s.get("profile", {}).get("enabled", True):
+            text = await asyncio.to_thread(profile_store.text, self.user_id)
+            if text.strip():
+                fp = profile_fingerprint(text)
+                profile = profile_block(text, fp)
+                if fp != last_shown_profile_fingerprint(messages):
+                    new_profile = profile
+        return self._render_context(recent, hits, profile), self._render_context(new_recent, new_hits, new_profile)
 
     @staticmethod
-    def _render_context(recent: list[str], hits: list[str]) -> str:
+    def _render_context(recent: list[str], hits: list[str], profile: str = "") -> str:
         parts = [f"Current time in UTC+0: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"]
         memory: list[str] = []
         if recent:
@@ -1078,6 +1091,8 @@ User message: {question}"""
             memory.append("Related earlier conversations (semantic search):\n" + "\n".join(hits))
         if memory:
             parts.append("<memory>\n" + "\n\n".join(memory) + "\n</memory>")
+        if profile:
+            parts.append(profile)  # <profile fingerprint="..."> ... </profile> (agents.profile_tools.profile_block)
         return "<context>\n" + "\n".join(parts) + "\n</context>"
 
     async def _summarize_messages(self, old: list[dict]) -> str:
@@ -1153,7 +1168,7 @@ User message: {question}"""
             if stripped:
                 print(f"Transcript prefix changed (model, system prompt or tools): dropped {stripped} thinking block(s)")
             transcript.fingerprint = fingerprint
-        full_context, turn_context = await self._request_context(question, update_status, shown_memory_lines(transcript.messages))
+        full_context, turn_context = await self._request_context(question, update_status, transcript.messages)
         if self.subagents is not None:
             self.subagents.update_status = update_status
             self.subagents.trace = trace

@@ -15,7 +15,9 @@ thinking block (``strip_thinking``) because the old blocks no longer match:
 
 * a compaction boundary (``prune``): only when the estimated size exceeds
   ``max_context_tokens``, tool results older than the last
-  ``keep_tool_results_turns`` user turns are cleared to a short marker and, if
+  ``keep_tool_results_turns`` user turns are cleared to a short marker, image and
+  document blocks of those turns become a marker naming how to get the file back
+  (``clear_old_media``) and, if
   still above the target, the oldest half is summarized by the caller-supplied
   ``summarize`` coroutine into one user message, until the transcript is below
   ``PRUNE_TARGET_RATIO`` of the budget (so the next boundary is many turns away);
@@ -41,12 +43,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from agents.content import estimate_block_tokens
+from agents.content import estimate_block_tokens, is_media_block
 
 logger = logging.getLogger(__name__)
 
 TRANSCRIPT_VERSION = 1
 CLEARED_MARKER = "[tool result cleared to save context; call the tool again if you need it]"
+IMAGE_CLEARED_MARKER = (
+    "[image removed from the context to save space; it is still in the workspace: "
+    "use view_image with the path named in the message]"
+)
+DOCUMENT_CLEARED_MARKER = (
+    "[document '{title}' removed from the context to save space; it is still in the workspace: "
+    "use read_document with its path]"
+)
 SUMMARY_TAG = "earlier_conversation_summary"
 CONTEXT_OPEN = "<context>\n"  # the per-turn context block stored first in each user turn
 MEMORY_BULLET = "• "  # one memory line (summary or semantic hit) inside a context block
@@ -270,6 +280,40 @@ def clear_old_tool_results(messages: list[dict], keep_turns: int) -> int:
     return cleared
 
 
+def _media_cleared_block(block: dict) -> dict:
+    if block.get("type") == "document":
+        return {"type": "text", "text": DOCUMENT_CLEARED_MARKER.format(title=block.get("title") or "document")}
+    return {"type": "text", "text": IMAGE_CLEARED_MARKER}
+
+
+def clear_old_media(messages: list[dict], keep_turns: int) -> int:
+    """Replace image / document blocks in user messages older than the last ``keep_turns`` user
+    turns (tool results included) with a text marker that names how to get the file back
+    (``view_image`` / ``read_document``). A photo costs ~1600 tokens for as long as it stays in
+    the transcript; the file itself stays in the workspace. Never touches the last ``keep_turns``
+    turns. Returns the number of blocks replaced."""
+    turn_starts = [i for i, m in enumerate(messages) if is_user_turn(m)]
+    if len(turn_starts) <= keep_turns:
+        return 0
+    cutoff = turn_starts[-keep_turns] if keep_turns > 0 else len(messages)
+    cleared = 0
+    for m in messages[:cutoff]:
+        content = m.get("content")
+        if m.get("role") != "user" or not isinstance(content, list):
+            continue
+        for i, block in enumerate(content):
+            if is_media_block(block):
+                content[i] = _media_cleared_block(block)
+                cleared += 1
+            elif isinstance(block, dict) and block.get("type") == "tool_result" and isinstance(block.get("content"), list):
+                inner = block["content"]
+                for j, part in enumerate(inner):
+                    if is_media_block(part):
+                        inner[j] = _media_cleared_block(part)
+                        cleared += 1
+    return cleared
+
+
 def split_for_summary(messages: list[dict]) -> tuple[list[dict], list[dict]]:
     """Oldest part (to summarize) and the rest, cut at a user-turn boundary near the middle."""
     turn_starts = [i for i, m in enumerate(messages) if is_user_turn(m)]
@@ -299,11 +343,12 @@ async def prune(
     history stays append-only). Above it: clear old tool results, then summarize the
     oldest half until under ``PRUNE_TARGET_RATIO`` of the budget; if anything was edited,
     strip every thinking block. Returns counters for logging."""
-    stats = {"cleared": 0, "summarized": 0, "thinking_stripped": 0}
+    stats = {"cleared": 0, "cleared_media": 0, "summarized": 0, "thinking_stripped": 0}
     if estimate_tokens(messages) <= max_context_tokens:
         return stats
     target = int(max_context_tokens * PRUNE_TARGET_RATIO)
     stats["cleared"] = clear_old_tool_results(messages, keep_tool_results_turns)
+    stats["cleared_media"] = clear_old_media(messages, keep_tool_results_turns)
     if estimate_tokens(messages) > target and summarize is not None:
         for _ in range(4):  # a few rounds at most; each halves the transcript
             old, rest = split_for_summary(messages)
@@ -318,7 +363,7 @@ async def prune(
             stats["summarized"] += len(old)
             if estimate_tokens(messages) <= target:
                 break
-    if stats["cleared"] or stats["summarized"]:
+    if stats["cleared"] or stats["cleared_media"] or stats["summarized"]:
         stats["thinking_stripped"] = strip_thinking(messages)
     return stats
 

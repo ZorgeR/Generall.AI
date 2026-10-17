@@ -320,6 +320,7 @@ def quiet_media(monkeypatch):
     monkeypatch.setattr(media, "describe_image_openai", AsyncMock(return_value="a tabby cat"))
     monkeypatch.setattr(media, "describe_document", AsyncMock(return_value="quarterly numbers"))
     monkeypatch.setattr(media, "prepare_downloaded_image_for_vision", lambda src, dst: shutil.copy(src, dst))
+    monkeypatch.setattr(media, "save_vision_copy", lambda src, dst, max_px=None: (shutil.copy(src, dst), (1, 1))[1])
 
 
 def ctx() -> JobContext:
@@ -327,8 +328,12 @@ def ctx() -> JobContext:
 
 
 def prompt_of(run_turn: AsyncMock) -> str:
+    """The prompt's text: the string itself, or the first text block of a block prompt (media jobs)."""
     run_turn.assert_awaited_once()
-    return run_turn.await_args.kwargs["prompt"]
+    prompt = run_turn.await_args.kwargs["prompt"]
+    if isinstance(prompt, list):
+        return next(b["text"] for b in prompt if b.get("type") == "text")
+    return prompt
 
 
 def assert_preamble_first(prompt: str, own_text: str) -> None:
@@ -379,7 +384,7 @@ async def test_photo_job(run_turn, quiet_media):
     await messages._run_images(FakeBot(), m, USER, None, [m.photo[-1]], m.caption, None, ctx())
     prompt = prompt_of(run_turn)
     assert_preamble_first(prompt, "which breed?")
-    assert "User attached 1 image(s)" in prompt and "Anthropic description: a cat" in prompt
+    assert "User attached 1 image(s)" in prompt and "Image 1: " in prompt
 
 
 async def test_album_job(run_turn, quiet_media):
@@ -388,8 +393,8 @@ async def test_album_job(run_turn, quiet_media):
     refs = [m.photo[-1], m.photo[-1]]
     await messages._run_images(FakeBot(), m, USER, None, refs, None, None, ctx())
     prompt = prompt_of(run_turn)
-    assert_preamble_first(prompt, "Describe what is in this image")
-    assert "User attached 2 image(s)" in prompt
+    assert_preamble_first(prompt, "User sent 2 photo(s).")
+    assert "Image 2: " in prompt
 
 
 async def test_document_job(run_turn, quiet_media):

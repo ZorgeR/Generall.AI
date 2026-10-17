@@ -16,7 +16,7 @@ import subprocess
 import uuid
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 from bot.clients import anthropic_client, openai_client, whisper_client
 from models import (
@@ -31,7 +31,7 @@ from models import (
     openai_reasoning_options,
 )
 from bot.config import config
-from image_utils import is_jpeg_image, save_image_as_jpeg
+from image_utils import flatten_to_rgb, is_jpeg_image, save_image_as_jpeg
 
 logger = logging.getLogger(__name__)
 
@@ -43,9 +43,20 @@ TEXT_EXTENSIONS = [
     ".txt", ".csv", ".py", ".sh", ".bat", ".md", ".ps1", ".js", ".css", ".html", ".php", ".sql",
     ".xml", ".yaml", ".yml", ".toml", ".ini", ".conf", ".log", ".jsonl",
 ]
-DOCUMENT_EXTENSIONS = [".pdf", ".json", ".docx", ".xlsx", ".xls"] + TEXT_EXTENSIONS
+OFFICE_EXTENSIONS = [".json", ".docx", ".xlsx", ".xls"]  # extracted to text before the agent sees them
+DOCUMENT_EXTENSIONS = [".pdf"] + OFFICE_EXTENSIONS + TEXT_EXTENSIONS
 VIDEO_EXTENSIONS = [".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".3gp"]
 LARGE_TEXT_THRESHOLD = 100_000
+
+# A PDF reaches the agent as a real document block when it is within these limits; larger
+# ones are extracted to text (docs/design-v3.md, F7).
+PDF_MAX_BYTES = 20 * 1024 * 1024
+PDF_MAX_PAGES = 100
+
+# Picture formats the Messages API takes as image blocks (PIL format name -> media type);
+# anything else (BMP, HEIC, TIFF ...) is re-encoded as JPEG before it is sent.
+VISION_MEDIA_TYPES = {"JPEG": "image/jpeg", "PNG": "image/png", "GIF": "image/gif", "WEBP": "image/webp"}
+_JPEG_QUALITIES = (90, 80, 70, 60, 50)
 
 
 def describe_type_for(extension: str) -> str:
@@ -131,10 +142,73 @@ def encode_image(image_path: str) -> str:
 
 
 def prepare_downloaded_image_for_vision(source_path: str, target_path: str) -> None:
+    """A full-resolution JPEG copy of an uploaded picture (JPEG copied as is; PNG, WebP, GIF, BMP,
+    HEIC and anything else PIL opens are converted). This is the permanent workspace file, so it
+    is never downscaled: the agent edits and re-sends it later. ``save_vision_copy`` makes the
+    smaller copy the model looks at."""
     if is_jpeg_image(source_path):
         shutil.copy(source_path, target_path)
         return
     save_image_as_jpeg(source_path, target_path, quality=90)
+
+
+def _max_vision_bytes() -> int:
+    from agents.content import MAX_IMAGE_BYTES  # no agents import at module level in bot/
+
+    return MAX_IMAGE_BYTES
+
+
+def _fit_jpeg(img: Image.Image, max_px: int, max_bytes: int) -> tuple[bytes, tuple[int, int]]:
+    """JPEG bytes of ``img`` at most ``max_px`` on the long side and under ``max_bytes``: the
+    quality drops first, then the picture is halved until it fits. Returns (data, size)."""
+    img = ImageOps.exif_transpose(img)
+    resample = getattr(Image, "Resampling", Image).LANCZOS
+    if max_px > 0 and max(img.size) > max_px:
+        img.thumbnail((max_px, max_px), resample)
+    img = flatten_to_rgb(img)
+    while True:
+        data = b""
+        for quality in _JPEG_QUALITIES:
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG", quality=quality, optimize=True)
+            data = buffer.getvalue()
+            if len(data) <= max_bytes:
+                return data, img.size
+        if max(img.size) <= 256:
+            return data, img.size  # cannot shrink any further; the API will say so
+        img.thumbnail((max(1, img.size[0] // 2), max(1, img.size[1] // 2)), resample)
+
+
+def save_vision_copy(source_path: str, target_path: str, max_px: int | None = None) -> tuple[int, int]:
+    """Write the copy the model looks at: a JPEG at most ``max_px`` (default
+    ``MAX_IMAGE_RESOLUTION_VISION``) on the long side and under the API's size limit. Returns
+    the copy's (width, height). Blocking: run in a worker thread."""
+    max_px = max_px or config.max_image_resolution_vision
+    with Image.open(source_path) as img:
+        data, size = _fit_jpeg(img, max_px, _max_vision_bytes())
+    with open(target_path, "wb") as f:
+        f.write(data)
+    return size
+
+
+def image_for_vision(source_path: str, max_px: int | None = None) -> tuple[bytes, str, tuple[int, int], tuple[int, int]]:
+    """The bytes of an image as the model should see it, in memory (``view_image``).
+
+    A JPEG/PNG/GIF/WebP file already within ``max_px`` and the size limit is passed through
+    unchanged (no second lossy encoding of a screenshot); anything else is re-encoded with
+    ``_fit_jpeg``. Returns (data, media_type, original (w, h), sent (w, h)). Blocking.
+    """
+    max_px = max_px or config.max_image_resolution_vision
+    max_bytes = _max_vision_bytes()
+    with Image.open(source_path) as img:
+        original = ImageOps.exif_transpose(img).size
+        media_type = VISION_MEDIA_TYPES.get((img.format or "").upper())
+        size = os.path.getsize(source_path)
+        if media_type and max(original) <= max_px and size <= max_bytes and getattr(img, "n_frames", 1) == 1:
+            with open(source_path, "rb") as f:
+                return f.read(), media_type, original, original
+        data, sent = _fit_jpeg(img, max_px, max_bytes)
+    return data, "image/jpeg", original, sent
 
 
 async def describe_image_anthropic(question: str, image_path: str) -> str:
@@ -277,8 +351,7 @@ async def describe_txt(question: str, path: str) -> str:
 
 async def describe_json(question: str, path: str) -> str:
     try:
-        content = await asyncio.to_thread(_read_text, path)
-        json.loads(content)
+        content = await asyncio.to_thread(_read_json, path)
     except FileNotFoundError:
         return "Error: JSON file not found"
     except json.JSONDecodeError:
@@ -293,11 +366,15 @@ async def describe_json(question: str, path: str) -> str:
     )
 
 
+def _read_docx(path: str) -> str:
+    import docx2txt
+
+    return docx2txt.process(path)
+
+
 async def describe_docx(question: str, path: str) -> str:
     try:
-        import docx2txt
-
-        content = await asyncio.to_thread(docx2txt.process, path)
+        content = await asyncio.to_thread(_read_docx, path)
     except ImportError:
         return "Error: docx2txt library not installed."
     except FileNotFoundError:
@@ -338,6 +415,55 @@ async def describe_xlsx(question: str, path: str) -> str:
         "You are a very professional data analyst specializing in Excel spreadsheets. Analyze the given spreadsheet in a detailed way, to answer user's question. Format numeric insights clearly.",
         f"Here is the content of an Excel spreadsheet:\n\n{content}\n\n{question}",
     )
+
+
+def _read_json(path: str) -> str:
+    """The JSON file's text, validated (``json.JSONDecodeError`` when it is not JSON)."""
+    content = _read_text(path)
+    json.loads(content)
+    return content
+
+
+def _read_pdf_text(path: str) -> str:
+    from pypdf import PdfReader
+
+    reader = PdfReader(path)
+    pages = []
+    for i, page in enumerate(reader.pages, 1):
+        text = (page.extract_text() or "").strip()
+        pages.append(f"--- page {i} ---\n{text}" if text else f"--- page {i} --- (no extractable text)")
+    return "\n\n".join(pages)
+
+
+def pdf_page_count(path: str) -> int:
+    """Number of pages (pypdf; raises when the file is not a readable PDF). Blocking."""
+    from pypdf import PdfReader
+
+    return len(PdfReader(path).pages)
+
+
+def pdf_fits_as_block(path: str, pages: int) -> bool:
+    """True when the PDF may go to the model as a document block (size and page limits)."""
+    return os.path.getsize(path) <= PDF_MAX_BYTES and pages <= PDF_MAX_PAGES
+
+
+def extract_document_text(path: str) -> str:
+    """The plain text of a document the agent should read: txt/code as is, JSON validated,
+    DOCX via docx2txt, XLSX/XLS as pandas tables per sheet, PDF via pypdf. The same readers
+    the ``describe_*`` functions use. ``ValueError`` for an unsupported extension; the reader's
+    own exception when the file cannot be read. Blocking: run in a worker thread."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".pdf":
+        return _read_pdf_text(path)
+    if ext in TEXT_EXTENSIONS:
+        return _read_text(path)
+    if ext == ".json":
+        return _read_json(path)
+    if ext == ".docx":
+        return _read_docx(path)
+    if ext in (".xlsx", ".xls"):
+        return _read_xlsx(path)
+    raise ValueError(f"Unsupported document type {ext}")
 
 
 async def describe_document(question: str, file_path: str) -> str:

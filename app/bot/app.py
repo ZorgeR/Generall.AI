@@ -13,6 +13,7 @@ from bot.auth import auth
 from bot.config import config
 from bot.handlers import build_root_router
 from bot.handlers.commands import bot_commands
+from bot.handlers.mcp_ui import refresh_admin_servers
 from bot.jobs import reminders_loop
 from bot.media import configure_ffmpeg, ensure_temp_dirs
 from bot.queue import Job
@@ -54,6 +55,8 @@ async def on_startup(bot: Bot) -> None:
     ensure_temp_dirs()
     runtime.queue.on_timeout = lambda job: _on_timeout(bot, job)
     runtime.background_tasks.append(asyncio.create_task(reminders_loop(bot, runtime.queue), name="reminders-loop"))
+    # The admin's MCP servers (MCP_SERVERS_FILE) get their tool cache refreshed once, off the startup path.
+    runtime.background_tasks.append(asyncio.create_task(refresh_admin_servers(), name="mcp-admin-refresh"))
     await register_commands(bot)
     me = await bot.me()
     logger.info("Bot @%s is running (streaming=%s, local_api=%s)", me.username, config.streaming_enabled, config.use_local_api)
