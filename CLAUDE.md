@@ -182,7 +182,9 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
     system_tools.py         SystemTools: apt/pip/service/network tools — NOT wired into the agent
     paths.py                resolve_under(): safe resolution of model-supplied paths inside data/<uid>;
                             regular_files(folder, pattern): host reads of a workspace folder that never follow
-                            a link (O_NOFOLLOW folder and files, regular UTF-8 files only; memory_search, embeddings)
+                            a link (O_NOFOLLOW folder and files, regular UTF-8 files only; memory_search, embeddings); ensure_real_dir(path, mode):
+                            a workspace subfolder the bot prepares (downloads/, documents/) made a real directory
+                            (a link or file there is unlinked) and chmod-ed through an O_NOFOLLOW descriptor
     trace.py                ToolTrace/ToolCall/TurnBudget: per-turn tool calls, token usage, shared tool budget
     transcript.py           TranscriptStore + size control: one real API transcript per chat/topic (transcript mode);
                             prune clears old tool results AND old media blocks (clear_old_media)
@@ -764,7 +766,9 @@ pip) and replayed once at every session start; a file the model writes with `cre
   own deadline (browse 60 s, render 75 s) with a watchdog thread and print an error JSON instead of running
   into the container timeout, which would lose the logs. Chromium runs with `--no-sandbox
   --disable-dev-shm-usage --disable-gpu`. `web_tools.writable_dir()` creates `downloads/` (screenshots) and
-  `documents/` (rendered files) and chmods them 777 so the container's `runner` can write there.
+  `documents/` (rendered files) and chmods them 777 so the container's `runner` can write there, through
+  `paths.ensure_real_dir`: the sandbox can replace those folders with links, and a plain chmod by the root bot
+  would follow them (e.g. to `/var/run/docker.sock`, which is the host's socket).
 - Commands always run through `bash -lc`, in the session and in the one-off fallback alike, so pipes, `&&`,
   redirects and globs work. `run_script` alone is `shlex`-split by docker-py (`entrypoint.sh` does
   `exec "$@"`), which is why it quotes every argument.
