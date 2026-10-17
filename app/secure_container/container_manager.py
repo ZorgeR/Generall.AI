@@ -28,7 +28,11 @@ IMAGE_NAME = "secure-container"
 # The files baked into the sandbox image. Scripts under scripts/ are copied into the workspace at
 # run time (run_script), so they are not part of the image and not of its tag.
 IMAGE_BUILD_FILES = ("Dockerfile", "entrypoint.sh", "requirements.txt")
-IMAGE_LATEST_TAG = "latest"  # alias kept for people: the content tag is what the bot runs
+IMAGE_LATEST_TAG = "latest"  # alias kept for people: the content tag is what the bot runs; also the
+                             # fallback when building a new content tag fails (_ensure_image_exists)
+# Content tags whose build failed in this process: the other ContainerManager instances
+# (SecureToolWrapper's, web_tools') use the fallback instead of starting another long build.
+_FAILED_BUILDS: set[str] = set()
 
 
 def image_build_fingerprint(dockerfile_dir: Path | None = None) -> str:
@@ -128,8 +132,10 @@ class ContainerManager:
             logger.info(f"Image {self.image_name}:{self.image_tag} already exists")
             return None
         except ImageNotFound:
+            if self.image_tag in _FAILED_BUILDS and self._fall_back_to_latest():
+                return None
             logger.info(f"Building image {self.image_name}:{self.image_tag} (the build context changed or no image yet)")
-            
+
             # Get the directory of the Dockerfile
             dockerfile_dir = Path(__file__).parent.absolute()
             logger.info(f"Dockerfile directory: {dockerfile_dir}")
@@ -174,8 +180,29 @@ class ContainerManager:
                 # Print more detailed error information
                 if hasattr(e, 'stderr'):
                     logger.error(f"Build stderr: {e.stderr}")
+                # A failed build (network, a removed upstream package) must not take the whole bot
+                # down while the previous image is still there: run on that one, rebuild next start.
+                _FAILED_BUILDS.add(self.image_tag)
+                if self._fall_back_to_latest():
+                    return None
                 raise
-    
+
+    def _fall_back_to_latest(self) -> bool:
+        """Run on ``secure-container:latest`` (the last image built successfully) when the current
+        content tag could not be built. False when there is no such image either."""
+        wanted = f"{self.image_name}:{self.image_tag}"
+        try:
+            self.docker_client.images.get(f"{self.image_name}:{IMAGE_LATEST_TAG}")
+        except Exception:  # noqa: BLE001 - ImageNotFound or Docker trouble: nothing to fall back to
+            return False
+        logger.error(
+            f"Could not build {wanted}; running on the previous sandbox image "
+            f"{self.image_name}:{IMAGE_LATEST_TAG} until a restart builds it (tools that need the new "
+            f"image, e.g. browse_webpage or the pdf render, may fail meanwhile)"
+        )
+        self.image_tag = IMAGE_LATEST_TAG
+        return True
+
     def _retag_latest_and_prune(self):
         """Point ``secure-container:latest`` at the new image and drop the older content-tagged
         images (they only take disk). Best effort: a failure here never fails startup."""

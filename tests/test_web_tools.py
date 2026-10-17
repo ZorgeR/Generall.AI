@@ -378,3 +378,90 @@ def test_browse_script_emits_one_ascii_json_line(browse_module, capsys):
 def test_browse_script_extract_text_prefers_trafilatura_then_the_body(browse_module):
     assert browse_module.extract_text(HTML, "fallback body").startswith("Sentence number 0") or "Sentence number 0" in browse_module.extract_text(HTML, "fallback body")
     assert browse_module.extract_text("<html><body></body></html>", "fallback body") == "fallback body"
+
+
+class FakePage:
+    """Just enough of a Playwright page for browse.browse(); the screenshot and title may fail."""
+
+    def __init__(self, screenshot_error=None, title_error=None):
+        self.screenshot_error, self.title_error = screenshot_error, title_error
+        self.url = "https://e.com/final"
+
+    def on(self, *a):
+        pass
+
+    def goto(self, url, **kw):
+        pass
+
+    def wait_for_load_state(self, *a, **kw):
+        pass
+
+    def wait_for_timeout(self, ms):
+        pass
+
+    def content(self):
+        return "<html><body></body></html>"
+
+    def inner_text(self, selector, **kw):
+        return "Text the browser already read"
+
+    def evaluate(self, script, arg):
+        return [["Home", "https://e.com/"]]
+
+    def screenshot(self, path, **kw):
+        if self.screenshot_error:
+            raise self.screenshot_error
+        Path(path).write_bytes(b"\x89PNG")
+
+    def title(self):
+        if self.title_error:
+            raise self.title_error
+        return "Fake title"
+
+
+def use_fake_playwright(monkeypatch, page):
+    import types
+
+    browser = SimpleNamespace(new_context=lambda **kw: SimpleNamespace(new_page=lambda: page), close=lambda: None)
+
+    class Playwright:
+        def __enter__(self):
+            return SimpleNamespace(chromium=SimpleNamespace(launch=lambda **kw: browser))
+
+        def __exit__(self, *exc):
+            return False
+
+    sync_api = types.ModuleType("playwright.sync_api")
+    sync_api.sync_playwright = Playwright
+    package = types.ModuleType("playwright")
+    package.sync_api = sync_api
+    monkeypatch.setitem(sys.modules, "playwright", package)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+
+
+def _browse(browse_module, capsys, *args):
+    assert browse_module.main(["https://e.com", *args]) == 0
+    return json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+
+def test_browse_script_takes_the_screenshot_when_asked(browse_module, monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    use_fake_playwright(monkeypatch, FakePage())
+    data = _browse(browse_module, capsys, "--screenshot", "downloads/s.png", "--wait-ms", "0")
+    assert data["error"] is None and data["screenshot"] == "downloads/s.png" and (tmp_path / "downloads" / "s.png").exists()
+    assert data["title"] == "Fake title" and "already read" in data["text"] and data["links"] == [["Home", "https://e.com/"]]
+
+
+def test_a_failed_screenshot_keeps_the_page_that_was_read(browse_module, monkeypatch, tmp_path, capsys):
+    """A screenshot timing out on web fonts used to replace the whole result with the error."""
+    monkeypatch.chdir(tmp_path)
+    use_fake_playwright(monkeypatch, FakePage(
+        screenshot_error=TimeoutError("page.screenshot: Timeout 10000ms exceeded. waiting for fonts to load"),
+        title_error=RuntimeError("Execution context was destroyed"),
+    ))
+    data = _browse(browse_module, capsys, "--screenshot", "downloads/s.png", "--wait-ms", "0")
+    assert data["error"] is None and data["screenshot"] is None and data["title"] is None
+    assert "already read" in data["text"] and data["final_url"] == "https://e.com/final" and data["links"]
+    # the host then reports the text with "Screenshot: not saved"
+    formatted = WebTools("7")._format(data, "downloads/s.png", 20_000)
+    assert "already read" in formatted and "Screenshot: not saved" in formatted

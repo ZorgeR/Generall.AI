@@ -211,9 +211,10 @@ async def run_turn(agents_main, monkeypatch, user_settings, script=None):
     return request
 
 
-async def run_turn_client(agents_main, monkeypatch, user_settings, script=None, classify=never):
-    """Runs the turn and returns the fake client (loop requests in ``requests``, judge calls in
-    ``created``). ``classify`` stands in for the Haiku classifier; the default fails if it runs."""
+async def run_turn_client(agents_main, monkeypatch, user_settings, script=None, classify=never, question="what time is it?"):
+    """Runs the turn on ``question`` (a string or content blocks) and returns the fake client (loop
+    requests in ``requests``, judge calls in ``created``). ``classify`` stands in for the Haiku
+    classifier; the default fails if it runs."""
     agent = agents_main.ChainOfThoughtAgent(user_id="42", user_settings=user_settings)
     client = FakeClient(script or [answer("done")])
     agent.agent.client = client
@@ -230,7 +231,7 @@ async def run_turn_client(agents_main, monkeypatch, user_settings, script=None, 
     monkeypatch.setattr(agent, "_save_conversation", no_save)
     monkeypatch.setattr(agent, "_semantic_hits", no_hits)
     monkeypatch.setattr(agent, "_recent_summaries", lambda limit: [])
-    response, _ = await agent.generate_response("what time is it?")
+    response, _ = await agent.generate_response(question)
     assert response == "done"
     return client
 
@@ -279,3 +280,69 @@ async def test_auto_mode_judge_keeps_light_thinking_on_the_main_model(agents_mai
     assert judge_request["model"] == models.ANTHROPIC_MODEL
     assert judge_request["output_config"]["effort"] == models.ANTHROPIC_EFFORT_LIGHT
     assert judge_request["thinking"]["display"] == "omitted"
+
+
+async def test_a_photo_reaches_the_model_as_an_image_block_and_is_stored(agents_main, monkeypatch, tmp_path):
+    """The whole turn, not the pieces: a block prompt with a picture skips the classifier (which
+    would route it to the tool-less quick answer), and the loop request carries the <context>
+    block, the question with the received-time prefix and the image itself, exactly as stored."""
+    from PIL import Image
+
+    from agents import content
+    from agents.transcript import transcript_store
+
+    picture = tmp_path / "data" / "42" / "images" / "x_v.jpg"
+    picture.parent.mkdir(parents=True)
+    Image.new("RGB", (8, 8), "red").save(picture, "JPEG")
+    asked = []
+
+    async def would_say_simple(question, history):
+        asked.append(question)
+        return "simple"
+
+    prompt = [content.text_block("which breed?"), content.image_ref("data/42/images/x_v.jpg")]
+    client = await run_turn_client(agents_main, monkeypatch, settings("auto"), classify=would_say_simple, question=prompt)
+
+    assert asked == []  # a prompt with media is always "complex"
+    (request,) = client.requests
+    user = request["messages"][-1]
+    assert user["role"] == "user" and [b["type"] for b in user["content"]] == ["text", "text", "image"]
+    assert "<context>" in user["content"][0]["text"]
+    assert user["content"][1]["text"].startswith("Message received time in UTC+0: ") and user["content"][1]["text"].endswith("which breed?")
+    image = user["content"][2]
+    assert image["source"]["type"] == "base64" and image["source"]["media_type"] == "image/jpeg" and image["source"]["data"]
+    stored = transcript_store.load("42", None).messages
+    assert stored[0]["role"] == "user" and stored[0]["content"][2] == image
+
+
+async def test_the_turn_sends_every_provider_tool_and_the_capabilities_notes(agents_main, monkeypatch, tmp_path):
+    """Registration and notes are checked on the request the model actually gets, not on a bare
+    AgentAnthropic: dropping a register_provider line or the <capabilities> block must fail here."""
+    from agents.mcp_tools import MCPTools
+    from agents.profile_tools import ProfileTools
+    from agents.user_interactions import UserInteractions
+    from agents.vision_tools import VisionTools
+    from bot import mcp_store
+
+    monkeypatch.setenv(mcp_store.ENV_ADMIN_FILE, str(tmp_path / "no_admin_servers.json"))
+    mcp_store.save_user("42", [{  # one cached MCP server: its tools are offered without any network
+        "name": "demo", "url": "https://demo.example.com/mcp", "transport": "http", "headers": {}, "enabled": True,
+        "tools": [{"name": "lookup", "description": "Look a thing up", "input_schema": {"type": "object"}}],
+        "updated": None, "error": None,
+    }])
+
+    request = await run_turn(agents_main, monkeypatch, settings("speed"))
+    names = {tool["name"] for tool in request["tools"]}
+    assert names >= {
+        "view_image", "describe_image", "read_document",  # VisionTools
+        "user_profile_read", "user_profile_add", "user_profile_remove", "user_profile_replace",  # ProfileTools
+        "mcp_demo_lookup",  # MCPTools
+        "browse_webpage", "create_document",  # WebTools, DocumentTools
+        "set_user_timezone", "schedule_reminder", "ask_user_choice",  # UserInteractions
+        "memory_search", "run_subagent",
+    }, sorted(names)
+    system = "".join(block["text"] for block in request["system"]) if isinstance(request["system"], list) else request["system"]
+    assert "<capabilities>" in system and "</capabilities>" in system
+    for provider in (VisionTools, ProfileTools, UserInteractions):
+        assert str(provider.prompt_notes).strip() in system, provider.__name__
+    assert MCPTools("42").prompt_notes.strip() in system

@@ -152,10 +152,19 @@ def browse(url: str, screenshot: str, wait_ms: int, max_chars: int) -> dict:
             links = collect_links(page)
             shot = None
             if screenshot:
-                os.makedirs(os.path.dirname(screenshot) or ".", exist_ok=True)
-                page.screenshot(path=screenshot, full_page=False, timeout=remaining_ms(10_000))
-                shot = screenshot
-            return result(title=page.title(), final_url=page.url, text=text, links=links, screenshot=shot)
+                # optional: a screenshot that times out (e.g. waiting for web fonts) or cannot be
+                # written must not throw away the page already read; the host says "not saved"
+                try:
+                    os.makedirs(os.path.dirname(screenshot) or ".", exist_ok=True)
+                    page.screenshot(path=screenshot, full_page=False, timeout=remaining_ms(10_000))
+                    shot = screenshot
+                except Exception:  # noqa: BLE001
+                    shot = None
+            try:
+                title = page.title()
+            except Exception:  # noqa: BLE001 - the page may have navigated away meanwhile
+                title = None
+            return result(title=title, final_url=page.url, text=text, links=links, screenshot=shot)
         finally:
             browser.close()
 

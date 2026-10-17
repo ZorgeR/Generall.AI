@@ -31,7 +31,8 @@ reply/forward preamble and /help, content blocks and media prompts, the vision t
 and memory_search, the MCP client and /mcp, the mode setting, the web/document tools and the
 sandbox image tag, embeddings, time zones and the /reminders UI, scheduled tasks, the agent's retry
 loop and the error path (`test_timezones.py`, `test_reminders_ui.py`, `test_proactive_tasks.py`,
-`test_stream_retry.py`, `test_error_recovery.py`), and how these features meet
+`test_stream_retry.py`, `test_error_recovery.py`), whole turns on a fake client (`test_mode.py`: the tools and
+`<capabilities>` notes actually sent, a photo reaching the loop as an image block), and how these features meet
 (`tests/test_cross_features.py`).
 There is no CI, linter, formatter or type checking. Validate changes with the tests and
 the import smoke check at the end of this file.
@@ -56,10 +57,12 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
     agent_runner.py         run_turn(prompt: str | content blocks): builds ChainOfThoughtAgent, status updates (Stop
                             button, "recovering" lines from the agent's retries), streaming, voice reply, answer, turn
                             record + buttons, partial answer on Stop, token accounting (record_usage), quiet_marker
-                            (scheduled tasks: an answer that is only the marker sends nothing); a failed turn ends as
+                            (scheduled tasks: an answer that is only the marker sends nothing; with quiet_notice the status
+                            becomes that line instead, "📭 Nothing new to report." on a Retry); a failed turn ends as
                             "❌ <friendly_error(e)> (trace <uuid>)" + 🔁 Retry over an error TurnRecord (ERROR_* texts)
     turn_actions.py         buttons of a finished turn: <follow_ups> parsing, TurnRecord store (data/<uid>/turns/; prompt
-                            text view + prompt_blocks media refs for Retry; error = a failed turn, Retry only), turn_*
+                            text view + prompt_blocks media refs for Retry; error = a failed turn, Retry only; quiet_marker = a scheduled task's
+                            marker, Retry runs with it again), turn_*
                             callback data, action rows (Continue/Retry/Listen/Reasoning) and answer keyboard
     message_context.py      reply / forward preamble: describe_reference(message, bot_id) and with_reference(prompt,
                             message, bot_id), pure (metadata + quoted text only, nothing downloaded); every content job
@@ -168,7 +171,9 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
     embeddings.py           ConversationEmbeddings: OpenAI text-embedding-3-small + FAISS IndexFlatIP (cosine) per user;
                             model-tagged metadata, stale detection, one background rebuild per user per process
     system_tools.py         SystemTools: apt/pip/service/network tools — NOT wired into the agent
-    paths.py                resolve_under(): safe resolution of model-supplied paths inside data/<uid>
+    paths.py                resolve_under(): safe resolution of model-supplied paths inside data/<uid>;
+                            regular_files(folder, pattern): host reads of a workspace folder that never follow
+                            a link (O_NOFOLLOW folder and files, regular UTF-8 files only; memory_search, embeddings)
     trace.py                ToolTrace/ToolCall/TurnBudget: per-turn tool calls, token usage, shared tool budget
     transcript.py           TranscriptStore + size control: one real API transcript per chat/topic (transcript mode);
                             prune clears old tool results AND old media blocks (clear_old_media)
@@ -262,7 +267,8 @@ Deployment facts that are easy to get wrong:
   `environment: PROD`) plus `deploy/`: `render_env.py` turns **every** PROD secret/variable into the
   server's `.env` (secrets win; `SERVER_*` are the SSH settings and are excluded), the workflow uploads
   it as `.env.new` and streams `remote_deploy.sh` over SSH (refuse on dirty tracked files, checkout the
-  ref, swap `.env` keeping `.env.bak`, compose build/up, wait for "is running"). The server's `.env` is
+  ref, swap `.env` keeping `.env.bak`, compose build/up, wait for "is running": `HEALTH_TIMEOUT` 90 s, or `SANDBOX_BUILD_TIMEOUT` 1200 s when the
+  deploy changes the sandbox build files, which the bot rebuilds before it starts). The server's `.env` is
   therefore generated: change the PROD environment, not the file. Tests: `tests/test_render_env.py`.
 
 ## Startup order and the monkey-patching (read this first)
@@ -353,7 +359,9 @@ execution between host and sandbox.
   gets `agent_response` (the marker when quiet), `last_result` quiet|answered and a `quiet_runs` counter.
   `run_turn` returning None (error) marks a one-shot task `failed`; a periodic one is rescheduled anyway.
   While queued/running the record has `status: "processing"`; a stale `processing` older than twice the
-  turn timeout is reset to `pending` on the next scan. Fired user reminders are sent directly with snooze
+  turn timeout is reset to `pending` on the next scan. A task moved with ⏰ +1h / 📅 +1d while it runs keeps the
+  new time: `_finalize` sees `time` differ from the snapshot it queued, sets it pending and records the result
+  without stepping or completing it. Fired user reminders are sent directly with snooze
   buttons (`reminder_snooze_<id>_<10|60|tomorrow>`) and rescheduled/completed only once delivered.
 - Forum topics: the queue key is the chat id, so all topics of one chat share one queue.
 
@@ -414,6 +422,9 @@ worker → _run_text → prompt = message_context.with_reference(text, message, 
        │       empty it eats the summaries pair or the intro pair instead)
        │     + short_term_memory.json messages whose FIRST block is text (reasoning_context)
        │     + the question                       (all three gated by short_term_memory.enabled too)
+       │     the user turn = _legacy_context() (<context>: UTC time, local time/zone, <profile> when profile.enabled;
+       │     no memory lines) + a blank line + the question, quick path too; afterwards thread_messages gets the
+       │     bare question back, so short_term_memory.json and the conversation file never store a context block
        ├─ _classify_complexity (Haiku, auto mode only) → "simple": tool-less Haiku answer; on any error fall back ↓
        ├─ AgentAnthropic.generate_response: prefix_len = len(incoming messages);
        │  for iteration in range(tools.max_iteration):
@@ -435,7 +446,7 @@ worker → _run_text → prompt = message_context.with_reference(text, message, 
        │     gate fails → tool_use blocks silently dropped, text goes on to critique/judge/return
        │        (budget spent → AgentAnthropic.limit_reached, which offers ▶️ Continue)
        │     else optional critique (OpenAI gpt-6.1-sol) / judge (Claude yes/no, same request_options_for) re-prompts → return
-       │     for-loop exhausted → forced "SYSTEM NOTICE" final call without tools (same thinking mode;
+       │     for-loop exhausted → forced "SYSTEM NOTICE" final call with the loop's tools and tool_choice none (same thinking mode;
        │        limit_reached too)
        └─ strip pre-loaded context from thread_messages; persist memory inside try/except
           (a failed Haiku summary is logged, the answer is still returned) → (response, messages)
@@ -537,7 +548,10 @@ take a string or a list of blocks built with `agents/content.py`; the stored `me
 (`{"type": "media_ref", "kind": "image"|"document", "path", "title"}`) is small and JSON-safe (turn records),
 `content.materialize` turns it into base64 API blocks right before the request (image media type from the
 extension or sniffed; documents must be PDF, anything else must be extracted to text by the caller; a file that
-cannot be embedded becomes a text block saying why). `transcript.estimate_tokens` counts an image block as
+cannot be embedded becomes a text block saying why). `materialize(blocks, base)` confines refs to `base`
+(`_build_user_message` passes `data/<uid>`, for new turns and Retry alike): a ref resolving outside it
+(`..`, a symlink out) or not a regular file reads as `[<kind> not found: <path>]`; without `base` the path is
+read as given (`vision_tools.read_document` resolves it first). `transcript.estimate_tokens` counts an image block as
 `content.IMAGE_TOKENS` (1600) and a document by its size, never the base64 as text.
 
 ## The tool contract
@@ -596,10 +610,10 @@ Effective tool list as the model sees it (after patching; 44 built-in tools plus
 
 | Provider | Tools | Runs where |
 |---|---|---|
-| FileOperations | `list_files`, `create_file`, `read_file`, `download_file`, `download_webpage` (readable main content: `trafilatura.extract(include_tables=True)`, lazy import cached in `file_ops._TRAFILATURA`, BeautifulSoup page text when trafilatura is missing, raises or finds < `MIN_EXTRACTED_CHARS` 200 chars), `upload_to_s3`, `create_zip_archive`, `send_file_path_to_user_via_telegram` | bot process, paths resolved under `data/<uid>/` by `agents/paths.resolve_under` (escapes refused) |
+| FileOperations | `list_files`, `create_file`, `read_file`, `download_file`, `download_webpage` (readable main content: `trafilatura.extract(include_tables=True)`, lazy import cached in `file_ops._TRAFILATURA`, BeautifulSoup page text when trafilatura is missing, raises or finds < `MIN_EXTRACTED_CHARS` 200 chars), `upload_to_s3`, `create_zip_archive`, `send_file_path_to_user_via_telegram` | bot process, paths resolved under `data/<uid>/` by `agents/paths.resolve_under` (escapes refused); the names download_file / download_webpage(save_to_file) / create_zip_archive write keep only their base name (`FileOperations._download_target` → `downloads/<name>`, so a link planted in downloads/ that points outside is refused) |
 | FileOperations | `create_directory`, `delete_file` | sandbox container (a fresh `docker run` per call), paths relative to `data/<uid>` |
 | SearchTools | `search_web` (Tavily), `deep_research` (Perplexity `sonar*`) | bot process, worker thread |
-| SearchTools | `memory_search` (query with `" | "` alternatives, case_sensitive, max_results 1..100 default 20): substring search over `conversations/*.json` (summary, topic, question, response), `profile.md` (field = section) and the text view of `transcripts/*.json` (user/assistant text only: no context blocks, tool results, thinking or media); JSON array of `{source, timestamp, topic, field, snippet}` newest first, or "No matches for …" | bot process, worker thread (reads every conversation file and transcript on each call) |
+| SearchTools | `memory_search` (query with `" | "` alternatives, case_sensitive, max_results 1..100 default 20): substring search over `conversations/*.json` (summary, topic, question, response), `profile.md` (field = section) and the text view of `transcripts/*.json` (user/assistant text only: no context blocks, tool results, thinking or media); JSON array of `{source, timestamp, topic, field, snippet}` newest first, or "No matches for …" | bot process, worker thread (reads every conversation file and transcript on each call through `agents.paths.regular_files`: a symlinked folder or file, or a FIFO, is skipped, because data/<uid> is the sandbox's workspace) |
 | CodeTools | `execute_python` (+`network_enabled`) | sandbox |
 | TerminalTools | `run_command` (no network option), `run_shell_script` (+`network_enabled`), `install_package` (apt, persisted, network on) | sandbox |
 | TimeTools | `get_time_in_timezone`, `list_timezones` | bot process |
@@ -611,7 +625,7 @@ Effective tool list as the model sees it (after patching; 44 built-in tools plus
 | VisionTools (registered, awaited) | `view_image` (path, max_px 128..2048, default `MAX_IMAGE_RESOLUTION_VISION`) → `[image block, text "<rel path> · WxH px (shown at wxh)"]` (JPEG/PNG/GIF/WebP within the limits and upright pass through unchanged, else re-encoded as JPEG); `describe_image` (path, question?, model anthropic\|openai) → text from `bot.media.describe_image_anthropic/openai` (temp JPEG in the system temp dir; the OpenAI call writes its own usage row); `read_document` (path, question?) → a PDF within the limits as `[document block, text "<name> · N pages"]`, else extracted text capped at `vision_tools.EXTRACTED_TEXT_CAP` (60000), unknown types through `describe_document` | bot process, never sandboxed; paths via `resolve_under` with images/downloads/documents fallbacks |
 | ProfileTools (registered, awaited) | `user_profile_read`, `user_profile_add(section, text)`, `user_profile_remove(section, needle)`, `user_profile_replace(section, old, new)`; needle = exact entry, a unique substring or a 1-based index; results = confirmation + the numbered section; registered always (the `profile` setting only gates the `<profile>` block in the context) | bot process, file I/O in to_thread |
 | MCPTools (registered, awaited) | `mcp_<server>_<tool>` for every tool of the user's enabled MCP servers and the admin's (names sanitized to `[a-zA-Z0-9_-]{1,64}`, collisions `_2`, `_3`…; description `[MCP <server>] …`; input_schema passed through, an empty object schema when missing/invalid); `prompt_notes` only when the user has MCP tools | bot process: schemas from the cached tool lists (NO network at turn start); one fresh connection per call (streamable HTTP or SSE by `transport`, stored headers) → `initialize` → `call_tool` → closed; `CALL_TIMEOUT` 60 s (`DISCOVER_TIMEOUT` 30 s); text → joined text, images → base64 `image` blocks (list result), embedded resources → their text or `[resource <uri>]`, `isError` → `Error: …`, unreachable → `Error: MCP server <name> unreachable: <reason>` (never raises; URLs in the reason redacted to scheme+host+path; the error is recorded in the store and shown by `/mcp`) |
-| WebTools (registered, blocking) | `browse_webpage` (url, wait_ms 0..10000 default 1500, screenshot, max_chars 500..100000 default 20000): page title, final URL, readable text (trafilatura on the rendered HTML), first 20 links, optional screenshot `downloads/screenshot_<hex>.png` (view with `view_image`) | sandbox: ONE container with network on, `mem_limit` 1g, timeout 75 s (script deadline 60 s) via `ContainerManager.run_script("browse.py", …)`; the bot process only formats the JSON |
+| WebTools (registered, blocking) | `browse_webpage` (url, wait_ms 0..10000 default 1500, screenshot, max_chars 500..100000 default 20000): page title, final URL, readable text (trafilatura on the rendered HTML), first 20 links, optional screenshot `downloads/screenshot_<hex>.png` (view with `view_image`; a failed screenshot keeps the page read and says "Screenshot: not saved") | sandbox: ONE container with network on, `mem_limit` 1g, timeout 75 s (script deadline 60 s) via `ContainerManager.run_script("browse.py", …)`; the bot process only formats the JSON |
 | DocumentTools (registered, blocking) | `create_document` (format md\|html\|pdf\|docx\|xlsx, title, content Markdown, filename?) → `documents/<sanitized name>.<fmt>` (existing names get `-2`, `-3`); the tool sends the file itself and returns "Document saved to documents/… (<size> KB) and sent to the user." | md/html: bot process (python-markdown: tables, fenced_code, sane_lists, toc + embedded CSS); pdf/docx/xlsx: sandbox via `run_script("render_document.py", …)`, network off, 1g for pdf, timeout 90 s (script deadline 75 s) |
 
 Unreachable: all 11 `SystemTools` tools (`install_package`, `run_shell_script` duplicates plus
@@ -631,6 +645,9 @@ writes it, but the model can create the file with `create_file` and it will then
   to any of the three files is picked up at the next startup by itself; the scripts in `scripts/` are copied
   in at call time and need no rebuild. The image installs playwright, trafilatura, markdown, python-docx, openpyxl and Chromium
   (`PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers`, world-readable, installed as root before `USER runner`).
+  If building a new content tag fails and `secure-container:latest` exists, the bot logs an error and runs on
+  `:latest` (`_fall_back_to_latest`; the tag goes into `_FAILED_BUILDS`, so the other ContainerManager
+  instances do not build again; the next start retries). Only without any image does the constructor raise.
 - Every sandboxed call = one new container `secure-container-<uid>-<8 hex>`: bind-mount
   `$WORKSPACE_ROOT/data/<uid>` → `/home/runner/workspace` (rw, shared), cwd there, user `runner`,
   `mem_limit` = `DEFAULT_MEM_LIMIT` ("512m") unless the caller passes one (`run_command`/`run_script`
@@ -640,7 +657,9 @@ writes it, but the model can create the file with `create_file` and it will then
   worker thread). `browse_webpage` and a pdf render hold a slot for 10-60 s each.
 - `ContainerManager.run_script(user_id, script_name, args=(), timeout=90, network_enabled=False, mem_limit=None)`
   copies ONE bundled script from `secure_container/scripts/` (`SCRIPTS_DIR`) into the workspace as
-  `temp_tool_<hex>.py` (unique per call), runs `python <file> <shlex-quoted args>` through `run_command`
+  `temp_tool_<hex>.py` (unique per call), runs `python -I <file> <shlex-quoted args>` through `run_command` (isolated mode: the script's directory is the
+  user's workspace, so a workspace `json.py` or a `pip install --user` copy of a library would otherwise shadow
+  its imports)
   (same slots, mount, package prelude), deletes the copy in `finally` and returns the raw logs.
   `script_name` must be a bare file name of a bundled script; anything with a directory part (`../x.py`,
   absolute paths) is refused with "Error: sandbox script not found". Script output contract: the scripts
@@ -692,7 +711,9 @@ data/
     settings.json                   per-user settings (see table); merged over defaults on load, unknown keys preserved
     profile.md                      agent-managed profile: "## About", "## Preferences", "## Notes" (entries "- ...", Notes dated
                                     "[YYYY-MM-DD] "), other "## Title" sections after them; ≤ 8 KB (oldest Notes rotated out); deleted
-                                    when empty; edited only through bot/profile.ProfileStore (user_profile_* tools, /profile)
+                                    when empty; edited only through bot/profile.ProfileStore (user_profile_* tools, /profile); read only
+                                    as a regular file (read_regular_text: O_NOFOLLOW|O_NONBLOCK, so a symlink or
+                                    FIFO reads as empty), written via a mkstemp tmp file + os.replace
     mcp.json                        the user's MCP servers: {"servers": [{name, url, transport, headers: {Authorization: "Bearer …"},
                                     enabled, tools: [{name, description, input_schema}], updated (iso), error}]}; atomic writes
     conversations/conversation_<YYYYmmdd_HHMMSS>_<topic>.json
@@ -715,7 +736,7 @@ data/
                                     one TurnRecord per turn (prompt = text view, prompt_blocks = media refs when the prompt had
                                     media, displayed answer, speak, thread_id, limit_reached, follow_ups, has_reasoning, error =
                                     the friendly reason of a FAILED turn: response "", no reasoning file, Retry only; records
-                                    without the key read as null) + its reasoning transcript; what the turn_ buttons load;
+                                    without the key read as null; quiet_marker = the scheduled task's marker or null) + its reasoning transcript; what the turn_ buttons load;
                                     newest 50 kept (pruned on save); atomic writes
     reminders/reminders.json        list of {id (8 hex), user_id, text, time (ISO UTC), type: user|agent,
                                     status: pending|processing|completed|failed, created_at, is_periodic, period_type,
@@ -762,12 +783,15 @@ Memory semantics worth knowing before touching `ChainOfThoughtAgent.generate_res
   is built lazily, `client=` injects a fake). On load, a different `metadata.model`, the legacy layout, a
   dimension mismatch, a non-cosine index or index/metadata disagreement marks the index **stale**:
   `search_conversations` returns `[]` and one daemon rebuild thread per user per process is started
-  (`AUTO_REINDEX`), which embeds every conversation in batches of 64, writes both files atomically and swaps
+  (`AUTO_REINDEX`), which embeds every conversation in batches of ≤ 64 texts and ≤ `BATCH_BYTES` (250k) UTF-8 bytes (a batch the API
+  refuses with a 400 is retried one text at a time; a text still refused is skipped and logged, any other error
+  fails the rebuild; conversations/ is read through `regular_files`), writes both files atomically and swaps
   the index under a per-user `RLock`; other live instances reload via a generation counter. `add_conversation`
   during a rebuild is queued and appended after the swap (deduped by `text_hash`); while stale with no rebuild
   running the add is dropped (logged): the next rebuild reads the conversation file anyway. A failed automatic
   rebuild is not retried until the next process start (`reindex_status(uid)`; `reindex(blocking=True)` forces
-  one). Searches strip the `Message received time in UTC+0:` prefix from the query, collapse hits with the
+  one). Every embedded text and the query are cut to `EMBED_TEXT_BYTES` (8000 UTF-8 bytes). Searches strip the
+  `Message received time in UTC+0:` prefix from the query, collapse hits with the
   same normalized question and return `{question, answer, timestamp, topic, score 0..1}`; adds strip that
   prefix from the question and the last `<follow_ups>` block from the answer. Neither method ever raises.
   Embedding calls write no `usage_events` row.
@@ -834,8 +858,8 @@ every `set`. `run_turn` saves once per turn so new defaults reach disk. Agent co
 | `semantic_search` | enabled (true), max_results (3, 1..20) | FAISS hits in system prompt |
 | `thinking` | enabled (true) | on ("deep"): adaptive thinking, `display: summarized`, effort `ANTHROPIC_EFFORT` (high), max_tokens `ANTHROPIC_MAX_TOKENS` (64000); off ("light"): still adaptive, `display: omitted`, effort `ANTHROPIC_EFFORT_LIGHT` (low), max_tokens 16000. Never `disabled` (`models.anthropic_request_options` / `anthropic_max_tokens`). Overridden by `mode` speed (off) and intelligence (on) |
 | `mode` | type (`auto`; also `speed`, `intelligence`; `MODE_TYPES`) | `ChainOfThoughtAgent.__init__` (`_mode_of`: unknown → auto) and `_decide_complexity`. auto: the Haiku classifier picks quick answer vs full agent, model `ANTHROPIC_MODEL`, thinking = the toggle; speed: no classifier, the fast model runs the whole tool loop (`request_options_for` gives it no effort/thinking, `ANTHROPIC_MAX_TOKENS_FAST`), thinking off; intelligence: no classifier, `ANTHROPIC_MODEL`, thinking on. A prompt with media is always "complex" |
-| `timezone` | name ("" = unknown → times in UTC; a canonical IANA name otherwise) | set by `/timezone` (picker `tz_set_<i>` over `COMMON_ZONES`, or `/timezone <name\|city>` through `timezones.valid_zone`), by sharing a location (`messages.on_location`, needs the optional `timezonefinder`) or by the agent's `set_user_timezone`; not on the `/settings` page. Read by `_render_context` (the local-time line of the `<context>` block), `schedule_reminder` (default zone of `reminder_time`), `jobs.task_prompt` (the time in the framing prompt) and the `/reminders` pages (`timezones.format_local`) |
-| `profile` | enabled (true) | the `<profile>` block in the `<context>`; the `user_profile_*` tools work regardless (the model then sees the file only via `user_profile_read`) |
+| `timezone` | name ("" = unknown → times in UTC; a canonical IANA name otherwise) | set by `/timezone` (picker `tz_set_<i>` over `COMMON_ZONES`, or `/timezone <name\|city>` through `timezones.valid_zone`), by sharing a location (`messages.on_location`, needs the optional `timezonefinder`) or by the agent's `set_user_timezone`; not on the `/settings` page. Read by `_render_context` (the local-time line of the `<context>` block, transcript and legacy mode), `schedule_reminder` (default zone of `reminder_time`), `jobs.task_prompt` (the time in the framing prompt) and the `/reminders` pages (`timezones.format_local`) |
+| `profile` | enabled (true) | the `<profile>` block in the `<context>` (both modes; legacy shows it every turn); the `user_profile_*` tools work regardless (the model then sees the file only via `user_profile_read`) |
 | `ui` | advanced (false) | `/settings` page only: off hides the power settings (`Control.advanced`); the section summaries still show their values |
 | `rich_messages` | enabled (true) | answers as Telegram rich messages (native GFM); off = legacy Markdown v1 path; also selects the `<formatting>` prompt section and rich vs plain streaming drafts |
 | `image` | engine (`auto`), quality (`auto`), size (`2K`), max_variants (4), metadata (true) | defaults for `generate_image`; the agent may override engine/quality from the request, `max_variants` is a hard cap, `metadata` puts model/quality/size in the delivered file's caption |
@@ -992,6 +1016,8 @@ name; a new temp dir needs its own `.gitignore` line).
   family needs a prefix that is not a prefix of (and does not start with) any other, and a
   `@router.callback_query(F.data.startswith(...))` handler on the router with the right middleware;
   `tests/test_cross_features.py::ROUTING` checks that every family reaches its own handler in router order
+  (`MESSAGE_ROUTING` does the same for message handlers: plain text, text during a pending reminder edit,
+  /reminders and /cancel during one, a location, a photo)
   (rows exist for usage_, profile_, mcp_, setp_preset_, setp_ui_advanced, settings_preset_, settings_mode_set_,
   tz_set_, reminder_snooze_, reminder_delay_, reminder_edit_, reminders_new). Read the chat from
   `callback.message.chat.id` and guard `isinstance(callback.message, Message)`. Answer the callback best-effort
@@ -1033,7 +1059,8 @@ name; a new temp dir needs its own `.gitignore` line).
   `_prompt_with_reference(text, media_blocks, message, bot_id)`) and calls `run_turn`. Retry /
   Continue / follow-up buttons do the same: they post a short echo ("🔁 Retry", "💬 <suggestion>") and
   queue the turn on it, so the busy notice and the reply-to work as for a typed message; Retry re-runs
-  `record.prompt_blocks or record.prompt`.
+  `record.prompt_blocks or record.prompt` with `record.quiet_marker` (and `QUIET_NOTICE`), so a retried
+  scheduled task with nothing new never shows `<no_update/>`.
 - Action-limit accounting counts **every** `stats_events` row in 30 days: each received message,
   sent message, tool call (`memory_search`, `view_image`, `user_profile_*` and `mcp_*` included), describe
   call (now only the document fallback path and video frames) and media group. A turn with 20 tool calls
@@ -1076,7 +1103,10 @@ name; a new temp dir needs its own `.gitignore` line).
 - The iteration counter `cicles` counts individual `tool_use` blocks (a whole batch is added at once,
   so it can overshoot the limit by one batch) while the `for` loop counts API round-trips; hitting
   either limit drops pending tool calls and may return an incomplete
-  "Let me check..." text. The forced final call has no tools (thinking mode as the loop).
+  "Let me check..." text. The forced final call sends the loop's tool definitions with `tool_choice: none` (thinking mode as the loop):
+  the model cannot call a tool, and the request prefix (tools, system, messages) stays the one the turn's
+  thinking blocks were made against. A tool-less final call made every thinking block stale (a 400 on
+  enforced accounts, after which the stored thinking was stripped).
 - `judge_response` treats exceptions as "yes" (accept); `critique_response` treats them as "no rewrite".
   That is why the loop, the final call AND the judge build their options with
   `models.request_options_for(self.model, …)` / `max_tokens_for`: in speed mode `self.model` is Haiku, which
@@ -1097,8 +1127,10 @@ name; a new temp dir needs its own `.gitignore` line).
   forgets it (`reminders_ui.reset()` in tests).
 - `set_user_timezone` writes `settings.json` but not the running turn's `user_settings` dict, and the
   `<context>` block was rendered at turn start: the model keeps seeing "User timezone: unknown" until the next
-  turn. `schedule_reminder` in the same turn is fine because `UserInteractions._user_zone()` re-reads
-  `UserSettings` on every call. The same holds for `/timezone` pressed while a turn runs.
+  turn. `schedule_reminder` in the same turn is fine: `UserInteractions._user_zone()` returns the zone
+  `set_user_timezone` accepted this turn (`_zone_override`, set before its save's first await, put back if the
+  save fails), else re-reads `UserSettings`; `schedule_reminder` yields once (`asyncio.sleep(0)`) before reading
+  the zone, so the two in one concurrent tool batch agree in either block order. The same holds for `/timezone` pressed while a turn runs.
 - Snoozing a periodic reminder adds a separate one-off `type: user` reminder (`snoozed_from`, its own id, no
   `weekdays`) and leaves the series alone: deleting or disabling the series does not remove the copy, which
   has its own row in `/reminders`. Snoozing a completed one-shot makes it `pending` again.
@@ -1124,6 +1156,13 @@ name; a new temp dir needs its own `.gitignore` line).
   access, i.e. on the event loop at turn start (KB-sized files, fine; do not grow them). `tools_schema` is
   computed once per instance (= per turn); tool discovery is cached, so a server whose tools changed shows
   the old tools until `/mcp refresh` (users) or a restart / admin `/mcp refresh` (admin servers).
+- A user's MCP server must be https to a public host: `mcp_store.validate_url` refuses http, localhost /
+  *.localhost and loopback/private/link-local/shared/reserved/unspecified/multicast (IPv4-mapped included)
+  literals for non-admins, and `MCPTools._check_host` runs `mcp_store.check_public_host` (getaddrinfo via
+  `_resolve`, in to_thread; an unresolvable name passes) before every discovery and call of a non-admin
+  user's server, which also covers records written straight into `mcp.json`. The admin (shared servers and
+  the admin's own `/mcp add`) may use http and private hosts. Not pinned: httpx resolves again (a DNS
+  rebinding window). `download_file` / `download_webpage` still reach any host. Tests stub `mcp_store._resolve`.
 - Adding, removing, toggling or refreshing an MCP server (or an admin file change), switching `mode` to or
   from `speed` (the model changes; `transcript.model` is overwritten with the latest turn's model) and any new
   or changed provider `prompt_notes` change the tool list / static prompt → `transcript.prefix_fingerprint` →
@@ -1136,6 +1175,10 @@ name; a new temp dir needs its own `.gitignore` line).
   version, and the `_v.jpg` must stay because Retry re-materializes the stored `prompt_blocks`.
   `content.IMAGE_TOKENS` assumes ≤ ~1 MP, so a `view_image` with `max_px` 2048 is slightly underestimated.
   `image_for_vision` re-encodes a JPEG whose EXIF orientation is not 1 so the model sees it upright.
+  `content.MAX_IMAGE_BYTES` (5 MiB) is the API's per-image limit on the base64 data; files are judged by
+  `content.max_image_file_bytes()` (3/4 of it): `materialize` refuses a larger image file, `image_for_vision`
+  passes a file through only up to it, `_fit_jpeg` / `save_vision_copy` target it, and an MCP image whose
+  base64 is over the limit becomes the text "[image <mime> omitted: too large to show (N MB)]".
 - `memory_search` is a plain substring scan of every conversation file, `profile.md` and every transcript
   of the user on each call (worker thread), and like any tool call it burns an action. Conversation
   timestamps are local time (`datetime.now()`) while transcript/context times are UTC, which only affects
@@ -1153,7 +1196,8 @@ name; a new temp dir needs its own `.gitignore` line).
   is prepended. `render_document.py`'s Markdown parser is a deliberate subset (#..###### headings at column 0,
   paragraphs, -/*/+ and 1. lists, **bold**, *italic* only when not adjacent to word characters, `code`,
   fenced code where a ```csv fence becomes an xlsx sheet, GFM pipe tables; `_text_` is NOT italic so
-  snake_case survives; numeric-looking cells become numbers, cells starting with "=" are forced to text,
+  snake_case survives; numeric-looking cells become numbers except identifiers (`looks_like_identifier`: a leading zero, a leading "+"
+  or more than 15 significant digits stay text, so zip codes and phone numbers survive), cells starting with "=" are forced to text,
   sheet names come from the nearest heading or "Table N"); richer Markdown renders fine in md/html/pdf
   (python-markdown) but degrades to paragraphs in docx/xlsx.
 - `run_script` shell-quotes every argument because `run_command` does not go through a shell: docker-py
@@ -1300,7 +1344,8 @@ name; a new temp dir needs its own `.gitignore` line).
   `content.IMAGE_MEDIA_TYPES` / `media.VISION_MEDIA_TYPES`.
 - **Add a slash command / callback family**: a handler on the router with the right middleware in
   `bot/handlers/__init__.py`; copy the nearest existing handler; a user command also goes into
-  `commands.COMMANDS` (menu + /help); add the family to `ROUTING` in `tests/test_cross_features.py`.
+  `commands.COMMANDS` (menu + /help); add the family to `ROUTING` (a new message handler to `MESSAGE_ROUTING`)
+  in `tests/test_cross_features.py`.
 - **Add a turn button**: an action name, label and `_CALLBACK_RE` alternative in `bot/turn_actions.py`
   (`record_actions` decides when it shows; an error record gets Retry only), and a handler in
   `handlers/turn_actions_ui.py`: on `router` when it only reads the stored record, on `turn_router` (quota

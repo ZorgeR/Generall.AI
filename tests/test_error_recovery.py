@@ -468,6 +468,60 @@ async def test_quiet_marker_round_trips_and_old_records_read_as_none():
     assert TurnRecord.from_dict({**data, "quiet_marker": 7}).quiet_marker is None
 
 
+# ---- run_turn with the quiet marker (scheduled tasks, without a button press) ----------------
+class DeletableBot(FakeBot):
+    """FakeBot whose sent messages can be deleted (``delete_quietly`` calls ``message.delete()``)."""
+
+    def _msg(self):
+        message = super()._msg()
+
+        async def delete():
+            self.calls.append(("delete", {"message_id": message.message_id}))
+            return True
+
+        message.delete = delete
+        return message
+
+
+def shown_texts(bot) -> list[str]:
+    return [str(kw.get("rich_message").model_dump()) if kw.get("rich_message") is not None else str(kw.get("text") or "")
+            for name, kw in bot.calls if name in ("send_message", "send_rich_message", "edit_message_text")]
+
+
+@pytest.mark.parametrize("rich_on", [True, False])
+@pytest.mark.parametrize("answer", [
+    agent_runner.QUIET_MARKER,
+    f"{agent_runner.QUIET_MARKER}\n<follow_ups>\n- What else is new?\n</follow_ups>",  # the block is cut first
+    f"\n  {agent_runner.QUIET_MARKER}  \n",
+])
+async def test_a_quiet_answer_sends_nothing_and_removes_the_status(monkeypatch, env, rich_on, answer):
+    """jobs.run_agent_reminder passes quiet_marker: an uneventful run must not post the marker to the user."""
+    from bot.jobs import TASK_HEADER
+
+    UserSettings(USER).set("rich_messages", rich_on, "enabled")
+    use_agent(monkeypatch, response=answer)
+    bot = DeletableBot()
+    result = await run(bot, header=TASK_HEADER, quiet_marker=agent_runner.QUIET_MARKER)
+
+    assert result is not None and result.quiet is True and result.turn_id is None and result.response == ""
+    (status,) = bot.of("send_message")  # only the status message was ever sent
+    assert bot.of("delete") == [{"message_id": 101}]  # ... and it is gone again
+    assert bot.of("send_rich_message") == [] and bot.of("send_voice") == [] and bot.of("send_document") == []
+    assert not any(agent_runner.QUIET_MARKER in text for text in shown_texts(bot))
+    assert records() == []  # no turn record: no Retry/Listen buttons on a message that does not exist
+    assert len(env.usage) == 1  # the tokens were still spent
+
+
+async def test_an_answer_that_only_mentions_the_marker_is_delivered(monkeypatch, env):
+    use_agent(monkeypatch, response=f"Two items need you today. {agent_runner.QUIET_MARKER}")
+    bot = DeletableBot()
+    result = await run(bot, quiet_marker=agent_runner.QUIET_MARKER)
+    assert result is not None and result.quiet is False and result.turn_id
+    assert any("Two items need you today." in text for text in shown_texts(bot))
+    (record,) = records()
+    assert record["id"] == result.turn_id and record["quiet_marker"] == agent_runner.QUIET_MARKER
+
+
 # ---- StatusMessage.fail -------------------------------------------------------------------
 class StatusBot:
     def __init__(self, rich_error=None, row_error=None):

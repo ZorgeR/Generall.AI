@@ -320,6 +320,19 @@ def test_inline_runs_and_cell_values(rd):
     assert rd.cell_value("") == ""
 
 
+def test_identifiers_that_look_numeric_stay_text_in_xlsx(rd):
+    """Zip codes, phone numbers and long ids lost their leading zeros, their "+" or their last digits."""
+    for text in ("02134", "0791234567", "007", "-007", "+44", "+447911123456", "12345678901234567890",
+                 "4111111111111111", "00.5"):
+        assert rd.cell_value(text) == text, text
+    # ordinary quantities still become numbers
+    assert rd.cell_value("0") == 0 and rd.cell_value("0.5") == 0.5 and rd.cell_value("-0.25") == -0.25
+    assert rd.cell_value("123456789012345") == 123456789012345  # 15 digits: exact in Excel
+    assert rd.cell_value("1e3") == 1000.0 and rd.cell_value("0.000123") == 0.000123
+    wb = rd.build_xlsx("| Phone | ZIP | Order | Qty |\n|---|---|---|---|\n| 0791234567 | 02134 | 12345678901234567890 | 3 |\n", "T")
+    assert [[c.value for c in r] for r in wb["Table 1"].iter_rows()][1] == ["0791234567", "02134", "12345678901234567890", 3]
+
+
 def test_markers_that_are_not_markup_survive_untouched(rd):
     """snake_case identifiers and arithmetic are everyday report content, not italics."""
     for text in ("user_id_hash", "column_name_x", "2*3*4", "a*b", "_private", "__init__", "foo_ bar_", "5 * 3 = 15", "**"):
