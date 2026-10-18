@@ -187,7 +187,8 @@ def test_the_toolset_entry_disables_the_risky_members():
 # ---- browser_confirm --------------------------------------------------------------------------
 @pytest.fixture
 def answers(monkeypatch):
-    """Scripted answers to bot.questions.ask, with what was asked."""
+    """Scripted answers to bot.questions.ask, with what was asked: a plain string is a tap on that
+    option (what ask() returns for a tap), anything else (None, a typed Answer) is returned as it is."""
     from bot import questions
 
     asked: list[dict] = []
@@ -195,7 +196,8 @@ def answers(monkeypatch):
 
     async def ask(sender, question, options, timeout):
         asked.append({"question": question, "options": options, "timeout": timeout})
-        return script.pop(0)
+        answer = script.pop(0)
+        return questions.Answer(answer, tapped=True) if type(answer) is str else answer
 
     monkeypatch.setattr(questions, "ask", ask)
     return SimpleNamespace(asked=asked, script=script)
@@ -243,6 +245,33 @@ async def test_confirm_decline_and_timeout(answers):
     result = await t.confirm("Delete the account")
     assert result.startswith("No answer within 5 minutes") and "Delete the account" in result
     assert not t.allowance_active() and t.sender.photos == []
+
+
+async def test_only_a_tap_on_allow_grants_the_allowance(answers):
+    """A typed "yes" (or even the button's own text, typed) goes back to the agent as text and allows nothing."""
+    from bot import questions
+
+    manager = Manager([{"ok": True, "content": []}])
+    t = tools(manager, Sender())
+    answers.script.extend([questions.Answer("yes, go ahead", tapped=False), questions.Answer(B.ALLOW_OPTION, tapped=False)])
+    for typed in ("yes, go ahead", B.ALLOW_OPTION):
+        result = await t.confirm("Pay 10 EUR")
+        assert result.startswith(f'User answered in text instead of tapping a button: "{typed}"')
+        assert "not a permission" in result and not t.allowance_active()
+    await t.execute_member("left_click", {"target": {"type": "ref", "ref": "ref_1"}})
+    assert manager.requests[0]["allow_sensitive"] is False
+
+
+async def test_a_plain_string_from_a_stand_in_is_no_tap(monkeypatch):
+    """The allowance needs an ``Answer`` that says it was tapped: anything else allows nothing."""
+    from bot import questions
+
+    async def ask(*a, **k):
+        return B.ALLOW_OPTION  # a str, not an Answer
+
+    monkeypatch.setattr(questions, "ask", ask)
+    t = tools(Manager(), Sender())
+    assert not (await t.confirm("Pay 10 EUR")).startswith("The user allowed") and not t.allowance_active()
 
 
 async def test_confirm_needs_a_chat_and_a_summary(answers):

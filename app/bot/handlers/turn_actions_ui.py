@@ -8,6 +8,9 @@ task's with its quiet marker: "nothing new" ends as ``QUIET_NOTICE``), ▶️ Co
 asks the agent to finish what it listed, and a follow-up button sends its
 suggestion. Those post a short echo of what was pressed and queue the turn on it
 like a typed message (busy notice included), so the answer replies to the echo.
+A follow-up pressed while a turn of that topic is working joins it instead, exactly
+like a typed message (``messages.inject_target``: 👀 on the echo, no busy notice);
+Retry and Continue always queue.
 
 A press is answered right away; a turn whose record is gone (pruned, or from a
 forged button) gets "This action has expired."
@@ -21,7 +24,7 @@ from functools import partial
 from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery, Message
 
-from bot import media, turn_actions
+from bot import inbox, media, turn_actions
 from bot.agent_runner import run_turn
 from bot.handlers import messages as chat_messages  # the chat queue and its busy notice
 from bot.queue import Job, JobContext
@@ -153,19 +156,32 @@ async def _run_button_turn(
 async def _start_turn(
     callback: CallbackQuery, bot: Bot, user_id: str, limit: int | None, message: Message,
     record: turn_actions.TurnRecord, *, prompt: str | list, echo: str, label: str, speak: bool = False,
-    quiet_marker: str | None = None,
+    quiet_marker: str | None = None, join_running: bool = False,
 ) -> None:
-    """Echo the press as a plain message and queue the turn on it, like a typed message."""
+    """Echo the press as a plain message and queue the turn on it, like a typed message.
+
+    ``join_running`` (follow-ups): a turn of this topic that is still working reads it instead,
+    as it would a typed message.
+    """
     await _answer(callback)
     chat_id = message.chat.id
     thread_id = _thread_id(message, record)
     echo_message = await ChatSender(bot, chat_id, thread_id).send_text(echo, markdown=False)
     _stats().track_message_received(user_id, "button")
+    target = chat_messages.inject_target(user_id, thread_id) if join_running and isinstance(prompt, str) else None
+    if target is not None:
+        item = chat_messages.inject(
+            target, bot, user_id, limit, chat_id=chat_id, thread_id=thread_id, message_id=echo_message.message_id,
+            label=label, kind=label, error_text="❌ Could not process this button.",
+            prepared=inbox.Prepared(prompt=prompt, kind=label, label=label, speak=speak),
+        )
+        await inbox.mark_seen(item)
+        return
     run = partial(
         _run_button_turn, bot, user_id, chat_id, thread_id, prompt, echo_message.message_id, limit, speak,
         quiet_marker=quiet_marker,
     )
-    await chat_messages.submit(echo_message, Job(user_id=user_id, label=label, run=run))
+    await chat_messages.submit(echo_message, Job(user_id=user_id, label=label, run=run, thread_id=thread_id, from_user=True))
 
 
 @turn_router.callback_query(F.data.startswith(f"{_P}{turn_actions.RETRY}_"))
@@ -205,7 +221,7 @@ async def on_follow_up(callback: CallbackQuery, bot: Bot, user_id: str, limit: i
     suggestion = record.follow_ups[index]
     await _start_turn(
         callback, bot, user_id, limit, message, record,
-        prompt=suggestion, echo=FOLLOW_UP_ECHO.format(suggestion), label="follow-up",
+        prompt=suggestion, echo=FOLLOW_UP_ECHO.format(suggestion), label="follow-up", join_running=True,
     )
 
 

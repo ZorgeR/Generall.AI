@@ -15,10 +15,20 @@ never hits the next turn, and queued messages are kept.
 Jobs must be cooperative: they run as asyncio tasks, so blocking work inside
 them has to be offloaded with ``asyncio.to_thread``. A job that ignores
 cancellation cannot be stopped.
+
+Every job also carries ``seq``, a process-wide arrival number (``next_seq``), and a
+queued job is inserted before every pending job with a larger one. Jobs created
+when they are submitted simply go to the end; a job submitted later for something
+that arrived earlier (a message the running turn's inbox did not consume,
+``bot.inbox``, or an album flushed after a text) keeps its place. ``thread_id`` and
+``from_user`` say whether a pending job holds a user's message in a forum topic:
+``has_pending_user_jobs`` is how the handlers know a new message must queue behind
+it instead of joining the running turn.
 """
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import re
 import secrets
@@ -32,6 +42,12 @@ logger = logging.getLogger(__name__)
 STOP_CALLBACK_PREFIX = "queue_stop_"
 _JOB_ID_LIMIT = 2**31  # ids are 1 .. 2**31 - 1
 _TOKEN_RE = re.compile(r"[0-9a-f]{1,8}")
+_SEQ = itertools.count(1)
+
+
+def next_seq() -> int:
+    """A process-wide increasing arrival number (jobs, inbox items): the order the user sent things in."""
+    return next(_SEQ)
 
 
 def new_job_id() -> int:
@@ -56,6 +72,9 @@ class Job:
     progress: str = ""
     started_at: float | None = None  # set when the job actually starts (after the slot wait)
     id: int = field(default_factory=new_job_id)  # also the draft_id of the turn's streaming drafts
+    seq: int = field(default_factory=next_seq)  # arrival order: a queued job goes before pending jobs with a larger one
+    thread_id: int | None = None  # the forum topic of the message it answers (None: none / not a topic)
+    from_user: bool = False  # holds a user's message or button press (not a scheduled task or a notification)
 
     @property
     def elapsed(self) -> float:
@@ -96,8 +115,10 @@ class QueueStatus:
 
 class _UserQueue:
     def __init__(self) -> None:
-        self.queue: asyncio.Queue[Job] = asyncio.Queue()
-        self.pending: list[Job] = []  # mirror of the queue contents, in order
+        # One token per pending job: the worker waits on it, then takes ``pending[0]``. The jobs
+        # themselves live in ``pending`` (sorted by ``seq``), so one can be inserted in its place.
+        self.queue: asyncio.Queue[None] = asyncio.Queue()
+        self.pending: list[Job] = []
         self.worker: asyncio.Task | None = None
         self.current: Job | None = None
         self.current_task: asyncio.Task | None = None
@@ -138,17 +159,30 @@ class QueueManager:
         st = self.status(user_id)
         return st.current is not None or st.pending > 0
 
+    def has_pending_user_jobs(self, user_id: str, thread_id: int | None) -> bool:
+        """A queued (not yet running) job holds a message or button press of the user in that topic."""
+        uq = self._users.get(str(user_id))
+        return uq is not None and any(j.from_user and j.thread_id == thread_id for j in uq.pending)
+
     async def submit(self, job: Job) -> SubmitResult:
+        return self.submit_nowait(job)
+
+    def submit_nowait(self, job: Job) -> SubmitResult:
+        """``submit`` without a suspension point: callable from cleanup code (``finally``, a cancelled
+        task) and atomic with whatever the caller checked just before."""
         if self._closed:
             raise RuntimeError("queue manager is closed")
         uq = self._get(job.user_id)
-        position = len(uq.pending) + (1 if uq.current is not None else 0)
+        index = len(uq.pending)
+        while index > 0 and uq.pending[index - 1].seq > job.seq:
+            index -= 1  # something that arrived after this job is waiting: go before it
+        position = index + (1 if uq.current is not None else 0)
         was_busy = position > 0
         # The job the user is waiting on: the running one, or the head of the queue
         # when the worker has not picked it up yet.
         current = uq.current or (uq.pending[0] if uq.pending else None)
-        uq.pending.append(job)
-        await uq.queue.put(job)
+        uq.pending.insert(index, job)
+        uq.queue.put_nowait(None)
         if uq.worker is None or uq.worker.done():
             uq.worker = asyncio.create_task(self._worker(job.user_id, uq), name=f"queue-worker-{job.user_id}")
         return SubmitResult(was_busy=was_busy, position=position, current=current)
@@ -234,11 +268,11 @@ class QueueManager:
 
     async def _worker(self, user_id: str, uq: _UserQueue) -> None:
         while True:
-            job = await uq.queue.get()
-            if uq.pending and uq.pending[0] is job:
-                uq.pending.pop(0)
-            elif job in uq.pending:
-                uq.pending.remove(job)
+            await uq.queue.get()
+            if not uq.pending:  # a token whose job was dropped (cannot happen: cancel() drains both)
+                uq.queue.task_done()
+                continue
+            job = uq.pending.pop(0)
             ctx = JobContext(job)
             uq.current = job
             uq.context = ctx

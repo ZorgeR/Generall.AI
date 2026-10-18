@@ -17,6 +17,14 @@ message ends in a final state without buttons: the question plus
 The question text is shown as plain text in both forms (no Markdown parsing),
 so what the model wrote is what the user reads. All tool calls of one assistant
 message run concurrently, so several questions may be pending in one chat.
+
+A user may type instead of tapping: while a question waits in a chat (and forum
+topic), a plain text message there answers it (``answer_in_text``, called by the text
+handler before the message could join the running turn): the newest waiting
+question gets the text, its message ends as "💬 Answered in text", and the tool call
+reads ``User answered in text instead of tapping a button: "<text>"``. ``ask`` returns
+an ``Answer``: the option or the text, with ``tapped`` telling which, so a tool that
+must only act on a tap (``browser_confirm``) can tell a typed "yes" from the button.
 No import-time side effects and no ``agents`` imports.
 """
 from __future__ import annotations
@@ -67,8 +75,28 @@ ANSWERED_PREFIX = "✅ "
 NO_ANSWER_LINE = "⌛ No answer"
 CANCELLED_LINE = "🛑 Cancelled"
 EXPIRED_LINE = "⌛ This question has expired."
+TYPED_LINE = "💬 Answered in text"
+TYPED_RESULT = 'User answered in text instead of tapping a button: "{}"'
+MAX_TYPED = 4000  # characters of a typed answer handed to the tool
 
 _CALLBACK_RE = re.compile(r"ask_([0-9a-f]{8})_(\d{1,2})")
+
+
+class Answer(str):
+    """What ``ask`` returns: the option the user tapped (``tapped`` True) or the text they typed
+    instead (``tapped`` False). It is the string itself, so ``answer == option`` keeps working."""
+
+    tapped: bool
+
+    def __new__(cls, value: str, *, tapped: bool) -> "Answer":
+        answer = super().__new__(cls, value)
+        answer.tapped = bool(tapped)
+        return answer
+
+
+def typed_result(answer: str) -> str:
+    """The tool result for a typed answer."""
+    return TYPED_RESULT.format(answer)
 
 
 @dataclass
@@ -81,6 +109,7 @@ class PendingQuestion:
     created_at: float = field(default_factory=time.time)
     message_id: int | None = None  # set once the question message is sent
     rich: bool = False  # sent as a rich message with button blocks (else text + inline keyboard)
+    thread_id: int | None = None  # the forum topic it was asked in (a typed answer must come from there)
 
 
 _pending: dict[str, PendingQuestion] = {}
@@ -89,7 +118,7 @@ _closed: OrderedDict[str, str] = OrderedDict()
 
 
 # ---- registry ---------------------------------------------------------------
-def register(chat_id: int, question: str, options: list[str]) -> PendingQuestion:
+def register(chat_id: int, question: str, options: list[str], thread_id: int | None = None) -> PendingQuestion:
     """A new pending question (call from inside the event loop that will await it)."""
     qid = secrets.token_hex(4)
     while qid in _pending or qid in _closed:
@@ -100,6 +129,7 @@ def register(chat_id: int, question: str, options: list[str]) -> PendingQuestion
         question=question,
         options=list(options),
         future=asyncio.get_running_loop().create_future(),
+        thread_id=thread_id,
     )
     _pending[qid] = pending
     return pending
@@ -126,8 +156,54 @@ def resolve(qid: str, chat_id: int, index: int) -> str | None:
     if not isinstance(index, int) or not 0 <= index < len(pending.options):
         return None
     option = pending.options[index]
-    pending.future.set_result(option)
+    pending.future.set_result(Answer(option, tapped=True))
     return option
+
+
+def waiting_in(chat_id: int, thread_id: int | None) -> PendingQuestion | None:
+    """The newest question of that chat and topic that is on screen and still waits for an answer."""
+    try:
+        chat_id = int(chat_id)
+    except (TypeError, ValueError):
+        return None
+    waiting = [
+        p for p in _pending.values()
+        if p.chat_id == chat_id and p.thread_id == thread_id and p.message_id is not None and not p.future.done()
+    ]
+    return max(waiting, key=lambda p: p.created_at) if waiting else None
+
+
+def resolve_text(chat_id: int, thread_id: int | None, text: str) -> PendingQuestion | None:
+    """Answer the newest waiting question of that chat and topic with typed ``text``; the question, or None."""
+    text = (text or "").strip()
+    pending = waiting_in(chat_id, thread_id) if text else None
+    if pending is None:
+        return None
+    if len(text) > MAX_TYPED:
+        text = text[: MAX_TYPED - 1] + "…"
+    pending.future.set_result(Answer(text, tapped=False))
+    return pending
+
+
+class _MessageRef:
+    """What ``show_outcome`` needs of a question message it only knows by id."""
+
+    def __init__(self, message_id: int) -> None:
+        self.message_id = message_id
+
+
+async def answer_in_text(bot, chat_id: int, thread_id: int | None, text: str) -> bool:
+    """A plain text message answers the question waiting there (the text handler calls this first).
+
+    True when it did: the tool call wakes with the text and the question loses its buttons.
+    """
+    pending = resolve_text(chat_id, thread_id, text)
+    if pending is None:
+        return False
+    from bot.sender import ChatSender  # no import-time side effects either way
+
+    await show_outcome(ChatSender(bot, chat_id, thread_id), pending, TYPED_LINE, _MessageRef(pending.message_id))
+    return True
 
 
 def discard(qid: str) -> None:
@@ -364,16 +440,17 @@ async def expire_message(bot, message: Message) -> None:
             logger.debug("Could not remove the buttons of an expired question: %s", e)
 
 
-async def ask(sender, question: str, options: list[str], timeout: float) -> str | None:
-    """Send the question and wait for a tap: the chosen option, or None after ``timeout`` seconds.
+async def ask(sender, question: str, options: list[str], timeout: float) -> Answer | None:
+    """Send the question and wait for an answer: an ``Answer`` (the tapped option, or the text the user
+    typed instead: see ``Answer.tapped``), or None after ``timeout`` seconds.
 
     ``question`` and ``options`` are expected cleaned (``clean_question`` / ``clean_options``).
-    The tap handler edits the message on an answer; here a timeout edits it into
-    "⌛ No answer" and a cancellation (/cancel, turn deadline) into "🛑 Cancelled" before
-    re-raising, unless a tap already answered it. A failed send raises. The question
-    always leaves the registry on the way out.
+    The tap handler (or the text handler) edits the message on an answer; here a timeout edits it
+    into "⌛ No answer" and a cancellation (/cancel, turn deadline) into "🛑 Cancelled" before
+    re-raising, unless an answer came first. A failed send raises. The question always leaves
+    the registry on the way out.
     """
-    pending = register(sender.chat_id, question, options)
+    pending = register(sender.chat_id, question, options, getattr(sender, "thread_id", None))
     message = None
     try:
         message = await _send(sender, pending)

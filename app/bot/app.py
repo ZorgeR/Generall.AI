@@ -8,7 +8,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 
-from bot import runtime
+from bot import background, runtime
 from bot.auth import auth
 from bot.config import config
 from bot.handlers import build_root_router, sandbox_ui
@@ -85,7 +85,8 @@ async def on_shutdown(bot: Bot) -> None:
     if runtime.background_tasks:
         await asyncio.gather(*runtime.background_tasks, return_exceptions=True)
     runtime.background_tasks.clear()
-    await runtime.queue.shutdown()
+    await background.shutdown()  # the agents' background tool calls: cancelled, nothing announced
+    await runtime.queue.shutdown()  # running turns drop their unread messages (cancel reason "shutdown")
     await sandbox_ui.shutdown_sessions()  # after the jobs: no turn starts a session behind it
 
 
