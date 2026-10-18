@@ -1,7 +1,7 @@
 """MCPTools: the tools of the user's connected MCP servers as agent tools.
 
-Servers and their cached tool lists come from ``bot.mcp_store`` (the user's ``data/<uid>/mcp.json``
-plus the admin's servers). Nothing touches the network at turn start: ``tools_schema`` is built once
+Servers and their cached tool lists come from ``bot.mcp_store`` (the user's ``data/_mcp/<uid>.json``,
+outside the workspace, plus the admin's servers). Nothing touches the network at turn start: ``tools_schema`` is built once
 per instance from the cache, every enabled server's tools as ``mcp_<server>_<tool>`` (sanitized to
 ``[a-zA-Z0-9_-]{1,64}``, a numeric suffix on a collision) with the description prefixed
 ``[MCP <server>] `` and the input schema passed through (an object schema; anything else becomes an
@@ -31,7 +31,8 @@ error. ``discover(..., oauth=connection)`` is the interactive sign-in (``oauth_f
 provider and the request guard reach ``open_transport`` through the ``_CONNECTION`` context variable, so
 the transport keeps its ``(server, timeout)`` signature. Every request of a non-admin user's connection
 (redirects and the OAuth endpoints the SDK discovers included) passes ``oauth_flow.request_guard``: https
-to a public address, or it is never sent.
+to a public address, or it is never sent; on an admin's shared server only its configured origin is
+exempt.
 
 The mcp package is imported lazily (it costs almost a second) inside ``open_transport`` and
 ``client_session``, which tests replace with fakes (``HTTP_TRANSPORT`` puts an ``httpx2.MockTransport``
@@ -384,17 +385,25 @@ class MCPTools:
         return self._map.get(tool_name)
 
     # -- connection policy --
-    def _trusted(self, server: dict) -> bool:
-        """The admin's servers (shared or their own) skip the public-address checks."""
-        if server.get("admin"):
-            return True
+    def _user_is_admin(self) -> bool:
         from bot.auth import auth  # bot/auth has no import-time side effects
 
         return auth.is_admin(self.user_id)
 
+    def _trusted(self, server: dict) -> bool:
+        """The admin's servers (shared or their own) skip the public-address check of the server itself."""
+        return bool(server.get("admin")) or self._user_is_admin()
+
     def _connection(self, server: dict, oauth: Any = None) -> Connection:
-        guard = None if self._trusted(server) else oauth_flow.request_guard(str(server.get("url") or ""))
-        return Connection(oauth=oauth, guard=guard)
+        """No guard for the admin. Everyone else's requests pass ``oauth_flow.request_guard``: a user's own
+        server needs https + public addresses everywhere; an admin's shared server may use http or a private
+        address at its configured origin only (the admin chose it), while every other host its responses
+        name (metadata, authorization server, registration and token endpoints, redirects) needs https and a
+        public address, so a shared server cannot steer a user's sign-in into the bot's network."""
+        if self._user_is_admin():
+            return Connection(oauth=oauth, guard=None)
+        url = str(server.get("url") or "")
+        return Connection(oauth=oauth, guard=oauth_flow.request_guard(url, trust_origin=bool(server.get("admin"))))
 
     @staticmethod
     def uses_oauth(server: dict) -> bool:
@@ -481,8 +490,9 @@ class MCPTools:
 
     async def _check_host(self, server: dict) -> None:
         """A user's server must be on a public address, checked after DNS before every connection:
-        the bot runs on the host network, and the record may come straight from ``mcp.json``, which
-        the sandbox can write. The admin's servers (shared or their own) are trusted."""
+        the bot runs on the host network, a name may re-resolve, and a record migrated from the old
+        workspace file never went through ``validate_url``. The admin's servers (shared or their own)
+        are trusted here (their other endpoints are still guarded for non-admins, ``_connection``)."""
         if self._trusted(server):
             return
         await asyncio.to_thread(mcp_store.check_public_host, str(server.get("url") or ""))

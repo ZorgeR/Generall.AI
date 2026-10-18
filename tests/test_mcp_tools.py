@@ -519,7 +519,10 @@ def test_user_round_trip_add_replace_toggle_tools_remove(store):
     mcp_store.add_user_server(USER, a)
     mcp_store.add_user_server(USER, b)
     assert [s["name"] for s in mcp_store.load_user(USER)] == ["a", "b"]
-    assert (store / "data" / USER / "mcp.json").exists() and not list((store / "data" / USER).glob("*.tmp"))
+    # The file lives in data/_mcp/<uid>.json now, outside the user's workspace data/<uid> (which the sandbox
+    # and the agent's file tools can write); nothing of it is left in the workspace.
+    assert (store / "data" / "_mcp" / f"{USER}.json").exists() and not list((store / "data" / "_mcp").glob("*.tmp"))
+    assert not (store / "data" / USER / "mcp.json").exists()
 
     replaced = mcp_store.new_server("a", "https://a2.example.com/mcp", "t2")
     mcp_store.add_user_server(USER, replaced)

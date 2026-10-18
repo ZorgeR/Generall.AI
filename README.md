@@ -342,11 +342,13 @@ and image results included. An administrator can offer servers to every user thr
 Sentry, …) take no token: `/mcp add notion https://mcp.notion.com/mcp` answers with a 🔐 *Sign in to
 notion* button; you sign in in the browser, the provider sends you back to the bot's sign-in page and the
 chat message turns into "✅ notion connected (N tools)". The bot registers itself with the provider,
-uses PKCE, stores the tokens encrypted (`MCP_TOKEN_KEY`) and refreshes them by itself; when a refresh
+uses PKCE, stores the tokens encrypted (`MCP_TOKEN_KEY`, in bot-only state the sandbox and the agent's file
+tools cannot reach) and refreshes them by itself; when a refresh
 fails a tool answers "needs you to sign in again" and `/mcp` shows 🔐 *Sign in to …* (or 🚪 *Sign out of …*
 while signed in). Shared OAuth servers: each user signs in with their own account. Without a public
 sign-in page (`PUBLIC_BASE_URL`, below) the browser ends on an error page after the sign-in: copy its
-whole address and send it to the bot.
+whole address and send it to the bot. Never forward a sign-in link: whoever completes it connects *their*
+account to the bot user who asked for it (a link works once, for 10 minutes).
 
 ### 🌐 Web reading and headless browsing
 

@@ -33,7 +33,8 @@ settings, presets and the /settings page, auth, reminder store, text splitting, 
 module, the /stats views and /usage, the Stop buttons, the turn buttons, `ask_user_choice`, the
 reply/forward preamble and /help, content blocks and media prompts, the vision tools, the profile
 and memory_search, the MCP client and /mcp, MCP OAuth sign-ins (`test_mcp_oauth.py`: the SDK's provider against a
-fake OAuth + MCP server, storage, keys, refresh, copy-paste fallback) and their callback endpoint
+fake OAuth + MCP server, storage, keys, refresh, copy-paste fallback, the move of the records out of the
+workspace, the URL binding, the shared-server guard, sign-out / removal racing a refresh or a sign-in) and their callback endpoint
 (`test_oauth_web.py`: routes, headers, TLS), the mode setting, the web/document tools and the
 sandbox image tag, embeddings, time zones and the /reminders UI, scheduled tasks, the agent's retry
 loop and the error path (`test_timezones.py`, `test_reminders_ui.py`, `test_proactive_tasks.py`,
@@ -107,18 +108,23 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
                             Notes (+ any "## Title" the agent creates), "- " entries, dated Notes, 8 KB cap (oldest Notes
                             rotate out), atomic writes, per-user threading.Lock, fingerprint(text) = 12 hex; sync, callers
                             use to_thread
-    mcp_store.py            MCP server records + cached tool lists: per-user data/<uid>/mcp.json, the admin file
-                            (MCP_SERVERS_FILE) + its .cache.json; sync I/O, per-user lock, atomic writes (mkstemp, 0600;
-                            the user file is read O_NOFOLLOW), name/URL validation, tokens never rendered back; OAuth
-                            sign-ins: token_cipher() (Fernet: MCP_TOKEN_KEY, else data/.mcp_token_key; MCP_TOKEN_KEY_OLD),
-                            read_oauth / write_oauth / clear_oauth / seal_oauth / mark_signin_needed (values bound to
-                            user + server + URL), all_servers(with_state=True) → oauth_state
+    mcp_store.py            MCP server records + cached tool lists: per-user data/_mcp/<uid>.json (bot-only, outside the
+                            workspace; _migrate moves an old data/<uid>/mcp.json there on the user's first load), the admin
+                            file (MCP_SERVERS_FILE) + its .cache.json; sync I/O, per-user lock, atomic writes (mkstemp, 0600,
+                            data/_mcp 0700; read O_NOFOLLOW, ≤ MAX_FILE_BYTES), name/URL validation, tokens never rendered
+                            back; OAuth sign-ins: token_cipher() (Fernet: MCP_TOKEN_KEY, else data/.mcp_token_key;
+                            MCP_TOKEN_KEY_OLD), read_oauth / write_oauth / clear_oauth / seal_oauth / mark_signin_needed
+                            (values bound to user + server + URL, used only while the stored record has the URL of the
+                            connection: _locate), all_servers(with_state=True) → oauth_state
     oauth_flow.py           MCP OAuth sign-in: pending logins (register / resolve / wait_for_code, keyed by the SDK's state,
                             one-shot, LOGIN_TIMEOUT 600 s, one per user + server), OAuthStorage (the SDK's TokenStorage,
                             expires_at + discovered metadata kept, refresh lock), OAuthConnection (→ OAuthClientProvider,
-                            non-interactive without handlers: NeedsSignIn), request_guard (https + public, httpx2 hook),
-                            install_log_filter, start_sign_in (the background task: 🔐 URL button → "✅ <name> connected"),
-                            redirect_uri (public callback or LOOPBACK_REDIRECT), shutdown
+                            non-interactive without handlers: NeedsSignIn), request_guard (https + public, httpx2 hook;
+                            trust_origin: a shared server's configured origin exempt), install_log_filter, start_sign_in
+                            (the background task: 🔐 URL button → "✅ <name> connected" once the store took tokens and tools,
+                            else REMOVED_TEXT), cancel_sign_in, sign_out / remove_server (cancel a running sign-in, wait for
+                            a refresh in flight: the refresh lock), redirect_uri (public callback or LOOPBACK_REDIRECT),
+                            shutdown
     oauth_web.py            the sign-in callback endpoint (aiohttp in the bot process, task "oauth-web", only with
                             PUBLIC_BASE_URL): GET /oauth/callback + /oauth/health, settings_from_env (OAUTH_LISTEN, OAUTH_TLS,
                             OAUTH_TLS_CERT/KEY), load_tls (admin files, else a generated self-signed pair), callback_url()
@@ -175,7 +181,8 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
                             imported lazily
       profile_ui.py         /profile: the profile as legacy Markdown, paged under Telegram's 4096-char limit (render_pages),
                             🔄 Refresh / 🗑 Forget everything (confirm step); profile_ callbacks
-      mcp_ui.py             /mcp [add|remove|refresh|help] + mcp_ buttons (mcp_signin_ / mcp_signout_ for OAuth servers);
+      mcp_ui.py             /mcp [add|remove|refresh|help] + mcp_ buttons (mcp_signin_ / mcp_signout_ for OAuth servers;
+                            removal and sign-out through oauth_flow.remove_server / sign_out);
                             add without a token probes for OAuth and starts the background sign-in (begin_sign_in);
                             pasted_callback (the copy-paste fallback: a pasted http://localhost:8765/oauth/callback URL
                             while a sign-in is pending; async filter); refresh_admin_servers() also runs once from
@@ -909,7 +916,7 @@ browser, with no background host no task tools: 44 at the least):
 | SubagentTools | `run_subagent` (task, tools subset, model main/fast, max_tool_calls) | bot process: a fresh `AgentAnthropic` with the same providers (registered ones included), empty non-persisted context, budget slice of the parent's `TurnBudget`, trace depth 1; main agent only (a subagent has no `run_subagent`); model "main" is `ANTHROPIC_MODEL` whatever the mode |
 | VisionTools (registered, awaited) | `view_image` (path, max_px 128..2048, default `MAX_IMAGE_RESOLUTION_VISION`) → `[image block, text "<rel path> · WxH px (shown at wxh)"]` (JPEG/PNG/GIF/WebP within the limits and upright pass through unchanged, else re-encoded as JPEG); `describe_image` (path, question?, model anthropic\|openai) → text from `bot.media.describe_image_anthropic/openai` (temp JPEG in the system temp dir; the OpenAI call writes its own usage row); `read_document` (path, question?) → a PDF within the limits as `[document block, text "<name> · N pages"]`, else extracted text capped at `vision_tools.EXTRACTED_TEXT_CAP` (60000), unknown types through `describe_document` | bot process, never sandboxed; paths via `resolve_under` with images/downloads/documents fallbacks |
 | ProfileTools (registered, awaited) | `user_profile_read`, `user_profile_add(section, text)`, `user_profile_remove(section, needle)`, `user_profile_replace(section, old, new)`; needle = exact entry, a unique substring or a 1-based index; results = confirmation + the numbered section; registered always (the `profile` setting only gates the `<profile>` block in the context) | bot process, file I/O in to_thread |
-| MCPTools (registered, awaited) | `mcp_<server>_<tool>` for every tool of the user's enabled MCP servers and the admin's (names sanitized to `[a-zA-Z0-9_-]{1,64}`, collisions `_2`, `_3`…; description `[MCP <server>] …`; input_schema passed through, an empty object schema when missing/invalid); `prompt_notes` only when the user has MCP tools | bot process: schemas from the cached tool lists (NO network at turn start); one fresh connection per call (streamable HTTP or SSE by `transport`, stored headers) → `initialize` → `call_tool` → closed; `CALL_TIMEOUT` 60 s (`DISCOVER_TIMEOUT` 30 s); text → joined text, images → base64 `image` blocks (list result), embedded resources → their text or `[resource <uri>]`, `isError` → `Error: …`, unreachable → `Error: MCP server <name> unreachable: <reason>` (never raises; URLs in the reason redacted to scheme+host+path; the error is recorded in the store and shown by `/mcp`); an OAuth server (`auth: "oauth"`) connects with the SDK's `OAuthClientProvider` over the user's stored sign-in, non-interactive (an expired access token is refreshed first; a refused one gets one forced refresh), else `Error: MCP server <name> needs you to sign in again (use /mcp).` with the record's error / the per-user flag "sign in needed" (no request at all when nothing is stored); every request of a non-admin user's connection (the OAuth endpoints included) must be https to a public address (`oauth_flow.request_guard`) |
+| MCPTools (registered, awaited) | `mcp_<server>_<tool>` for every tool of the user's enabled MCP servers and the admin's (names sanitized to `[a-zA-Z0-9_-]{1,64}`, collisions `_2`, `_3`…; description `[MCP <server>] …`; input_schema passed through, an empty object schema when missing/invalid); `prompt_notes` only when the user has MCP tools | bot process: schemas from the cached tool lists (NO network at turn start); one fresh connection per call (streamable HTTP or SSE by `transport`, stored headers) → `initialize` → `call_tool` → closed; `CALL_TIMEOUT` 60 s (`DISCOVER_TIMEOUT` 30 s); text → joined text, images → base64 `image` blocks (list result), embedded resources → their text or `[resource <uri>]`, `isError` → `Error: …`, unreachable → `Error: MCP server <name> unreachable: <reason>` (never raises; URLs in the reason redacted to scheme+host+path; the error is recorded in the store and shown by `/mcp`); an OAuth server (`auth: "oauth"`) connects with the SDK's `OAuthClientProvider` over the user's stored sign-in, non-interactive (an expired access token is refreshed first; a refused one gets one forced refresh), else `Error: MCP server <name> needs you to sign in again (use /mcp).` with the record's error / the per-user flag "sign in needed" (no request at all when nothing is stored, nor when the stored record's URL is no longer the URL this provider loaded at turn start); every request of a non-admin user's connection (the OAuth endpoints and redirects included) must be https to a public address (`oauth_flow.request_guard`), on an admin's shared server too except at its configured origin; the admin's own connections are not guarded |
 | WebTools (registered, blocking) | `browse_webpage` (url, wait_ms 0..10000 default 1500, screenshot, max_chars 500..100000 default 20000): page title, final URL, readable text (trafilatura on the rendered HTML), first 20 links, optional screenshot `downloads/screenshot_<hex>.png` (view with `view_image`; a failed screenshot keeps the page read and says "Screenshot: not saved") | sandbox: ONE container with network on, `mem_limit` 1g, timeout 75 s (script deadline 60 s) via `ContainerManager.run_script("browse.py", …)`; the bot process only formats the JSON |
 | SandboxTools (registered, awaited; only while sessions are on) | `sandbox_status`: when the sandbox and the browser close if unused (user's local time), memory, open tabs, stored logins size, saved packages, whether the user was warned; its `prompt_notes` carry the sandbox facts (30 min idle, the warning, what persists, fresh bash per command, `nohup` for background jobs, filtered internet, apt/pip persistence) | bot process (`manager.status` in to_thread); inherited by subagents |
 | BrowserTools (registered, awaited; only with `browser.enabled`) | the browser toolset members (`navigate`, `screenshot`, `zoom`, `left_click`, `right_click`, `middle_click`, `double_click`, `triple_click`, `hover`, `left_click_drag`, `left_mouse_down`, `left_mouse_up`, `mouse_move`, `scroll`, `scroll_to`, `type`, `key`, `hold_key`, `wait`, `read_page`, `find`, `get_page_text`, `form_input`, `new_tab`, `list_tabs`, `switch_tab`, `close_tab`; `javascript_exec`, `file_upload`, `read_console`, `read_network` disabled); `browser_confirm(summary)` (sends the current screenshot with ✅ Allow / ❌ Cancel through `bot/questions.ask`, 300 s; Allow = one sensitive action within 5 minutes, this turn only; only a tap grants it: a typed answer, `Answer.tapped` False, returns the text with "That is not a permission" and clears any allowance); `browser_show_screenshot(caption, region?)` (crop scaled up to 3x, e.g. a captcha for the user) | members: the user's browser container (`SessionManager.browser_call` in to_thread, 75 s); the two tools: bot process. Never given to subagents |
@@ -1061,12 +1068,21 @@ pip) and replayed once at every session start; a file the model writes with `cre
   (`ensure_real_dir`, `regular_files`, `resolve_under`): a chmod, copy or read that followed a planted link
   would act on its target as root. The shell session keeps `sudo` for apt;
   the browser container has `no-new-privileges`; neither can reach private addresses while the egress filter
-  is on. `data/<uid>/mcp.json` is in the workspace too: `mcp_store` reads it `O_NOFOLLOW` (a link reads as no
-  servers) and writes it through `mkstemp` + `os.replace` (0600), and the OAuth tokens and client registrations
-  in it are Fernet-encrypted with a key outside the workspace (`MCP_TOKEN_KEY` or `data/.mcp_token_key`); each
-  encrypted value carries the user id, server name, URL and admin flag and is refused for any other record, so a
-  sandbox that moves a token to a record pointing at its own server, changes a URL or tampers with a value only
-  signs the user out. `data/tls/` and `data/.mcp_token_key` are never mounted into a container.
+  is on. The users' MCP records (servers, static Bearer headers, cached tools, OAuth sign-ins) are bot-only state
+  in `data/_mcp/<uid>.json`, like `data/_sandbox/<uid>/` outside every workspace: never mounted into a container,
+  unreachable by `resolve_under` (so not by `read_file` / `create_file` either). They used to be
+  `data/<uid>/mcp.json`, where the sandbox (data/<uid> is 777, and its shell has sudo for apt) and a
+  prompt-injected agent could rewrite them, e.g. point a signed-in record at their own server for one turn, swap
+  the file blind during a sign-in or write back an old copy after a sign-out; `mcp_store._migrate` moves that file
+  on the user's first load (see the data layout) and a `mcp.json` in the workspace is never read afterwards.
+  Defence in depth stays: the file is read `O_NOFOLLOW` (≤ `MAX_FILE_BYTES`), written through `mkstemp` +
+  `os.replace` (0600, directory 0700), and the OAuth tokens and client registrations are Fernet-encrypted with a
+  key outside the workspace (`MCP_TOKEN_KEY` or `data/.mcp_token_key`); each encrypted value carries the user id,
+  server name, URL and admin flag and is refused for any other record, and a user server's value is used or
+  written only while the stored record is an OAuth server whose URL is also the URL of the connection asking
+  (`mcp_store._locate`), so a provider that loaded a record before it changed gets no token and a sign-in that
+  finishes after its record changed stores nothing. `data/_mcp/`, `data/tls/` and `data/.mcp_token_key` are never
+  mounted into a container.
 
 ## Memory and on-disk data layout
 
@@ -1086,6 +1102,20 @@ data/
                                     with the admin's sign-ins), by the admin's /mcp refresh and by the admin's sign-in to such a server
   .mcp_token_key                    the generated Fernet key of stored MCP sign-ins when MCP_TOKEN_KEY is unset (0600, O_EXCL, kept;
                                     with MCP_TOKEN_KEY set it only decrypts what it sealed before)
+  _mcp/<chat_id>.json               the user's MCP servers (bot-only: the directory is 0700, never mounted, outside the workspace):
+                                    {"servers": [{name, url, transport, headers: {Authorization: "Bearer …"},
+                                    enabled, tools: [{name, description, input_schema}], updated (iso), error[, auth: "oauth",
+                                    oauth: {tokens: "<fernet>", client: "<fernet>", account: null, updated[, needs_signin: true]}]}],
+                                    "oauth_admin": {"<admin server>": {same entry}}} (the user's own sign-ins to admin servers);
+                                    tokens = {tokens (the SDK's OAuthToken), expires_at, metadata (discovered AS + resource metadata:
+                                    the refresh endpoint)}, client = the dynamic client registration; each value bound to user +
+                                    server + URL + admin flag (see the security boundary); mkstemp + os.replace (0600), read
+                                    O_NOFOLLOW, at most MAX_FILE_BYTES (4 MB). Replaces <chat_id>/mcp.json: the user's first load
+                                    with this file missing moves the old one here (read O_NOFOLLOW | O_NONBLOCK, a regular file
+                                    ≤ 4 MB, normalized like any record, then unlinked; a link, FIFO, oversized or broken one is not
+                                    read, just unlinked, with a WARNING; a moved one is logged once at INFO) or, when there is none,
+                                    writes {"servers": []}: from then on the file exists and a mcp.json in the workspace is ignored
+                                    (neither read nor deleted)
   tls/                              the sign-in endpoint's certificates (only with TLS: port 443 or OAUTH_TLS=on): <host>.pem / <host>.key
                                     (the admin's, e.g. a Cloudflare Origin Certificate; they win) or the generated <host>.selfsigned.pem /
                                     <host>.selfsigned.key (EC P-256, CN + SAN = the host of PUBLIC_BASE_URL, 10 years, key 0600, O_EXCL,
@@ -1102,13 +1132,8 @@ data/
                                     when empty; edited only through bot/profile.ProfileStore (user_profile_* tools, /profile); read only
                                     as a regular file (read_regular_text: O_NOFOLLOW|O_NONBLOCK, so a symlink or
                                     FIFO reads as empty), written via a mkstemp tmp file + os.replace
-    mcp.json                        the user's MCP servers: {"servers": [{name, url, transport, headers: {Authorization: "Bearer …"},
-                                    enabled, tools: [{name, description, input_schema}], updated (iso), error[, auth: "oauth",
-                                    oauth: {tokens: "<fernet>", client: "<fernet>", account: null, updated[, needs_signin: true]}]}],
-                                    "oauth_admin": {"<admin server>": {same entry}}} (the user's own sign-ins to admin servers);
-                                    tokens = {tokens (the SDK's OAuthToken), expires_at, metadata (discovered AS + resource metadata:
-                                    the refresh endpoint)}, client = the dynamic client registration; each value bound to user +
-                                    server + URL + admin flag (see the security boundary); mkstemp + os.replace (0600), read O_NOFOLLOW
+    mcp.json                        legacy: the user's MCP servers before they moved to data/_mcp/<chat_id>.json (moved away on the
+                                    first load; a file of that name written here later is never read)
     conversations/conversation_<YYYYmmdd_HHMMSS>_<topic>.json
                                     one file per turn: {timestamp, thread_id, topic, summary, question, response, full_history}
                                     (full_history with media blocks replaced by their markers: content.strip_media; question =
@@ -1622,23 +1647,30 @@ name; a new temp dir needs its own `.gitignore` line).
 - Dead code: `JudgeResponse`, `tavily_client` in `agents/main.py`, `describe_document_openai` was removed;
   `ToolIntegrator.patch_search_tools` only logs. `bot.limits.check_user_limits` is blocking SQLite with a
   side effect (`ensure_user_limit` inserts the default row): outside the middleware call it in `to_thread`.
-- `MCPTools` reads the user's `mcp.json` and the admin cache synchronously on the first `tools_schema`
-  access, i.e. on the event loop at turn start (KB-sized files, fine; do not grow them). `tools_schema` is
-  computed once per instance (= per turn); tool discovery is cached, so a server whose tools changed shows
-  the old tools until `/mcp refresh` (users) or a restart / admin `/mcp refresh` (admin servers).
-- A user's MCP server must be https to a public host: `mcp_store.validate_url` refuses http, localhost /
-  *.localhost and loopback/private/link-local/shared/reserved/unspecified/multicast (IPv4-mapped included)
-  literals for non-admins, and `MCPTools._check_host` runs `mcp_store.check_public_host` (getaddrinfo via
-  `_resolve`, in to_thread; an unresolvable name passes) before every discovery and call of a non-admin
-  user's server, which also covers records written straight into `mcp.json`. The admin (shared servers and
-  the admin's own `/mcp add`) may use http and private hosts. Not pinned: httpx resolves again (a DNS
+- `MCPTools` reads the user's `data/_mcp/<uid>.json` and the admin cache synchronously on the first `tools_schema`
+  access, i.e. on the event loop at turn start (KB-sized files, fine; do not grow them). The very first load of a
+  user after the move out of the workspace writes too (`mcp_store._migrate`: the moved file, or an empty one), once.
+  `tools_schema` is computed once per instance (= per turn); tool discovery is cached, so a server whose tools
+  changed shows the old tools until `/mcp refresh` (users) or a restart / admin `/mcp refresh` (admin servers).
+- A user's MCP server must be https to a public host: `mcp_store.validate_url` refuses http, localhost / *.localhost
+  and loopback/private/link-local/shared/reserved/unspecified/multicast (IPv4-mapped included) literals for
+  non-admins, and `MCPTools._check_host` runs `mcp_store.check_public_host` (getaddrinfo via `_resolve`, in
+  to_thread; an unresolvable name passes) before every discovery and call of a non-admin user's server, which also
+  covers records that never went through `validate_url` (moved from the old workspace file). The admin (shared
+  servers and the admin's own `/mcp add`) may use http and private hosts. Not pinned: httpx resolves again (a DNS
   rebinding window). `download_file` / `download_webpage` still reach any host. Tests stub `mcp_store._resolve`.
-  Every request of a non-admin user's MCP connection also passes `oauth_flow.request_guard` (an httpx2 request
-  event hook, which httpx2 runs for the OAuth flow's own requests too): https only, and every host other than the
-  server's own (already checked) through `check_public_host` once per connection; a refused request raises
-  `UnsafeEndpoint` and is never sent (fail closed). That covers the metadata, registration and token endpoints the
-  SDK discovers, which a malicious server could point at the bot's host network. The authorization URL (opened
-  by the user's browser, never fetched) must be https for non-admins.
+  Every request of a non-admin user's MCP connection also passes `oauth_flow.request_guard` (an httpx2 request event
+  hook, which httpx2 runs for the OAuth flow's own requests too): https only, and every host other than the server's
+  own (already checked) through `check_public_host` once per connection; a refused request raises `UnsafeEndpoint`
+  and is never sent (fail closed). That covers the metadata, registration and token endpoints the SDK discovers,
+  which a malicious server could point at the bot's host network. A non-admin user's connection to an admin's shared
+  server is guarded too (`request_guard(trust_origin=True)`): only the configured origin (scheme, host, port) is
+  exempt, since the admin may run it on http or a private address; every other origin, the same host on another port
+  or scheme included, needs https and a public address, so a shared server's metadata cannot send a user's
+  registration or token request to the bot's network. Consequence: a private shared server that redirects (http →
+  https on the same host included) fails for non-admins; configure its final URL. Only the admin's own connections
+  run unguarded. The authorization URL (opened by the user's browser, never fetched) must be https for non-admins,
+  except at a shared server's configured origin.
 - **MCP OAuth** (`bot/oauth_flow.py`): one `OAuthClientProvider` per connection, so whatever the SDK keeps in
   memory is lost after each call; `OAuthStorage` makes up for two gaps: the SDK restores no expiry from storage
   (`_initialize` only loads the token, and only a token it thinks expired is refreshed) and, before a 401 made it
@@ -1664,12 +1696,26 @@ name; a new temp dir needs its own `.gitignore` line).
 - Sign-in state: a user server is "sign in needed" while it has no decryptable tokens, its oauth entry says
   `needs_signin` (set by a failed refresh, cleared by a refresh or a successful call) or its error is "sign in
   needed"; an admin server's state is the user's own `oauth_admin` entry, never the shared cache (a user's failed
-  refresh does not write the cache; `record_error` would). The tools of an OAuth admin server come from the admin
-  cache, filled only by the admin's sign-in, the admin's `/mcp refresh` and the startup refresh with the admin's
-  tokens (`refresh_admin_servers` uses `auth.admin_id`); a user who signs in first is told so.
+  refresh does not write the cache; `record_error` would). Every successful interactive sign-in clears the flag
+  (`write_oauth(needs_signin=False)`), also one that needed no login because the stored token was accepted again.
+  The tools of an OAuth admin server come from the admin cache, filled only by the admin's sign-in, the admin's
+  `/mcp refresh` and the startup refresh with the admin's tokens (`refresh_admin_servers` uses `auth.admin_id`); a
+  user who signs in first is told so.
 - Pending sign-ins, their Futures and the sign-in tasks live in memory, bound to the event loop (cleared when it
   changes, `oauth_flow.reset()` in tests): a restart loses them, the link then shows the expired page. One
-  pending sign-in per user + server: starting another cancels the running task ("replaced").
+  pending sign-in per user + server: starting another cancels the running task ("replaced"); removing the server
+  (`oauth_flow.remove_server`) or signing out of it (`sign_out`) cancels it too (`cancel_sign_in`: the message ends
+  as `REMOVED_TEXT` / `SIGNED_OUT_TEXT`, the link as the expired page). Both also take the refresh lock around the
+  store call, so a token refresh in flight finishes first and cannot write its tokens back after the sign-out;
+  keep any new path that deletes tokens or records behind that lock. A sign-in whose writes the store refuses
+  (`write_oauth` False, `update_user_tools(url=…)` None: the record is gone, no longer OAuth or has another URL,
+  e.g. re-added with a token meanwhile) keeps going in memory but stores nothing and ends as `REMOVED_TEXT`
+  ("❌ The server was removed while you were signing in."), never "✅ connected".
+- The sign-in callback is not tied to the Telegram user: the `state` in the link identifies the pending sign-in,
+  and whoever completes the provider's login with that link connects THEIR account to the bot user who started it
+  (their tokens end up in that user's record and the agent acts with them). The link is single-use and expires
+  after `LOGIN_TIMEOUT` (10 minutes); never forward a sign-in link, and treat a forwarded one as a phishing attempt
+  (a user who signs in through someone else's link hands them access to their account).
 - Adding, removing, toggling or refreshing an MCP server (or an admin file change), switching `mode` to or
   from `speed` (the model changes; `transcript.model` is overwritten with the latest turn's model) and any new
   or changed provider `prompt_notes` change the tool list / static prompt → `transcript.prefix_fingerprint` →
@@ -1940,7 +1986,10 @@ name; a new temp dir needs its own `.gitignore` line).
   transport/result conversion (`convert_content`, `error_reason`) and the OAuth connection policy,
   `bot/oauth_flow.py` for the sign-in, `bot/oauth_web.py` for the callback page, `bot/handlers/mcp_ui.py` for the
   command. Tests with a fake OAuth + MCP server: `tests/mcp_oauth_fakes.py` (an httpx2 MockTransport handler,
-  put into `agents.mcp_tools.HTTP_TRANSPORT`).
+  put into `agents.mcp_tools.HTTP_TRANSPORT`). Every read of a user's records goes through `mcp_store._read_user`
+  under the user's lock (it runs the one-time migration), every write through `_write_user_file` (private
+  directory, 0600); never put MCP state back under `data/<uid>/`, and delete tokens or records only through
+  `oauth_flow.sign_out` / `remove_server` (the refresh lock).
 - **Host the sign-in callback**: see "Running" (Cloudflare Tunnel recommended); code in `bot/oauth_web.py`
   (routes, headers, TLS rule), tests in `tests/test_oauth_web.py`. Never add an access log or a route that
   echoes the query: the request line carries the authorization code and the state.

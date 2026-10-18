@@ -23,7 +23,12 @@ access token before a request. This module gives it what it asks for:
 * ``start_sign_in``: the background task behind ``/mcp add`` (when the probe asked for a sign-in) and the
   ``mcp_signin_<name>`` button: it edits its status message into "🔐 <name> needs you to sign in." with a URL
   button, waits for the callback, lets the SDK finish, discovers the tools, stores them and edits the message
-  into "✅ <name> connected (N tools)" (or "⌛ Sign-in expired …", "❌ …").
+  into "✅ <name> connected (N tools)" (or "⌛ Sign-in expired …", "❌ …"). "✅" only once the store took the
+  tools and the cleared "sign in needed" flag: a server removed or replaced meanwhile ends as
+  ``REMOVED_TEXT`` with nothing stored.
+* ``sign_out`` / ``remove_server`` (the ``/mcp`` buttons and ``/mcp remove``): cancel a sign-in of that user
+  to that server still running (``cancel_sign_in``) and take the refresh lock around the store call, so a
+  refresh in flight finishes first and the sign-out (or removal) is what stays.
 
 The redirect URI is the public callback (``PUBLIC_BASE_URL`` + ``/oauth/callback``) while ``bot.oauth_web``
 serves it, else ``LOOPBACK_REDIRECT``: the user copies the address of the browser's error page back into the
@@ -61,6 +66,8 @@ FALLBACK_HINT = ("After you sign in, your browser will show an error page. Copy 
                  "address bar and send it here. The link works for 10 minutes.")
 EXPIRED_TEXT = "⌛ Sign-in expired. Try again with /mcp."
 REPLACED_TEXT = "⌛ This sign-in was replaced by a newer one."
+REMOVED_TEXT = "❌ The server was removed while you were signing in."
+SIGNED_OUT_TEXT = "🚪 You signed out, so this sign-in was cancelled."
 
 
 # ---- errors --------------------------------------------------------------------------------
@@ -106,12 +113,26 @@ class SignInLinkRefused(Exception):
     """Telegram refused the message with the sign-in button."""
 
 
+class ServerGone(Exception):
+    """The server was removed (or replaced by a record for another URL) while the sign-in ran: the store
+    refused to keep its tokens or tools."""
+
+
 # ---- loop-bound registries (cleared when the running loop changes: every test has its own) ---------
 _loop: Any = None
 _pending: dict[str, "PendingLogin"] = {}
 _tasks: dict[tuple[str, str], asyncio.Task] = {}
 _replaced: set[asyncio.Task] = set()
+_stopped: dict[asyncio.Task, str] = {}  # sign-ins cancelled by a removal or sign-out → their final text
 _refresh_locks: dict[tuple, asyncio.Lock] = {}
+
+
+def _clear() -> None:
+    _pending.clear()
+    _tasks.clear()
+    _replaced.clear()
+    _stopped.clear()
+    _refresh_locks.clear()
 
 
 def _check_loop() -> asyncio.AbstractEventLoop:
@@ -119,10 +140,7 @@ def _check_loop() -> asyncio.AbstractEventLoop:
     loop = asyncio.get_running_loop()
     if _loop is not loop:
         _loop = loop
-        _pending.clear()
-        _tasks.clear()
-        _replaced.clear()
-        _refresh_locks.clear()
+        _clear()
     return loop
 
 
@@ -130,10 +148,12 @@ def reset() -> None:
     """Forget every pending login, task and lock (tests)."""
     global _loop
     _loop = None
-    _pending.clear()
-    _tasks.clear()
-    _replaced.clear()
-    _refresh_locks.clear()
+    _clear()
+
+
+def lock_key(user_id: str, server: dict) -> tuple[str, str, bool]:
+    """The refresh lock of one user's sign-in to one server."""
+    return str(user_id), str(server["name"]), bool(server.get("admin"))
 
 
 def _refresh_lock(key: tuple) -> asyncio.Lock:
@@ -286,17 +306,38 @@ def client_metadata(redirect: str):
     )
 
 
-def request_guard(server_url: str) -> Callable[[Any], Awaitable[None]]:
+def _origin(scheme: Any, host: Any, port: Any) -> tuple[str, str, int]:
+    scheme = str(scheme or "").lower()
+    return scheme, str(host or "").lower(), int(port or (443 if scheme == "https" else 80))
+
+
+def url_origin(url: str) -> tuple[str, str, int] | None:
+    """(scheme, host, port with the default filled in) of ``url``, None when it has none."""
+    try:
+        parts = urlsplit(str(url or ""))
+        return _origin(parts.scheme, parts.hostname, parts.port) if parts.hostname else None
+    except ValueError:
+        return None
+
+
+def request_guard(server_url: str, *, trust_origin: bool = False) -> Callable[[Any], Awaitable[None]]:
     """An httpx2 request hook for a non-admin user's connections: every request (the MCP endpoint and the
-    metadata, registration and token endpoints the OAuth flow discovers) must be https to a public address
-    (``mcp_store.check_public_host``, in a worker thread, once per host and connection). Fails closed: a
-    refused request raises ``UnsafeEndpoint`` and is never sent. The server's own host was checked before
-    connecting (``MCPTools._check_host``)."""
-    trusted = {(urlsplit(str(server_url or "")).hostname or "").lower()}
+    metadata, registration and token endpoints the OAuth flow discovers, redirects) must be https to a
+    public address (``mcp_store.check_public_host``, in a worker thread, once per host and connection).
+    Fails closed: a refused request raises ``UnsafeEndpoint`` and is never sent. A user's server: its own
+    host was checked before connecting (``MCPTools._check_host``) and still needs https. ``trust_origin``
+    (an admin's shared server used by a non-admin user): requests to the configured server's own origin
+    (scheme, host and port) pass unchecked, since the admin may run it on plain http or a private address;
+    every other origin, the same host on another port or scheme included, needs https and a public address
+    like any user's endpoint, so the server cannot point the sign-in at the bot's network."""
+    own = url_origin(server_url) if trust_origin else None
+    trusted = set() if trust_origin else {(urlsplit(str(server_url or "")).hostname or "").lower()}
 
     async def guard(request: Any) -> None:
         url = request.url
         host = str(url.host or "").lower()
+        if own is not None and _origin(url.scheme, host, url.port) == own:
+            return
         if url.scheme != "https":
             raise UnsafeEndpoint(f"Refused a plain-http request to {host}: MCP servers and their sign-in endpoints must use https.")
         if host in trusted:
@@ -362,6 +403,7 @@ class OAuthStorage:
         self.provider: Any = None
         self.stale_access: str | None = None  # an access token the server refused: refreshed before reuse
         self.refreshed = False
+        self.dropped = False  # a write the store refused: the server was removed or replaced meanwhile
         self._loaded = not persist
         self._held: asyncio.Lock | None = None
 
@@ -442,7 +484,7 @@ class OAuthStorage:
     # -- the refresh lock --
     async def _acquire(self) -> None:
         if self._held is None:  # re-entrant for this storage: the SDK may load the tokens twice
-            lock = _refresh_lock((self.user_id, self.server["name"], self.server["admin"]))
+            lock = _refresh_lock(lock_key(self.user_id, self.server))
             await lock.acquire()
             self._held = lock
 
@@ -482,10 +524,18 @@ class OAuthStorage:
             self.metadata = self._capture_metadata() or self.metadata
             self.stale_access, self.refreshed, self.needs_signin = None, True, False
             if self.persist:
-                await asyncio.to_thread(mcp_store.write_oauth, self.user_id, self.server,
-                                        tokens=self._token_payload(), needs_signin=False)
+                self._written(await asyncio.to_thread(mcp_store.write_oauth, self.user_id, self.server,
+                                                      tokens=self._token_payload(), needs_signin=False))
         finally:
             self.close()
+
+    def _written(self, ok: bool) -> None:
+        """The store refused the write (the record is gone, no longer OAuth or has another URL): this
+        connection goes on with what it holds in memory, nothing is stored, the sign-in reports it."""
+        if not ok:
+            self.dropped = True
+            logger.info("MCP sign-in of %s to %s not stored: the server was removed or changed meanwhile",
+                        self.user_id, self.server["name"])
 
     async def get_client_info(self):
         from mcp.shared.auth import OAuthClientInformationFull
@@ -504,7 +554,7 @@ class OAuthStorage:
     async def set_client_info(self, client_info: Any) -> None:
         self.client = client_info.model_dump(mode="json", exclude_none=True)
         if self.persist:
-            await asyncio.to_thread(mcp_store.write_oauth, self.user_id, self.server, client=self.client)
+            self._written(await asyncio.to_thread(mcp_store.write_oauth, self.user_id, self.server, client=self.client))
 
 
 # ---- connections ---------------------------------------------------------------------------
@@ -558,9 +608,44 @@ def start_sign_in(user_id: str, server: dict, status: Message) -> asyncio.Task:
         if _tasks.get(key) is t:
             del _tasks[key]
         _replaced.discard(t)
+        _stopped.pop(t, None)
 
     task.add_done_callback(forget)
     return task
+
+
+def cancel_sign_in(user_id: str, name: str, text: str) -> bool:
+    """Cancel the sign-in of ``user_id`` to ``name`` still running (its message ends as ``text``) and its
+    pending login (the link then shows the expired page). True when one was running."""
+    _check_loop()
+    user_id, name = str(user_id), str(name)
+    task = _tasks.get((user_id, name))
+    running = task is not None and not task.done()
+    if running:
+        _stopped[task] = text
+        task.cancel()
+    for login in [l for l in _pending.values() if l.user_id == user_id and l.server == name]:
+        drop(login)
+    return running
+
+
+async def sign_out(user_id: str, server: dict) -> bool:
+    """Sign out of ``server`` (``mcp_store.clear_oauth``: the tokens go, the registration stays). A sign-in
+    still running is cancelled, and a refresh of this sign-in in flight is waited for (its refresh lock),
+    which would otherwise store fresh tokens right after the sign-out. False when nothing was stored."""
+    cancel_sign_in(user_id, server["name"], SIGNED_OUT_TEXT)
+    async with _refresh_lock(lock_key(user_id, server)):
+        return await asyncio.to_thread(mcp_store.clear_oauth, user_id, server)
+
+
+async def remove_server(user_id: str, name: str) -> bool:
+    """Remove the user's server ``name`` with its sign-in (``mcp_store.remove_user_server``), cancelling a
+    sign-in to it still running and waiting for a refresh in flight, like ``sign_out``. False when there
+    was no such server."""
+    name = str(name or "").strip().lower()
+    cancel_sign_in(user_id, name, REMOVED_TEXT)
+    async with _refresh_lock(lock_key(user_id, {"name": name, "admin": False})):
+        return await asyncio.to_thread(mcp_store.remove_user_server, user_id, name)
 
 
 async def discover_with_sign_in(user_id: str, server: dict, connection: OAuthConnection) -> list[dict]:
@@ -611,9 +696,13 @@ ADMIN_CACHE_NOTE = "Its tools reach me once the admin has signed in to it too (o
 
 
 async def _save_tools(user_id: str, server: dict, tools: list[dict]) -> str:
-    """Store the discovered tools; a note for the user when they cannot use them yet ("" otherwise)."""
+    """Store the discovered tools; a note for the user when they cannot use them yet ("" otherwise).
+    ServerGone when the user's server was removed or now points at another URL."""
     if not server.get("admin"):
-        await asyncio.to_thread(mcp_store.update_user_tools, user_id, server["name"], tools, None, auth=mcp_store.AUTH_OAUTH)
+        stored = await asyncio.to_thread(mcp_store.update_user_tools, user_id, server["name"], tools, None,
+                                         auth=mcp_store.AUTH_OAUTH, url=server["url"])
+        if stored is None:
+            raise ServerGone()
         return ""
     current = await asyncio.to_thread(mcp_store.load_admin)
     if _is_admin(user_id):  # the admin's sign-in fills the shared tool cache of an admin server
@@ -633,14 +722,16 @@ async def _sign_in(user_id: str, server: dict, status: Message) -> None:
     storage = OAuthStorage(user_id, server, for_sign_in=True)
     box: dict[str, PendingLogin] = {}
     fallback = storage.redirect_uri == LOOPBACK_REDIRECT
-    trusted = bool(server.get("admin")) or _is_admin(user_id)
+    trusted = _is_admin(user_id)
+    own_origin = url_origin(server["url"]) if server.get("admin") else None  # an admin server's own origin may be http
 
     async def redirect_handler(authorization_url: str) -> None:
         storage.close()  # a failed refresh may have left the refresh lock with us: never hold it while the user signs in
         state = (parse_qs(urlsplit(authorization_url).query).get("state") or [""])[0]
         if not state:
             raise LoginRefused("invalid_request", "the authorization URL has no state")
-        if not trusted and urlsplit(authorization_url).scheme != "https":
+        if (not trusted and urlsplit(authorization_url).scheme != "https"
+                and (own_origin is None or url_origin(authorization_url) != own_origin)):
             raise UnsafeEndpoint("The sign-in page must use https.")
         chat = getattr(status, "chat", None)
         box["login"] = register(state, user_id, name, chat_id=getattr(chat, "id", None),
@@ -655,13 +746,25 @@ async def _sign_in(user_id: str, server: dict, status: Message) -> None:
     connection = OAuthConnection(storage, redirect_handler, callback_handler)
     try:
         tools = await discover_with_sign_in(user_id, server, connection)
+        if storage.dropped:  # the store refused the tokens or the registration: removed or replaced meanwhile
+            raise ServerGone()
         note = await _save_tools(user_id, server, tools)
+        # Signed in now, whether it took a login or the stored tokens were accepted (then nothing else
+        # cleared the flag); False: the server went away since the tools were saved.
+        if not await asyncio.to_thread(mcp_store.write_oauth, user_id, storage.server, needs_signin=False):
+            raise ServerGone()
         logger.info("MCP sign-in to %s finished for %s: %d tools", name, user_id, len(tools))
         await edit_md(status, connected_text(name, len(tools)) + (f"\n\n{note}" if note else ""))
     except asyncio.CancelledError:
-        if asyncio.current_task() in _replaced:
+        task = asyncio.current_task()
+        if task in _replaced:
             await edit_md(status, REPLACED_TEXT)
+        elif task in _stopped:
+            await edit_md(status, _stopped[task])
         raise
+    except ServerGone:
+        logger.info("MCP sign-in to %s for %s ended: the server was removed or changed meanwhile, nothing stored", name, user_id)
+        await edit_md(status, REMOVED_TEXT)
     except LoginExpired:
         logger.info("MCP sign-in to %s expired for %s", name, user_id)
         await edit_md(status, EXPIRED_TEXT)

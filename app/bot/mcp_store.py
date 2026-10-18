@@ -2,10 +2,17 @@
 
 Two sources of servers, both read by ``agents.mcp_tools.MCPTools`` at turn start without any network:
 
-* the user's own servers in ``data/<uid>/mcp.json``::
+* the user's own servers in ``data/_mcp/<uid>.json`` (bot-only: outside the user's workspace ``data/<uid>``,
+  never mounted into a container, unreachable by the agent's file tools)::
 
       {"servers": [{"name": "github", "url": "https://.../mcp", "transport": "http", "headers": {"Authorization": "Bearer ..."},
                     "enabled": true, "tools": [{"name", "description", "input_schema"}], "updated": "<iso>", "error": null}]}
+
+  The file used to be ``data/<uid>/mcp.json``, inside the workspace the sandbox and a prompt-injected agent
+  can write. The first load of a user whose new file is missing moves it (``_migrate``: read without
+  following a link, regular files of at most ``MAX_FILE_BYTES`` only; the new file written 0600 in a 0700
+  directory; the old one unlinked) or, with nothing to move, writes an empty file, so a ``mcp.json`` that
+  appears in the workspace later is never read.
 
 * the admin's servers, offered to every user and read-only in ``/mcp``: the same shape in the file named
   by ``MCP_SERVERS_FILE`` (default ``data/mcp_servers.json``), hand-edited and never rewritten by the
@@ -30,17 +37,21 @@ file, encrypted with ``token_cipher()`` (Fernet; the key is ``MCP_TOKEN_KEY``, e
   the top-level ``"oauth_admin": {"<server name>": {...}}``.
 
 Each encrypted value is bound to the user id, the server name, its URL and whether it is an admin
-server (they are inside the plaintext and checked on decryption): ``data/<uid>/mcp.json`` is in the
-user's sandbox workspace, and a value moved to another record (say, one pointing at a server the
-sandbox controls), a changed URL, a tampered or undecryptable value (key lost or changed) all read as
-"signed out", never as an error. ``read_oauth`` / ``write_oauth`` / ``clear_oauth`` / ``seal_oauth`` work
+server (they are inside the plaintext and checked on decryption): a value moved to another record, a
+changed URL, a tampered or undecryptable value (key lost or changed) all read as "signed out", never as
+an error. A user server's sealed value is used only while the stored record's URL is the one it was
+sealed for AND the URL of the connection asking for it (``_locate``): an ``MCPTools`` that loaded the
+record before it changed never gets the tokens for the old URL, and a sign-in that finishes after the
+record was replaced or removed writes nothing (``write_oauth`` → False; it also refuses a record that is
+no longer an OAuth server). ``read_oauth`` / ``write_oauth`` / ``clear_oauth`` / ``seal_oauth`` work
 on decrypted dicts; nothing here renders a token: ``describe_headers`` says "🔐 signed in" or
 "🔐 sign in needed" (``all_servers(uid, with_state=True)`` puts the per-user ``oauth_state`` on the
 records; it is never stored).
 
 All functions are synchronous file I/O (callers use ``asyncio.to_thread``): one ``threading.Lock``
 per user and one for the admin cache, atomic writes (tmp + ``os.replace``). A missing or corrupt
-file is an empty server list, logged, never an error.
+file is an empty server list, logged, never an error. Sign-out and removal racing a token refresh are
+ordered by the caller (``bot.oauth_flow.sign_out`` / ``remove_server`` take the refresh lock).
 """
 from __future__ import annotations
 
@@ -63,7 +74,10 @@ from bot.config import config
 
 logger = logging.getLogger(__name__)
 
-USER_FILE = "mcp.json"
+USER_DIR = "_mcp"  # data/_mcp/<uid>.json; a leading "_" is never a user id (sessions.check_user_id)
+LEGACY_USER_FILE = "mcp.json"  # data/<uid>/mcp.json, in the workspace: moved away on the first load
+MAX_FILE_BYTES = 4 * 1024 * 1024  # a user's file (or the legacy one) larger than this reads as broken
+USER_ID_RE = re.compile(r"^[A-Za-z0-9-][A-Za-z0-9_-]{0,63}$")
 DEFAULT_ADMIN_FILE = "mcp_servers.json"
 ENV_ADMIN_FILE = "MCP_SERVERS_FILE"
 TRANSPORTS = ("http", "sse")
@@ -87,8 +101,26 @@ _admin_lock = threading.Lock()
 
 
 # ---- paths ---------------------------------------------------------------------
+def _uid(user_id: str) -> str:
+    """The user id as a file name component (chat ids, negative ones included); ValueError otherwise."""
+    uid = str(user_id).strip()
+    if not USER_ID_RE.match(uid):
+        raise ValueError(f"invalid user id: {user_id!r}")
+    return uid
+
+
+def store_dir() -> Path:
+    """``data/_mcp``: the users' MCP files, bot-only (0700, never mounted into a container)."""
+    return Path(config.data_dir) / USER_DIR
+
+
 def user_path(user_id: str) -> Path:
-    return Path(config.data_dir) / str(user_id) / USER_FILE
+    return store_dir() / f"{_uid(user_id)}.json"
+
+
+def legacy_user_path(user_id: str) -> Path:
+    """Where the user's file was before it left the workspace (``_migrate``)."""
+    return Path(config.data_dir) / _uid(user_id) / LEGACY_USER_FILE
 
 
 def admin_path() -> Path:
@@ -164,8 +196,8 @@ def check_public_host(url: str) -> None:
 
     Blocking (DNS): call in a worker thread. ``agents.mcp_tools`` runs it before every connection
     to a user's server, so a name that resolves (or later re-resolves) to a local address and a
-    record written straight into ``mcp.json`` are refused too. A name that does not resolve
-    passes: the connection fails on its own.
+    record that never went through ``validate_url`` (one migrated from the workspace) are refused
+    too. A name that does not resolve passes: the connection fails on its own.
     """
     parts = urlsplit(str(url or ""))
     host = (parts.hostname or "").lower()
@@ -251,8 +283,8 @@ def normalize(raw: Any, *, admin: bool = False) -> dict | None:
 
 
 def _clean_entry(raw: Any) -> dict | None:
-    """A stored sign-in entry with only its known keys and value types, or None: the file is in the
-    user's sandbox workspace, so anything odd is dropped instead of trusted."""
+    """A stored sign-in entry with only its known keys and value types, or None: a file migrated from
+    the user's workspace may hold anything, so anything odd is dropped instead of trusted."""
     if not isinstance(raw, dict):
         return None
     entry: dict[str, Any] = {}
@@ -268,18 +300,27 @@ def _clean_entry(raw: Any) -> dict | None:
 
 
 # ---- file I/O ---------------------------------------------------------------------
+def _read_regular_json(path: Path) -> Any:
+    """The parsed JSON of ``path``, never through a link (``O_NOFOLLOW``), never blocking on a FIFO
+    (``O_NONBLOCK``), a regular file of at most ``MAX_FILE_BYTES`` only; raises otherwise."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            raise OSError("not a regular file")
+        raw = f.read(MAX_FILE_BYTES + 1)
+    if len(raw) > MAX_FILE_BYTES:
+        raise OSError(f"larger than {MAX_FILE_BYTES} bytes")
+    return json.loads(raw.decode("utf-8"))
+
+
 def _read_json(path: Path, *, no_follow: bool = False) -> Any:
-    """The parsed file, or None when it is missing or broken (logged). ``no_follow``: a link or a
-    non-regular file reads as missing (the user's file lives in the sandbox workspace)."""
+    """The parsed file, or None when it is missing or broken (logged). ``no_follow``: a link, a
+    non-regular or an oversized file reads as broken (``_read_regular_json``; the users' files)."""
     if not path.exists() and not path.is_symlink():
         return None
     try:
         if no_follow:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-            with os.fdopen(fd, "r", encoding="utf-8") as f:
-                if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
-                    raise OSError("not a regular file")
-                return json.load(f)
+            return _read_regular_json(path)
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:  # noqa: BLE001 - a broken file must not break every turn
@@ -305,9 +346,8 @@ def _read_servers(path: Path, *, admin: bool = False) -> list[dict]:
     return _servers_of(_read_json(path), admin=admin)
 
 
-def _read_user_file(path: Path) -> tuple[list[dict], dict[str, dict]]:
-    """The user's servers and their sign-ins to admin servers (``oauth_admin``)."""
-    data = _read_json(path, no_follow=True)
+def _parse_user_data(data: Any) -> tuple[list[dict], dict[str, dict]]:
+    """The user's servers and their sign-ins to admin servers (``oauth_admin``) from a parsed file."""
     raw = data.get("oauth_admin") if isinstance(data, dict) else None
     oauth_admin: dict[str, dict] = {}
     if isinstance(raw, dict):
@@ -318,10 +358,79 @@ def _read_user_file(path: Path) -> tuple[list[dict], dict[str, dict]]:
     return _servers_of(data), oauth_admin
 
 
-def _write(path: Path, data: dict) -> None:
+def _read_user_file(path: Path) -> tuple[list[dict], dict[str, dict]]:
+    return _parse_user_data(_read_json(path, no_follow=True))
+
+
+def _read_user(user_id: str) -> tuple[list[dict], dict[str, dict]]:
+    """The user's servers and admin-server sign-ins from ``data/_mcp/<uid>.json``, moved there from the
+    workspace first when this is the user's first load (``_migrate``). Call with the user's lock held."""
+    path = user_path(user_id)
+    if not os.path.lexists(path):
+        _migrate(user_id, path)
+    return _read_user_file(path)
+
+
+def _migrate(user_id: str, path: Path) -> None:
+    """The first load of ``user_id`` since the file left the workspace (``path`` is missing): move
+    ``data/<uid>/mcp.json`` to ``path``, or write an empty file when there is none, so that a
+    ``mcp.json`` the sandbox (or an agent's ``create_file``) puts into the workspace later is never
+    read: from now on ``path`` exists. The old file is read with ``_read_regular_json`` (no link, no
+    FIFO, at most ``MAX_FILE_BYTES``); whatever it holds is normalized like any stored record (its sealed
+    values stay bound to user, server, URL and admin flag) and it is unlinked afterwards (never follows),
+    readable or not. A failed write of the moved records raises (nothing is deleted, the next load tries
+    again); a failed write of the empty marker is only logged."""
+    legacy = legacy_user_path(user_id)
+    if not os.path.lexists(legacy):
+        try:
+            _write_user_file(path, [], {})
+        except OSError as e:
+            logger.warning("Could not create the MCP file of %s (%s): %s", user_id, path, e)
+        return
+    data, problem = None, None
+    try:
+        data = _read_regular_json(legacy)
+    except Exception as e:  # noqa: BLE001 - a link, a FIFO, too big, not JSON: nothing to move
+        problem = str(e) or type(e).__name__
+    servers, oauth_admin = _parse_user_data(data)
+    _write_user_file(path, servers, oauth_admin)
+    try:
+        os.unlink(legacy)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning("Moved the MCP servers of %s but could not delete %s: %s (it is never read again)", user_id, legacy, e)
+    if problem:
+        logger.warning("The MCP servers of %s in %s could not be read (%s): not moved, the file was deleted; "
+                       "the servers have to be added again", user_id, legacy, problem)
+    else:
+        logger.info("Moved the MCP servers of %s out of the workspace: %s -> %s (%d servers, %d shared-server sign-ins)",
+                    user_id, legacy, path, len(servers), len(oauth_admin))
+
+
+def _private_dir(directory: Path) -> None:
+    """``directory`` (``data/_mcp``) as a real directory with mode 0700: created so, a link refused
+    (``O_NOFOLLOW`` raises), a wider mode narrowed through the descriptor."""
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.mkdir(directory, 0o700)
+    except FileExistsError:
+        pass
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if stat.S_IMODE(os.fstat(fd).st_mode) != 0o700:
+            os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+
+
+def _write(path: Path, data: dict, *, private: bool = False) -> None:
     """Atomic: a fresh temp file (``mkstemp``: O_EXCL, never through a link planted under its name,
-    mode 0600) beside the target, then ``os.replace``."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    mode 0600) beside the target, then ``os.replace``. ``private``: the directory is ``_private_dir``'d."""
+    if private:
+        _private_dir(path.parent)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -343,18 +452,18 @@ def _write_user_file(path: Path, servers: list[dict], oauth_admin: dict[str, dic
     data: dict[str, Any] = {"servers": [_storable(s) for s in servers]}
     if oauth_admin:
         data["oauth_admin"] = oauth_admin
-    _write(path, data)
+    _write(path, data, private=True)
 
 
 def load_user(user_id: str) -> list[dict]:
     with _lock(user_id):
-        return _read_user_file(user_path(user_id))[0]
+        return _read_user(user_id)[0]
 
 
 def save_user(user_id: str, servers: list[dict]) -> None:
     with _lock(user_id):
         path = user_path(user_id)
-        _, oauth_admin = _read_user_file(path)
+        _, oauth_admin = _read_user(user_id)
         _write_user_file(path, servers, oauth_admin)
 
 
@@ -407,7 +516,7 @@ def all_servers(user_id: str, *, with_state: bool = False) -> list[dict]:
     signed in to counts as an OAuth server. ``with_state``: every OAuth record gets ``oauth_state``
     (``signed_in`` / ``signin_needed``, decided by decrypting the stored tokens) for ``/mcp``."""
     with _lock(user_id):
-        servers, oauth_admin = _read_user_file(user_path(user_id))
+        servers, oauth_admin = _read_user(user_id)
     admin = load_admin()
     for server in admin:
         if server["name"] in oauth_admin:
@@ -448,7 +557,7 @@ def add_user_server(user_id: str, server: dict) -> dict:
     record's sign-in goes with it)."""
     with _lock(user_id):
         path = user_path(user_id)
-        servers, oauth_admin = _read_user_file(path)
+        servers, oauth_admin = _read_user(user_id)
         record = _storable(server)
         for i, existing in enumerate(servers):
             if existing["name"] == record["name"]:
@@ -461,11 +570,12 @@ def add_user_server(user_id: str, server: dict) -> dict:
 
 
 def remove_user_server(user_id: str, name: str) -> bool:
-    """Forget the server and, with its record, its stored sign-in."""
+    """Forget the server and, with its record, its stored sign-in (from the UI through
+    ``oauth_flow.remove_server``, which orders it after a token refresh in flight)."""
     name = str(name or "").strip().lower()
     with _lock(user_id):
         path = user_path(user_id)
-        servers, oauth_admin = _read_user_file(path)
+        servers, oauth_admin = _read_user(user_id)
         kept = [s for s in servers if s["name"] != name]
         if len(kept) == len(servers):
             return False
@@ -477,7 +587,7 @@ def toggle_user_server(user_id: str, name: str) -> bool | None:
     """Flip ``enabled``; the new state, or None when there is no such server."""
     with _lock(user_id):
         path = user_path(user_id)
-        servers, oauth_admin = _read_user_file(path)
+        servers, oauth_admin = _read_user(user_id)
         server = find(servers, name)
         if server is None:
             return None
@@ -487,14 +597,15 @@ def toggle_user_server(user_id: str, name: str) -> bool | None:
 
 
 def update_user_tools(user_id: str, name: str, tools: list[dict] | None, error: str | None = None,
-                      *, auth: str | None = None) -> dict | None:
-    """Store a discovery result (``with_tools``); the updated record, or None when the server is gone.
+                      *, auth: str | None = None, url: str | None = None) -> dict | None:
+    """Store a discovery result (``with_tools``); the updated record, or None when the server is gone
+    or, with ``url`` (the URL the discovery connected to), now points elsewhere (replaced meanwhile).
     ``auth="oauth"`` marks a server whose discovery asked for a sign-in."""
     with _lock(user_id):
         path = user_path(user_id)
-        servers, oauth_admin = _read_user_file(path)
+        servers, oauth_admin = _read_user(user_id)
         server = find(servers, name)
-        if server is None:
+        if server is None or (url is not None and server.get("url") != url):
             return None
         server.update(with_tools(server, tools, error))
         if auth == AUTH_OAUTH:
@@ -520,10 +631,10 @@ def record_error(user_id: str, server: dict, error: str | None) -> None:
             return
         with _lock(user_id):
             path = user_path(user_id)
-            servers, oauth_admin = _read_user_file(path)
+            servers, oauth_admin = _read_user(user_id)
             stored = find(servers, server.get("name", ""))
-            if stored is None or stored.get("error") == error:
-                return
+            if stored is None or stored.get("error") == error or ("url" in server and stored.get("url") != server["url"]):
+                return  # gone, unchanged, or replaced by a record for another URL since the call started
             stored["error"] = error
             _write_user_file(path, servers, oauth_admin)
     except Exception as e:  # noqa: BLE001
@@ -723,11 +834,17 @@ def _state_of(user_id: str, server: dict, entry: dict | None) -> str:
 
 
 def _locate(user_id: str, server: dict, servers: list[dict], oauth_admin: dict[str, dict]) -> tuple[dict | None, dict | None]:
-    """(the stored record or None for an admin server, the server dict to bind against). A user's
-    server binds against its record as stored: a URL changed in the file no longer matches."""
+    """(the stored record or None for an admin server, the server dict to bind against, or None when
+    nothing stored may be used or written for ``server``). A user's server binds against its record as
+    stored, and only while that record is an OAuth server whose URL is the URL of ``server``, the
+    connection asking (``OAuthStorage.server``): a record replaced or changed since the caller loaded it
+    (another URL, no longer OAuth) neither hands its tokens to the old URL nor takes tokens obtained
+    there. An admin server binds against ``server`` itself (the admin file is not the user's to change)."""
     if server.get("admin"):
         return None, server
     stored = find(servers, server.get("name", ""))
+    if stored is None or stored.get("auth") != AUTH_OAUTH or stored.get("url") != server.get("url"):
+        return stored, None
     return stored, stored
 
 
@@ -736,7 +853,7 @@ def read_oauth(user_id: str, server: dict) -> dict:
     "metadata": dict|None, "client": dict|None, "needs_signin": bool, "account", "updated"}``. Never raises."""
     try:
         with _lock(user_id):
-            servers, oauth_admin = _read_user_file(user_path(user_id))
+            servers, oauth_admin = _read_user(user_id)
         stored, bind = _locate(user_id, server, servers, oauth_admin)
         if bind is None:
             return _open_entry(user_id, server, None)
@@ -753,18 +870,19 @@ _UNSET: Any = object()
 def write_oauth(user_id: str, server: dict, *, tokens: Any = _UNSET, client: Any = _UNSET,
                 needs_signin: bool | None = None) -> bool:
     """Change the stored sign-in: ``tokens`` = ``{"tokens", "expires_at", "metadata"}`` or None to drop
-    them, ``client`` = the registration dict or None; ``needs_signin`` sets or clears the flag. A user
-    server's record becomes ``auth: "oauth"``. False when the user's server is gone."""
+    them, ``client`` = the registration dict or None; ``needs_signin`` sets or clears the flag. False,
+    and nothing written, when the user's server is gone, is no longer an OAuth server or now has another
+    URL than ``server`` (``_locate``): the caller's sign-in or refresh belongs to a record that is no
+    more."""
     with _lock(user_id):
         path = user_path(user_id)
-        servers, oauth_admin = _read_user_file(path)
+        servers, oauth_admin = _read_user(user_id)
         stored, bind = _locate(user_id, server, servers, oauth_admin)
         if bind is None:
             return False
         if server.get("admin"):
             entry = oauth_admin.setdefault(server["name"], _clean_entry({}) or {})
         else:
-            stored["auth"] = AUTH_OAUTH
             entry = stored.setdefault("oauth", _clean_entry({}) or {})
         for field, value in (("tokens", tokens), ("client", client)):
             if value is _UNSET:
@@ -784,10 +902,12 @@ def write_oauth(user_id: str, server: dict, *, tokens: Any = _UNSET, client: Any
 
 def clear_oauth(user_id: str, server: dict, *, keep_client: bool = True) -> bool:
     """Sign out: the stored tokens are deleted (the client registration stays unless ``keep_client``
-    is False); the record stays. False when there was nothing to clear."""
+    is False); the record stays. False when there was nothing to clear. From the UI through
+    ``oauth_flow.sign_out``, which orders it after a token refresh in flight (or that would write the
+    refreshed tokens back)."""
     with _lock(user_id):
         path = user_path(user_id)
-        servers, oauth_admin = _read_user_file(path)
+        servers, oauth_admin = _read_user(user_id)
         if server.get("admin"):
             entry = oauth_admin.get(server["name"])
             if entry is None:

@@ -24,11 +24,13 @@ connected (N tools)". A token given explicitly keeps the Bearer header (no OAuth
 
 Buttons under the list, per user server: toggle (``mcp_toggle_<name>``), refresh
 (``mcp_refresh_<name>``), remove (``mcp_remove_<name>`` → a confirmation with ``mcp_rm_<name>`` /
-``mcp_back``; removing a server deletes its sign-in with the record), plus "🔄 Refresh all"
-(``mcp_refreshall``). Per OAuth server (the user's or an admin's, each user signs in with their own
-account): "🔐 Sign in to <name>" (``mcp_signin_<name>``, the same background sign-in) while the sign-in
-is missing or broken, "🚪 Sign out of <name>" (``mcp_signout_<name>``: the tokens are deleted, the server
-stays) while signed in. Names are ``[a-z0-9_-]`` so the data is split as ``mcp_<action>_<name>``; actions
+``mcp_back``; removing a server deletes its sign-in with the record and cancels a sign-in to it still
+running), plus "🔄 Refresh all" (``mcp_refreshall``). Per OAuth server (the user's or an admin's, each user
+signs in with their own account): "🔐 Sign in to <name>" (``mcp_signin_<name>``, the same background
+sign-in) while the sign-in is missing or broken, "🚪 Sign out of <name>" (``mcp_signout_<name>``: the
+tokens are deleted, the server stays) while signed in. Removal and sign-out go through
+``oauth_flow.remove_server`` / ``sign_out``, which wait for a token refresh in flight so it cannot store
+the tokens again afterwards. Names are ``[a-z0-9_-]`` so the data is split as ``mcp_<action>_<name>``; actions
 carry no underscore. Store calls run in worker threads; discovery goes through ``discover_tools`` (lazy
 ``agents`` import, replaced in tests). The admin sees the admin servers like everyone else; only the
 admin's ``/mcp refresh`` re-discovers them too, as does ``refresh_admin_servers`` at startup
@@ -103,7 +105,8 @@ async def refresh_one(user_id: str, server: dict) -> dict:
         if auth_flag:
             updated["auth"] = auth_flag
         return updated
-    updated = await asyncio.to_thread(mcp_store.update_user_tools, user_id, server["name"], tools, error, auth=auth_flag)
+    updated = await asyncio.to_thread(mcp_store.update_user_tools, user_id, server["name"], tools, error,
+                                      auth=auth_flag, url=server.get("url"))
     return updated or mcp_store.with_tools(server, tools, error)
 
 
@@ -312,7 +315,7 @@ async def remove_command(message: Message, user_id: str, args: list[str]) -> Non
         await answer_md(message, "Usage: `/mcp remove <name>`")
         return
     name = args[0].lower()
-    removed = await asyncio.to_thread(mcp_store.remove_user_server, user_id, name)
+    removed = await oauth_flow.remove_server(user_id, name)  # a sign-in or refresh in flight cannot bring it back
     if removed:
         await answer_md(message, f"🗑 Removed *{escape_markdown(name)}*.")
     else:
@@ -374,7 +377,7 @@ async def mcp_button(callback: CallbackQuery, user_id: str) -> None:
     elif action == "remove" and name:
         await edit_md(message, f"🗑 Remove *{escape_markdown(name)}* and its tools?", confirm_keyboard(name))
     elif action == "rm" and name:
-        await asyncio.to_thread(mcp_store.remove_user_server, user_id, name)  # its sign-in goes with the record
+        await oauth_flow.remove_server(user_id, name)  # its sign-in goes with the record; a running one is cancelled
         await show_list(message, user_id, edit=True)
     elif action == "signin" and name:
         server = mcp_store.find(await servers_of(user_id), name)
@@ -386,7 +389,7 @@ async def mcp_button(callback: CallbackQuery, user_id: str) -> None:
     elif action == "signout" and name:
         server = mcp_store.find(await servers_of(user_id), name)
         if server is not None and server.get("auth") == mcp_store.AUTH_OAUTH:
-            await asyncio.to_thread(mcp_store.clear_oauth, user_id, server)
+            await oauth_flow.sign_out(user_id, server)  # waits for a refresh in flight, cancels a running sign-in
             logger.info("MCP sign-out of %s for %s", name, user_id)
         await show_list(message, user_id, edit=True)
     else:
