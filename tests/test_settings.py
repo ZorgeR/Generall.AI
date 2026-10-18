@@ -77,6 +77,21 @@ def test_mode_and_ui_defaults():
     assert MODE_TYPES == ("auto", "speed", "intelligence")
 
 
+def test_browser_defaults_and_backfill(tmp_path):
+    assert DEFAULT_SETTINGS["browser"] == {"enabled": True, "stream": True, "remember": True}
+    user_dir = tmp_path / "11"
+    user_dir.mkdir()
+    # an old file without the category, and one that only changed one key
+    (user_dir / "settings.json").write_text(json.dumps({"thinking": {"enabled": False}}))
+    assert UserSettings("11", base_dir=str(tmp_path)).get("browser") == DEFAULT_SETTINGS["browser"]
+    (user_dir / "settings.json").write_text(json.dumps({"browser": {"remember": False}}))
+    s = UserSettings("11", base_dir=str(tmp_path))
+    assert s.get("browser") == {"enabled": True, "stream": True, "remember": False}
+    s.save()
+    assert json.loads((user_dir / "settings.json").read_text())["browser"]["stream"] is True  # persisted backfill
+    assert not any(category == "browser" for values in SETTINGS_PRESETS.values() for category, _ in values)
+
+
 def test_presets_are_well_formed():
     assert PRESET_NAMES == ("fast", "balanced", "deep")
     for name, values in SETTINGS_PRESETS.items():

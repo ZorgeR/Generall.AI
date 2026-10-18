@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import inspect
 import logging
 from pathlib import Path
@@ -12,6 +13,55 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# The tool texts the patcher adds. The commands run in the user's persistent sandbox session
+# (secure_container.sessions), so the descriptions say what persists and that bash syntax works.
+NETWORK_ENABLED_DESCRIPTION = (
+    "Ignored in the persistent sandbox session (it always has internet access; private networks "
+    "are blocked). Only used when the bot has to fall back to a one-off container (default: false)."
+)
+RUN_SHELL_SCRIPT_DESCRIPTION = (
+    "Run a bash script in the user's persistent sandbox session (the same Linux machine, files, "
+    "installed packages and background processes as run_command; working directory "
+    "/home/runner/workspace = the user's files). Use it for multi-line scripts; each call is a new "
+    "bash process. Long jobs: start them in the background (nohup <command> > job.log 2>&1 &) and "
+    "check job.log later."
+)
+INSTALL_PACKAGE_DESCRIPTION = (
+    "Install system packages (manager \"apt\", with sudo apt-get) or Python packages (manager \"pip\", "
+    "pip install --user) in the user's persistent sandbox session and remember them: on success the "
+    "names are saved to installed_packages.txt (apt) or installed_python_packages.txt (pip) in the "
+    "workspace and reinstalled automatically whenever a new sandbox session starts (an idle session "
+    "closes and its installed software with it). Remove a line from that file to stop reinstalling "
+    "the package. Packages installed with run_command instead are not remembered."
+)
+INSTALL_PACKAGE_SCHEMA = {
+    "name": "install_package",
+    "description": INSTALL_PACKAGE_DESCRIPTION,
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "package_name": {
+                "type": "string",
+                "description": "One or more package names separated by spaces, e.g. \"imagemagick\" (apt) "
+                               "or \"pandas==2.2.2 openpyxl\" (pip). Names and version specifiers only.",
+            },
+            "manager": {
+                "type": "string",
+                "enum": ["apt", "pip"],
+                "description": "\"apt\" for Debian system packages (default), \"pip\" for Python packages.",
+                "default": "apt",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Timeout in seconds (default: 300)",
+                "default": 300,
+            },
+        },
+        "required": ["package_name"],
+    },
+}
+
 
 class ToolIntegrator:
     """
@@ -63,10 +113,12 @@ class ToolIntegrator:
             logger.info(f"Running shell script for user {self.user_id}")
             return self.secure_wrapper.wrap_shell_script(self.user_id, script_content, timeout, network_enabled)
         
-        def install_package(self, package_name, timeout=300):
-            """Install a package in a secure container"""
-            logger.info(f"Installing package {package_name} for user {self.user_id}")
-            return self.secure_wrapper.wrap_package_installation(self.user_id, package_name, timeout)
+        def install_package(self, package_name, manager="apt", timeout=300):
+            """Install apt or pip packages in the sandbox session and save them for replay"""
+            logger.info(f"Installing {manager} package {package_name} for user {self.user_id}")
+            return self.secure_wrapper.wrap_package_installation(
+                self.user_id, package_name, timeout=timeout, manager=manager
+            )
         
         # Add the new methods to the class
         terminal_tools_class.run_shell_script = run_shell_script
@@ -82,7 +134,7 @@ class ToolIntegrator:
             # Add run_shell_script to the schema
             schema.append({
                 "name": "run_shell_script",
-                "description": "Execute a shell script in a secure container. The script will be run with bash.",
+                "description": RUN_SHELL_SCRIPT_DESCRIPTION,
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -97,7 +149,7 @@ class ToolIntegrator:
                         },
                         "network_enabled": {
                             "type": "boolean",
-                            "description": "Whether to enable network access for the container (default: false)",
+                            "description": NETWORK_ENABLED_DESCRIPTION,
                             "default": False
                         }
                     },
@@ -105,26 +157,8 @@ class ToolIntegrator:
                 },
             })
             
-            # Add install_package to the schema
-            schema.append({
-                "name": "install_package",
-                "description": "Install a package in the secure container using apt-get.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "package_name": {
-                            "type": "string",
-                            "description": "The name of the package to install.",
-                        },
-                        "timeout": {
-                            "type": "integer",
-                            "description": "Timeout in seconds (default: 300)",
-                            "default": 300
-                        }
-                    },
-                    "required": ["package_name"],
-                },
-            })
+            # Add install_package to the schema (a deep copy: the caller may mutate it)
+            schema.append(json.loads(json.dumps(INSTALL_PACKAGE_SCHEMA)))
             
             return schema
         
@@ -144,6 +178,7 @@ class ToolIntegrator:
             elif tool_name == "install_package":
                 return self.install_package(
                     tool_args["package_name"],
+                    tool_args.get("manager") or "apt",
                     tool_args.get("timeout", 300)
                 )
             else:
@@ -186,7 +221,7 @@ class ToolIntegrator:
                 if tool["name"] == "execute_python":
                     tool["input_schema"]["properties"]["network_enabled"] = {
                         "type": "boolean",
-                        "description": "Whether to enable network access for the container (default: false)",
+                        "description": NETWORK_ENABLED_DESCRIPTION,
                         "default": False
                     }
             
@@ -336,7 +371,7 @@ class ToolIntegrator:
         def secure_install_package(self, package_name, timeout=300):
             """Secure version of install_package that runs in a container"""
             logger.info(f"Intercepted package installation for user {self.user_id}: {package_name}")
-            return self.secure_wrapper.wrap_package_installation(self.user_id, package_name, timeout)
+            return self.secure_wrapper.wrap_package_installation(self.user_id, package_name, timeout=timeout)
         
         system_tools_class.install_package = secure_install_package
         
@@ -584,7 +619,7 @@ echo "Package {package_name} removed from installed packages list."
         def secure_install_python_package(self, package_name, timeout=300):
             """Secure version of install_python_package that runs in a container"""
             logger.info(f"Intercepted pip package installation for user {self.user_id}: {package_name}")
-            return self.secure_wrapper.wrap_python_package_installation(self.user_id, package_name, timeout)
+            return self.secure_wrapper.wrap_python_package_installation(self.user_id, package_name, timeout=timeout)
 
         system_tools_class.install_python_package = secure_install_python_package
 

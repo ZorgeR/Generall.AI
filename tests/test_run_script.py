@@ -1,6 +1,10 @@
-"""ContainerManager.run_script: bundled sandbox scripts run from a unique workspace copy."""
+"""ContainerManager.run_script: bundled sandbox scripts run from a unique workspace copy, always in a
+one-off container (run_one_shot) and without the saved-package replay."""
 import importlib
+import os
+import re
 import shlex
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,16 +35,17 @@ def test_scripts_dir_holds_the_bundled_scripts():
 def test_run_script_copies_quotes_and_cleans_up(manager, monkeypatch):
     calls = []
 
-    def fake_run_command(user_id, command, timeout=60, network_enabled=False, mem_limit=None):
+    def fake_run_one_shot(user_id, command, timeout=60, network_enabled=False, mem_limit=None, **kw):
         parts = shlex.split(command)
         copied = manager.base_data_path / user_id / Path(parts[2]).name
         calls.append(SimpleNamespace(
             user_id=user_id, parts=parts, timeout=timeout, network_enabled=network_enabled, mem_limit=mem_limit,
-            existed=copied.exists(), content=copied.read_text() if copied.exists() else None,
+            existed=copied.exists(), content=copied.read_text() if copied.exists() else None, kw=kw,
         ))
         return BANNER + '{"ok": true}\n'
 
-    monkeypatch.setattr(manager, "run_command", fake_run_command)
+    monkeypatch.setattr(manager, "run_one_shot", fake_run_one_shot)
+    monkeypatch.setattr(manager, "run_command", lambda *a, **k: pytest.fail("run_script never uses the session"))
 
     logs = manager.run_script("7", "browse.py", ["https://x.y/?a=1&b=2", "--screenshot", "downloads/s p.png"],
                               timeout=75, network_enabled=True, mem_limit="1g")
@@ -48,6 +53,7 @@ def test_run_script_copies_quotes_and_cleans_up(manager, monkeypatch):
     assert logs.endswith('{"ok": true}\n')
     call = calls[0]
     assert call.user_id == "7" and call.timeout == 75 and call.network_enabled is True and call.mem_limit == "1g"
+    assert call.kw == {"replay_packages": False}  # bundled scripts need no saved packages
     assert call.parts[:2] == ["python", "-I"]  # isolated: workspace files never shadow the script's imports
     assert call.parts[2].startswith("/home/runner/workspace/temp_tool_") and call.parts[2].endswith(".py")
     assert call.parts[3:] == ["https://x.y/?a=1&b=2", "--screenshot", "downloads/s p.png"]  # shell-safe quoting
@@ -58,7 +64,7 @@ def test_run_script_copies_quotes_and_cleans_up(manager, monkeypatch):
 
 def test_run_script_defaults_and_unique_names(manager, monkeypatch):
     names = []
-    monkeypatch.setattr(manager, "run_command", lambda uid, cmd, timeout=60, network_enabled=False, mem_limit=None:
+    monkeypatch.setattr(manager, "run_one_shot", lambda uid, cmd, timeout=60, network_enabled=False, mem_limit=None, **kw:
                         names.append((shlex.split(cmd)[2], timeout, network_enabled, mem_limit)) or "")
     for _ in range(3):
         manager.run_script("7", "render_document.py")
@@ -82,14 +88,14 @@ def test_workspace_files_named_like_stdlib_modules_do_not_break_the_bundled_scri
         (user_dir / f"{module}.py").write_text(f"raise SystemExit('planted {module}.py was imported')\n")
     (user_dir / "in.md").write_text("# Title\n\n| a | b |\n|---|---|\n| 1 | 2 |\n")
 
-    def run_locally(user_id, command, timeout=60, network_enabled=False, mem_limit=None):
+    def run_locally(user_id, command, timeout=60, network_enabled=False, mem_limit=None, **kw):
         parts = shlex.split(command)
         assert parts[0] == "python"
         parts = [sys.executable] + [p.replace("/home/runner/workspace/", f"{user_dir}/") for p in parts[1:]]
         done = subprocess.run(parts, cwd=user_dir, capture_output=True, text=True, timeout=60)
         return BANNER + done.stdout + done.stderr
 
-    monkeypatch.setattr(manager, "run_command", run_locally)
+    monkeypatch.setattr(manager, "run_one_shot", run_locally)
     for fmt in ("docx", "xlsx"):
         logs = manager.run_script("7", "render_document.py", ["--format", fmt, "--input", "in.md", "--output", f"out.{fmt}"])
         data = last_json_line(logs)
@@ -101,14 +107,14 @@ def test_run_script_cleans_up_when_run_command_raises(manager, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("docker down")
 
-    monkeypatch.setattr(manager, "run_command", boom)
+    monkeypatch.setattr(manager, "run_one_shot", boom)
     with pytest.raises(RuntimeError):
         manager.run_script("7", "browse.py", ["https://x"])
     assert list((manager.base_data_path / "7").glob("temp_tool_*")) == []
 
 
 def test_run_script_refuses_unknown_scripts(manager, monkeypatch):
-    monkeypatch.setattr(manager, "run_command", lambda *a, **k: pytest.fail("must not run"))
+    monkeypatch.setattr(manager, "run_one_shot", lambda *a, **k: pytest.fail("must not run"))
     assert manager.run_script("7", "nope.py").startswith("Error: sandbox script not found")
     assert manager.run_script("7", "").startswith("Error: sandbox script not found")
     assert manager.run_script("7", None).startswith("Error: sandbox script not found")
@@ -118,7 +124,7 @@ def test_run_script_accepts_only_bare_names_of_bundled_scripts(manager, monkeypa
     """Anything with a directory part is refused before the filesystem is consulted, even when the
     file exists: ``../container_manager.py`` does exist next to SCRIPTS_DIR, and so does the
     absolute path of a bundled script."""
-    monkeypatch.setattr(manager, "run_command", lambda *a, **k: pytest.fail("must not run"))
+    monkeypatch.setattr(manager, "run_one_shot", lambda *a, **k: pytest.fail("must not run"))
     script = tmp_path / "custom.py"
     script.write_text("print('hi')\n")
     assert (cm_module.SCRIPTS_DIR / "../container_manager.py").is_file()
@@ -173,3 +179,48 @@ def test_run_command_keyword_signature_is_backwards_compatible(manager):
     manager.docker_client, runs = _fake_docker(FakeContainer(status=2, logs=b"bad"))
     result = manager.run_command("7", "false", 10, False)
     assert result.startswith("Error (exit code 2):") and runs[0]["mem_limit"] == "512m"
+
+
+def test_workspace_temp_files_are_never_chmodded_through_a_swapped_link(manager, monkeypatch, tmp_path):
+    """The user's sandbox session can replace a workspace file with a link at any moment. The temp
+    files (run_script's copy, run_python_code, run_shell_script, the one-off setup script) were
+    written first and chmodded by path afterwards, so a link swapped in between made the root bot
+    chmod its target. They are created with their mode in one step now; a link in their place at
+    the end is removed, never followed."""
+    outside = tmp_path / "outside.bin"
+    outside.write_text("keep")
+    os.chmod(outside, 0o600)
+    user_dir = manager.base_data_path / "7"
+    user_dir.mkdir(parents=True)
+    (user_dir / "installed_packages.txt").write_text("jq\n")  # the one-off path writes temp_setup_*.sh
+    modes = {}
+    real_chmod = os.chmod
+
+    def chmod_after_a_swap(path, mode, *args, **kwargs):
+        target = Path(path)
+        if target.parent == user_dir and target.name.startswith("temp_"):
+            target.unlink()
+            target.symlink_to(outside)  # what a background process in the session could do
+        return real_chmod(path, mode, *args, **kwargs)
+
+    container = FakeContainer(logs=b"done")
+
+    def run(**kwargs):  # every temp file the command names, and those its setup script names
+        text = kwargs["command"] if isinstance(kwargs["command"], str) else " ".join(kwargs["command"])
+        names = re.findall(r"/home/runner/workspace/(temp_\w+\.\w+)", text)
+        for name in list(names):
+            if name.startswith("temp_setup_"):
+                names += re.findall(r"/home/runner/workspace/(temp_\w+\.\w+)", (user_dir / name).read_text())
+        for name in names:
+            st = os.lstat(user_dir / name)
+            modes[name.split("_")[1]] = (stat.S_IMODE(st.st_mode), stat.S_ISREG(st.st_mode))
+        return container
+
+    manager.docker_client = SimpleNamespace(containers=SimpleNamespace(run=run, get=lambda name: container))
+    monkeypatch.setattr(os, "chmod", chmod_after_a_swap)
+    manager.run_script("7", "browse.py", ["https://x"])
+    manager.run_python_code("7", "print(1)")
+    manager.run_shell_script("7", "echo hi")
+    assert stat.S_IMODE(os.stat(outside).st_mode) == 0o600 and outside.read_text() == "keep"
+    assert modes == {kind: (0o755, True) for kind in ("tool", "setup", "code", "script")}
+    assert list(user_dir.glob("temp_*")) == []

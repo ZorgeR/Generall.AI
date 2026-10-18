@@ -7,8 +7,8 @@ Settings page (``rich_messages`` on, and the Bot API server takes rich messages 
 🧠 Deep" (``bot.settings.SETTINGS_PRESETS``; the one matching the current values is marked)
 and the "⚙️ Advanced" toggle (``ui.advanced``): off, the power settings (``Control.advanced``:
 transcript sizes, dialog/reasoning/summaries, critique, judge, semantic max, system prompt,
-image variants/metadata) are hidden and only the section summaries show their values. Four
-collapsible sections (Memory, Agent, Replies, Images) hold every setting under a friendly
+image variants/metadata) are hidden and only the section summaries show their values. Five
+collapsible sections (Memory, Agent, Replies, Images, Browser) hold every setting under a friendly
 name as a bold paragraph followed by a row of buttons inside the message
 (``InputRichBlockButtons``): a toggle is one "✅ On" / "⬜ Off" button, a number is
 "−  value  +", a choice is one "<current> ▸" button that cycles. A tap applies the change and
@@ -28,7 +28,7 @@ authorization is handled by ``AuthMiddleware``.
 Keyboard callback_data scheme: ``settings_<token>[_<action>[_<value>]]`` where
 ``<token>`` is a short name (summarization, dialog, reasoning, memory,
 critique, judge, tools, semantic, thinking, mode, rich, transcript, trace, image, followups,
-main), parsed with a plain ``split("_")``. ``settings_system_prompt`` and
+browser, main), parsed with a plain ``split("_")``. ``settings_system_prompt`` and
 ``settings_system_prompt_set_<type>`` are special-cased because of the
 underscore in their token; ``settings_preset_<name>`` applies a preset and shows the overview.
 """
@@ -248,6 +248,14 @@ def _images_state(s: UserSettings) -> str:
     )
 
 
+def _browser_state(s: UserSettings) -> str:
+    return (
+        f"{'on' if s.get('browser', 'enabled') else 'off'}"
+        f" · screenshots {_mark(s.get('browser', 'stream'))}"
+        f" · logins {_mark(s.get('browser', 'remember'))}"
+    )
+
+
 SECTIONS: tuple[Section, ...] = (
     Section("memory", "🧠 Memory", (
         Control("transcript", "toggle", "transcript", "enabled", "toggle",
@@ -318,6 +326,14 @@ SECTIONS: tuple[Section, ...] = (
         Control("image", "metadata", "image", "metadata", "toggle",
                 "🏷 Caption details", "model, quality and size in each caption", advanced=True),
     ), _images_state),
+    Section("browser", "🌐 Browser", (
+        Control("browser", "toggle", "browser", "enabled", "toggle",
+                "🌐 Interactive browser", "I open sites, click, type and log in for you; /sandbox closes it"),
+        Control("browser", "stream", "browser", "stream", "toggle",
+                "📸 Show screenshots while browsing", "a live view of the page as I work"),
+        Control("browser", "remember", "browser", "remember", "toggle",
+                "🔑 Remember logins", "keep cookies between sessions; /sandbox forgets them"),
+    ), _browser_state),
 )
 
 # The "⚙️ Advanced" toggle of the first row: a Control (apply_setting, the keyboards' parser),
@@ -420,7 +436,11 @@ def _overview(user_settings: UserSettings) -> tuple[str, InlineKeyboardMarkup]:
         f"Quality: {s.get('image', 'quality')} | "
         f"{s.get('image', 'size')}\n"
         "🧩 *System Prompt*: "
-        f"{s.get('system_prompt', 'type')}\n\n"
+        f"{s.get('system_prompt', 'type')}\n"
+        "🌐 *Browser*: "
+        f"{_mark(s.get('browser', 'enabled'))} | "
+        f"Screenshots: {_mark(s.get('browser', 'stream'))} | "
+        f"Logins: {_mark(s.get('browser', 'remember'))}\n\n"
         "Select a setting to configure:"
     )
 
@@ -466,6 +486,7 @@ def _overview(user_settings: UserSettings) -> tuple[str, InlineKeyboardMarkup]:
                 InlineKeyboardButton(text="🧭 Follow-ups", callback_data="settings_followups"),
                 InlineKeyboardButton(text="🎛 Mode", callback_data="settings_mode"),
             ],
+            [InlineKeyboardButton(text="🌐 Browser", callback_data="settings_browser")],
         ]
     )
     return status_text, keyboard
@@ -1229,6 +1250,35 @@ async def show_followups_menu(message: Message, user_settings: UserSettings) -> 
     )
 
 
+async def show_browser_menu(message: Message, user_settings: UserSettings) -> None:
+    """Show the interactive browser settings menu (three toggles)."""
+    enabled = user_settings.get("browser", "enabled")
+    stream = user_settings.get("browser", "stream")
+    remember = user_settings.get("browser", "remember")
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"{_mark(enabled)} Interactive browser", callback_data="settings_browser_toggle")],
+            [InlineKeyboardButton(text=f"{_mark(stream)} Screenshots while browsing", callback_data="settings_browser_stream")],
+            [InlineKeyboardButton(text=f"{_mark(remember)} Remember logins", callback_data="settings_browser_remember")],
+            [_back_button()],
+        ]
+    )
+    await edit_md(
+        message,
+        "*Browser Settings*\n\n"
+        f"Interactive browser: {_status(enabled)}\n"
+        f"Screenshots while browsing: {_status(stream)}\n"
+        f"Remember logins: {_status(remember)}\n\n"
+        "The assistant can open websites in its own browser, click,\n"
+        "type and log in for you. It asks you first before buying,\n"
+        "paying, sending messages or deleting anything. Screenshots\n"
+        "show the page in the chat while it works; remembered logins\n"
+        "keep you signed in between sessions. /sandbox closes the\n"
+        "browser or forgets the logins.",
+        keyboard,
+    )
+
+
 # Keyboard token -> the menu shown after a change (or when the token itself is tapped).
 _LEGACY_MENUS: dict[str, Callable[[Message, UserSettings], Awaitable[None]]] = {
     "summarization": show_summarization_menu,
@@ -1246,4 +1296,5 @@ _LEGACY_MENUS: dict[str, Callable[[Message, UserSettings], Awaitable[None]]] = {
     "trace": show_trace_menu,
     "transcript": show_transcript_menu,
     "followups": show_followups_menu,
+    "browser": show_browser_menu,
 }

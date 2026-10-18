@@ -458,6 +458,16 @@ ROUTING = {
     "reminder_delay_abcd1234_60": "reminders_ui.reminder_button",
     "reminder_edit_abcd1234": "reminders_ui.reminder_button",
     "reminders_new": "reminders_ui.reminder_button",
+    "sandbox_refresh": "sandbox_ui.sandbox_button",
+    "sandbox_close": "sandbox_ui.sandbox_button",
+    "sandbox_forget": "sandbox_ui.sandbox_button",
+    "sandbox_forget_yes": "sandbox_ui.sandbox_button",
+    "sandbox_back": "sandbox_ui.sandbox_button",
+    "sandbox_ok": "sandbox_ui.sandbox_button",
+    "sandbox_keep": "sandbox_ui.sandbox_button",
+    "setp_browser_remember": "settings_ui.settings_page_button",
+    "settings_browser": "settings_ui.settings_button",
+    "settings_browser_stream": "settings_ui.settings_button",
 }
 
 
