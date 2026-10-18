@@ -9,7 +9,9 @@ Unless that job is a turn of the same chat and forum topic whose agent is still 
 queued): then the message joins that turn instead (``bot.inbox``). It gets a 👀 reaction,
 no busy notice, and is prepared in the background (``prepare_<kind>``: the download,
 conversion and transcription a job would do, without the status messages) while the agent
-goes on; the agent reads it at its next tool boundary (✍). Every kind of message is split
+goes on (at most ``PREPARE_SLOTS`` preparations per user at once; a document or audio file is
+never written by two of them at the same time: ``_path_lock``); the agent reads it at its next
+tool boundary (✍). Every kind of message is split
 that way: ``prepare_<kind>`` builds a ``bot.inbox.Prepared`` (the prompt, the voice reply
 flag, the error to show), and the ``_run_<kind>`` job wraps it in status messages and runs
 the turn. A message the turn did not read is queued as a turn of its own on the prompt it
@@ -40,6 +42,7 @@ import logging
 import os
 import shutil
 import uuid
+import weakref
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Awaitable, Callable
@@ -151,6 +154,42 @@ async def submit(message: Message, job: Job) -> None:
 # ---------------------------------------------------------------------------
 Progress = Callable[[str | None, str | None], Awaitable[None]]  # (status text, job progress)
 
+PREPARE_SLOTS = 2  # messages of one user prepared at once for the running turn (downloads, Whisper, vision)
+_prepare_slots: dict[str, asyncio.Semaphore] = {}
+_path_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = weakref.WeakValueDictionary()
+_locks_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _same_loop() -> None:
+    """asyncio locks belong to one event loop: a new loop (every test) starts with none."""
+    global _locks_loop
+    loop = asyncio.get_running_loop()
+    if loop is not _locks_loop:
+        _prepare_slots.clear()
+        _path_locks.clear()
+        _locks_loop = loop
+
+
+def _prepare_slot(user_id: str) -> asyncio.Semaphore:
+    """The user's ``PREPARE_SLOTS`` slots: twenty voice notes sent during a turn are not transcribed all at once."""
+    _same_loop()
+    slot = _prepare_slots.get(str(user_id))
+    if slot is None:
+        slot = _prepare_slots[str(user_id)] = asyncio.Semaphore(PREPARE_SLOTS)
+    return slot
+
+
+def _path_lock(path: str) -> asyncio.Lock:
+    """One writer per saved file (documents and audio keep their names): two uploads of the same
+    name are downloaded one after the other, never into the same file at the same time."""
+    _same_loop()
+    key = os.path.abspath(path)
+    lock = _path_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _path_locks[key] = lock
+    return lock
+
 
 async def _no_progress(status_text: str | None = None, step: str | None = None) -> None:
     """Preparing for the running turn: no status message, no job to report to."""
@@ -186,10 +225,14 @@ def inject_target(user_id: str, thread_id: int | None) -> inbox.TurnInbox | None
 
 async def _prepare_for_inbox(
     prepare: Callable[[], Awaitable[Prepared]], *, kind: str, label: str, error_text: str, echo: ChatSender | None,
+    user_id: str | None = None,
 ) -> Prepared:
-    """Run a ``prepare_<kind>`` for the running turn; never raises (a failure is a short note the agent reads)."""
+    """Run a ``prepare_<kind>`` for the running turn in one of the user's ``PREPARE_SLOTS``; never
+    raises (a failure is a short note the agent reads). A leftover queued as its own turn awaits
+    this same task (``_run_prepared``), so the slots cover that path too."""
     try:
-        prepared = await prepare()
+        async with _prepare_slot(user_id or ""):
+            prepared = await prepare()
     except asyncio.CancelledError:
         raise
     except Exception as e:  # noqa: BLE001
@@ -219,7 +262,8 @@ def inject(
     else:
         echo = ChatSender(bot, chat_id, thread_id, message_id)
         future = asyncio.create_task(
-            _prepare_for_inbox(prepare, kind=kind, label=label, error_text=error_text, echo=echo), name=f"prepare-{user_id}-{label}",
+            _prepare_for_inbox(prepare, kind=kind, label=label, error_text=error_text, echo=echo, user_id=user_id),
+            name=f"prepare-{user_id}-{label}",
         )
     item = inbox.InboxItem(
         kind=inbox.USER, future=future, thread_id=thread_id, label=label, bot=bot, chat_id=chat_id, message_id=message_id,
@@ -231,9 +275,12 @@ def inject(
 
 
 def _requeue(bot: Bot, user_id: str, chat_id: int, thread_id: int | None, reply_to: int | None, limit: int | None, item: inbox.InboxItem) -> None:
+    # /cancel dropping the queued job also stops its preparation (no echo, no transcription or
+    # description after the cancel); a running one is stopped with the job (_run_prepared awaits it).
     queue.submit_nowait(Job(
         user_id=user_id, label=item.label, seq=item.seq, thread_id=thread_id, from_user=True,
         run=partial(_run_prepared, bot, user_id, chat_id, thread_id, reply_to, limit, item.future),
+        on_drop=partial(inbox.drop, [item]),
     ))
 
 
@@ -621,7 +668,8 @@ async def prepare_audio(bot: Bot, message: Message, user_id: str) -> Prepared:
     caption = message.caption or ""
     file_name = os.path.basename(audio.file_name or f"audio_{uuid.uuid4()}.mp3")
     audio_path = str(media.user_dir(user_id, "audio") / file_name)
-    await bot.download(audio.file_id, destination=audio_path)
+    async with _path_lock(audio_path):
+        await bot.download(audio.file_id, destination=audio_path)
     duration = f"{audio.duration // 60}m{audio.duration % 60}s" if audio.duration else "unknown"
     prompt = f"User sent an audio file.\nFile: {file_name}\nPath: {audio_path}\nDuration: {duration}"
     if audio.performer:
@@ -928,8 +976,9 @@ async def prepare_document(bot: Bot, message: Message, user_id: str, progress: P
     file_name, ext, doc_type = _document_names(message)
     await progress(None, "reading document")
     saved = str(media.user_dir(user_id, "documents") / file_name)
-    await bot.download(message.document.file_id, destination=saved)
-    text, media_blocks = await _document_prompt(progress, user_id, ext, doc_type, file_name, saved, message.caption)
+    async with _path_lock(saved):  # the same name sent twice meanwhile: one download (and read) at a time
+        await bot.download(message.document.file_id, destination=saved)
+        text, media_blocks = await _document_prompt(progress, user_id, ext, doc_type, file_name, saved, message.caption)
     kind = f"{doc_type} document"
     return Prepared(prompt=_prompt_with_reference(text, media_blocks, message, _bot_id(bot)), kind=kind, label=kind)
 

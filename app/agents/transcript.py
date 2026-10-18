@@ -51,6 +51,9 @@ logger = logging.getLogger(__name__)
 
 TRANSCRIPT_VERSION = 1
 CLEARED_MARKER = "[tool result cleared to save context; call the tool again if you need it]"
+# A finished background task's result as a live turn delivers it (bot/background.py): one text block
+# '<task_notification id="t3" tool="..." status="..." elapsed="...">\n<result>…</result>\n</task_notification>'.
+TASK_NOTIFICATION_OPEN = "<task_notification"
 IMAGE_CLEARED_MARKER = (
     "[image removed from the context to save space; it is still in the workspace: "
     "use view_image with the path named in the message]"
@@ -307,21 +310,50 @@ def _cleared_result_content(block: dict) -> str | list[dict]:
     return [{"type": "text", "text": CLEARED_MARKER}, *states]
 
 
+def _cleared_notification(text: str) -> str:
+    """A ``<task_notification>`` block with its result cleared: the opening tag (id, tool, status)
+    stays, so the model still knows which task it was."""
+    head = text.lstrip().split("\n", 1)[0]
+    return f"{head}\n{CLEARED_MARKER}\n</task_notification>"
+
+
+def _clear_notifications(content: list) -> int:
+    """Clear the ``<task_notification>`` text blocks of one user message in place; how many changed."""
+    cleared = 0
+    for i, block in enumerate(content):
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        text = str(block.get("text") or "")
+        if not text.lstrip().startswith(TASK_NOTIFICATION_OPEN):
+            continue
+        new_text = _cleared_notification(text)
+        if new_text != text:
+            content[i] = {**block, "text": new_text}
+            cleared += 1
+    return cleared
+
+
 def clear_old_tool_results(messages: list[dict], keep_turns: int) -> int:
     """Replace tool results older than the last ``keep_turns`` user turns with a marker (a browser
     result keeps its ``browser_state`` blocks and its ``is_error`` flag, so it stays a valid toolset
-    result: see ``_cleared_result_content``)."""
+    result: see ``_cleared_result_content``). A finished background task's result is a tool result
+    too: its ``<task_notification>`` text block (behind tool results, or in a "background task
+    finished" turn) keeps only its opening tag (``_cleared_notification``); its pictures are left
+    to ``clear_old_media``."""
     turn_starts = [i for i, m in enumerate(messages) if is_user_turn(m)]
     if len(turn_starts) <= keep_turns:
         return 0
     cutoff = turn_starts[-keep_turns] if keep_turns > 0 else len(messages)
     cleared = 0
     for m in messages[:cutoff]:
+        if m.get("role") != "user" or not isinstance(m.get("content"), list):
+            continue
+        cleared += _clear_notifications(m["content"])
         if not answers_tool_call(m):
             continue
         for block in m["content"]:
             if not isinstance(block, dict) or block.get("type") != "tool_result":
-                continue  # what a live turn injected behind the results (old media: clear_old_media)
+                continue  # what a live turn injected behind the results (notifications: above; media: clear_old_media)
             cleared_content = _cleared_result_content(block)
             if block.get("content") != cleared_content:
                 block["content"] = cleared_content

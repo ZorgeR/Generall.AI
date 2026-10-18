@@ -15,10 +15,13 @@ protocol of the agent core). From then on the host owns it, across turns:
   ``NOTIFICATION_HEADER``, the quiet marker allowed). Notifications that finish while such
   a turn is still queued join it instead of queueing another;
 * ``/cancel`` cancels the user's tasks (``cancel_all``, nothing is announced), the Stop
-  button does not; shutdown cancels everyone's (``shutdown``).
+  button does not; a turn that fails cancels the ones it adopted (``cancel_turn``: its Retry
+  starts them again); shutdown cancels everyone's (``shutdown``) and refuses new ones.
 
-At most ``MAX_BACKGROUND_TASKS`` run per user (``can_adopt``). Task ids are "t1", "t2", …
-per user, increasing for the life of the process.
+At most ``MAX_BACKGROUND_TASKS`` run per user (``can_adopt``), whatever their topic. Task ids
+are "t1", "t2", … per user, increasing for the life of the process. What the agent's task tools
+see is the bound turn's topic only (``running``, ``list``, ``cancel``): a turn in one forum topic
+neither waits for, lists nor cancels the tasks of another.
 
 No import-time side effects: ``agents``, ``bot.runtime`` and ``bot.agent_runner`` are imported
 where they are used.
@@ -72,7 +75,8 @@ class BackgroundTask:
     thread_id: int | None
     status: str = RUNNING
     finished_wall: float | None = None
-    silent: bool = False  # cancelled by /cancel or shutdown: nothing is announced
+    silent: bool = False  # cancelled by /cancel, a failed turn or shutdown: nothing is announced
+    turn: int = 0  # the host's turn number when it was adopted (cancel_turn)
 
     def elapsed(self) -> int:
         end = self.finished_wall if self.finished_wall is not None else time.time()
@@ -199,7 +203,9 @@ class BackgroundHost:
     """One user's background tasks (the ``BackgroundHost`` protocol of the agent core).
 
     ``bind`` (``run_turn``, at the start of each turn) records the bot, the chat and the topic
-    of the running turn: a task adopted now reports to that topic.
+    of the running turn and starts a new turn number: a task adopted now reports to that topic,
+    and the task tools of the turn (``running``, ``list``, ``cancel``) see that topic's tasks
+    only. The cap (``can_adopt``), ``cancel_all`` and shutdown count every topic.
     """
 
     def __init__(self, user_id: str) -> None:
@@ -208,30 +214,50 @@ class BackgroundHost:
         self.chat_id: int | None = None
         self.thread_id: int | None = None
         self._counter = 0
+        self._turn = 0
         self._tasks: dict[str, BackgroundTask] = {}
 
     def bind(self, *, bot: Any, chat_id: int | None, thread_id: int | None) -> "BackgroundHost":
         self.bot = bot
         self.chat_id = chat_id
         self.thread_id = thread_id
+        self._turn += 1
         return self
+
+    @property
+    def turn(self) -> int:
+        """The number of the bound turn (``cancel_turn``)."""
+        return self._turn
+
+    def _all_running(self) -> list[BackgroundTask]:
+        return [t for t in self._tasks.values() if t.status == RUNNING]
+
+    def _here(self, record: BackgroundTask) -> bool:
+        return record.thread_id == self.thread_id
 
     # -- the protocol -------------------------------------------------------------------------------
     def running(self) -> list[BackgroundTask]:
-        return [t for t in self._tasks.values() if t.status == RUNNING]
+        """The running tasks of the bound turn's topic."""
+        return [t for t in self._all_running() if self._here(t)]
 
     def can_adopt(self) -> bool:
-        return len(self.running()) < MAX_BACKGROUND_TASKS
+        return not _closed and len(self._all_running()) < MAX_BACKGROUND_TASKS
 
     def adopt(
         self, task: asyncio.Task, *, tool_name: str, tool_use_id: str, display_args: str,
         started: float, max_chars: int | None,
-    ) -> str:
+    ) -> str | None:
+        if _closed:
+            # Shutting down: nothing may outlive the process. The call ends here (None: not taken,
+            # so the turn sees it end as cancelled).
+            if not task.done():
+                task.cancel()
+            return None
         self._counter += 1
         task_id = f"t{self._counter}"
         record = BackgroundTask(
             id=task_id, tool=str(tool_name), tool_use_id=str(tool_use_id), args=str(display_args or ""), task=task,
-            started_wall=_wall(float(started)), max_chars=max_chars, thread_id=self.thread_id,
+            started_wall=_wall(float(started)), max_chars=max_chars, thread_id=self.thread_id, turn=self._turn,
         )
         self._tasks[task_id] = record
         self._prune()
@@ -239,25 +265,36 @@ class BackgroundHost:
         return task_id
 
     def list(self) -> list[dict]:
-        return [t.entry() for t in self._tasks.values()]
+        return [t.entry() for t in self._tasks.values() if self._here(t)]
 
     def cancel(self, task_id: str) -> bool:
         record = self._tasks.get(str(task_id).strip())
-        if record is None or record.status != RUNNING or record.task.done() or record.task.cancelling():
+        if record is None or not self._here(record):
+            return False
+        if record.status != RUNNING or record.task.done() or record.task.cancelling():
             return False
         record.task.cancel()
         return True
 
     # -- the rest -------------------------------------------------------------------------------------
-    def cancel_all(self) -> int:
-        """Cancel every running task without announcing it (/cancel, shutdown)."""
+    @staticmethod
+    def _cancel_silently(records: list[BackgroundTask]) -> int:
         count = 0
-        for record in self.running():
-            record.silent = True  # also one the agent is already cancelling: /cancel announces nothing
+        for record in records:
+            record.silent = True  # also one the agent is already cancelling: nothing is announced
             if not record.task.done() and not record.task.cancelling():
                 record.task.cancel()
                 count += 1
         return count
+
+    def cancel_all(self) -> int:
+        """Cancel every running task of the user, in every topic, without announcing it (/cancel, shutdown)."""
+        return self._cancel_silently(self._all_running())
+
+    def cancel_turn(self, turn: int) -> int:
+        """Cancel, without announcing it, every running task adopted during turn ``turn`` (a turn
+        that failed: its Retry runs the calls again)."""
+        return self._cancel_silently([t for t in self._all_running() if t.turn == turn])
 
     def _prune(self) -> None:
         finished = [k for k, t in self._tasks.items() if t.status != RUNNING]
@@ -293,11 +330,12 @@ class BackgroundHost:
 
 _hosts: dict[str, BackgroundHost] = {}
 _registry_loop: asyncio.AbstractEventLoop | None = None
+_closed = False  # shutdown() ran: no host adopts anything any more
 
 
 def _same_loop() -> None:
     """Tasks belong to the event loop they run on: a new loop (every test) starts with no hosts."""
-    global _registry_loop
+    global _registry_loop, _closed
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -305,6 +343,7 @@ def _same_loop() -> None:
     if loop is not _registry_loop:
         _hosts.clear()
         _batches.clear()
+        _closed = False
         _registry_loop = loop
 
 
@@ -327,11 +366,15 @@ def cancel_all(user_id: str) -> int:
 
 
 async def shutdown(grace: float = SHUTDOWN_GRACE) -> None:
-    """Cancel every user's tasks (nothing announced) and give them ``grace`` seconds to end."""
+    """Cancel every user's tasks (nothing announced) and give them ``grace`` seconds to end. From
+    now on no host adopts a call: a turn still running hands none over (``can_adopt`` is False,
+    and a task given to ``adopt`` anyway is cancelled)."""
+    global _closed
     _same_loop()
+    _closed = True
     tasks = []
     for host in _hosts.values():
-        tasks += [r.task for r in host.running()]
+        tasks += [r.task for r in host._all_running()]
         host.cancel_all()
     _batches.clear()
     if tasks:
@@ -340,5 +383,7 @@ async def shutdown(grace: float = SHUTDOWN_GRACE) -> None:
 
 def reset() -> None:
     """Forget every host and queued notification (tests)."""
+    global _closed
     _hosts.clear()
     _batches.clear()
+    _closed = False

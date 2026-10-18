@@ -246,6 +246,22 @@ def background_placeholder(task_id: str, started_wall: float) -> str:
     return BACKGROUND_PLACEHOLDER.format(task_id=task_id, started=started)
 
 
+def with_messages_read(question: str, inbox) -> str:
+    """``question`` followed by the messages the user sent while the turn ran and the agent read
+    (``inbox.drained_user_texts``), after ``SENT_WHILE_WORKING``; the bare question when none was
+    read (or there is no inbox). What the memory files keep, and what the judge and the critique
+    judge the answer against: the answer must cover those messages too."""
+    try:
+        texts = list(inbox.drained_user_texts or []) if inbox is not None else []
+    except Exception as e:  # noqa: BLE001 - the inbox is the bot's
+        print(f"WARNING: could not read the messages sent during the turn: {e}")
+        texts = []
+    texts = [str(t).strip() for t in texts if str(t or "").strip()]
+    if not texts:
+        return question
+    return f"{question}{SENT_WHILE_WORKING}" + "\n\n".join(texts)
+
+
 def _retrieve_result(task: asyncio.Task) -> None:
     """Done callback of a call cancelled with its turn: read the outcome so asyncio does not log it."""
     if not task.cancelled():
@@ -1143,7 +1159,8 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 last_step_category = "critique"
                 if update_status:
                     await update_status(step=last_step_category, details="Starting critique session", iteration=cicles, critique=critique)
-                critique_answer = await self.critique_response(question=question, answer=current_text, dialog_history=dialog_history, trace=trace)
+                # judged against what the user asked, the messages read mid-turn included
+                critique_answer = await self.critique_response(question=with_messages_read(question, self.inbox), answer=current_text, dialog_history=dialog_history, trace=trace)
                 print(f"\nCritique: {critique_answer}")
                 if critique_answer:
                     need_rewrite_answer = critique_answer.need_rewrite_answer
@@ -1172,7 +1189,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                     last_step_category = "judge"
                     await update_status(step=last_step_category, details="Judge evaluating response", iteration=cicles, critique=critique)
                 
-                judge_decision = await self.judge_response(question=question, answer=current_text)
+                judge_decision = await self.judge_response(question=with_messages_read(question, self.inbox), answer=current_text)
                 if not judge_decision:
                     if judge < user_settings.get("judge").get("max_iteration"):
                         if update_status:
@@ -1354,17 +1371,9 @@ class ChainOfThoughtAgent:
     def _memory_question(self, question: str) -> str:
         """The question as the memory files keep it (conversation file, its topic and summary,
         the embeddings, dialog_history.json): with the messages the user sent while the turn ran
-        and the agent read (``inbox.drained_user_texts``) after it. The transcript needs nothing:
+        and the agent read (``with_messages_read``) after it. The transcript needs nothing:
         it holds them where they were read."""
-        try:
-            texts = list(self.inbox.drained_user_texts or []) if self.inbox is not None else []
-        except Exception as e:  # noqa: BLE001
-            print(f"WARNING: could not read the messages sent during the turn: {e}")
-            texts = []
-        texts = [str(t).strip() for t in texts if str(t or "").strip()]
-        if not texts:
-            return question
-        return question + SENT_WHILE_WORKING + "\n\n".join(texts)
+        return with_messages_read(question, self.inbox)
 
     async def _save_conversation(self, question: str, response: str, messages: list):
         """Save conversation summary and full history"""

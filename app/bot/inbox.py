@@ -16,7 +16,9 @@ waiting up to ``DRAIN_WAIT`` for it), so nothing overtakes it. What the turn did
 consume is handed back at ``close()``: each user item becomes a queued turn of its own
 (``requeue``, with the prompt it already prepared: nothing is downloaded or transcribed
 twice), inserted in the queue by its arrival number, and task notifications become
-"background task finished" turns. ``/cancel`` drops them instead (``discard``).
+"background task finished" turns. ``/cancel`` drops them instead (``discard``). A run that
+ends quiet (a scheduled task or a notification turn answering the quiet marker) hands back
+the user messages it did read as well (``consumed_user_items``, ``bot.agent_runner``).
 
 The formats, which the agent core passes through without parsing::
 
@@ -207,6 +209,7 @@ class TurnInbox:
         self.base = Path(base) if base is not None else None
         self.closed = False
         self._items: list[InboxItem] = []  # not consumed yet, sorted by seq
+        self._consumed: list[InboxItem] = []  # the user items consumed so far, in the order they were read
         self._texts: list[str] = []  # text views of the consumed user messages
         self._record: list[dict] = []  # their text + media ref blocks (turn record)
         self._changed = asyncio.Event()
@@ -228,8 +231,13 @@ class TurnInbox:
 
     # -- the protocol ----------------------------------------------------------------------------------
     def has_user_messages(self) -> bool:
-        """A user message is waiting, ready or still being prepared."""
-        return any(i.kind == USER for i in self._items)
+        """A user message can be drained now: ready, with nothing still being prepared ahead of it.
+
+        One still being prepared (a video being described can take minutes) does not count until
+        it is ready: the agent loop moves calls to the background for a message it can read now,
+        not for one it cannot read yet (it looks again while ``has_pending`` says something waits).
+        """
+        return self._drainable() == "message"
 
     def has_pending(self) -> bool:
         """Anything is waiting: user messages or task notifications."""
@@ -248,6 +256,11 @@ class TurnInbox:
     @property
     def drained_media(self) -> bool:
         return any(b.get("type") != "text" for b in self._record)
+
+    @property
+    def consumed_user_items(self) -> list[InboxItem]:
+        """The user items read so far, in reading order (a quiet run hands them back: ``requeue``)."""
+        return list(self._consumed)
 
     def _drainable(self) -> str | None:
         """"message" / "task" for what drain() would return right now (the ready head), else None."""
@@ -288,6 +301,10 @@ class TurnInbox:
 
         Waits up to ``DRAIN_WAIT`` in total for an item still being prepared and stops at the
         first one that is still not ready, so nothing overtakes it. [] when empty.
+
+        An item leaves the inbox only once it has been read: a cancel (Stop, the deadline) while a
+        user item is being read (``_user_blocks`` in a thread) leaves it in its place, and the
+        turn's ``close()`` hands it back like any other leftover.
         """
         async with self._lock:
             out: list[dict] = []
@@ -303,14 +320,26 @@ class TurnInbox:
                     if not item.ready():
                         break
                     continue  # the head may have changed while waiting
-                self._items.pop(0)
-                out.extend(await self._consume(item))
+                blocks = await self._consume(item)
+                if blocks is None:
+                    break  # the inbox closed while the item was read: it is a leftover now
+                out.extend(blocks)
             return out
 
-    async def _consume(self, item: InboxItem) -> list[dict]:
+    def _take(self, item: InboxItem) -> bool:
+        """Remove ``item`` from the waiting items; False when it is no longer there (``close()`` took it)."""
+        if self.closed or item not in self._items:
+            return False
+        self._items.remove(item)
+        return True
+
+    async def _consume(self, item: InboxItem) -> list[dict] | None:
+        """Read ``item`` and mark it consumed (its API blocks); None when it was taken away meanwhile."""
         if item.future.cancelled():
-            return []
+            return [] if self._take(item) else None
         if item.kind == TASK:
+            if not self._take(item):
+                return None
             try:
                 blocks = item.future.result()
             except Exception as e:  # noqa: BLE001
@@ -329,6 +358,9 @@ class TurnInbox:
             logger.error("Could not read an injected message of %s: %s", self.user_id, e)
             fallback = Prepared(prompt=None, kind=prepared.kind, reason=failure_reason(e))
             api, text, record = _user_blocks(fallback, item.sent_at, None)
+        if not self._take(item):
+            return None  # /cancel or the turn's end took it while it was read: not consumed, no ✍
+        self._consumed.append(item)
         self._texts.append(text)
         if self._record:
             self._record.extend(record)

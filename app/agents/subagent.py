@@ -7,7 +7,12 @@ budget. It returns its final text as the tool result; files it creates are in
 the same workspace. Depth is one: a subagent gets no ``run_subagent`` tool. It never gets a
 provider with a client-side toolset (the browser, ``agents.browser_tools``) either, nor the
 live-turn machinery: no inbox, no background host, no task tools (a provider that sets
-``inherit_to_subagents = False``, ``agents.task_tools.TaskTools``).
+``inherit_to_subagents = False``, ``agents.task_tools.TaskTools``), nor any tool that talks to
+the user or waits for them (``agents.main.NEVER_BACKGROUND``: ``ask_user_choice``,
+``send_user_telegram_message``, ``send_voice_message``, ``set_message_reaction``, …): a
+``run_subagent`` call may be moved to the background at any moment, even while the child waits
+in one of them, and a question still open after its turn ended would take the user's next text
+as its answer. The child reports to the main agent instead.
 Several subagents requested in one assistant message run concurrently through
 the normal parallel tool execution. A ``run_subagent`` call the parent moved to the background
 keeps running there, but no longer edits the parent's status message (its turn may be over).
@@ -36,7 +41,7 @@ SUBAGENT_SYSTEM = """You are a subagent of a persistent personal assistant. The 
 Rules:
 - Use the tools until the task is done, then answer with a complete, self-contained report: facts found, numbers, sources or URLs, and the paths of any files you created in the workspace.
 - Do not ask questions; state your assumptions instead.
-- Do not send messages to the user yourself unless the task explicitly says so.
+- You cannot reach the user (no messages, questions, voice notes or reactions): everything goes into your report.
 - Be concise but keep every detail the main agent needs to use your result.
 
 Current time in UTC+0: {now}
@@ -104,6 +109,10 @@ class SubagentTools:
         ]
 
     def _available_tool_names(self) -> set[str]:
+        """The tool names a subagent may get: the parent's slots and inherited providers, minus
+        the tools that talk to or wait for the user (``agents.main.NEVER_BACKGROUND``)."""
+        from agents.main import NEVER_BACKGROUND  # circular import at module level
+
         names: set[str] = set()
         for slot in PROVIDER_SLOTS:
             provider = getattr(self.parent, slot, None)
@@ -112,17 +121,18 @@ class SubagentTools:
         for provider, _blocking in self._inherited_providers():
             names.update(str(t.get("name") or "") for t in provider.tools_schema)
         names.discard("")
-        return names
+        return names - NEVER_BACKGROUND
 
     def _child(self, model: str, allowed: set[str] | None, budget: TurnBudget):
-        from agents.main import AgentAnthropic  # circular import at module level
+        from agents.main import NEVER_BACKGROUND, AgentAnthropic  # circular import at module level
 
         child = AgentAnthropic(model=model, user_id=self.parent.user_id)
         for slot in PROVIDER_SLOTS:
             setattr(child, slot, getattr(self.parent, slot, None))
         child.subagents = None  # depth 1: a subagent cannot spawn subagents
         child.extra_providers = self._inherited_providers()  # registered providers too, the browser excepted
-        child.allowed_tools = allowed
+        # never a tool that talks to or waits for the user (_available_tool_names), subset or not
+        child.allowed_tools = set(allowed) - NEVER_BACKGROUND if allowed is not None else self._available_tool_names()
         child.thinking = getattr(self.parent, "thinking", False)
         child.trace_depth = getattr(self.parent, "trace_depth", 0) + 1
         child.budget = budget

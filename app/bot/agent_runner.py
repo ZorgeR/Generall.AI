@@ -35,8 +35,14 @@ turn of its own, and tool calls that run long continue in the background
 (only when its constructor takes them). The inbox closes as soon as the agent returned,
 failed or was stopped; what it did not consume becomes the next turns, in order (dropped
 on /cancel and at shutdown). The messages it did consume are part of the turn record
-("[Sent while I was working]"), so Retry replays them, and a scheduled task that read one
-is answered even when its answer is the quiet marker: the user is waiting.
+("[Sent while I was working]"), so Retry replays them. A scheduled task (or a notification
+turn) that read one and still answers the quiet marker stays quiet and hands the messages it read
+back to the queue: each gets a turn of its own on its prepared prompt, in arrival order.
+
+A call moved to the background keeps spending after the turn's usage was recorded (a video
+generation, a subagent, a slow image): from then on every addition to the turn's trace is
+recorded as it arrives (``record_late_usage``). A failed turn cancels the calls it moved to the
+background (silently), so Retry is the only re-run; a successful or stopped turn keeps them.
 """
 from __future__ import annotations
 
@@ -68,8 +74,6 @@ logger = logging.getLogger(__name__)
 
 THINKING = "💭 *Thinking...*"
 QUIET_MARKER = "<no_update/>"  # a scheduled task answers with this alone when there is nothing to say
-# A turn with a quiet marker that read a message the user sent meanwhile must answer something.
-QUIET_ANSWERED_TEXT = "📭 Nothing new to report."
 STOPPED_NOTE = "⏹ Stopped — partial answer, not saved to memory."
 
 # Plain-language reasons for a failed turn (friendly_error). The technical detail is in the log.
@@ -270,6 +274,29 @@ def record_usage(stats_tracker, user_id: str, trace) -> None:
         logger.warning("Could not record token usage for %s: %s", user_id, e)
 
 
+def record_late_usage(stats_tracker, user_id: str, trace) -> None:
+    """After ``record_usage``: usage that still reaches ``trace`` (a call the turn moved to the
+    background: Veo, a subagent's model calls, a slow image) is recorded as it arrives, one usage
+    row per addition with exactly that usage, so nothing is lost and nothing is counted twice."""
+
+    def late(model: str, counts: dict, cost_usd: float | None) -> None:
+        try:
+            if cost_usd is None:
+                from models import estimate_cost
+
+                cost_usd = estimate_cost(model, counts["input_tokens"], counts["output_tokens"],
+                                         counts["cache_read_tokens"], counts["cache_write_tokens"])
+            stats_tracker.track_usage(
+                user_id, model=model, api_calls=counts["api_calls"], input_tokens=counts["input_tokens"],
+                output_tokens=counts["output_tokens"], cache_read_tokens=counts["cache_read_tokens"],
+                cache_write_tokens=counts["cache_write_tokens"], tool_calls=0, duration_s=0.0, cost_usd=cost_usd,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not record late token usage for %s: %s", user_id, e)
+
+    trace.on_late_usage = late
+
+
 async def send_reasoning_file(sender: ChatSender, messages: list, settings: UserSettings, caption: str = "Reasoning history.") -> None:
     if not settings.get("reasoning_context", "enabled") or not messages:
         return
@@ -349,9 +376,10 @@ async def run_turn(
     ``quiet_marker`` (scheduled tasks): an answer consisting of exactly that marker means the
     agent has nothing worth saying; nothing is sent, the status message is removed (or, with
     ``quiet_notice``, edited into that line: a turn the user started by a button expects some
-    reply) and the result carries ``quiet=True``. The marker is stored on the turn record, so
-    Retry runs with it again. Such a turn never shows the browser's live view (it would stay
-    behind after a quiet run).
+    reply) and the result carries ``quiet=True``; user messages the turn read meanwhile are
+    queued again as turns of their own (``inbox.requeue``). The marker is stored on the turn
+    record, so Retry runs with it again. Such a turn never shows the browser's live view (it
+    would stay behind after a quiet run).
     """
     from stats import stats_tracker
     from agents import content as prompt_content  # no import-time side effects; after the patcher ran
@@ -396,6 +424,8 @@ async def run_turn(
     # or error after that (e.g. /cancel while the buttons go on) must not overwrite it.
     status_final = False
     box: inbox.TurnInbox | None = None  # the turn's inbox, while the agent runs
+    host: background.BackgroundHost | None = None  # the user's background host, bound to this turn
+    host_turn = 0
 
     def close_inbox() -> None:
         # Leftovers become the next turns; at shutdown the queue is closing, so they are dropped.
@@ -414,7 +444,9 @@ async def run_turn(
         if takes_live_turn(agents.ChainOfThoughtAgent):
             # Messages of this chat and topic join this turn from now on (bot/handlers/messages.py).
             box = inbox.open_inbox(user_id, thread_id, base=user_dir(user_id))
-            live = {"inbox": box, "background": background.host_for(user_id, bot=bot, chat_id=chat_id, thread_id=thread_id)}
+            host = background.host_for(user_id, bot=bot, chat_id=chat_id, thread_id=thread_id)
+            host_turn = host.turn
+            live = {"inbox": box, "background": host}
         agent = agents.ChainOfThoughtAgent(
             model_type="anthropic",
             model=ANTHROPIC_MODEL,
@@ -435,19 +467,22 @@ async def run_turn(
             ctx.stoppable = False
         stats_tracker.track_message_sent(user_id)
         record_usage(stats_tracker, user_id, trace)
+        record_late_usage(stats_tracker, user_id, trace)  # calls still running in the background
 
         # A trailing <follow_ups> block becomes buttons; it is never part of the visible answer.
         display, suggestions = turn_actions.parse_follow_ups(response or "")
         if not (user_settings.get("follow_ups") or {}).get("enabled", True):
             suggestions = []
         record_prompt, record_blocks = with_drained(prompt_text, prompt_blocks, box)
-        if quiet_marker and display.strip() == quiet_marker and box is not None and box.drained_user_texts:
-            # The user wrote while the task ran and the agent read it: they wait for an answer.
-            display = quiet_notice or QUIET_ANSWERED_TEXT
         if quiet_marker and display.strip() == quiet_marker:
             # Nothing to tell the user: no answer, no voice, no buttons; the status goes away too
             # (or says so, when the user pressed a button and waits for a reply).
             status_final = True
+            if box is not None and box.consumed_user_items:
+                # The user wrote while the task ran and the agent read it: those messages wait for
+                # an answer the quiet run does not give. Each becomes a turn of its own on its
+                # prepared prompt, in arrival order, ahead of anything sent later.
+                inbox.requeue(box.consumed_user_items)
             if quiet_notice:
                 await status_msg.set_text(quiet_notice)
             else:
@@ -492,6 +527,8 @@ async def run_turn(
         return TurnResult(response=display, messages=messages, turn_id=record.id if record is not None else None)
     except asyncio.CancelledError:
         close_inbox()  # a Stop or the deadline: the unread messages still get their turns
+        if not agent_done:
+            record_late_usage(stats_tracker, user_id, trace)  # calls moved to the background keep running
         reason = ctx.cancel_reason if ctx else None
         if reason == "user" and not agent_done:
             await send_partial_answer(sender, on_text_chunk)
@@ -507,8 +544,13 @@ async def run_turn(
         logger.exception("Turn failed for user %s (trace %s): %s", user_id, trace_id, e)
         if not agent_done:
             record_usage(stats_tracker, user_id, trace)  # the tokens spent before the failure
+            record_late_usage(stats_tracker, user_id, trace)
         if status_final:
             return None  # the answer (or the summary) is already there; nothing to replace it with
+        if host is not None:
+            # Retry runs the turn again, background calls included: the ones this turn started end
+            # here, silently, so they do not run twice.
+            host.cancel_turn(host_turn)
         reason = friendly_error(e, trace_id)
         # The failed turn is saved too (prompt and reason, no answer, no reasoning file), so the
         # status can carry a Retry button; when even that fails, the text goes out without buttons.

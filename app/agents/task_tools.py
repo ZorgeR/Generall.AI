@@ -44,11 +44,14 @@ class TurnInbox(Protocol):
 
 
 class BackgroundHost(Protocol):
-    """What the agent core needs from the bot side's background task host (``bot/background.py``)."""
+    """What the agent core needs from the bot side's background task host (``bot/background.py``).
+
+    ``list`` and ``cancel`` cover the running turn's conversation (its forum topic) only; ``adopt``
+    may refuse (a falsy id: the call stays in the foreground)."""
 
     def can_adopt(self) -> bool: ...
     def adopt(self, task: asyncio.Task, *, tool_name: str, tool_use_id: str, display_args: str,
-              started: float, max_chars: int | None) -> str: ...
+              started: float, max_chars: int | None) -> str | None: ...
     def list(self) -> list[dict]: ...
     def cancel(self, task_id: str) -> bool: ...
 

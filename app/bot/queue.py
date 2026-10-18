@@ -23,7 +23,8 @@ that arrived earlier (a message the running turn's inbox did not consume,
 ``bot.inbox``, or an album flushed after a text) keeps its place. ``thread_id`` and
 ``from_user`` say whether a pending job holds a user's message in a forum topic:
 ``has_pending_user_jobs`` is how the handlers know a new message must queue behind
-it instead of joining the running turn.
+it instead of joining the running turn. ``on_drop`` is called when ``cancel()`` drops a
+job before it ran (a requeued inbox message cancels its preparation still in flight).
 """
 from __future__ import annotations
 
@@ -75,6 +76,7 @@ class Job:
     seq: int = field(default_factory=next_seq)  # arrival order: a queued job goes before pending jobs with a larger one
     thread_id: int | None = None  # the forum topic of the message it answers (None: none / not a topic)
     from_user: bool = False  # holds a user's message or button press (not a scheduled task or a notification)
+    on_drop: Callable[[], Any] | None = None  # cancel() dropped it before it ran (never raises into cancel)
 
     @property
     def elapsed(self) -> float:
@@ -200,7 +202,13 @@ class QueueManager:
                 dropped += 1
             except asyncio.QueueEmpty:
                 break
-        uq.pending.clear()
+        dropped_jobs, uq.pending = uq.pending, []
+        for job in dropped_jobs:
+            if job.on_drop is not None:
+                try:
+                    job.on_drop()
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("on_drop of %r for %s failed: %s", job.label, user_id, e)
         cancelled = False
         if uq.current_task is not None and not uq.current_task.done():
             # A job already stopping (a Stop button, the deadline) is left to finish its

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 PREVIEW_CHARS = 60
 ARGS_CHARS = 500  # JSON of a call's arguments kept for the expandable summary
@@ -107,6 +108,9 @@ class ToolTrace:
     cache_write_tokens: int = 0
     usage_by_model: dict = field(default_factory=dict)  # model -> the same five counters
     thinking: list[str] = field(default_factory=list)  # summarized thinking of the turn, in order
+    # Set once the turn's usage was recorded (bot.agent_runner.record_late_usage): called with
+    # (model, counts, cost_usd) for every later addition, e.g. a call that went on in the background.
+    on_late_usage: Callable[[str, dict, float | None], None] | None = field(default=None, repr=False, compare=False)
 
     def add_usage(self, usage, model: str | None = None, cost_usd: float | None = None) -> None:
         """Accumulate a Messages API ``usage`` object (attributes or dict), per model too.
@@ -115,6 +119,7 @@ class ToolTrace:
         accepted as well; its cached prompt share is not split out. ``cost_usd`` is a
         cost the caller priced itself (image models bill by modality, which the token
         counts here do not keep); it replaces the MODEL_PRICES estimate for that model.
+        After the turn's usage was recorded, the addition also goes to ``on_late_usage``.
         """
         if usage is None:
             return
@@ -134,6 +139,12 @@ class ToolTrace:
             bucket[key] += value
         if cost_usd is not None:
             bucket["cost_usd"] = bucket.get("cost_usd", 0.0) + cost_usd
+        late = self.on_late_usage
+        if late is not None:
+            try:
+                late(model or "unknown", dict(counts), cost_usd)
+            except Exception:  # noqa: BLE001 - accounting never breaks a tool call
+                pass
 
     def add_thinking(self, text: str) -> None:
         text = (text or "").strip()

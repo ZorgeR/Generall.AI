@@ -325,6 +325,153 @@ async def test_shutdown_cancels_every_task_silently(qm, turns):
     assert turns == []
 
 
+async def test_a_call_handed_over_during_shutdown_is_refused_and_cancelled(qm, turns):
+    h = host()
+
+    async def stubborn():  # a tool in a worker thread: its cancel waits for the thread
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.3)
+            raise
+
+    adopt(h, stubborn())
+    shutting = asyncio.create_task(background.shutdown(grace=1.0))
+    await asyncio.sleep(0.05)
+    # a turn still running (the queue shuts down after the host) tries to hand over another call
+    assert not h.can_adopt()
+    late = asyncio.create_task(asyncio.sleep(5))
+    assert h.adopt(late, tool_name="run_command", tool_use_id="b", display_args="", started=time.time(), max_chars=None) is None
+    await shutting
+    await asyncio.sleep(0)
+    assert late.cancelled() and [e["id"] for e in h.list()] == ["t1"]
+    assert turns == []
+
+
+# ---- topics -----------------------------------------------------------------------------------------------
+async def test_the_task_tools_of_a_turn_see_only_its_topic(qm, turns):
+    """A task started in topic 5 is neither waited for, listed nor cancelled by a turn in topic 9; the
+    cap of running tasks still counts every topic."""
+    from agents.task_tools import TaskTools
+
+    h = host(thread_id=5)
+    other = adopt(h, asyncio.sleep(30))  # t1, topic 5: still running
+
+    box = inbox.open_inbox(USER, 9)  # the topic-5 turn ended; a turn in topic 9 runs
+    tools = TaskTools(host(thread_id=9), box)
+    assert tools.list_tasks() == "No background tasks in this conversation."
+    assert tools.cancel_task(other).startswith("Error: no running background task t1")
+    t0 = time.monotonic()
+    assert await tools.wait_for_tasks(5) == "No background tasks are running."
+    assert time.monotonic() - t0 < 1
+
+    mine = adopt(h, result_after("tests passed", 0.1))  # t2, topic 9
+    assert await tools.wait_for_tasks(5) == "A background task finished; its notification follows."
+    assert mine in (await box.drain())[0]["text"]
+    gate = asyncio.Event()
+    for _ in range(3):
+        adopt(h, gate.wait())
+    assert not h.can_adopt()  # t1 (topic 5) + three in topic 9: the per-user cap
+    assert [e["id"] for e in h.list()] == ["t2", "t3", "t4", "t5"]
+
+    h = host(thread_id=5)  # back in topic 5
+    assert [e["id"] for e in h.list()] == ["t1"] and h.cancel(other) is True
+    inbox.finish(box, discard=True)
+    background.cancel_all(USER)
+
+
+# ---- usage after the turn, a failed turn ------------------------------------------------------------------
+def use_agent_with(monkeypatch, generate) -> dict:
+    """A ChainOfThoughtAgent stand-in whose generate_response is ``generate(seen, trace)``."""
+    seen: dict = {}
+
+    class Agent:
+        def __init__(self, **kw):
+            seen.update(kw)
+            self.agent = SimpleNamespace(limit_reached=False)
+
+        async def generate_response(self, prompt, update_status, on_text_chunk=None, trace=None):
+            return await generate(seen, trace)
+
+    monkeypatch.setattr(agent_runner, "_agents", lambda: SimpleNamespace(ChainOfThoughtAgent=Agent))
+    return seen
+
+
+def adopt_in_turn(seen, coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    seen.setdefault("tasks", []).append(task)
+    seen["background"].adopt(task, tool_name="video_generator", tool_use_id="toolu_v", display_args="a cat",
+                             started=time.monotonic(), max_chars=1000)
+    return task
+
+
+async def test_usage_that_reaches_the_trace_after_the_turn_is_recorded_once(monkeypatch, qm, turns):
+    from models import estimate_cost
+
+    rows: list[dict] = []
+    monkeypatch.setattr(sys.modules["stats"].stats_tracker, "track_usage", lambda uid, **k: rows.append({"user": uid, **k}))
+    release = asyncio.Event()
+
+    async def generate(seen, trace):
+        trace.add_usage({"input_tokens": 100, "output_tokens": 10}, model="claude-sonnet-5-5")
+
+        async def video():  # e.g. Veo: always longer than the turn
+            await release.wait()
+            trace.add_usage({"input_tokens": 0, "output_tokens": 0}, model="veo-3.1-generate-preview", cost_usd=1.6)
+            trace.add_usage({"input_tokens": 7, "output_tokens": 3, "cache_read_input_tokens": 2}, model="claude-sonnet-5-5")
+            return "video.mp4"
+
+        adopt_in_turn(seen, video())
+        return "Started; the video follows.", []
+
+    seen = use_agent_with(monkeypatch, generate)
+    await qm.submit(turn_job(FakeBot()))
+    await until(lambda: not qm.is_busy(USER))
+    assert [(r["model"], r["input_tokens"]) for r in rows] == [("claude-sonnet-5-5", 100)]  # the turn's own row
+
+    release.set()
+    await seen["tasks"][0]
+    assert len(rows) == 3  # exactly one row per late addition, the turn's row not repeated
+    assert rows[1] == {
+        "user": USER, "model": "veo-3.1-generate-preview", "api_calls": 1, "input_tokens": 0, "output_tokens": 0,
+        "cache_read_tokens": 0, "cache_write_tokens": 0, "tool_calls": 0, "duration_s": 0.0, "cost_usd": 1.6,
+    }
+    assert (rows[2]["model"], rows[2]["input_tokens"], rows[2]["output_tokens"], rows[2]["cache_read_tokens"]) == ("claude-sonnet-5-5", 7, 3, 2)
+    assert rows[2]["cost_usd"] == estimate_cost("claude-sonnet-5-5", 7, 3, 2, 0)
+
+
+async def test_a_failed_turn_cancels_the_calls_it_moved_to_the_background(monkeypatch, qm, turns):
+    h = host()
+    earlier = asyncio.create_task(asyncio.sleep(30))  # adopted by an earlier turn: not this turn's to cancel
+    h.adopt(earlier, tool_name="run_command", tool_use_id="toolu_1", display_args="", started=time.monotonic(), max_chars=None)
+
+    async def generate(seen, trace):
+        adopt_in_turn(seen, asyncio.sleep(30))
+        raise RuntimeError("boom")
+
+    seen = use_agent_with(monkeypatch, generate)
+    await qm.submit(turn_job(FakeBot()))
+    await until(lambda: not qm.is_busy(USER))
+    await until(lambda: seen["tasks"][0].done())
+    assert seen["tasks"][0].cancelled() and not earlier.done()
+    assert [(e["id"], e["status"]) for e in h.list()] == [("t1", "running"), ("t2", "cancelled")]
+    await asyncio.sleep(0.05)
+    assert turns == [] and qm.status(USER).pending == 0  # silently: Retry is the only re-run
+    background.cancel_all(USER)
+
+
+async def test_a_successful_turn_keeps_the_calls_it_moved_to_the_background(monkeypatch, qm, turns):
+    async def generate(seen, trace):
+        adopt_in_turn(seen, asyncio.sleep(30))
+        return "Started; the result follows.", []
+
+    seen = use_agent_with(monkeypatch, generate)
+    await qm.submit(turn_job(FakeBot()))
+    await until(lambda: not qm.is_busy(USER))
+    assert not seen["tasks"][0].done() and seen["background"].list()[0]["status"] == "running"
+    background.cancel_all(USER)
+
+
 async def test_app_shutdown_cancels_the_background_tasks_before_the_queue(monkeypatch):
     from bot import app
 

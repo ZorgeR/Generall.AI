@@ -104,3 +104,27 @@ def test_trace_counts_openai_chat_usage():
     assert gpt["input_tokens"] == 1_000_000 and gpt["output_tokens"] == 100_000 and gpt["api_calls"] == 1
     assert trace.input_tokens == 1_000_010
     assert abs(trace.cost_usd - (2.0 + 1.0 + (10 * 2 + 5 * 10) / 1_000_000)) < 1e-9
+
+
+def test_usage_added_after_the_turn_was_recorded_goes_to_the_late_hook_once():
+    """bot.agent_runner.record_late_usage sets ``on_late_usage`` once the turn's usage was stored: each
+    later addition (a call that went on in the background) is handed over with exactly its own counts,
+    still accumulated as before; a failing hook never breaks the caller."""
+    trace = ToolTrace()
+    trace.add_usage({"input_tokens": 10, "output_tokens": 5}, model="claude-sonnet-5-5")  # before: nobody is told
+    late = []
+    trace.on_late_usage = lambda model, counts, cost: late.append((model, counts, cost))
+    trace.add_usage({"input_tokens": 3, "output_tokens": 1, "cache_creation_input_tokens": 4}, model="claude-sonnet-5-5")
+    trace.add_usage({"input_tokens": 0, "output_tokens": 0}, model="veo-3.1-generate-preview", cost_usd=1.6)
+    assert late == [
+        ("claude-sonnet-5-5", {"api_calls": 1, "input_tokens": 3, "output_tokens": 1, "cache_read_tokens": 0, "cache_write_tokens": 4}, None),
+        ("veo-3.1-generate-preview", {"api_calls": 1, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0}, 1.6),
+    ]
+    assert trace.usage_by_model["claude-sonnet-5-5"]["input_tokens"] == 13  # the trace still sums everything
+
+    def broken(model, counts, cost):
+        raise RuntimeError("database locked")
+
+    trace.on_late_usage = broken
+    trace.add_usage({"input_tokens": 1, "output_tokens": 1}, model="claude-sonnet-5-5")
+    assert trace.usage_by_model["claude-sonnet-5-5"]["input_tokens"] == 14

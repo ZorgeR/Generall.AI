@@ -297,6 +297,34 @@ async def test_nothing_is_injected_before_the_first_call_after_end_turn_or_into_
     assert all(USER_TAG not in json.dumps(r["messages"]) for r in agent.client.requests)
 
 
+async def test_the_judge_and_the_critique_see_the_messages_read_mid_turn(agents_main):
+    """The answer must cover what the user added during the turn, so both check it against that too."""
+    seen: list[tuple[str, str]] = []
+
+    async def judge(question, answer):
+        seen.append(("judge", question))
+        return True
+
+    async def critique(question, answer, dialog_history=[], trace=None):
+        seen.append(("critique", question))
+        return None
+
+    both = settings({("judge", "enabled"): True, ("critique", "enabled"): True})
+    inbox = FakeInbox()
+    agent = make_agent(agents_main, [reply(call("c1", "slow"), stop="tool_use"), reply(text("A and B done"))], inbox)
+    agent.user_interactions.on_start = lambda name, args: inbox.deliver_user("also B")
+    agent.judge_response, agent.critique_response = judge, critique
+    await run_loop(agent, both)
+    expected = "do it\n\n[Sent while I was working]\nalso B"
+    assert seen == [("critique", expected), ("judge", expected)]
+
+    seen.clear()  # nothing read: the bare question, as before
+    plain = make_agent(agents_main, [reply(text("done"))], FakeInbox())
+    plain.judge_response, plain.critique_response = judge, critique
+    await run_loop(plain, both)
+    assert seen == [("critique", "do it"), ("judge", "do it")]
+
+
 async def test_the_forced_final_call_injects_nothing(agents_main):
     inbox = FakeInbox()
     agent = make_agent(agents_main, [reply(call("c1", "slow"), stop="tool_use"), reply(text("summary"))], inbox)
@@ -465,6 +493,36 @@ async def test_a_waiting_user_message_moves_a_call_after_a_few_seconds(agents_ma
     inbox.reset()
     results = await agent.run_tool_batch([call("c3", "slow", delay=0.3)])
     assert results[0]["content"] == "slow done" and len(host.adopted) == 2
+
+
+async def test_a_message_still_being_prepared_moves_no_call_until_it_is_ready(agents_main, monkeypatch):
+    """With the real inbox: a message still being prepared (a video being described can take minutes)
+    is no reason to move calls to the background, since the agent cannot read it yet; once it is
+    ready, the watcher sees it at its next look and the call goes."""
+    from bot import inbox as real_inbox
+
+    monkeypatch.setattr(agents_main, "TOOL_BACKGROUND_AFTER_SECONDS", 0)
+    monkeypatch.setattr(agents_main, "BACKGROUND_ON_MESSAGE_AFTER", 0.2)
+    monkeypatch.setattr(agents_main, "BACKGROUND_POLL_SECONDS", 0.1)
+    monkeypatch.setattr(real_inbox, "DRAIN_WAIT", 0.05)
+    real_inbox.reset()
+    box = real_inbox.open_inbox("7", None)
+    preparing = asyncio.get_running_loop().create_future()
+    box.deliver(real_inbox.InboxItem(kind=real_inbox.USER, future=preparing))
+    host = FakeHost()
+    agent = make_agent(agents_main, inbox=box, host=host)
+    for i in range(2):
+        results = await agent.run_tool_batch([call(f"c{i}", "slow", delay=0.5)])
+        assert results[0]["content"] == "slow done" and await box.drain() == []
+    assert host.adopted == []
+
+    asyncio.get_running_loop().call_later(0.3, preparing.set_result, real_inbox.Prepared(prompt="also B"))
+    t0 = time.monotonic()
+    results = await agent.run_tool_batch([call("c9", "slow", delay=3.0)])
+    assert PLACEHOLDER_RE.match(results[0]["content"]) and time.monotonic() - t0 < 1.0
+    assert "also B" in (await box.drain())[0]["text"]
+    host.adopted[0]["task"].cancel()
+    real_inbox.finish(box, discard=True)
 
 
 async def test_a_pending_notification_does_not_spin_the_watcher(agents_main, monkeypatch):
@@ -749,6 +807,55 @@ async def test_subagents_get_no_inbox_host_or_task_tools(agents_main, monkeypatc
     inbox.deliver_user("for the main agent")
     results = await child.run_tool_batch([call("c1", "slow", delay=0.2)])
     assert results[0]["content"] == "slow done" and host.adopted == [] and inbox.has_user_messages()
+
+
+def test_a_subagent_never_gets_a_tool_that_talks_to_or_waits_for_the_user(agents_main, monkeypatch):
+    """run_subagent may be moved to the background at any moment (even while the child waits for a
+    tap): an open question after the turn ended would take the user's next text as its answer. So
+    the child never has the NEVER_BACKGROUND tools, whatever subset was asked for."""
+    chain, _, _ = make_chain(agents_main, monkeypatch, [], FakeInbox(), FakeHost())
+    sub = chain.subagents
+    user_facing = {"ask_user_choice", "send_user_telegram_message", "send_voice_message", "set_message_reaction"}
+    assert user_facing <= set(tool_names(chain))  # the main agent keeps them
+    child = sub._child(agents_main.ANTHROPIC_MODEL, None, TurnBudget(limit=5))
+    names = {t["name"] for t in child.get_tools_schema()}
+    assert not names & agents_main.NEVER_BACKGROUND
+    assert {"schedule_reminder", "search_web", "view_image"} <= names  # everything else stays
+    assert not sub._available_tool_names() & agents_main.NEVER_BACKGROUND
+    subset = sub._child(agents_main.ANTHROPIC_MODEL, {"ask_user_choice", "search_web"}, TurnBudget(limit=5))
+    assert subset.allowed_tools == {"search_web"}
+
+
+async def test_a_backgrounded_subagents_tokens_are_recorded_as_they_arrive(agents_main, monkeypatch):
+    """run_subagent moved to the background: the child's model calls reach the turn's trace after
+    bot.agent_runner recorded the turn's usage; each one is recorded when it arrives, once."""
+    from agents.subagent import SubagentTools
+    from bot import agent_runner
+
+    monkeypatch.setattr(agents_main, "TOOL_BACKGROUND_AFTER_SECONDS", 0.1)
+
+    async def slow_stream(self, kwargs, on_event=None):
+        await asyncio.sleep(0.4)  # the child's model call
+        return reply(text("REPORT"))
+
+    monkeypatch.setattr(agents_main.AgentAnthropic, "_stream_message", slow_stream)
+    host = FakeHost()
+    parent = agents_main.AgentAnthropic(user_id="7")
+    parent.background, parent.inbox = host, FakeInbox()
+    parent.budget = TurnBudget(limit=20)
+    parent.subagents = SubagentTools(parent, settings())
+    trace = ToolTrace()
+    parent.subagents.trace = trace
+    results = await parent.run_tool_batch([call("c1", "run_subagent", task="research")], trace=trace)
+    assert PLACEHOLDER_RE.match(results[0]["content"])
+
+    rows: list[dict] = []
+    tracker = SimpleNamespace(track_usage=lambda uid, **k: rows.append(k))
+    agent_runner.record_usage(tracker, "7", trace)  # the turn ends now: nothing of the child's yet
+    agent_runner.record_late_usage(tracker, "7", trace)
+    assert rows == []
+    assert await host.adopted[0]["task"] == "REPORT"
+    assert [(r["model"], r["api_calls"], r["input_tokens"], r["output_tokens"]) for r in rows] == [(agents_main.ANTHROPIC_MODEL, 1, 10, 5)]
 
 
 async def test_a_backgrounded_subagent_stops_editing_the_status(agents_main, monkeypatch):

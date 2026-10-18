@@ -10,6 +10,7 @@ import asyncio
 import io
 import shutil
 import sys
+import threading
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -313,10 +314,11 @@ async def test_wait_reports_what_can_be_drained():
     assert await box.wait(0.05) == "timeout"
     preparing = asyncio.get_running_loop().create_future()
     box.deliver(inbox.InboxItem(kind=inbox.USER, future=preparing))
-    assert box.has_user_messages()
+    assert not box.has_user_messages() and box.has_pending()  # pending, but nothing to read yet
     assert await box.wait(0.05) == "timeout"  # not ready yet: a drain would return nothing
     asyncio.get_running_loop().call_later(0.02, preparing.set_result, Prepared(prompt="hi"))
     assert await box.wait(2) == "message"
+    assert box.has_user_messages()
     await box.drain()
     asyncio.get_running_loop().call_later(0.02, box.deliver, ready_item("done", kind=inbox.TASK))
     assert await box.wait(2) == "task"
@@ -645,6 +647,181 @@ async def test_shutdown_drops_the_unread_messages(monkeypatch, qm, later_turns):
     assert later_turns == [] and inbox.current(USER) is None
 
 
+def slow_reading(monkeypatch) -> tuple[threading.Event, threading.Event]:
+    """``_user_blocks`` (run in a thread by drain) blocks until released: (entered, release)."""
+    entered, release = threading.Event(), threading.Event()
+    original = inbox._user_blocks
+
+    def slow(*args):
+        entered.set()
+        release.wait(5)
+        return original(*args)
+
+    monkeypatch.setattr(inbox, "_user_blocks", slow)
+    return entered, release
+
+
+async def test_a_stop_while_the_agent_reads_a_message_requeues_it(monkeypatch, qm, later_turns):
+    entered, release = slow_reading(monkeypatch)  # e.g. materializing a photo or a PDF
+    started = asyncio.Event()
+
+    async def behaviour(kw, prompt, update_status):
+        started.set()
+        await until(lambda: kw["inbox"].has_pending())
+        await kw["inbox"].drain()
+        await asyncio.sleep(30)
+
+    use_agent(monkeypatch, behaviour)
+    bot = FakeBot()
+    job = turn_job(bot)
+    await qm.submit(job)
+    await started.wait()
+    await messages.on_text(msg(11, text="unread"), bot, USER)
+    await until(entered.is_set)  # drain is reading it in its thread now
+    assert await qm.cancel_current(USER, job.id) is True
+    release.set()
+    await idle(qm)
+    await inbox.flush_reactions()
+    assert [t["prompt"] for t in later_turns] == ["unread"]
+    assert bot.reactions() == [(11, "👀")]  # never marked read: it was not
+
+
+async def test_a_cancelled_drain_leaves_the_message_in_its_place(monkeypatch):
+    entered, release = slow_reading(monkeypatch)
+    bot = FakeBot()
+    box = inbox.open_inbox(USER, None)
+    first, second = ready_item("hello", message_id=11, bot=bot), ready_item("world", message_id=12, bot=bot)
+    box.deliver(first)
+    box.deliver(second)
+    task = asyncio.create_task(box.drain())
+    await until(entered.is_set)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()
+    assert box._items == [first, second] and box.drained_user_texts == [] and box.consumed_user_items == []
+    blocks = await box.drain()  # the next drain reads both, once, in order
+    assert ["hello" in t for t in texts_of(blocks)] == [True, False] and "world" in texts_of(blocks)[1]
+    assert box.drained_user_texts == ["hello", "world"] and box.consumed_user_items == [first, second]
+    await inbox.flush_reactions()
+    assert bot.reactions() == [(11, "✍"), (12, "✍")]
+
+
+async def test_an_inbox_closed_while_a_message_is_read_hands_it_back_only(monkeypatch):
+    entered, release = slow_reading(monkeypatch)
+    bot = FakeBot()
+    box = inbox.open_inbox(USER, None)
+    item = ready_item("hello", message_id=11, bot=bot)
+    box.deliver(item)
+    task = asyncio.create_task(box.drain())
+    await until(entered.is_set)
+    assert box.close() == [item]  # e.g. /cancel: the item is the leftovers' now
+    release.set()
+    assert await task == []
+    await inbox.flush_reactions()
+    assert box.drained_user_texts == [] and bot.reactions() == []
+
+
+async def test_messages_sent_during_a_turn_are_prepared_two_at_a_time(monkeypatch, qm, later_turns, quiet_media):
+    live = {"now": 0, "max": 0}
+
+    async def transcribe(path):
+        live["now"] += 1
+        live["max"] = max(live["max"], live["now"])
+        await asyncio.sleep(0.05)
+        live["now"] -= 1
+        return "words"
+
+    quiet_media.transcribe.side_effect = transcribe
+    started, gate = asyncio.Event(), asyncio.Event()
+
+    async def behaviour(kw, prompt, update_status):
+        started.set()
+        await gate.wait()
+        return "Done.", []
+
+    use_agent(monkeypatch, behaviour)
+    bot = FakeBot()
+    await qm.submit(turn_job(bot))
+    await started.wait()
+    for i in range(10):
+        await messages.on_voice(msg(100 + i, voice={"file_id": f"v{i}", "file_unique_id": f"u{i}", "duration": 3}), bot, USER)
+    await asyncio.sleep(0.1)
+    gate.set()  # the turn ends: the rest are leftovers awaited by their own turns, still two at a time
+    await idle(qm)
+    assert live["max"] == 2 and messages.PREPARE_SLOTS == 2
+    assert quiet_media.transcribe.await_count == 10 and len(later_turns) == 10
+
+
+async def test_two_documents_of_the_same_name_are_never_downloaded_at_once(monkeypatch, qm, later_turns, quiet_media):
+    writers: dict[str, int] = {}
+    peak = {"value": 0}
+
+    class SlowBot(FakeBot):
+        async def download(self, file, destination=None, **kw):
+            writers[destination] = writers.get(destination, 0) + 1
+            peak["value"] = max(peak["value"], writers[destination])
+            await asyncio.sleep(0.05)
+            await super().download(file, destination=destination)
+            writers[destination] -= 1
+
+    started, gate = asyncio.Event(), asyncio.Event()
+
+    async def behaviour(kw, prompt, update_status):
+        started.set()
+        await gate.wait()
+        return "Done.", []
+
+    use_agent(monkeypatch, behaviour)
+    bot = SlowBot({"d1": pdf_bytes(1), "d2": pdf_bytes(2)})
+    await qm.submit(turn_job(bot))
+    await started.wait()
+    for i, file_id in enumerate(("d1", "d2")):
+        await messages.on_document(msg(20 + i, document={"file_id": file_id, "file_unique_id": f"{file_id}u", "file_name": "Report.pdf"}), bot, USER)
+    gate.set()
+    await idle(qm)
+    assert bot.downloads == ["d1", "d2"] and peak["value"] == 1
+    assert len(later_turns) == 2
+
+
+async def test_slash_cancel_stops_preparing_the_messages_requeued_from_a_turn(monkeypatch, qm, later_turns, quiet_media):
+    release = asyncio.Event()
+    finished: list[str] = []
+
+    async def transcribe(path):
+        await release.wait()
+        finished.append(path)
+        return "words"
+
+    quiet_media.transcribe.side_effect = transcribe
+    started, gate = asyncio.Event(), asyncio.Event()
+
+    async def behaviour(kw, prompt, update_status):
+        started.set()
+        await gate.wait()
+        return "Done.", []  # never drains: both voice notes become turns of their own
+
+    use_agent(monkeypatch, behaviour)
+    bot = FakeBot()
+    await qm.submit(turn_job(bot))
+    await started.wait()
+    for i in range(2):
+        await messages.on_voice(msg(11 + i, voice={"file_id": f"v{i}", "file_unique_id": f"u{i}", "duration": 3}), bot, USER)
+    gate.set()
+
+    def leftovers_queued() -> bool:
+        status = qm.status(USER)
+        return inbox.current(USER) is None and status.current is not None and status.current.label == messages.VOICE_KIND and status.pending == 1
+
+    await until(leftovers_queued)  # the first awaits its transcription, the second waits behind it
+    assert await messages._cancel_for(USER) == "🛑 Stopped the current task and dropped 1 queued message(s)."
+    release.set()
+    await idle(qm)
+    await asyncio.sleep(0.05)
+    assert finished == [] and later_turns == []
+    assert not [t for t in bot.texts() if "Transcription" in t]  # no echo after the cancel
+
+
 # ---- the turn record and the quiet marker ----------------------------------------------------------------------
 async def test_the_turn_record_carries_what_was_read_during_the_turn(monkeypatch, qm, quiet_media):
     started, gate = asyncio.Event(), asyncio.Event()
@@ -695,13 +872,17 @@ async def test_a_failed_turn_record_keeps_them_too(monkeypatch, qm):
     assert record.error and record.prompt == f"first\n\n{inbox.SENT_WHILE_WORKING}\nand this" and record.prompt_blocks is None
 
 
-async def test_a_quiet_task_that_read_a_message_still_answers(monkeypatch, qm):
-    started, gate = asyncio.Event(), asyncio.Event()
+async def test_a_quiet_task_that_read_a_message_stays_quiet_and_requeues_it(monkeypatch, qm, later_turns):
+    """The task's run says nothing; the message it read gets a turn of its own on its prepared
+    prompt, ahead of a message the run did not read and of one sent after it."""
+    started, gate, read, finish = asyncio.Event(), asyncio.Event(), asyncio.Event(), asyncio.Event()
 
     async def behaviour(kw, prompt, update_status):
         started.set()
         await gate.wait()
         await kw["inbox"].drain()
+        read.set()
+        await finish.wait()
         return agent_runner.QUIET_MARKER, []
 
     use_agent(monkeypatch, behaviour)
@@ -716,10 +897,18 @@ async def test_a_quiet_task_that_read_a_message_still_answers(monkeypatch, qm):
     await started.wait()
     await messages.on_text(msg(11, text="are you there?"), bot, USER)
     gate.set()
+    await read.wait()
+    await messages.on_text(msg(12, text="and this"), bot, USER)  # joins the run, never read by it
+    finish.set()
+    await until(lambda: results)
+    await messages.on_text(msg(13, text="sent after it"), bot, USER)
     await idle(qm)
     (result,) = results
-    assert result.quiet is False and result.response == agent_runner.QUIET_ANSWERED_TEXT
-    assert agent_runner.QUIET_ANSWERED_TEXT in bot.texts()
+    assert result.quiet is True and result.response == ""
+    # the run sent nothing but its status line (which it removes): no answer of its own
+    assert [kw["text"] for kw in bot.of("send_message")] == [agent_runner.THINKING] and bot.of("send_rich_message") == []
+    assert [t["prompt"] for t in later_turns] == ["are you there?", "and this", "sent after it"]
+    assert [t["reply_to_message_id"] for t in later_turns] == [11, 12, 13]
 
 
 async def test_a_quiet_task_nobody_wrote_to_stays_quiet(monkeypatch):
