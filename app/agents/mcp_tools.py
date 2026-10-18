@@ -19,8 +19,23 @@ effort) so ``/mcp`` shows it. The reason goes to the user, the store and the tra
 in it is shown as ``mcp_store.display_url`` shows it: httpx embeds the full request URL, query string
 and all, in its status errors, and a key passed in the query must not leak that way.
 
+OAuth (``bot.oauth_flow``): a server with ``"auth": "oauth"`` connects with an
+``mcp.client.auth.OAuthClientProvider`` as the httpx2 ``auth``, over the user's stored (encrypted) tokens
+and without interactive handlers: the SDK refreshes an expired access token by itself; when the refresh
+fails or nothing is stored, the call answers ``Error: MCP server <name> needs you to sign in again (use
+/mcp).``, the record says "sign in needed" and ``/mcp`` offers the button (one retry with a forced refresh
+first when the server refused a token that still looked valid). A tool call never starts a login. A
+server without credentials is discovered with a provider over an empty in-memory storage (the probe of
+``/mcp add`` and refresh): a server that answers 401 raises ``oauth_flow.SignInRequired`` instead of an
+error. ``discover(..., oauth=connection)`` is the interactive sign-in (``oauth_flow.start_sign_in``). The
+provider and the request guard reach ``open_transport`` through the ``_CONNECTION`` context variable, so
+the transport keeps its ``(server, timeout)`` signature. Every request of a non-admin user's connection
+(redirects and the OAuth endpoints the SDK discovers included) passes ``oauth_flow.request_guard``: https
+to a public address, or it is never sent.
+
 The mcp package is imported lazily (it costs almost a second) inside ``open_transport`` and
-``client_session``, which tests replace with fakes. mcp 1.x and 2.x differ in attribute names
+``client_session``, which tests replace with fakes (``HTTP_TRANSPORT`` puts an ``httpx2.MockTransport``
+under the real ones). mcp 1.x and 2.x differ in attribute names
 (``inputSchema`` / ``input_schema``, ``mimeType`` / ``mime_type``, ``isError`` / ``is_error``) and in
 how the streamable HTTP client takes headers; ``_field`` and ``open_transport`` cover both.
 Runs in the bot process, never sandboxed.
@@ -32,10 +47,13 @@ import json
 import logging
 import re
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 from agents import content
-from bot import mcp_store
+from bot import mcp_store, oauth_flow
 
 logger = logging.getLogger(__name__)
 
@@ -206,27 +224,76 @@ def error_reason(exc: BaseException) -> str:
     return reason[:MAX_REASON_CHARS]
 
 
+def find_exception(exc: BaseException | None, kind: type | tuple, depth: int = 0) -> BaseException | None:
+    """The first ``kind`` in ``exc``, its exception-group leaves and its causes (anyio wraps a failure
+    of the transport's task group, the SDK's auth flow raises from inside httpx2)."""
+    if exc is None or depth > 12:
+        return None
+    if isinstance(exc, kind):
+        return exc
+    if isinstance(exc, BaseExceptionGroup):
+        for inner in exc.exceptions:
+            found = find_exception(inner, kind, depth + 1)
+            if found is not None:
+                return found
+    return find_exception(exc.__cause__ or exc.__context__, kind, depth + 1)
+
+
 # ---- connections (replaced by fakes in tests) ---------------------------------------------------
+@dataclass
+class Connection:
+    """Per-connection options for ``open_transport``: the OAuth connection and the request guard."""
+
+    oauth: Any = None  # bot.oauth_flow.OAuthConnection
+    guard: Any = None  # an async httpx2 request hook
+
+
+_CONNECTION: ContextVar[Connection | None] = ContextVar("mcp_connection", default=None)
+HTTP_TRANSPORT: Any = None  # tests: an httpx2 transport (MockTransport) under every client built here
+
+
+def _http_client(headers: dict | None = None, timeout: Any = None, auth: Any = None, *, hooks: list | None = None):
+    """``create_mcp_http_client`` (the SDK's timeouts) plus the request hooks; matches the SDK's
+    ``McpHttpClientFactory`` so ``sse_client`` can use it too."""
+    if HTTP_TRANSPORT is not None:
+        import httpx2
+
+        client = httpx2.AsyncClient(headers=headers, timeout=timeout or httpx2.Timeout(30.0, read=300.0), auth=auth,
+                                    transport=HTTP_TRANSPORT)
+    else:
+        from mcp.client.streamable_http import create_mcp_http_client
+
+        client = create_mcp_http_client(headers=headers, timeout=timeout, auth=auth)
+    if hooks:
+        client.event_hooks = {"request": list(hooks), "response": []}
+    return client
+
+
 @asynccontextmanager
 async def open_transport(server: dict, timeout: float):
-    """The transport of ``server`` as an async context manager yielding ``(read_stream, write_stream)``."""
+    """The transport of ``server`` as an async context manager yielding ``(read_stream, write_stream)``;
+    the OAuth provider and the request guard of ``_CONNECTION`` (set by ``open_session``) are applied."""
     url = str(server.get("url") or "")
     headers = {str(k): str(v) for k, v in (server.get("headers") or {}).items()} or None
+    options = _CONNECTION.get()
+    auth = options.oauth.provider() if options is not None and options.oauth is not None else None
+    hooks = [options.guard] if options is not None and options.guard is not None else None
     if str(server.get("transport") or "http") == "sse":
         from mcp.client.sse import sse_client
 
-        async with sse_client(url, headers=headers, timeout=timeout) as streams:
+        async with sse_client(url, headers=headers, timeout=timeout, auth=auth,
+                              httpx_client_factory=partial(_http_client, hooks=hooks)) as streams:
             yield streams[0], streams[1]
         return
     try:
-        from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client  # mcp 2.x
+        from mcp.client.streamable_http import streamable_http_client  # mcp 2.x
     except ImportError:  # pragma: no cover - mcp 1.x
         from mcp.client.streamable_http import streamablehttp_client
 
-        async with streamablehttp_client(url, headers=headers) as streams:
+        async with streamablehttp_client(url, headers=headers, auth=auth) as streams:
             yield streams[0], streams[1]
         return
-    async with create_mcp_http_client(headers=headers) as http_client:
+    async with _http_client(headers=headers, auth=auth, hooks=hooks) as http_client:
         async with streamable_http_client(url, http_client=http_client) as streams:
             yield streams[0], streams[1]
 
@@ -239,11 +306,15 @@ def client_session(read, write, timeout: float):
 
 
 @asynccontextmanager
-async def open_session(server: dict, timeout: float):
-    async with open_transport(server, timeout) as (read, write):
-        async with client_session(read, write, timeout) as session:
-            await session.initialize()
-            yield session
+async def open_session(server: dict, timeout: float, connection: Connection | None = None):
+    token = _CONNECTION.set(connection)
+    try:
+        async with open_transport(server, timeout) as (read, write):
+            async with client_session(read, write, timeout) as session:
+                await session.initialize()
+                yield session
+    finally:
+        _CONNECTION.reset(token)
 
 
 async def _list_tools(session, cursor: str | None):
@@ -312,34 +383,114 @@ class MCPTools:
         self._load()
         return self._map.get(tool_name)
 
-    # -- discovery --
-    async def discover(self, server: dict, timeout: float = DISCOVER_TIMEOUT) -> list[dict]:
-        """Connect once and list the tools as ``{name, description, input_schema}``; MCPUnreachable on failure."""
+    # -- connection policy --
+    def _trusted(self, server: dict) -> bool:
+        """The admin's servers (shared or their own) skip the public-address checks."""
+        if server.get("admin"):
+            return True
+        from bot.auth import auth  # bot/auth has no import-time side effects
+
+        return auth.is_admin(self.user_id)
+
+    def _connection(self, server: dict, oauth: Any = None) -> Connection:
+        guard = None if self._trusted(server) else oauth_flow.request_guard(str(server.get("url") or ""))
+        return Connection(oauth=oauth, guard=guard)
+
+    @staticmethod
+    def uses_oauth(server: dict) -> bool:
+        return server.get("auth") == mcp_store.AUTH_OAUTH
+
+    @staticmethod
+    def has_credentials(server: dict) -> bool:
+        """Stored headers (a bearer token, an API key header): such a server is never probed for OAuth."""
+        return bool(server.get("headers"))
+
+    async def _with_stored_sign_in(self, server: dict, run, timeout: float):
+        """``run(connection)`` over the user's stored sign-in, non-interactive. SignInRequired when nothing
+        usable is stored or the server still asks for a sign-in after one forced refresh (a token that
+        looked valid but was refused, or one without a known expiry)."""
+        storage = oauth_flow.OAuthStorage(self.user_id, server)
         try:
-            return await asyncio.wait_for(self._discover(server, timeout), timeout)
-        except asyncio.CancelledError:
+            await storage.load()
+            if not storage.has_tokens():
+                raise oauth_flow.SignInRequired()
+            for attempt in range(2):
+                try:
+                    result = await asyncio.wait_for(run(oauth_flow.OAuthConnection(storage)), timeout)
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as e:  # noqa: BLE001
+                    if find_exception(e, oauth_flow.NeedsSignIn) is None:
+                        raise
+                    if attempt == 0 and storage.can_force_refresh():
+                        storage.force_refresh()
+                        continue
+                    raise oauth_flow.SignInRequired(stale=True) from None
+                if storage.needs_signin and not storage.refreshed:  # it works again: drop the stale flag
+                    await asyncio.to_thread(mcp_store.write_oauth, self.user_id, server, needs_signin=False)
+                return result
+        finally:
+            storage.close()
+
+    async def _mark_signin_needed(self, server: dict) -> None:
+        try:
+            await asyncio.to_thread(mcp_store.mark_signin_needed, self.user_id, server)
+            if not server.get("admin"):
+                server["error"] = mcp_store.SIGN_IN_NEEDED
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Could not mark the sign-in of %s: %s", server.get("name"), e)
+
+    # -- discovery --
+    async def discover(self, server: dict, timeout: float = DISCOVER_TIMEOUT, *, oauth: Any = None) -> list[dict]:
+        """Connect once and list the tools as ``{name, description, input_schema}``.
+
+        MCPUnreachable on failure; ``oauth_flow.SignInRequired`` when the server needs a sign-in (an OAuth
+        server whose stored sign-in is missing or no longer works, or a server without credentials that
+        answered 401: then ``.storage`` holds the probe's client registration). ``oauth``: the interactive
+        connection of a sign-in; its LoginError (expired, refused, replaced) is raised as it is."""
+        try:
+            if oauth is not None:
+                return await asyncio.wait_for(self._discover(server, timeout, oauth), timeout)
+            if self.uses_oauth(server):
+                try:
+                    return await self._with_stored_sign_in(server, partial(self._discover, server, timeout), timeout)
+                except oauth_flow.SignInRequired as e:
+                    if e.stale:
+                        await self._mark_signin_needed(server)
+                    raise
+            if not self.has_credentials(server):
+                probe = oauth_flow.OAuthStorage(self.user_id, server, persist=False)
+                try:
+                    return await asyncio.wait_for(self._discover(server, timeout, oauth_flow.OAuthConnection(probe)), timeout)
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as e:  # noqa: BLE001
+                    if find_exception(e, oauth_flow.NeedsSignIn) is not None:
+                        raise oauth_flow.SignInRequired(probe) from None
+                    raise
+            return await asyncio.wait_for(self._discover(server, timeout, None), timeout)
+        except (asyncio.CancelledError, oauth_flow.SignInRequired):
             raise
         except BaseException as e:  # noqa: BLE001 - anyio raises ExceptionGroups; every reason becomes one message
             if isinstance(e, (KeyboardInterrupt, SystemExit)):
                 raise
+            login_error = find_exception(e, oauth_flow.LoginError)
+            if login_error is not None:
+                raise login_error from None
             raise MCPUnreachable(error_reason(e)) from None
 
     async def _check_host(self, server: dict) -> None:
         """A user's server must be on a public address, checked after DNS before every connection:
         the bot runs on the host network, and the record may come straight from ``mcp.json``, which
         the sandbox can write. The admin's servers (shared or their own) are trusted."""
-        if server.get("admin"):
-            return
-        from bot.auth import auth  # bot/auth has no import-time side effects
-
-        if auth.is_admin(self.user_id):
+        if self._trusted(server):
             return
         await asyncio.to_thread(mcp_store.check_public_host, str(server.get("url") or ""))
 
-    async def _discover(self, server: dict, timeout: float) -> list[dict]:
+    async def _discover(self, server: dict, timeout: float, oauth: Any = None) -> list[dict]:
         await self._check_host(server)
         tools: list[dict] = []
-        async with open_session(server, timeout) as session:
+        async with open_session(server, timeout, self._connection(server, oauth)) as session:
             cursor = None
             for _ in range(20):  # pages; a server with more than ~1000 tools is not meant for a chat bot
                 result = await _list_tools(session, cursor)
@@ -356,9 +507,18 @@ class MCPTools:
             return f"Unknown tool: {tool_name}"
         server, remote = resolved
         try:
-            result = await asyncio.wait_for(self._call(server, remote, tool_args or {}, CALL_TIMEOUT), CALL_TIMEOUT)
+            if self.uses_oauth(server):
+                run = partial(self._call, server, remote, tool_args or {}, CALL_TIMEOUT)
+                result = await self._with_stored_sign_in(server, lambda connection: run(oauth=connection), CALL_TIMEOUT)
+            else:
+                result = await asyncio.wait_for(self._call(server, remote, tool_args or {}, CALL_TIMEOUT), CALL_TIMEOUT)
         except asyncio.CancelledError:
             raise
+        except oauth_flow.SignInRequired as e:
+            logger.info("MCP call %s needs a sign-in to %s for %s", tool_name, server.get("name"), self.user_id)
+            if e.stale:  # nothing stored at all already reads as "sign in needed"
+                await self._mark_signin_needed(server)
+            return oauth_flow.SIGN_IN_ERROR.format(name=server["name"])
         except BaseException as e:  # noqa: BLE001 - a tool must never take the turn down
             if isinstance(e, (KeyboardInterrupt, SystemExit)):
                 raise
@@ -370,9 +530,9 @@ class MCPTools:
             await self._remember_error(server, None)  # it works again
         return result
 
-    async def _call(self, server: dict, remote: str, args: dict, timeout: float) -> str | list:
+    async def _call(self, server: dict, remote: str, args: dict, timeout: float, oauth: Any = None) -> str | list:
         await self._check_host(server)
-        async with open_session(server, timeout) as session:
+        async with open_session(server, timeout, self._connection(server, oauth)) as session:
             result = await session.call_tool(remote, dict(args))
         return convert_result(result)
 

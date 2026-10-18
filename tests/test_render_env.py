@@ -169,3 +169,29 @@ def test_main_rejects_json_that_is_not_an_object(tmp_path, monkeypatch):
 def test_main_usage_error_without_output_path(capsys):
     assert render_env.main([]) == 2
     assert "usage" in capsys.readouterr().err
+
+
+def test_the_sign_in_and_tunnel_settings_pass_through_like_any_variable():
+    """COMPOSE_PROFILES=tunnel in the rendered .env is what starts the cloudflared service (Compose reads
+    COMPOSE_* from the project's .env); the tunnel token and the Fernet key are secrets, written bare."""
+    fernet_key = "pLpVSHneAazkDFjhBnJqpY_tVfMKmuJI0WNWr0xee7k="
+    secrets = {"CLOUDFLARE_TUNNEL_TOKEN": "eyJhIjoiYWJjIn0", "MCP_TOKEN_KEY": fernet_key}
+    variables = {"COMPOSE_PROFILES": "tunnel", "PUBLIC_BASE_URL": "https://gall.zor.gg", "OAUTH_LISTEN": "127.0.0.1:8090"}
+    text, keys = render(secrets, variables)
+    assert keys == ["CLOUDFLARE_TUNNEL_TOKEN", "COMPOSE_PROFILES", "MCP_TOKEN_KEY", "OAUTH_LISTEN", "PUBLIC_BASE_URL"]
+    assert f"MCP_TOKEN_KEY={fernet_key}\n" in text and "COMPOSE_PROFILES=tunnel\n" in text
+    assert "PUBLIC_BASE_URL=https://gall.zor.gg\n" in text and "CLOUDFLARE_TUNNEL_TOKEN=eyJhIjoiYWJjIn0\n" in text
+
+
+def test_the_compose_file_starts_cloudflared_only_with_the_tunnel_profile():
+    import pytest
+
+    yaml = pytest.importorskip("yaml")
+    compose = yaml.safe_load((SCRIPT.parents[1] / "docker-compose.yml").read_text())
+    tunnel = compose["services"]["cloudflared"]
+    assert tunnel["profiles"] == ["tunnel"] and tunnel["image"] == "cloudflare/cloudflared:latest"
+    assert tunnel["command"] == "tunnel --no-autoupdate run" and tunnel["network_mode"] == "host"
+    assert tunnel["environment"] == ["TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-}"] and tunnel["restart"] == "unless-stopped"
+    assert all("profiles" not in s for name, s in compose["services"].items() if name != "cloudflared")
+    deploy = (SCRIPT.parent / "remote_deploy.sh").read_text()
+    assert "docker compose config --services 2>/dev/null | grep -qx cloudflared" in deploy  # pulled only when active

@@ -8,7 +8,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 
-from bot import background, runtime
+from bot import background, oauth_flow, oauth_web, runtime
 from bot.auth import auth
 from bot.config import config
 from bot.handlers import build_root_router, sandbox_ui
@@ -57,9 +57,12 @@ async def on_startup(bot: Bot) -> None:
     runtime.background_tasks.append(asyncio.create_task(reminders_loop(bot, runtime.queue), name="reminders-loop"))
     # The admin's MCP servers (MCP_SERVERS_FILE) get their tool cache refreshed once, off the startup path.
     runtime.background_tasks.append(asyncio.create_task(refresh_admin_servers(), name="mcp-admin-refresh"))
+    # The callback page of MCP sign-ins (only with PUBLIC_BASE_URL; a bind failure is logged, never fatal).
+    runtime.background_tasks.append(asyncio.create_task(oauth_web.serve(), name="oauth-web"))
     await start_sandbox_sessions(bot)
     await register_commands(bot)
     me = await bot.me()
+    oauth_web.set_bot_username(me.username)  # the "Open Telegram" link of the sign-in page
     logger.info("Bot @%s is running (streaming=%s, local_api=%s)", me.username, config.streaming_enabled, config.use_local_api)
 
 
@@ -85,6 +88,7 @@ async def on_shutdown(bot: Bot) -> None:
     if runtime.background_tasks:
         await asyncio.gather(*runtime.background_tasks, return_exceptions=True)
     runtime.background_tasks.clear()
+    await oauth_flow.shutdown()  # MCP sign-ins still waiting for the browser: cancelled, nothing announced
     await background.shutdown()  # the agents' background tool calls: cancelled, nothing announced
     await runtime.queue.shutdown()  # running turns drop their unread messages (cancel reason "shutdown")
     await sandbox_ui.shutdown_sessions()  # after the jobs: no turn starts a session behind it

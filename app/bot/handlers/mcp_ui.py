@@ -16,24 +16,41 @@ shown without user info, query or token::
                                  URL is rejected, so the token does not stay in the chat
     /mcp remove <name>           /mcp refresh [name]          /mcp help
 
+OAuth: ``/mcp add <name> <url>`` without a token probes the server with the SDK's OAuth provider; when it
+asks for a sign-in (``oauth_flow.SignInRequired``) the record is saved at once as ``auth: "oauth"``, "sign
+in needed" (with the probe's client registration, encrypted), and ``oauth_flow.start_sign_in`` runs in
+the background: it edits the "Connecting…" message into the 🔐 URL button and later into "✅ <name>
+connected (N tools)". A token given explicitly keeps the Bearer header (no OAuth).
+
 Buttons under the list, per user server: toggle (``mcp_toggle_<name>``), refresh
 (``mcp_refresh_<name>``), remove (``mcp_remove_<name>`` → a confirmation with ``mcp_rm_<name>`` /
-``mcp_back``), plus "🔄 Refresh all" (``mcp_refreshall``). Names are ``[a-z0-9_-]`` so the data is
-split as ``mcp_<action>_<name>``; actions carry no underscore. Store calls run in worker threads;
-discovery goes through ``discover_tools`` (lazy ``agents`` import, replaced in tests). The admin
-sees the admin servers like everyone else; only the admin's ``/mcp refresh`` re-discovers them too,
-as does ``refresh_admin_servers`` at startup (``bot/app.py``).
+``mcp_back``; removing a server deletes its sign-in with the record), plus "🔄 Refresh all"
+(``mcp_refreshall``). Per OAuth server (the user's or an admin's, each user signs in with their own
+account): "🔐 Sign in to <name>" (``mcp_signin_<name>``, the same background sign-in) while the sign-in
+is missing or broken, "🚪 Sign out of <name>" (``mcp_signout_<name>``: the tokens are deleted, the server
+stays) while signed in. Names are ``[a-z0-9_-]`` so the data is split as ``mcp_<action>_<name>``; actions
+carry no underscore. Store calls run in worker threads; discovery goes through ``discover_tools`` (lazy
+``agents`` import, replaced in tests). The admin sees the admin servers like everyone else; only the
+admin's ``/mcp refresh`` re-discovers them too, as does ``refresh_admin_servers`` at startup
+(``bot/app.py``, with the admin's own sign-ins: an OAuth admin server's tool cache is filled once the
+admin has signed in to it).
+
+``pasted_callback``: the copy-paste fallback (no public callback endpoint). A plain text starting with
+``oauth_flow.LOOPBACK_REDIRECT`` while the chat has a pending sign-in resolves it (its ``state`` must be
+that user's) and the message, which holds the code, is deleted. Without a pending sign-in the text goes
+on to the agent like any other.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+from functools import partial
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from bot import mcp_store
+from bot import mcp_store, oauth_flow
 from bot.auth import auth
 from bot.ui import answer_md, delete_quietly, edit_md, escape_markdown
 
@@ -55,6 +72,9 @@ HELP = (
     "`/mcp refresh [name]` — rediscover the tools\n"
     "`/mcp` — the list with toggle, refresh and remove buttons\n\n"
     "Example: `/mcp add github https://api.githubcopilot.com/mcp/ ghp_xxx`\n\n"
+    "Services with an account (Notion, Linear, Sentry, …): add them without a token, e.g. "
+    "`/mcp add notion https://mcp.notion.com/mcp`, and tap 🔐 Sign in. The sign-in is stored encrypted and "
+    "renewed by itself; `/mcp` shows it with Sign in and Sign out buttons.\n\n"
     "_Changing the server set resets my saved reasoning for this chat once; the conversation itself stays._"
 )
 
@@ -68,25 +88,34 @@ async def discover_tools(user_id: str, server: dict) -> list[dict]:
 
 
 async def refresh_one(user_id: str, server: dict) -> dict:
-    """Discover and store; the updated record (the error inside when the server could not be reached)."""
+    """Discover and store; the updated record (the error inside when the server could not be reached,
+    "sign in needed" and ``auth: "oauth"`` when it asks for a sign-in: never an interactive one here)."""
+    auth_flag = None
     try:
         tools = await discover_tools(user_id, server)
         error = None
+    except oauth_flow.SignInRequired:
+        tools, error, auth_flag = None, mcp_store.SIGN_IN_NEEDED, mcp_store.AUTH_OAUTH
     except Exception as e:  # noqa: BLE001 - every reason is a message for the user
         tools, error = None, str(e) or type(e).__name__
     if server.get("admin"):
-        return mcp_store.with_tools(server, tools, error)
-    updated = await asyncio.to_thread(mcp_store.update_user_tools, user_id, server["name"], tools, error)
+        updated = mcp_store.with_tools(server, tools, error)
+        if auth_flag:
+            updated["auth"] = auth_flag
+        return updated
+    updated = await asyncio.to_thread(mcp_store.update_user_tools, user_id, server["name"], tools, error, auth=auth_flag)
     return updated or mcp_store.with_tools(server, tools, error)
 
 
 async def refresh_admin_servers() -> None:
-    """Re-discover every enabled admin server and rewrite the cache (startup task, admin /mcp refresh)."""
+    """Re-discover every enabled admin server and rewrite the cache (startup task, admin /mcp refresh).
+    An OAuth admin server is discovered with the admin's own sign-in (none yet: "sign in needed")."""
     try:
         servers = await asyncio.to_thread(mcp_store.load_admin)
         if not servers:
             return
-        refreshed = await asyncio.gather(*(refresh_one("admin", s) for s in servers if s.get("enabled", True)))
+        owner = getattr(auth, "admin_id", None) or "admin"
+        refreshed = await asyncio.gather(*(refresh_one(owner, s) for s in servers if s.get("enabled", True)))
         by_name = {s["name"]: s for s in refreshed}
         merged = [by_name.get(s["name"], s) for s in servers]
         await asyncio.to_thread(mcp_store.save_admin_cache, merged)
@@ -114,8 +143,9 @@ def describe(server: dict) -> str:
     if headers:
         detail += f" · {headers}"
     lines = [first, f"    {detail}"]
-    if server.get("error"):
-        lines.append(f"    ⚠️ {escape_markdown(str(server['error']))}")
+    error = server.get("error")
+    if error and not (server.get("auth") == mcp_store.AUTH_OAUTH and error == mcp_store.SIGN_IN_NEEDED):
+        lines.append(f"    ⚠️ {escape_markdown(str(error))}")  # (the 🔐 state above already says "sign in needed")
     return "\n".join(lines)
 
 
@@ -125,18 +155,37 @@ def render(servers: list[dict]) -> str:
     return "\n\n".join([HEADER, *(describe(s) for s in servers), "`/mcp help` for the commands"])
 
 
+def signed_in(server: dict) -> bool:
+    return server.get("oauth_state") == mcp_store.STATE_SIGNED_IN
+
+
+def oauth_row(server: dict) -> list[InlineKeyboardButton]:
+    """"🔐 Sign in to <name>" while the sign-in is missing or broken, else "🚪 Sign out of <name>"."""
+    name = server["name"]
+    if signed_in(server):
+        return [InlineKeyboardButton(text=f"🚪 Sign out of {name}", callback_data=f"mcp_signout_{name}")]
+    return [InlineKeyboardButton(text=f"🔐 Sign in to {name}", callback_data=f"mcp_signin_{name}")]
+
+
 def keyboard(servers: list[dict]) -> InlineKeyboardMarkup | None:
     rows = []
+    own = 0
     for server in servers:
+        is_oauth = server.get("auth") == mcp_store.AUTH_OAUTH
         if server.get("admin"):
+            if is_oauth:  # each user signs in to a shared OAuth server with their own account
+                rows.append(oauth_row(server))
             continue
         name = server["name"]
+        own += 1
         rows.append([
             InlineKeyboardButton(text=f"{'✅' if server.get('enabled', True) else '⬜'} {name}", callback_data=f"mcp_toggle_{name}"),
             InlineKeyboardButton(text="🔄", callback_data=f"mcp_refresh_{name}"),
             InlineKeyboardButton(text="🗑", callback_data=f"mcp_remove_{name}"),
         ])
-    if rows:
+        if is_oauth:
+            rows.append(oauth_row(server))
+    if own:
         rows.append([InlineKeyboardButton(text="🔄 Refresh all", callback_data=REFRESH_ALL)])
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
@@ -149,7 +198,8 @@ def confirm_keyboard(name: str) -> InlineKeyboardMarkup:
 
 
 async def servers_of(user_id: str) -> list[dict]:
-    return await asyncio.to_thread(mcp_store.all_servers, user_id)
+    """The user's servers and the admin's, OAuth ones with this user's ``oauth_state``."""
+    return await asyncio.to_thread(partial(mcp_store.all_servers, user_id, with_state=True))
 
 
 async def show_list(message: Message, user_id: str, *, edit: bool) -> None:
@@ -237,10 +287,24 @@ async def add_command(message: Message, user_id: str, args: list[str]) -> None:
     try:
         tools = await discover_tools(user_id, server)
         server = mcp_store.with_tools(server, tools)
+    except oauth_flow.SignInRequired as e:
+        await begin_sign_in(user_id, server, status, e.storage)
+        return
     except Exception as e:  # noqa: BLE001
         server = mcp_store.with_tools(server, None, str(e) or type(e).__name__)
     await asyncio.to_thread(mcp_store.add_user_server, user_id, server)
     await edit_md(status, added_text(server))
+
+
+async def begin_sign_in(user_id: str, server: dict, status: Message, probe: "oauth_flow.OAuthStorage | None") -> None:
+    """The server asked for a sign-in: save it now (OAuth, "sign in needed", the probe's client registration,
+    any older record of that name and its sign-in replaced), then sign in in the background, reporting in
+    ``status``. A timeout leaves the record for "🔐 Sign in" in /mcp."""
+    record = {**mcp_store.with_tools(server, None, mcp_store.SIGN_IN_NEEDED), "auth": mcp_store.AUTH_OAUTH}
+    secrets = probe.snapshot() if probe is not None else {}
+    record["oauth"] = await asyncio.to_thread(mcp_store.seal_oauth, user_id, record, secrets)
+    await asyncio.to_thread(mcp_store.add_user_server, user_id, record)
+    oauth_flow.start_sign_in(user_id, record, status)
 
 
 async def remove_command(message: Message, user_id: str, args: list[str]) -> None:
@@ -310,7 +374,45 @@ async def mcp_button(callback: CallbackQuery, user_id: str) -> None:
     elif action == "remove" and name:
         await edit_md(message, f"🗑 Remove *{escape_markdown(name)}* and its tools?", confirm_keyboard(name))
     elif action == "rm" and name:
-        await asyncio.to_thread(mcp_store.remove_user_server, user_id, name)
+        await asyncio.to_thread(mcp_store.remove_user_server, user_id, name)  # its sign-in goes with the record
+        await show_list(message, user_id, edit=True)
+    elif action == "signin" and name:
+        server = mcp_store.find(await servers_of(user_id), name)
+        if server is None or server.get("auth") != mcp_store.AUTH_OAUTH:
+            await show_list(message, user_id, edit=True)
+            return
+        status = await answer_md(message, f"🔌 Connecting to *{escape_markdown(name)}*…")
+        oauth_flow.start_sign_in(user_id, server, status)
+    elif action == "signout" and name:
+        server = mcp_store.find(await servers_of(user_id), name)
+        if server is not None and server.get("auth") == mcp_store.AUTH_OAUTH:
+            await asyncio.to_thread(mcp_store.clear_oauth, user_id, server)
+            logger.info("MCP sign-out of %s for %s", name, user_id)
         await show_list(message, user_id, edit=True)
     else:
         logger.warning("Unknown mcp callback from %s: %r", user_id, callback.data)
+
+
+# ---- the copy-paste fallback of a sign-in ------------------------------------------------------
+PASTE_EXPIRED = "⌛ This sign-in link has expired or was already used. Start again with /mcp."
+
+
+async def _pasted_while_pending(message: Message) -> bool:
+    """Filter: a pasted loopback callback URL while the chat has a pending sign-in. Async on purpose:
+    aiogram runs a plain function filter in a worker thread, and the pending logins belong to the loop."""
+    return (message.chat is not None and oauth_flow.is_pasted_callback(message.text)
+            and oauth_flow.has_pending(str(message.chat.id)))
+
+
+@router.message(F.text, _pasted_while_pending)
+async def pasted_callback(message: Message, user_id: str) -> None:
+    params = oauth_flow.parse_callback_url(message.text or "")
+    await delete_quietly(message)  # it holds the authorization code
+    login = oauth_flow.resolve(params["state"], code=params["code"], error=params["error"],
+                               error_description=params["error_description"], iss=params["iss"], user_id=user_id)
+    if login is None:
+        await answer_md(message, PASTE_EXPIRED)
+        return
+    logger.info("Pasted OAuth callback for %s of %s", login.server, user_id)
+    if params["code"] and not params["error"]:
+        await answer_md(message, f"🔐 Got it: finishing the sign-in to *{escape_markdown(login.server)}*…")

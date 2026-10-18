@@ -449,6 +449,8 @@ ROUTING = {
     "mcp_toggle_github": "mcp_ui.mcp_button",
     "mcp_rm_github": "mcp_ui.mcp_button",
     "mcp_refreshall": "mcp_ui.mcp_button",
+    "mcp_signin_notion": "mcp_ui.mcp_button",
+    "mcp_signout_notion": "mcp_ui.mcp_button",
     "setp_preset_fast": "settings_ui.settings_page_button",
     "setp_ui_advanced": "settings_ui.settings_page_button",
     "settings_preset_fast": "settings_ui.settings_button",
@@ -518,7 +520,8 @@ def test_every_callback_family_reaches_its_own_handler(tmp_path):
 
 # ---- message routing ----------------------------------------------------------------------
 # scenario -> (message spec, first handler in router order). "pending": the chat has a pending
-# ✏️ Edit text (reminders_ui._pending_edits), whose handler sits on the ui router before chat.
+# ✏️ Edit text (reminders_ui._pending_edits), whose handler sits on the ui router before chat. "login": the
+# chat has a pending MCP sign-in (oauth_flow), so a pasted loopback callback URL goes to mcp_ui.
 MESSAGE_ROUTING = {
     "plain text": ({"text": "hello"}, "messages.on_text"),
     "text while an edit is pending": ({"text": "call mom", "pending": True}, "reminders_ui.reminder_edit_text"),
@@ -527,6 +530,11 @@ MESSAGE_ROUTING = {
     "/reminders while an edit is pending": ({"text": "/reminders", "pending": True}, "reminders_ui.reminders_command"),
     "/cancel while an edit is pending": ({"text": "/cancel", "pending": True}, "messages.cancel_command"),
     "photo": ({"photo": True}, "messages.on_photo"),
+    "pasted sign-in URL while a sign-in is pending": (
+        {"text": "http://localhost:8765/oauth/callback?code=c&state=s", "login": True}, "mcp_ui.pasted_callback"),
+    "pasted sign-in URL without a pending sign-in": (
+        {"text": "http://localhost:8765/oauth/callback?code=c&state=s"}, "messages.on_text"),
+    "plain text while a sign-in is pending": ({"text": "hello", "login": True}, "messages.on_text"),
 }
 
 
@@ -539,6 +547,7 @@ def test_every_message_kind_reaches_its_own_handler(tmp_path):
         "from datetime import datetime, timezone\n"
         "from types import SimpleNamespace\n"
         "from aiogram.types import Chat, Location, Message, PhotoSize, User\n"
+        "from bot import oauth_flow\n"
         "from bot.handlers import build_root_router, reminders_ui\n"
         "root = build_root_router()\n"
         "def walk(r):\n"
@@ -550,6 +559,9 @@ def test_every_message_kind_reaches_its_own_handler(tmp_path):
         "bot = SimpleNamespace(id=999)\n"
         "async def matches(spec):\n"
         "    reminders_ui.reset()\n"
+        "    oauth_flow.reset()\n"
+        "    if spec.get('login'):\n"
+        "        oauth_flow.register('s', '42', 'notion')\n"
         "    if spec.get('pending'):\n"
         "        reminders_ui._pending_edits['42'] = ('abcd1234', time.monotonic() + 60)\n"
         "    extra = {}\n"
@@ -587,3 +599,6 @@ def test_every_message_kind_reaches_its_own_handler(tmp_path):
     # the pending-edit handler never sees a text when no edit is pending, nor a command when one is
     for name in ("plain text", "/reminders while an edit is pending", "/cancel while an edit is pending"):
         assert "reminders_ui.reminder_edit_text" not in found[name], (name, found[name])
+    # the pasted-URL handler takes only a loopback callback URL, and only while a sign-in is pending
+    for name in ("plain text", "pasted sign-in URL without a pending sign-in", "plain text while a sign-in is pending"):
+        assert "mcp_ui.pasted_callback" not in found[name], (name, found[name])

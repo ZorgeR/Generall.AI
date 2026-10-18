@@ -28,5 +28,6 @@ markdown>=3.5 # create_document md/html rendering
 trafilatura>=1.8.0 # download_webpage readable-text extraction
 python-docx>=1.1.0 # tests of secure_container/scripts/render_document.py (the sandbox renders docx)
 pypdf>=4 # PDF page count and text extraction (documents to the agent, read_document)
-mcp>=2.0 # MCP client: the user's own tool servers (/mcp, agents/mcp_tools.py)
+mcp>=2.2 # MCP client: the user's own tool servers (/mcp, agents/mcp_tools.py), its OAuthClientProvider for sign-ins (bot/oauth_flow.py)
+cryptography>=43.0 # Fernet encryption of stored MCP sign-ins (bot/mcp_store.py), the self-signed callback certificate (bot/oauth_web.py)
 # timezonefinder>=6.5 # optional: time zone from a shared Telegram location (bot/timezones.py imports it lazily; without it the bot asks for the zone name)
