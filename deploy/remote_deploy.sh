@@ -14,6 +14,9 @@
 # checkout to REF, installs the .env the workflow uploaded as .env.new (the old one is
 # kept as .env.bak), rebuilds and restarts the compose stack and waits until the bot
 # container is running and has logged "is running". Nothing here touches data/.
+# Compose reads COMPOSE_PROFILES from that .env: with COMPOSE_PROFILES=tunnel the
+# cloudflared service is pulled and started too (`up --remove-orphans` keeps a
+# service of a disabled profile; stop it with `docker compose --profile tunnel stop`).
 #
 # Everything lives in functions and the last line calls main: the script arrives on
 # stdin, and bash reads a function definition completely before running anything, so
@@ -133,6 +136,13 @@ main() {
 
   log "Pulling the telegram-bot-api image (best effort; rich messages need Bot API >= 10.1)"
   docker compose pull --quiet telegram-bot-api || echo "WARNING: pull failed, keeping the current image"
+
+  # Profile services (cloudflared with COMPOSE_PROFILES=tunnel in .env) are started by the "up" below;
+  # `config --services` lists only the active ones, so nothing is pulled for a disabled profile.
+  if docker compose config --services 2>/dev/null | grep -qx cloudflared; then
+    log "Pulling the cloudflared image (best effort; COMPOSE_PROFILES=tunnel)"
+    docker compose pull --quiet cloudflared || echo "WARNING: pull failed, keeping the current image"
+  fi
 
   log "Building the bot image"
   docker compose build --pull bot

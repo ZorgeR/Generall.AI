@@ -35,5 +35,14 @@ services:
     env_file:
       - .env
 
+  cloudflared: # Cloudflare Tunnel: https://<PUBLIC_BASE_URL host>/oauth/* -> the bot's sign-in callback on localhost:8090
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel"] # started only with COMPOSE_PROFILES=tunnel (in .env, rendered from the PROD environment)
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-}
+    network_mode: host # the bot uses host networking, so localhost:8090 is reachable from here
+    restart: unless-stopped
+
 volumes:
   telegram-bot-api-data:

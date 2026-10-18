@@ -62,7 +62,7 @@ GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bo
 - **🧠 Persistent Memory**: Maintain conversation context across sessions
 - **👤 Profile memory**: the agent keeps a short profile of durable facts about you (name, city, preferences, projects)
   that you can see and clear with `/profile`; say "remember that …" or "forget …"
-- **🔌 MCP servers**: connect your own Model Context Protocol tool servers with `/mcp` and the agent uses their tools
+- **🔌 MCP servers**: connect your own Model Context Protocol tool servers with `/mcp` (a token, or a one-tap OAuth sign-in for Notion, Linear, Sentry, …) and the agent uses their tools
 - **❓ /help and a command menu**: `/help` lists what the bot can do, the commands and example prompts; the commands
   show up in Telegram's "/" menu
 - **📊 /usage**: your own usage for the last 30 days (actions, tokens, estimated cost, reminders, workspace size)
@@ -337,6 +337,18 @@ Connect any Model Context Protocol server over streamable HTTP (or legacy SSE):
 their tool counts and ✅/⬜ toggles. The server's tools become `mcp_<server>_<tool>` for the agent, text
 and image results included. An administrator can offer servers to every user through a JSON file
 (`MCP_SERVERS_FILE`). Changing the server set resets the stored reasoning once; the conversation stays.
+
+**Sign in to MCP servers (OAuth).** Hosted servers that need an account (Notion, Linear, Atlassian,
+Sentry, …) take no token: `/mcp add notion https://mcp.notion.com/mcp` answers with a 🔐 *Sign in to
+notion* button; you sign in in the browser, the provider sends you back to the bot's sign-in page and the
+chat message turns into "✅ notion connected (N tools)". The bot registers itself with the provider,
+uses PKCE, stores the tokens encrypted (`MCP_TOKEN_KEY`, in bot-only state the sandbox and the agent's file
+tools cannot reach) and refreshes them by itself; when a refresh
+fails a tool answers "needs you to sign in again" and `/mcp` shows 🔐 *Sign in to …* (or 🚪 *Sign out of …*
+while signed in). Shared OAuth servers: each user signs in with their own account. Without a public
+sign-in page (`PUBLIC_BASE_URL`, below) the browser ends on an error page after the sign-in: copy its
+whole address and send it to the bot. Never forward a sign-in link: whoever completes it connects *their*
+account to the bot user who asked for it (a link works once, for 10 minutes).
 
 ### 🌐 Web reading and headless browsing
 
@@ -615,7 +627,22 @@ parentheses; see the commented block in `.env.example`):
   `{"servers": [{"name", "url", "transport": "http"|"sse", "headers": {...}, "enabled": true}]}` whose
   servers are offered to every user (read-only in `/mcp`; users add their own with `/mcp add`). The bot
   keeps the discovered tools next to it in `<name>.cache.json`, refreshed at startup and by the admin's
-  `/mcp refresh`.
+  `/mcp refresh`. A server that needs an OAuth sign-in (`"auth": "oauth"`, or found at startup) gets its
+  tools once the admin has signed in to it from `/mcp`; every user then signs in with their own account.
+
+### 🔐 MCP sign-ins (OAuth)
+
+- `PUBLIC_BASE_URL` (e.g. `https://gall.zor.gg`): turns on the sign-in page; providers send users back to
+  `PUBLIC_BASE_URL/oauth/callback`. Unset: the copy-paste fallback.
+- `OAUTH_LISTEN` (default `127.0.0.1:8090`): where the bot's small sign-in server listens, plain HTTP
+  for a tunnel or a reverse proxy. Port 443 (or `OAUTH_TLS=on`) serves HTTPS with `OAUTH_TLS_CERT` /
+  `OAUTH_TLS_KEY` (default `data/tls/<host>.pem` / `.key`) or, when those are missing, a self-signed
+  certificate the bot generates once; `OAUTH_TLS=off` forces plain HTTP.
+- `MCP_TOKEN_KEY`: the key that encrypts stored sign-ins (a Fernet key: `python -c "from cryptography.fernet
+  import Fernet; print(Fernet.generate_key().decode())"`). Keep it as a secret and never lose it; without it
+  the bot generates `data/.mcp_token_key` and warns. `MCP_TOKEN_KEY_OLD` (comma-separated) keeps old keys
+  readable during a rotation. A lost key only signs everyone out.
+- `COMPOSE_PROFILES=tunnel` and `CLOUDFLARE_TUNNEL_TOKEN`: start the `cloudflared` container (below).
 
 ### ☁️ S3 Storage Configuration
 
@@ -708,6 +735,23 @@ running and to log `is running`. If it does not, the job fails and prints `docke
 last log lines (the previous commit and `.env.bak` are named for a manual rollback). `data/` is never
 touched, and a concurrency group runs deploys one at a time.
 
+### 🔐 Hosting the sign-in page
+
+MCP sign-ins return to `https://<your host>/oauth/callback`. The recommended setup is a **Cloudflare
+Tunnel**: no inbound port, no certificate. In Cloudflare Zero Trust → Networks → Tunnels → *Create a
+tunnel* (Cloudflared), copy the token, add a *Public hostname* `gall.zor.gg` with path `oauth/*` and
+service `HTTP` → `localhost:8090` (delete an existing A record of that host first; the tunnel creates its
+own DNS record). Then in `PROD`: `CLOUDFLARE_TUNNEL_TOKEN` (secret), `COMPOSE_PROFILES=tunnel`,
+`PUBLIC_BASE_URL=https://gall.zor.gg` and `MCP_TOKEN_KEY` (secret, generated once). Deploy and open
+`https://gall.zor.gg/oauth/health`: it answers `ok`.
+
+Alternatives: let the bot serve HTTPS itself on 443 (`OAUTH_LISTEN=0.0.0.0:443`, a proxied DNS record):
+Cloudflare SSL mode **Full** works with the bot's self-signed certificate, **Full (strict)** needs a
+Cloudflare Origin Certificate saved as `data/tls/<host>.pem` and `data/tls/<host>.key`; set the mode for
+that hostname with a Configuration Rule instead of changing the whole zone. **Flexible** is not supported
+(it talks plain HTTP to port 80). Or put any reverse proxy in front that forwards `/oauth/` to
+`127.0.0.1:8090`.
+
 ## ❓ Troubleshooting
 
 - **🤖 Bot not responding**: Check your Telegram token and allowed chat IDs
@@ -722,6 +766,9 @@ touched, and a concurrency group runs deploys one at a time.
   secure-container:<hash>`); the first start after such a change takes several minutes
 - **🔌 An MCP tool answers "unreachable"**: check the URL and token with `/mcp` (the last error is shown
   there) and `/mcp refresh <name>` after fixing the server
+- **🔐 An MCP sign-in link ends on "This sign-in link has expired"**: links work for 10 minutes and once;
+  tap 🔐 *Sign in to …* in `/mcp` again. No sign-in page at all: check `https://<host>/oauth/health` and the
+  startup log line "OAuth callback endpoint listening on …"
 - **🕒 Sharing a location answers "I can't tell the time zone"**: the optional `timezonefinder` package is not
   installed (a commented line in `app/requirements.txt`); install it, or set the zone with `/timezone <city>`
 - **❌ "The AI provider is rate-limiting us" / "is overloaded"**: the bot already retried three times with
