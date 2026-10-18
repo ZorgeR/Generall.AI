@@ -1,7 +1,10 @@
 """ContainerManager.run_script: bundled sandbox scripts run from a unique workspace copy, always in a
 one-off container (run_one_shot) and without the saved-package replay."""
 import importlib
+import os
+import re
 import shlex
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -176,3 +179,48 @@ def test_run_command_keyword_signature_is_backwards_compatible(manager):
     manager.docker_client, runs = _fake_docker(FakeContainer(status=2, logs=b"bad"))
     result = manager.run_command("7", "false", 10, False)
     assert result.startswith("Error (exit code 2):") and runs[0]["mem_limit"] == "512m"
+
+
+def test_workspace_temp_files_are_never_chmodded_through_a_swapped_link(manager, monkeypatch, tmp_path):
+    """The user's sandbox session can replace a workspace file with a link at any moment. The temp
+    files (run_script's copy, run_python_code, run_shell_script, the one-off setup script) were
+    written first and chmodded by path afterwards, so a link swapped in between made the root bot
+    chmod its target. They are created with their mode in one step now; a link in their place at
+    the end is removed, never followed."""
+    outside = tmp_path / "outside.bin"
+    outside.write_text("keep")
+    os.chmod(outside, 0o600)
+    user_dir = manager.base_data_path / "7"
+    user_dir.mkdir(parents=True)
+    (user_dir / "installed_packages.txt").write_text("jq\n")  # the one-off path writes temp_setup_*.sh
+    modes = {}
+    real_chmod = os.chmod
+
+    def chmod_after_a_swap(path, mode, *args, **kwargs):
+        target = Path(path)
+        if target.parent == user_dir and target.name.startswith("temp_"):
+            target.unlink()
+            target.symlink_to(outside)  # what a background process in the session could do
+        return real_chmod(path, mode, *args, **kwargs)
+
+    container = FakeContainer(logs=b"done")
+
+    def run(**kwargs):  # every temp file the command names, and those its setup script names
+        text = kwargs["command"] if isinstance(kwargs["command"], str) else " ".join(kwargs["command"])
+        names = re.findall(r"/home/runner/workspace/(temp_\w+\.\w+)", text)
+        for name in list(names):
+            if name.startswith("temp_setup_"):
+                names += re.findall(r"/home/runner/workspace/(temp_\w+\.\w+)", (user_dir / name).read_text())
+        for name in names:
+            st = os.lstat(user_dir / name)
+            modes[name.split("_")[1]] = (stat.S_IMODE(st.st_mode), stat.S_ISREG(st.st_mode))
+        return container
+
+    manager.docker_client = SimpleNamespace(containers=SimpleNamespace(run=run, get=lambda name: container))
+    monkeypatch.setattr(os, "chmod", chmod_after_a_swap)
+    manager.run_script("7", "browse.py", ["https://x"])
+    manager.run_python_code("7", "print(1)")
+    manager.run_shell_script("7", "echo hi")
+    assert stat.S_IMODE(os.stat(outside).st_mode) == 0o600 and outside.read_text() == "keep"
+    assert modes == {kind: (0o755, True) for kind in ("tool", "setup", "code", "script")}
+    assert list(user_dir.glob("temp_*")) == []

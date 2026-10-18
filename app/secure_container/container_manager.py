@@ -2,10 +2,8 @@ import os
 import subprocess
 import uuid
 import logging
-import tempfile
 import json
 import shlex
-import shutil
 import threading
 from pathlib import Path
 import docker
@@ -73,7 +71,8 @@ class ContainerManager:
     (``secure_container.sessions``) when SANDBOX_SESSIONS is on and the session manager is up.
     When no session can start (memory, caps, a refused egress filter, a Docker error) or sessions
     are off, the command runs in a one-off container created for the call and removed afterwards,
-    as before. ``run_script`` (browse_webpage, document rendering) is always one-off.
+    as before (with SANDBOX_EGRESS_FILTER=required and the filter not active: without network, see
+    ``_one_shot_network``). ``run_script`` (browse_webpage, document rendering) is always one-off.
     """
     
     def __init__(self, base_data_path="./data", host_data_path=None):
@@ -313,7 +312,8 @@ class ContainerManager:
 
         Blocks until a sandbox slot is free (see MAX_SANDBOX_CONTAINERS). ``shell=True`` runs it
         through ``bash -lc`` (otherwise Docker splits the string itself, no shell syntax);
-        ``replay_packages`` reinstalls the user's saved packages first (forces network on)."""
+        ``replay_packages`` reinstalls the user's saved packages first (the validated names of
+        ``sessions.persisted_packages``; forces network on)."""
         with _SANDBOX_SLOTS:
             return self._run_command_in_slot(user_id, command, timeout, network_enabled, mem_limit,
                                              shell=shell, replay_packages=replay_packages)
@@ -343,8 +343,9 @@ class ContainerManager:
         user_dir = self.ensure_user_directory(user_id)
         target_file, file_in_container = self._workspace_file(user_dir, "temp_tool", ".py")
         try:
-            shutil.copy(source, target_file)
-            os.chmod(target_file, 0o755)
+            # created with its mode in one step, never through a link: the user's sandbox session
+            # can swap a workspace path for a link at any moment, and the bot is root
+            sessions.write_new_file(user_dir, target_file.name, source.read_bytes(), 0o755)
             # -I (isolated): the script's directory is the user's workspace, where the model writes
             # files; without it a workspace json.py/random.py or a `pip install --user` copy of
             # openpyxl/playwright would shadow what the script imports. The image installs the
@@ -352,11 +353,15 @@ class ContainerManager:
             command = " ".join([f"python -I {file_in_container}"] + [shlex.quote(str(a)) for a in args])
             return self.run_one_shot(user_id, command, timeout, network_enabled, mem_limit, replay_packages=False)
         finally:
-            try:
-                if target_file.exists():
-                    target_file.unlink()
-            except Exception as e:
-                logger.error(f"Error removing temporary script {target_file}: {str(e)}")
+            self._remove_workspace_file(target_file)
+
+    @staticmethod
+    def _remove_workspace_file(path):
+        """Remove a per-call workspace file (unlink never follows a link; a missing one is fine)."""
+        try:
+            Path(path).unlink(missing_ok=True)
+        except Exception as e:
+            logger.error(f"Error removing temporary file {path}: {str(e)}")
 
     @staticmethod
     def _workspace_file(user_dir, prefix, suffix):
@@ -372,10 +377,18 @@ class ContainerManager:
 
     def _one_shot_network(self, network_enabled):
         """docker run kwargs for a one-off container's network: none, or with network the sandbox
-        network when the session manager set it up (egress-filtered), else Docker's default bridge."""
+        network when the session manager set it up (egress-filtered), else Docker's default bridge.
+
+        With SANDBOX_EGRESS_FILTER=required a one-off container gets network only while the filter
+        is on (``manager.egress_state``): the fallback for a session refused because the filter
+        failed must not run unfiltered instead."""
         if not network_enabled:
             return {"network_mode": "none"}
         manager = getattr(self, "session_manager", None)
+        if sessions.EGRESS_FILTER == "required" and getattr(manager, "egress_state", None) != "on":
+            logger.warning("No network for a one-off sandbox container: the egress filter is not active "
+                           "(SANDBOX_EGRESS_FILTER=required)")
+            return {"network_mode": "none"}
         if manager is not None:
             kwargs = {"network": manager.network_name}
             if sessions.DNS_SERVERS:
@@ -387,76 +400,29 @@ class ContainerManager:
                              shell=False, replay_packages=True):
         # Ensure user directory exists
         user_dir = self.ensure_user_directory(user_id)
-        
-        # Check for user apt packages file and prepare installation script if needed
-        packages_file = user_dir / "installed_packages.txt"
-        python_packages_file = user_dir / "installed_python_packages.txt"
+
+        # The saved packages, reinstalled first. Read like a session start does
+        # (sessions.persisted_packages): never through a link, never blocking on a FIFO (we hold a
+        # MAX_SANDBOX_CONTAINERS slot here), and only names that pass validation reach the script.
         package_installation_prefix = ""
-
-        apt_packages = []
-        if replay_packages and packages_file.exists():
-            try:
-                with open(packages_file, 'r') as f:
-                    apt_packages = [line.strip() for line in f if line.strip()]
-            except Exception as e:
-                logger.error(f"Error reading apt packages file for user {user_id}: {str(e)}")
-
-        pip_packages = []
-        if replay_packages and python_packages_file.exists():
-            try:
-                with open(python_packages_file, 'r') as f:
-                    pip_packages = [line.strip() for line in f if line.strip()]
-            except Exception as e:
-                logger.error(f"Error reading pip packages file for user {user_id}: {str(e)}")
-
-        if apt_packages or pip_packages:
-            prefix_lines = ["#!/bin/bash"]
-            if apt_packages:
-                apt_str = " ".join(apt_packages)
-                logger.info(f"Found {len(apt_packages)} apt packages for user {user_id}")
-                prefix_lines += [
-                    f'echo "Installing apt packages: {apt_str}"',
-                    "sudo apt-get update -qq",
-                    f"sudo apt-get install -y -qq {apt_str} > /dev/null 2>&1",
-                    'echo "Apt package installation completed"',
-                ]
-                # python3-* apt packages install for Debian's Python 3.11, not the
-                # container's Python 3.12. As a best-effort fallback, also pip-install
-                # the equivalent PyPI packages (strip the "python3-" prefix).
-                pip_from_apt = [
-                    pkg[len("python3-"):] for pkg in apt_packages
-                    if pkg.startswith("python3-")
-                ]
-                if pip_from_apt:
-                    pip_from_apt_str = " ".join(pip_from_apt)
-                    logger.info(f"Adding pip fallback for python3-* apt packages: {pip_from_apt_str}")
-                    prefix_lines += [
-                        f'echo "Installing pip fallbacks for python3-* apt packages: {pip_from_apt_str}"',
-                        # Use --user so runner can write to ~/.local; || true because
-                        # the apt→PyPI name mapping isn't always exact (e.g. python3-pil → Pillow).
-                        f"pip install --user --quiet {pip_from_apt_str} 2>&1 || true",
-                    ]
-            # Collect all pip packages: persisted pip list + any merged above
-            all_pip = list(pip_packages)
-            if all_pip:
-                pip_str = " ".join(all_pip)
-                logger.info(f"Found {len(all_pip)} pip packages for user {user_id}")
-                prefix_lines += [
-                    f'echo "Installing pip packages: {pip_str}"',
-                    # --user: installs to ~/.local/lib/pythonX.Y/site-packages/ which
-                    # Python always checks and which runner can write to without sudo.
-                    f"pip install --user --quiet {pip_str}",
-                    'echo "Pip package installation completed"',
-                ]
-            package_installation_prefix = "\n".join(prefix_lines) + "\n"
+        packages = sessions.persisted_packages(user_dir) if replay_packages else {"apt": [], "pip": []}
+        if packages["apt"] or packages["pip"]:
+            logger.info(f"Reinstalling saved packages for user {user_id} in a one-off container: {packages}")
+            # sessions.replay_script: apt via sudo, the best-effort pip install of python3-* apt
+            # packages, then the pip list; it ends with `exit`, so it runs in a subshell and a failed
+            # install does not stop the command after it
+            package_installation_prefix = (
+                "#!/bin/bash\n(\n" + sessions.replay_script(packages["apt"], packages["pip"]) + ")\n"
+            )
             # Network access is required to install packages
             network_enabled = True
             logger.info("Network access enabled for package installation")
-        
+
         # Generate a unique container name
         container_name = f"{self.container_prefix}{user_id}-{uuid.uuid4().hex[:8]}"
-        
+
         command_text = command  # what the logs and the strace check look at
+        script_path = None
         try:
             # Run the container with the user directory mounted
             logger.info(f"Running command in container {container_name}: {command}")
@@ -466,15 +432,12 @@ class ContainerManager:
             
             # If we have packages to install, create a script to do that first
             if package_installation_prefix:
-                # Create a temporary script file in the user directory (unique per call)
+                # A temporary script in the user directory (unique per call), created executable
+                # in one step and never through a link (the sandbox can plant one at any time)
                 script_path, script_in_container = self._workspace_file(user_dir, "temp_setup", ".sh")
-                with open(script_path, 'w') as f:
-                    f.write(package_installation_prefix)
-                    f.write(f"\n# Now run the actual command\n{command}\n")
-                
-                # Make the script executable
-                os.chmod(script_path, 0o755)
-                
+                script = f"{package_installation_prefix}\n# Now run the actual command\n{command}\n"
+                sessions.write_new_file(user_dir, script_path.name, script.encode("utf-8"), 0o755)
+
                 # Update the command to run our script
                 command = script_in_container
             elif shell:
@@ -541,11 +504,8 @@ class ContainerManager:
                 logger.error(f"Error removing container {container_name}: {str(e)}")
             
             # Clean up the temporary script if it was created
-            if package_installation_prefix and script_path.exists():
-                try:
-                    script_path.unlink()
-                except Exception as e:
-                    logger.error(f"Error removing temporary script: {str(e)}")
+            if script_path is not None:
+                self._remove_workspace_file(script_path)
     
     def run_python_code(self, user_id, code, timeout=60, network_enabled=False):
         """
@@ -560,33 +520,19 @@ class ContainerManager:
         Returns:
             Code execution output
         """
-        # Create a temporary file with the code
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as temp_file:
-            temp_file.write(code)
-            temp_file_path = temp_file.name
-        
+        user_dir = self.ensure_user_directory(user_id)
+        target_file, file_in_container = self._workspace_file(user_dir, "temp_code", ".py")
         try:
-            # Copy the file to the user directory
-            user_dir = self.ensure_user_directory(user_id)
-            target_file, file_in_container = self._workspace_file(user_dir, "temp_code", ".py")
-            shutil.copy(temp_file_path, target_file)
-            
-            # Set proper permissions for the file (readable and executable by all)
-            os.chmod(target_file, 0o755)
-            
+            # Written into the workspace readable and executable by all, mode set on the new file
+            # itself: a chmod by path would follow a link the sandbox swapped in meanwhile
+            sessions.write_new_file(user_dir, target_file.name, str(code).encode("utf-8"), 0o755)
+
             # Run the code in the container
             command = f"python {file_in_container}"
-            result = self.run_command(user_id, command, timeout, network_enabled)
-            
-            # Clean up the temporary file in the user directory
-            if target_file.exists():
-                target_file.unlink()
-            
-            return result
+            return self.run_command(user_id, command, timeout, network_enabled)
         finally:
-            # Clean up the local temporary file
-            if os.path.exists(temp_file_path):
-                os.unlink(temp_file_path)
+            # Clean up the temporary file in the user directory
+            self._remove_workspace_file(target_file)
     
     def run_file_operation(self, user_id, operation, args, timeout=30):
         """
@@ -711,33 +657,18 @@ print(json.dumps(result))
         Returns:
             Script execution output
         """
-        # Create a temporary file with the script
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as temp_file:
-            temp_file.write(script_content)
-            temp_file_path = temp_file.name
-        
+        user_dir = self.ensure_user_directory(user_id)
+        target_file, file_in_container = self._workspace_file(user_dir, "temp_script", ".sh")
         try:
-            # Copy the file to the user directory
-            user_dir = self.ensure_user_directory(user_id)
-            target_file, file_in_container = self._workspace_file(user_dir, "temp_script", ".sh")
-            shutil.copy(temp_file_path, target_file)
-            
-            # Make the script executable
-            os.chmod(target_file, 0o755)
-            
+            # Created executable in one step, never through a link (see run_python_code)
+            sessions.write_new_file(user_dir, target_file.name, str(script_content).encode("utf-8"), 0o755)
+
             # Run the script in the container
             command = f"/bin/bash {file_in_container}"
-            result = self.run_command(user_id, command, timeout, network_enabled)
-            
-            # Clean up the temporary file in the user directory
-            if target_file.exists():
-                target_file.unlink()
-            
-            return result
+            return self.run_command(user_id, command, timeout, network_enabled)
         finally:
-            # Clean up the local temporary file
-            if os.path.exists(temp_file_path):
-                os.unlink(temp_file_path)
+            # Clean up the temporary file in the user directory
+            self._remove_workspace_file(target_file)
     
     def install_package(self, user_id, package_name, timeout=300, manager="apt"):
         """

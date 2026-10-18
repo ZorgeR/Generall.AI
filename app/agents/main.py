@@ -175,6 +175,16 @@ def block_input(block) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def display_input(block) -> dict:
+    """A tool_use block's input as people see it (trace, status, turn summary): what a toolset
+    member typed into a page is masked (``browser_tools.masked_input``). Never what is sent."""
+    args = block_input(block)
+    if toolset_of(block):
+        name = block.get("name") if isinstance(block, dict) else getattr(block, "name", "")
+        return browser_tools.masked_input(name, args)
+    return args
+
+
 # Streaming config: on by default (STREAMING_ENABLED=false turns the drafts off); bot/config.py
 # reads the same variable for the Telegram side, so the two defaults must agree.
 streaming_enabled = os.getenv("STREAMING_ENABLED", "true").lower() == "true"
@@ -587,8 +597,8 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         results of a message back in ONE user message); a toolset result echoes
         ``toolset_name``. A tool that raises becomes a tool_result with ``is_error`` instead of
         aborting the turn. ``trace`` (agents.trace.ToolTrace) records each call (toolset members
-        as ``<toolset>.<member>``); ``refresh(details)`` re-renders the status message as calls
-        finish.
+        as ``<toolset>.<member>``, typed text masked: ``display_input``); ``refresh(details)``
+        re-renders the status message as calls finish.
         """
         results: dict[int, dict] = {}
 
@@ -615,7 +625,8 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             return result
 
         def start(block):
-            return trace.start(tool_display_name(block), block_input(block), depth=self.trace_depth) if trace is not None else None
+            # the trace is shown to people: typed text is masked there, the call itself gets it
+            return trace.start(tool_display_name(block), display_input(block), depth=self.trace_depth) if trace is not None else None
 
         async def run_one(index: int, block) -> None:
             call = start(block)
@@ -632,7 +643,10 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         async def run_toolset(family: str, items: list) -> None:
             provider = self.toolset_provider(family)
             if self.user_id:
-                stats_tracker.track_tool_used(self.user_id, family)  # one quota unit per message
+                try:
+                    stats_tracker.track_tool_used(self.user_id, family)  # one quota unit per message
+                except Exception as e:  # noqa: BLE001 - accounting (SQLite locked) never fails the batch
+                    print(f"WARNING: could not record the {family} tool use for {self.user_id}: {e}")
             failed = False
             for index, block in items:
                 if failed:

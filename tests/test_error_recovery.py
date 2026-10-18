@@ -512,6 +512,80 @@ async def test_a_quiet_answer_sends_nothing_and_removes_the_status(monkeypatch, 
     assert len(env.usage) == 1  # the tokens were still spent
 
 
+class PhotoBot(DeletableBot):
+    """DeletableBot that also takes photos (the browser's live view)."""
+
+    async def send_photo(self, **kw):
+        self.calls.append(("send_photo", kw))
+        return self._msg()
+
+    async def edit_message_media(self, **kw):
+        self.calls.append(("edit_message_media", kw))
+        return True
+
+
+def use_browsing_agent(monkeypatch, response: str, seen: dict):
+    """A ChainOfThoughtAgent stand-in that drives a real BrowserTools (fake manager) as the loop does:
+    a member call, then ``after_batch`` (the live view), then the answer."""
+    import base64
+    import io
+
+    from PIL import Image
+
+    from agents.browser_tools import BrowserTools
+
+    picture = io.BytesIO()
+    Image.new("RGB", (8, 8), "white").save(picture, format="JPEG")
+    meta = {"title": "Shop", "url": "https://shop.example/"}
+
+    class Manager:
+        def browser_call(self, uid, request, remember=True, timeout=75):
+            return {"ok": True, "content": [{"type": "text", "text": "ok"}], "meta": meta}
+
+        def browser_peek(self, uid):
+            return {"ok": True, "image_b64": base64.b64encode(picture.getvalue()).decode(), "meta": meta}
+
+    class Agent:
+        def __init__(self, sender=None, user_settings=None, **kw):
+            self.agent = SimpleNamespace(limit_reached=False)
+            seen["settings"] = user_settings
+            self.browser = BrowserTools(USER, sender, user_settings, Manager())  # as ChainOfThoughtAgent registers it
+
+        async def generate_response(self, prompt, update_status, on_text_chunk=None, trace=None):
+            await self.browser.execute_member("navigate", {"url": "https://shop.example/"})
+            await self.browser.after_batch()  # what run_tool_batch does after the browser batch
+            return response, [{"role": "assistant", "content": [{"type": "text", "text": response}]}]
+
+    monkeypatch.setattr(agent_runner, "_agents", lambda: SimpleNamespace(ChainOfThoughtAgent=Agent))
+
+
+@pytest.mark.parametrize("answer", [agent_runner.QUIET_MARKER, "The price dropped to 40 EUR."])
+async def test_a_scheduled_task_never_shows_the_browser_live_view(monkeypatch, env, answer):
+    """A quiet run deleted only its status: the live-view photo of a browsing task stayed in the chat
+    with nothing explaining it. A turn with a quiet marker runs without the live view."""
+    seen: dict = {}
+    use_browsing_agent(monkeypatch, answer, seen)
+    bot = PhotoBot()
+    result = await run(bot, quiet_marker=agent_runner.QUIET_MARKER)
+    assert result is not None and result.quiet is (answer == agent_runner.QUIET_MARKER)
+    assert bot.of("send_photo") == [] and bot.of("edit_message_media") == []
+    if result.quiet:
+        assert bot.of("delete") == [{"message_id": 101}]  # the status; nothing else was left behind
+    assert seen["settings"]["browser"]["stream"] is False
+    assert UserSettings(USER).get("browser", "stream") is True  # this turn only: the setting is unchanged
+
+
+async def test_an_ordinary_turn_keeps_the_live_view(monkeypatch, env):
+    seen: dict = {}
+    use_browsing_agent(monkeypatch, "Here is the shop.", seen)
+    bot = PhotoBot()
+    result = await run(bot)
+    assert result is not None and not result.quiet
+    (photo,) = bot.of("send_photo")
+    assert photo["disable_notification"] is True and photo["caption"].startswith("🌐 Shop")
+    assert seen["settings"]["browser"]["stream"] is True
+
+
 async def test_an_answer_that_only_mentions_the_marker_is_delivered(monkeypatch, env):
     use_agent(monkeypatch, response=f"Two items need you today. {agent_runner.QUIET_MARKER}")
     bot = DeletableBot()

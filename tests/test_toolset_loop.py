@@ -287,6 +287,84 @@ async def test_long_text_is_capped_but_state_and_images_stay(agents_main, quota)
     assert content[1] == image and content[2] == STATE
 
 
+async def test_a_failing_quota_write_does_not_fail_the_browser_batch(agents_main, monkeypatch):
+    """track_tool_used writes SQLite ("database is locked"): for a normal tool that becomes its error
+    result; for a browser batch it went through gather and failed the turn while the rest ran on."""
+    import sqlite3
+
+    def locked(uid, name):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(agents_main.stats_tracker, "track_tool_used", locked)
+    browser = FakeBrowser()
+    agent = make_agent(agents_main, browser)
+    results = await agent.run_tool_batch([member("b1", "navigate", url="https://example.com"),
+                                          plain("t1", "slow_a", delay=0.01), member("b2", "screenshot")])
+    assert [c[0] for c in browser.calls] == ["navigate", "screenshot"] and browser.after_batches == 1
+    assert "is_error" not in results[0] and "is_error" not in results[2]
+    assert results[0]["content"] == [{"type": "text", "text": "navigate ok"}, STATE]
+    assert results[1]["is_error"] is True  # a normal tool: its own accounting failed inside execute_tool, as before
+
+
+SECRET = "correct-horse-42!xy"  # 19 characters
+CARD = "4111 1111 1111 1111"
+
+
+async def test_typed_text_is_masked_wherever_people_see_the_call(agents_main, quota):
+    """What browser.type / form_input put into a page (a password, a card number) is shown as its
+    length in the status, the turn summary and the reasoning file; the browser and the API get it."""
+    from bot.agent_runner import reasoning_text
+    from bot.status import render_trace
+
+    browser = FakeBrowser()
+    agent = make_agent(agents_main, browser)
+    agent.client = FakeClient([
+        reply(member("b1", "type", text=SECRET), member("b2", "form_input", target={"type": "ref", "ref": "ref_4"}, value=CARD),
+              member("b3", "form_input", target={"type": "ref", "ref": "ref_5"}, value=True), stop="tool_use"),
+        reply(text("Logged in.")),
+    ])
+    trace = ToolTrace()
+    response, messages = await agent.generate_response(
+        messages=[{"role": "user", "content": [{"type": "text", "text": "log in"}]}], system_role="sys", question="log in",
+        user_settings=settings(max_iteration=5), trace=trace,
+    )
+    assert response == "Logged in."
+    # the browser and the API request get the real input; the stored tool_use is what was sent
+    assert browser.calls[0] == ("type", {"text": SECRET}) and browser.calls[1][1]["value"] == CARD
+    sent = [b for m in agent.client.requests[1]["messages"] if isinstance(m["content"], list) for b in m["content"] if b.get("type") == "tool_use"]
+    assert sent[0]["input"] == {"text": SECRET} and sent[1]["input"]["value"] == CARD
+    stored = [b for m in messages if isinstance(m["content"], list) for b in m["content"] if b.get("type") == "tool_use"]
+    assert stored == sent
+
+    # what people see: the legacy status line, the rich summary's args JSON, the reasoning file
+    assert [c.args for c in trace.calls] == [
+        {"text": "<19 characters>"},
+        {"target": {"type": "ref", "ref": "ref_4"}, "value": "<19 characters>"},
+        {"target": {"type": "ref", "ref": "ref_5"}, "value": True},  # a checkbox's state is no secret
+    ]
+    status = render_trace(trace)
+    summary = "\n".join(c.args_text for c in trace.calls)
+    reasoning = reasoning_text(messages)
+    for shown in (status, summary, reasoning):
+        assert SECRET not in shown and CARD not in shown
+    assert "<19 characters>" in status and "<19 characters>" in summary
+    assert "[Tool call: browser.type]" in reasoning and '"text": "<19 characters>"' in reasoning
+    # a browser result's state block is rendered, not an empty line
+    assert "[Tool result: browser.type]\ntype ok\n[browser: 1 tab(s); active tab-1: Example https://example.com/]" in reasoning
+
+
+def test_masked_input_only_touches_typed_text():
+    from agents.browser_tools import masked_input
+
+    args = {"text": "x", "target": {"type": "ref", "ref": "ref_1"}}
+    assert masked_input("type", args) == {"text": "<1 character>", "target": {"type": "ref", "ref": "ref_1"}}
+    assert args["text"] == "x"  # a copy: the input itself is never changed
+    assert masked_input("form_input", {"value": 1234}) == {"value": "<4 characters>"}
+    assert masked_input("key", {"text": "Enter"}) == {"text": "Enter"}
+    assert masked_input("navigate", {"url": "https://example.com/"}) == {"url": "https://example.com/"}
+    assert masked_input("type", None) == {}
+
+
 # ---- generate_response ----------------------------------------------------------------------
 async def test_the_loop_stores_toolset_blocks_and_charges_one_unit_per_message(agents_main, quota):
     browser = FakeBrowser()

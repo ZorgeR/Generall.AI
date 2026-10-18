@@ -18,6 +18,9 @@ browser calls of one assistant message in order, stops at the first failure, and
 ``after_batch`` once the sequence is done (the live view). Each call goes to the per-user
 browser container through ``SessionManager.browser_call`` (blocking: a worker thread); a
 ``CapacityError`` (no memory for a browser right now) becomes an error result with its text.
+Until a member call of this turn succeeded, the request carries ``force_state``: the server
+reports the tab list only when it changed since its last report, which may have gone to another
+conversation (forum topics share one browser) or to a cancelled turn.
 
 Consequential actions (paying, sending, deleting, account changes) are refused by the browser
 server until the user allowed one through ``browser_confirm``: the allowance is one action,
@@ -133,6 +136,24 @@ def shell_sessions_enabled() -> bool:
 
 
 # ---- small helpers ----------------------------------------------------------------
+# Member inputs that carry what the model typed into the page (passwords, one-time codes):
+# member -> input key. Shown to people (status line, turn summary, reasoning file) as their
+# length only; the request and the stored tool_use block keep the real value.
+TYPED_INPUTS = {"type": "text", "form_input": "value"}
+
+
+def masked_input(name: str, args: Any) -> dict:
+    """A copy of a member's input for display, typed text and form values replaced by
+    ``<N characters>`` (a checkbox's true/false stays)."""
+    shown = dict(args) if isinstance(args, dict) else {}
+    key = TYPED_INPUTS.get(str(name))
+    value = shown.get(key) if key else None
+    if value is not None and not isinstance(value, bool):
+        length = len(str(value))
+        shown[key] = f"<{length} character{'' if length == 1 else 's'}>"
+    return shown
+
+
 def describe_action(name: str, args: Any) -> str:
     """One line for the live view. Typed text and form values are not repeated (passwords)."""
     args = args if isinstance(args, dict) else {}
@@ -393,6 +414,7 @@ class BrowserTools:
         self._manager = manager
         self._clock = time.monotonic
         self._allow_until = 0.0          # a consequential action is allowed until then (one action)
+        self._state_reported = False     # a member result of this turn carried the tab list
         self._last_action = ""
         self._last_meta: dict = {}
         self._live_message = None        # the turn's live-view photo
@@ -495,6 +517,10 @@ class BrowserTools:
             "action": name,
             "input": args,
             "allow_sensitive": self.allowance_active(),
+            # The server leaves browser_state out while the tabs are unchanged since its last
+            # report, but that report may have gone to another conversation (forum topics share one
+            # browser) or to a cancelled turn: until this turn has seen one, ask for it.
+            "force_state": not self._state_reported,
         }
         self._last_action = describe_action(name, args)
         try:
@@ -516,6 +542,7 @@ class BrowserTools:
         if response.get("ok"):
             if response.get("sensitive_done"):
                 self._allow_until = 0.0  # the one allowed consequential action happened
+            self._state_reported = True
             return clean_result_content(response.get("content")), False
         error = str(response.get("error") or "").strip() or "Error: the browser action failed."
         if not error.lower().startswith("error"):

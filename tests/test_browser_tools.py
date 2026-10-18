@@ -118,6 +118,24 @@ async def test_member_success_passes_content_through():
     assert t._last_action == "left_click ref_2" and t._last_meta == {"title": "Shop", "url": "u"}
 
 
+async def test_the_first_member_call_of_a_turn_asks_for_the_tab_state():
+    # review: browser_state was left out whenever unchanged since the last report to ANY
+    # conversation (forum topics share one browser; a cancelled turn's result is thrown away), so a
+    # turn's first read_page could carry no tab list. Until one call of THIS turn succeeded, the
+    # request asks the server for the full state.
+    manager = Manager([{"ok": False, "error": "Error: No tab is open. Use new_tab or navigate first."},
+                       {"ok": True, "content": [{"type": "text", "text": "page"}, STATE]},
+                       {"ok": True, "content": [{"type": "text", "text": "page"}]}])
+    t = tools(manager)
+    await t.execute_member("read_page", {})
+    await t.execute_member("read_page", {})
+    await t.execute_member("screenshot", {})
+    assert [r["force_state"] for r in manager.requests] == [True, True, False]
+    fresh = tools(manager)  # the next turn: a new instance asks again
+    await fresh.execute_member("find", {"query": "search"})
+    assert manager.requests[-1]["force_state"] is True
+
+
 async def test_member_with_empty_content_says_done():
     t = tools(Manager([{"ok": True, "content": []}]))
     assert await t.execute_member("hover", {"target": {"type": "coordinate", "x": 1, "y": 2}}) == ("Done.", False)
@@ -505,8 +523,12 @@ async def test_too_many_images_trigger_a_compaction():
         raise AssertionError("pictures alone never summarize")
 
     stats = await T.prune(messages, max_context_tokens=120000, keep_tool_results_turns=3, summarize=summarize)
-    assert T.count_images(messages) == 27  # the two oldest turns lost theirs
-    assert stats["cleared"] == 2 and stats["summarized"] == 0 and stats["thinking_stripped"] == 5
+    # the two oldest turns lost theirs (27 left), then the oldest 7 of the next turn: down to the target
+    assert T.count_images(messages) == T.IMAGE_PRUNE_TARGET == 20
+    assert stats["cleared"] == 2 and stats["cleared_media"] == 7
+    assert stats["summarized"] == 0 and stats["thinking_stripped"] == 5
+    third = messages[10]["content"][0]["content"]
+    assert third[1:8] == [{"type": "text", "text": T.SCREENSHOT_CLEARED_MARKER}] * 7 and third[8]["type"] == "image"
     assert not any(b.get("type") == "thinking" for m in messages for b in m["content"])
     assert messages[2]["content"][0]["content"] == T.CLEARED_MARKER  # old tool results cleared as usual
     assert messages[2]["content"][0]["toolset_name"] == "browser"
@@ -527,6 +549,130 @@ async def test_few_images_change_nothing():
     before = copy.deepcopy(messages)
     stats = await T.prune(messages, max_context_tokens=120000, keep_tool_results_turns=3)
     assert messages == before and stats == {"cleared": 0, "cleared_media": 0, "summarized": 0, "thinking_stripped": 0}
+
+
+def browser_server():
+    """The sandbox's browser server, loaded by path (a standalone script): its ``validate_content``
+    states what the API accepts in a member's tool_result."""
+    import importlib.util
+    from pathlib import Path
+
+    name = "browser_server_for_tools_tests"
+    if name not in sys.modules:
+        path = Path(__file__).resolve().parents[1] / "app" / "secure_container" / "scripts" / "browser_server.py"
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module  # dataclasses look the module up while the class is created
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
+def assert_valid_member_results(messages):
+    """Every successful browser member result is still one the API accepts (errors carry no state)."""
+    names = {b["id"]: b["name"] for m in messages if isinstance(m.get("content"), list)
+             for b in m["content"] if b.get("type") == "tool_use"}
+    for m in messages:
+        for b in m["content"] if isinstance(m.get("content"), list) else []:
+            if b.get("type") == "tool_result" and b.get("toolset_name") and not b.get("is_error"):
+                content = b["content"] if isinstance(b["content"], list) else [{"type": "text", "text": b["content"]}]
+                assert browser_server().validate_content(names[b["tool_use_id"]], content) == [], b
+
+
+def _browsing_turn(i, shots):
+    """A browsing turn as the loop stores it: one screenshot per assistant message, each with its state."""
+    pic = {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "AAAA"}}
+    turn = [{"role": "user", "content": [{"type": "text", "text": "<context>\nnow\n</context>"}, {"type": "text", "text": f"q{i}"}]}]
+    for j in range(shots):
+        tid = f"t{i}_{j}"
+        turn.append({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "x", "signature": "s"},
+            {"type": "tool_use", "id": tid, "name": "screenshot", "input": {}, "toolset_name": "browser"}]})
+        turn.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": tid, "toolset_name": "browser",
+                                                  "content": [dict(pic), copy.deepcopy(STATE)]}]})
+    turn.append({"role": "assistant", "content": [{"type": "text", "text": f"a{i}"}]})
+    return turn
+
+
+@pytest.mark.parametrize("shots, most_compactions", [(14, 5), (8, 3)])
+async def test_an_image_compaction_leaves_room_for_the_next_turns(shots, most_compactions):
+    """Clearing to just under the cap made the next browsing turn cross it again: a full cache miss
+    and every thinking block stripped on (nearly) every turn. A compaction leaves IMAGE_PRUNE_TARGET
+    pictures (the newest turn keeps all of its own), so the next one is turns away."""
+    messages: list[dict] = []
+    compacted: list[int] = []
+    for turn in range(12):
+        newest = len(messages)
+        messages.extend(_browsing_turn(turn, shots))
+        before = copy.deepcopy(messages)
+        stats = await T.prune(messages, max_context_tokens=120000, keep_tool_results_turns=3)
+        if messages == before:
+            assert T.count_images(messages) <= T.MAX_TRANSCRIPT_IMAGES
+            continue
+        compacted.append(turn)
+        assert stats["thinking_stripped"] > 0 and stats["summarized"] == 0
+        assert T.count_images(messages) <= max(T.IMAGE_PRUNE_TARGET, shots)
+        assert T.count_images(messages[newest:]) == shots  # the newest turn keeps its pictures
+        assert_valid_member_results(messages)
+    assert compacted, "the cap was never reached"
+    assert all(b - a >= 2 for a, b in zip(compacted, compacted[1:])), f"compactions on consecutive turns: {compacted}"
+    assert len(compacted) <= most_compactions
+
+
+OPENED = {"type": "browser_state", "tabs": [
+    {"tab_id": "tab-1", "title": "Shop", "url": "https://shop.example/", "active": False},
+    {"tab_id": "tab-2", "title": "New Tab", "url": "about:blank", "active": True},
+], "state_changes": [{"type": "tab_opened", "tab_id": "tab-2"}]}
+
+
+def _member_turn(i):
+    """One turn with a batch of browser members (and a normal tool) as the loop stores it."""
+    pic = {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "AAAA"}}
+    calls = [  # member, its result content, is_error
+        ("navigate", [{"type": "text", "text": "Navigated to https://shop.example/"}, STATE], False),
+        ("screenshot", [{"type": "text", "text": "1280x800"}, dict(pic), STATE], False),
+        ("list_tabs", [copy.deepcopy(STATE)], False),
+        ("new_tab", [copy.deepcopy(OPENED)], False),
+        ("scroll", [{"type": "text", "text": "Scrolled down."}], False),
+        ("switch_tab", "Error: there is no tab tab-9.", True),
+    ]
+    uses = [{"type": "tool_use", "id": f"{name}{i}", "name": name, "input": {}, "toolset_name": "browser"} for name, _, _ in calls]
+    results = [{"type": "tool_result", "tool_use_id": f"{name}{i}", "content": copy.deepcopy(content), "toolset_name": "browser",
+                **({"is_error": True} if error else {})} for name, content, error in calls]
+    uses.append({"type": "tool_use", "id": f"web{i}", "name": "search_web", "input": {"query": "x"}})
+    results.append({"type": "tool_result", "tool_use_id": f"web{i}", "content": "Error: search failed", "is_error": True})
+    return [
+        {"role": "user", "content": [{"type": "text", "text": f"turn {i}"}]},
+        {"role": "assistant", "content": [{"type": "thinking", "thinking": "t", "signature": f"s{i}"}, *uses]},
+        {"role": "user", "content": results},
+        {"role": "assistant", "content": [{"type": "text", "text": f"answer {i}"}]},
+    ]
+
+
+async def test_cleared_browser_results_keep_their_state():
+    """A cleared member result must stay a valid toolset result: a tab member answers with exactly one
+    browser_state block (the plain marker string was refused), the others keep theirs behind the marker."""
+    messages = _member_turn(0) + _member_turn(1)
+    assert_valid_member_results(messages)
+
+    media_only = copy.deepcopy(messages)  # clear_old_media alone: the picture goes, the state stays
+    assert T.clear_old_media(media_only, keep_turns=1) == 1
+    assert media_only[2]["content"][1]["content"] == [
+        {"type": "text", "text": "1280x800"}, {"type": "text", "text": T.SCREENSHOT_CLEARED_MARKER}, STATE]
+    assert_valid_member_results(media_only)
+
+    stats = await T.prune(messages, max_context_tokens=10, keep_tool_results_turns=1)
+    assert stats["cleared"] == 5 and stats["thinking_stripped"] == 2  # the tab members had nothing to clear
+    navigate, screenshot, list_tabs, new_tab, scroll, switch_tab, web = messages[2]["content"]
+    marker = {"type": "text", "text": T.CLEARED_MARKER}
+    assert navigate["content"] == [marker, STATE] and screenshot["content"] == [marker, STATE]
+    assert list_tabs["content"] == [STATE] and new_tab["content"] == [OPENED]
+    assert scroll["content"] == T.CLEARED_MARKER and "is_error" not in scroll
+    assert switch_tab["content"] == T.CLEARED_MARKER and switch_tab["is_error"] is True  # still an error: no state needed
+    assert all(r["toolset_name"] == "browser" for r in (navigate, screenshot, list_tabs, new_tab, scroll, switch_tab))
+    assert web == {"type": "tool_result", "tool_use_id": "web0", "content": T.CLEARED_MARKER}  # a normal tool as before
+    assert messages[6]["content"] == _member_turn(1)[2]["content"]  # the kept turn is untouched
+    assert_valid_member_results(messages)
+    assert T.clear_old_tool_results(messages, keep_turns=1) == 0  # idempotent
 
 
 # ---- ChatSender photo helpers --------------------------------------------------------------------

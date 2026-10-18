@@ -190,8 +190,14 @@ async def test_host_policy_resolves_caches_and_checks_schemes():
     "Donate", "Transfer", "Top up", "Top-up balance", "Send", "Send message", "Post", "Publish",
     "Tweet", "Reply", "Comment", "Delete", "Delete account", "Remove account", "Deactivate",
     "Close my account", "Change password", "Change email", "Оплатить", "Оплата картой", "Купить",
-    "Оформить заказ", "Заказать", "Перевести", "Подписаться", "Отправить", "Опубликовать",
+    "Оформить заказ", "Заказать", "Перевести", "Подписаться", "Опубликовать",
     "Ответить", "Удалить", "Сменить пароль", "Send code and pay",
+    # missed before (review): orders, payments, account security, Russian money words
+    "Submit order", "Submit payment", "Make payment", "Make a payment", "Update password",
+    "Update email", "Disable 2FA", "Turn off two-factor authentication", "Remove passkey",
+    "Изменить пароль", "Изменить email", "Изменить e-mail", "Пополнить", "Пополнить баланс",
+    "Приобрести", "Пожертвовать", "Перевод", "Перевод на карту", "Подтвердить перевод",
+    "Отправить сообщение", "Отправить комментарий", "Отключить двухфакторную аутентификацию",
 ])
 def test_sensitive_names(name):
     assert bs.matches_sensitive(name), name
@@ -202,9 +208,95 @@ def test_sensitive_names(name):
     "I agree", "Agree", "Continue", "Next", "Search", "Send code", "Resend verification code",
     "Send me a login link", "Отправить код", "Мои заказы", "Payment methods", "Comments (3)", "Posts",
     "Settings", "Unsubscribe", "Add to cart", "Next step",
+    # resending a one-time code is a login step (review: these were refused)
+    "Send again", "Resend", "Отправить повторно", "Отправить ещё раз",
+    # a bare "Отправить" is the generic Submit of Russian forms (registration, login, contact
+    # details): by its name alone it is NOT consequential any more; in a message context it is
+    # (test_bare_otpravit_is_sensitive_only_in_a_message_context)
+    "Отправить",
+    # "Перевод" meaning translation
+    "Перевод страницы", "Перевод на английский", "Переводы",
+    "Set password", "Reset password",
 ])
 def test_not_sensitive_names(name):
     assert not bs.matches_sensitive(name), name
+
+
+def test_bare_otpravit_is_sensitive_only_in_a_message_context():
+    submit = {"role": "button", "name": "Отправить", "actionable": True}
+    registration = dict(submit, ctxFields=["Email email", "Пароль password", "Имя name"], ctxPassword=True)
+    contact = dict(submit, ctxFields=["Имя", "Телефон phone", "E-mail"])
+    message_box = dict(submit, ctxFields=["Сообщение message"], ctxMultiline=True)
+    chat = dict(submit, ctxFields=["Напишите сообщение"])
+    comment = dict(submit, ctxFields=["Your comment"], ctxMultiline=True)
+    feedback = dict(submit, ctxFields=["Ваш вопрос"], ctxMultiline=True)
+    for desc in (submit, registration, contact):
+        assert bs.sensitive_label(desc, "click") is None, desc
+        assert bs.sensitive_label(desc, "space") is None, desc
+    for desc in (message_box, chat, comment, feedback):
+        assert bs.sensitive_label(desc, "click") == 'button "Отправить"', desc
+    # Enter in a field: the form's "Отправить" counts only in a message form
+    field = {"role": "textbox", "name": "Email", "textEntry": True, "submit": ["Отправить"]}
+    assert bs.sensitive_label(dict(field, ctxFields=["Email", "Пароль"], ctxPassword=True), "enter") is None
+    assert bs.sensitive_label(dict(field, ctxFields=["Имя", "Сообщение"], ctxMultiline=True), "enter") \
+        == 'button "Отправить"'
+    # English "Send" stays consequential by its name alone
+    assert bs.sensitive_label({"role": "button", "name": "Send", "actionable": True}, "click") == 'button "Send"'
+
+
+def test_secret_question_answer_is_not_a_composer():
+    # review: "\bответ" made Enter in "Ответ на секретный вопрос" (a login step) a message send
+    field = {"role": "textbox", "name": "Ответ на секретный вопрос", "textEntry": True}
+    assert bs.sensitive_label(field, "enter") is None
+    assert bs.sensitive_label(dict(field, name="Ответить", multiline=True), "enter")
+    assert bs.sensitive_label(dict(field, name="Chat", multiline=True), "enter")
+
+
+def test_clicking_into_a_text_field_is_never_consequential():
+    # review: a "Post code" registration field and a "Write a reply" box were refused, and an
+    # allowed click into the reply box spent the one-shot allowance on focusing it
+    assert bs.sensitive_label({"role": "textbox", "name": "Post code", "textEntry": True}, "click") is None
+    reply = {"role": "textbox", "name": "Write a reply", "textEntry": True, "multiline": True}
+    assert bs.sensitive_label(reply, "click") is None
+    assert bs.sensitive_label(reply, "space") is None          # typing a space
+    assert bs.sensitive_label(reply, "enter") == 'Enter in the text field "Write a reply"'
+    assert bs.sensitive_label(reply, "shift_enter") is None    # a new line
+    single = {"role": "textbox", "name": "Qty", "textEntry": True, "submit": ["Place order"]}
+    assert bs.sensitive_label(single, "shift_enter") == 'button "Place order"'
+
+
+def test_space_on_a_control_is_a_click():
+    assert bs.sensitive_label({"role": "button", "name": "Place order"}, "space") == 'button "Place order"'
+    assert bs.sensitive_label({"role": "checkbox", "name": "I agree"}, "space") is None
+    assert bs.sensitive_label(None, "space") is None
+
+
+def test_activation_kinds():
+    assert bs.activation_kind(["Enter"]) == "enter"
+    assert bs.activation_kind(["NumpadEnter"]) == "enter"
+    assert bs.activation_kind(["Control", "Enter"]) == "enter"
+    assert bs.activation_kind(["Shift", "Enter"]) == "shift_enter"
+    assert bs.activation_kind(["Space"]) == "space"
+    assert bs.activation_kind(["Tab"]) is None
+    assert bs.activation_kind(["Control", "a"]) is None
+
+
+def test_frames_the_guard_cannot_look_into():
+    opaque = {"role": "iframe", "name": "", "actionable": False, "opaqueFrame": True,
+              "frame": {"url": "https://js.stripe.com/v3/elements-inner-card.html", "title": "", "ownerName": ""}}
+    assert bs.sensitive_label(opaque, "click") == 'frame (looks like a payment form)'
+    assert bs.sensitive_label(opaque, "enter") and bs.sensitive_label(opaque, "space")
+    named = dict(opaque, name="Secure payment input frame", frame={"url": "https://x.example/f", "title": ""})
+    assert bs.sensitive_label(named, "click") == 'frame "Secure payment input frame" (looks like a payment form)'
+    video = dict(opaque, name="YouTube video player", frame={"url": "https://www.youtube.com/embed/x", "title": "Video"})
+    assert bs.sensitive_label(video, "click") is None
+    display = dict(opaque, frame={"url": "https://ads.example/display?slot=1", "title": "Ad"})
+    assert bs.sensitive_label(display, "click") is None        # "display" is not "pay"
+    # inside a payment frame the target decides; Enter in its field counts even without a form
+    card = {"role": "textbox", "name": "Card number", "textEntry": True,
+            "frame": {"url": "https://checkout.example/card", "title": "Checkout"}}
+    assert bs.sensitive_label(card, "click") is None
+    assert bs.sensitive_label(card, "enter") == 'Enter in the text field "Card number" of a payment form'
 
 
 def test_sensitive_label_rules():
@@ -243,6 +335,15 @@ def test_sensitive_label_rules():
 def test_clean_field_and_urls():
     assert bs.clean_field("a\nb\tc" + LS + "d" + PS + "e\x00f") == "a b c d e f"
     assert bs.clean_field("x" * 5000) == "x" * 4096
+    # review: a cut that ends on a space made validate_content reject every tab-member result
+    long_title = "a" * 4095 + " tail"
+    assert bs.clean_field(long_title) == "a" * 4095
+    assert bs.clean_field(bs.clean_field(long_title)) == bs.clean_field(long_title)
+    entries = bs.make_tab_entries([("tab-1", long_title, "https://example.com/" + "b" * 4075 + " c")], "tab-1")
+    for member in ("list_tabs", "new_tab"):
+        changes = [{"type": "tab_opened", "tab_id": "tab-1"}] if member == "new_tab" else []
+        content, _ = bs.assemble_content(member, entries=entries, changes=changes)
+        assert bs.validate_content(member, content) == []
     assert bs.clean_field(None) == ""
     assert bs.display_url("https://user:secret@example.com/a?b=1#c") == "https://example.com/a?b=1#c"
     assert bs.display_url("about:blank") == "about:blank"
@@ -557,6 +658,172 @@ async def test_dispatcher_without_a_browser(tmp_path):
     assert server._in_flight == 0
 
 
+# ---------------------------------------------------------------------------------------------
+# The egress proxy (in process: a fake resolver, local upstream servers)
+# ---------------------------------------------------------------------------------------------
+
+def test_proxy_request_parsing():
+    req = bs.parse_proxy_request(b"GET http://shop.example:8080/a/b?q=1 HTTP/1.1\r\nHost: shop.example:8080\r\n"
+                                 b"Proxy-Connection: keep-alive\r\nProxy-Authorization: x\r\nCookie: a=1\r\n\r\n")
+    assert (req.method, req.host, req.port, req.connect) == ("GET", "shop.example", 8080, False)
+    head = req.head.decode()
+    assert head.startswith("GET /a/b?q=1 HTTP/1.1\r\n") and head.endswith("Connection: close\r\n\r\n")
+    assert "Proxy-" not in head and "Cookie: a=1" in head and "Host: shop.example:8080" in head
+    tunnel = bs.parse_proxy_request(b"CONNECT [2606:4700::1]:443 HTTP/1.1\r\nHost: x\r\n\r\n")
+    assert (tunnel.host, tunnel.port, tunnel.connect) == ("2606:4700::1", 443, True)
+    bare = bs.parse_proxy_request(b"GET http://a.example HTTP/1.0\r\n\r\n")
+    assert bare.port == 80 and bare.head.decode().startswith("GET / HTTP/1.0\r\nHost: a.example\r\n")
+    upgrade = bs.parse_proxy_request(b"GET http://a.example/ws HTTP/1.1\r\nHost: a.example\r\n"
+                                     b"Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+    assert upgrade.head.decode().endswith("Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+    for bad in (b"GET /local HTTP/1.1\r\n\r\n",                      # not a proxy request
+                b"GET https://a.example/ HTTP/1.1\r\n\r\n",          # https goes through CONNECT
+                b"GET ftp://a.example/ HTTP/1.1\r\n\r\n",
+                b"CONNECT a.example HTTP/1.1\r\n\r\n",               # no port
+                b"GET http://u:p@a.example/ HTTP/1.1\r\n\r\n",
+                b"GET http://a.example/ HTTP/2\r\n\r\n",
+                b"GET http://a.example/ HTTP/1.1\r\n folded\r\n\r\n",
+                b"GET http://a.example:99999/ HTTP/1.1\r\n\r\n"):
+        with pytest.raises(bs.ProxyBadRequest):
+            bs.parse_proxy_request(bad)
+
+
+def test_proxy_response_heads():
+    head, status = bs.rewrite_response_head(b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\n"
+                                            b"Content-Length: 3\r\n\r\n")
+    assert status == 200
+    assert head == b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\nProxy-Connection: close\r\n\r\n"
+    early = b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\n"
+    assert bs.rewrite_response_head(early) == (early, 103)
+    assert bs.rewrite_response_head(b"HTTP/1.0 302\r\nLocation: /x\r\n\r\n")[1] == 302
+    with pytest.raises(bs.ProxyBadRequest):
+        bs.rewrite_response_head(b"garbage\r\n\r\n")
+    # long header names (CSP report-only: 35 characters) and odd lines pass; only Connection goes
+    long = (b"HTTP/1.1 200 OK\r\nContent-Security-Policy-Report-Only: default-src 'self'\r\n"
+            b"Cross-Origin-Embedder-Policy-Report-Only: require-corp\r\nX-Folded: a\r\n b\r\n"
+            b"Connection: keep-alive\r\n folded-continuation\r\n\r\n")
+    assert bs.rewrite_response_head(long)[0] == (
+        b"HTTP/1.1 200 OK\r\nContent-Security-Policy-Report-Only: default-src 'self'\r\n"
+        b"Cross-Origin-Embedder-Policy-Report-Only: require-corp\r\nX-Folded: a\r\n b\r\n"
+        b"Connection: close\r\nProxy-Connection: close\r\n\r\n")
+    preflight = bs.parse_proxy_request(b"OPTIONS http://a.example/api HTTP/1.1\r\nHost: a.example\r\n"
+                                       b"Access-Control-Request-Private-Network: true\r\n\r\n")
+    assert b"Access-Control-Request-Private-Network: true" in preflight.head
+    refusal = bs.proxy_error_response(403, "Blocked by the sandbox network policy: 10.0.0.1 is a private or local address.")
+    assert refusal.startswith(b"HTTP/1.1 403 Forbidden\r\n") and refusal.endswith(b"address.\n")
+
+
+async def _proxy_exchange(port: int, data: bytes, read_until_close: bool = True) -> bytes:
+    import asyncio
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(data)
+    await writer.drain()
+    out = await asyncio.wait_for(reader.read(-1), 10) if read_until_close else b""
+    writer.close()
+    return out
+
+
+async def test_egress_proxy_checks_every_host_and_connects_to_the_checked_address():
+    import asyncio
+    seen: list[bytes] = []
+
+    async def origin(reader, writer):  # a keep-alive origin server: the proxy must close anyway
+        head = await reader.readuntil(b"\r\n\r\n")
+        seen.append(head)
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nhello")
+        await writer.drain()
+
+    async def echo(reader, writer):
+        while data := await reader.read(100):
+            writer.write(data.upper())
+            await writer.drain()
+        writer.close()
+
+    web = await asyncio.start_server(origin, "127.0.0.1", 0)
+    raw = await asyncio.start_server(echo, "127.0.0.1", 0)
+    web_port, raw_port = web.sockets[0].getsockname()[1], raw.sockets[0].getsockname()[1]
+    lookups = []
+
+    async def resolver(host):
+        lookups.append(host)
+        return {"public.test": ["93.184.216.34"], "rebind.test": ["93.184.216.34", "127.0.0.1"],
+                "intranet.test": ["10.0.0.7"]}[host]
+
+    refused = []
+    proxy = bs.EgressProxy(bs.HostPolicy(resolver=resolver), on_refused=refused.append)
+    connected = []
+    original = bs.EgressProxy._connect_one
+
+    async def connect_one(self, address, port):  # the checked public address, mapped to the local server
+        connected.append(address)
+        return await original(self, "127.0.0.1" if address == "93.184.216.34" else address, port)
+
+    proxy._connect_one = connect_one.__get__(proxy)
+    port = await proxy.start()
+    try:
+        ok = await _proxy_exchange(port, f"GET http://public.test:{web_port}/page?x=1 HTTP/1.1\r\n"
+                                         f"Host: public.test:{web_port}\r\nProxy-Connection: keep-alive\r\n\r\n".encode())
+        assert ok.startswith(b"HTTP/1.1 200 OK\r\n") and b"Connection: close\r\n" in ok and ok.endswith(b"hello")
+        assert seen[0].startswith(b"GET /page?x=1 HTTP/1.1\r\n") and b"Connection: close" in seen[0]
+        assert connected == ["93.184.216.34"]             # the address that was checked, not a name
+        for target in ("127.0.0.1", "169.254.169.254", "[::1]", "localhost", "intranet.test", "rebind.test"):
+            out = await _proxy_exchange(port, f"GET http://{target}:{web_port}/secret HTTP/1.1\r\n\r\n".encode())
+            assert out.startswith(b"HTTP/1.1 403 Forbidden"), (target, out)
+            assert b"private or local address" in out
+            out = await _proxy_exchange(port, f"CONNECT {target}:443 HTTP/1.1\r\n\r\n".encode())
+            assert out.startswith(b"HTTP/1.1 403 Forbidden"), (target, out)
+        assert len(seen) == 1 and connected == ["93.184.216.34"]   # nothing private was ever contacted
+        assert {r.reason for r in refused} == {"private"}
+        # DNS failure: refused (fail closed), not passed on
+        out = await _proxy_exchange(port, b"GET http://unknown.test/ HTTP/1.1\r\n\r\n")
+        assert out.startswith(b"HTTP/1.1 502 Bad Gateway") and b"could not be resolved" in out
+        assert refused[-1].reason == "dns"
+        # a tunnel (https, wss): bytes both ways once the host passed
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(f"CONNECT public.test:{raw_port} HTTP/1.1\r\nHost: public.test:{raw_port}\r\n\r\n".encode())
+        await writer.drain()
+        assert await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5) == b"HTTP/1.1 200 Connection established\r\n\r\n"
+        writer.write(b"ping")
+        await writer.drain()
+        assert await asyncio.wait_for(reader.readexactly(4), 5) == b"PING"
+        writer.close()
+        # not a proxy request; a head that never ends within the limit
+        assert (await _proxy_exchange(port, b"GET / HTTP/1.1\r\n\r\n")).startswith(b"HTTP/1.1 400")
+        big = b"GET http://public.test/ HTTP/1.1\r\nX: " + b"a" * (bs.PROXY_HEAD_LIMIT + 10) + b"\r\n\r\n"
+        assert (await _proxy_exchange(port, big)).startswith(b"HTTP/1.1 400")
+        assert lookups.count("public.test") == 1        # cached: one lookup per host
+    finally:
+        proxy.close()
+        web.close()
+        raw.close()
+
+
+async def test_egress_proxy_with_allow_private_reaches_local_servers():
+    import asyncio
+
+    async def origin(reader, writer):
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(b"HTTP/1.0 200 OK\r\n\r\nlocal")
+        await writer.drain()
+        writer.close()
+
+    web = await asyncio.start_server(origin, "127.0.0.1", 0)
+    proxy = bs.EgressProxy(bs.HostPolicy(allow_private=True))
+    port = await proxy.start()
+    try:
+        out = await _proxy_exchange(port, f"GET http://127.0.0.1:{web.sockets[0].getsockname()[1]}/ HTTP/1.1\r\n\r\n".encode())
+        assert out.startswith(b"HTTP/1.0 200 OK") and out.endswith(b"local")
+    finally:
+        proxy.close()
+        web.close()
+
+
+def test_the_browser_is_launched_through_the_proxy_without_loopback_bypass():
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert '"bypass": "<-loopback>"' in source and 'proxy={"server": f"http://127.0.0.1:{port}"' in source
+    assert "--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in bs.CHROMIUM_ARGS
+
+
 # =============================================================================================
 # Integration tests: the real server, a local site, the unix socket
 # =============================================================================================
@@ -648,6 +915,13 @@ addEventListener('keydown', e => { if (e.key !== 'Shift') document.title = 'key 
 </script></body></html>"""
 
 
+# pages of the regression tests (path -> html, or a callable(handler) -> (body, status, headers)),
+# and every path the site was asked for (to prove a private URL was never fetched)
+EXTRA_PAGES: dict = {}
+HITS: list[str] = []
+POSTS: list[str] = []
+
+
 class _Handler(BaseHTTPRequestHandler):
     def _send(self, body, ctype="text/html; charset=utf-8", status=200, headers=()):
         data = body.encode("utf-8") if isinstance(body, str) else body
@@ -659,10 +933,25 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def do_POST(self):  # noqa: N802
+        HITS.append(self.path)
+        length = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(min(length, 1 << 20))
+        POSTS.append(self.path)
+        self._send(f"<html><head><title>Order #{len(POSTS)} placed</title></head><body>placed</body></html>")
+
     def do_GET(self):  # noqa: N802
+        HITS.append(self.path)
         parts = urlsplit(self.path)
         path, query = parts.path, parse_qs(parts.query)
-        if path == "/form":
+        extra = EXTRA_PAGES.get(path)
+        if extra is not None:
+            if callable(extra):
+                body, status, headers = extra(self)
+                self._send(body, status=status, headers=headers)
+            else:
+                self._send(extra)
+        elif path == "/form":
             self._send(FORM_PAGE)
         elif path == "/long":
             self._send(LONG_PAGE)
@@ -741,21 +1030,71 @@ class Client:
             pass
 
 
+# Starts the server with test patches: a fake DNS (BS_FAKE_DNS {host: [addresses]}) and a connect
+# map for the egress proxy (BS_CONNECT_MAP {checked address: real address}), so that "public.test"
+# passes the address check as 93.184.216.34 and still reaches the local test site; and
+# BS_NO_FRAME_SESSIONS (cross-origin frames cannot be entered: the guard's last resort).
+PATCHED_LAUNCHER = r"""
+import importlib.util, json, os, sys
+spec = importlib.util.spec_from_file_location("browser_server", os.environ["BS_SCRIPT"])
+bs = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = bs
+spec.loader.exec_module(bs)
+fake = json.loads(os.environ.get("BS_FAKE_DNS") or "null")
+connect_map = json.loads(os.environ.get("BS_CONNECT_MAP") or "{}")
+
+async def resolver(host):
+    if host in fake:
+        return fake[host]
+    raise OSError("unknown host " + host)
+
+if fake is not None:
+    original_init = bs.HostPolicy.__init__
+
+    def init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self._resolver = resolver
+
+    bs.HostPolicy.__init__ = init
+original_connect = bs.EgressProxy._connect_one
+
+async def connect_one(self, address, port):
+    return await original_connect(self, connect_map.get(address, address), port)
+
+bs.EgressProxy._connect_one = connect_one
+if os.environ.get("BS_NO_FRAME_SESSIONS"):
+    async def no_session(self, tab, frame_id):
+        return None
+
+    bs.BrowserServer._frame_session = no_session
+sys.exit(bs.main(sys.argv[1:]))
+"""
+
+
 class ServerProcess:
     def __init__(self, workdir: str, *, profile: str | None = "profile", idle: float = 300,
-                 allow_private: bool = True):
+                 allow_private: bool = True, fake_dns: dict | None = None, connect_map: dict | None = None,
+                 no_frame_sessions: bool = False):
         self.workdir = workdir
         self.socket = os.path.join(workdir, "ctl", "browser.sock")
         self.downloads = os.path.join(workdir, "downloads")
         self.log_path = os.path.join(workdir, "server.log")
         profile_arg = "" if profile is None else os.path.join(workdir, profile)
-        cmd = [sys.executable, str(SCRIPT), "--socket", self.socket, "--profile", profile_arg,
-               "--downloads", self.downloads, "--idle-seconds", str(idle), "--viewport", "1280x800",
-               "--executable", CHROME]
+        args = ["--socket", self.socket, "--profile", profile_arg,
+                "--downloads", self.downloads, "--idle-seconds", str(idle), "--viewport", "1280x800",
+                "--executable", CHROME]
+        env = None
+        if fake_dns is not None or no_frame_sessions:
+            cmd = [sys.executable, "-c", PATCHED_LAUNCHER] + args
+            env = dict(os.environ, BS_SCRIPT=str(SCRIPT), BS_FAKE_DNS=json.dumps(fake_dns),
+                       BS_CONNECT_MAP=json.dumps(connect_map or {}),
+                       BS_NO_FRAME_SESSIONS="1" if no_frame_sessions else "")
+        else:
+            cmd = [sys.executable, str(SCRIPT)] + args
         if allow_private:
             cmd.append("--allow-private")
         self.log = open(self.log_path, "wb")
-        self.proc = subprocess.Popen(cmd, stdout=self.log, stderr=subprocess.STDOUT)
+        self.proc = subprocess.Popen(cmd, stdout=self.log, stderr=subprocess.STDOUT, env=env)
         self._wait_ready()
 
     def _wait_ready(self, timeout: float = 40):
@@ -1079,7 +1418,9 @@ def test_read_page_output_is_capped(browser, site):
     browser.call("navigate", {"url": f"{site}/many"})
     page = _text(browser.call("read_page", {"filter": "all"}))
     assert page.endswith(bs.truncation_notice(bs.READ_PAGE_CAP))
-    assert len(page) <= bs.READ_PAGE_CAP + 200
+    assert len(page) <= bs.READ_PAGE_CAP   # the notice included (review: it came on top, 50,088)
+    top = _text(browser.call("read_page"))  # the viewport note is added too: still within the cap
+    assert len(top) <= bs.READ_PAGE_CAP and "Only elements in the viewport are listed" in top
     assert 'link "Item number 0 with a fairly long link text"' in page
 
 
@@ -1228,7 +1569,9 @@ def test_sensitive_actions_need_confirmation(browser, site):
     browser.call("left_click", {"target": {"type": "ref", "ref": _ref(page, 'textbox "Chat box"')}})
     composer = browser.call("key", {"text": "Enter"})
     assert composer["needs_confirmation"] is True and "Enter in the text field" in composer["error"]
-    assert browser.call("type", {"text": "hi\n"})["needs_confirmation"] is True
+    typed = browser.call("type", {"text": "hi\n"})
+    assert typed["needs_confirmation"] is True and "already done" not in typed["error"]
+    assert 'value="hi"' not in _text(browser.call("read_page"))   # refused before typing anything
     # a div "button" without a role, clicked by coordinate on its inner span
     buy = browser.call("left_click", {"target": {"type": "coordinate", "x": 1000, "y": 720}})
     assert buy["needs_confirmation"] is True and '(clickable "Buy now")' in buy["error"]
@@ -1442,3 +1785,394 @@ def test_navigating_to_a_file_downloads_it(browser, site, server):
     completed = [c for c in changes if c["type"] == "download_completed"]
     assert len(completed) == 1 and completed[0]["size_bytes"] == len(DOWNLOAD_BODY)
     assert (Path(server.downloads) / completed[0]["path"].split("/", 1)[1]).read_bytes() == DOWNLOAD_BODY
+
+
+# ---------------------------------------------------------------------------------------------
+# Regression tests from the review (real Chromium)
+# ---------------------------------------------------------------------------------------------
+
+def _redirect_to_secret(handler):
+    tag = parse_qs(urlsplit(handler.path).query).get("tag", ["x"])[0]
+    target = f"http://127.0.0.1:{handler.server.server_address[1]}/secret-{tag}"
+    return "", 302, [("Location", target)]
+
+
+SSRF_PAGE = """<!doctype html><html><head><title>ssrf main</title></head><body>
+<img src="/ssrf-redir?tag=img-redirect">
+<iframe src="/ssrf-redir?tag=iframe-redirect"></iframe>
+<script>
+fetch('/ssrf-redir?tag=fetch-redirect').catch(() => {});
+try { new SharedWorker('/ssrf-shared.js'); } catch (e) {}
+window.open('/ssrf-redir?tag=popup-redirect');
+setTimeout(() => { document.title = 'ssrf done'; }, 1500);
+</script></body></html>"""
+
+
+@needs_browser
+def test_private_addresses_are_unreachable_through_redirects_workers_and_popups(site):
+    # review (HIGH): the route filter missed redirects (navigation, subresources, popups) and
+    # SharedWorker requests. Every request now goes through the egress proxy, which checks each host.
+    port = urlsplit(site).port
+    secret = f"http://127.0.0.1:{port}/secret"
+    EXTRA_PAGES["/ssrf-main"] = SSRF_PAGE
+    EXTRA_PAGES["/ssrf-redir"] = _redirect_to_secret
+    EXTRA_PAGES["/ssrf-shared.js"] = lambda h: (
+        f"onconnect = () => {{}}; fetch('{secret}-sharedworker').catch(() => {{}}); "
+        f"fetch('/ssrf-redir?tag=sharedworker-redirect').catch(() => {{}});", 200, [])
+    workdir = _workdir()
+    # "public.test" resolves to a public address for the address check; the proxy's connection to
+    # that (checked) address is mapped to the local site
+    proc = ServerProcess(workdir, allow_private=False, profile=None,
+                         fake_dns={"public.test": ["93.184.216.34"]}, connect_map={"93.184.216.34": "127.0.0.1"})
+    try:
+        client = proc.client()
+        public = f"http://public.test:{port}"
+        nav = client.call("navigate", {"url": f"{public}/ssrf-main"})
+        assert nav["ok"], nav
+        time.sleep(3)
+        redirected = client.call("navigate", {"url": f"{public}/ssrf-redir?tag=navigation-redirect"})
+        assert redirected["ok"] is False
+        assert redirected["error"] == ("Error: Navigation refused. The page redirected to 127.0.0.1, "
+                                       "a private or local address.")
+        assert client.call("navigate", {"url": f"http://127.0.0.1:{port}/form"})["error"] == \
+            "Error: Navigation refused. 127.0.0.1 is a private or local address."
+        unknown = client.call("navigate", {"url": f"http://unknown.test:{port}/"})
+        assert unknown["ok"] is False and "unknown.test could not be resolved" in unknown["error"]
+        client.close()
+        hits = [h for h in HITS if "/secret" in h]
+        assert hits == [], hits
+        assert any(h.startswith("/ssrf-redir?tag=popup-redirect") for h in HITS)  # the popup did try
+        assert "/ssrf-shared.js" in HITS                                        # the worker did run
+        assert "proxy refused 127.0.0.1" in proc.logs()
+    finally:
+        proc.stop()
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _cross_site(site: str) -> str:
+    return site.replace("127.0.0.1", "localhost")  # another site: an out-of-process frame
+
+
+@needs_browser
+def test_guard_sees_into_cross_origin_frames_and_closed_shadow_roots(browser, site):
+    # review (HIGH): coordinate clicks on "Pay $500 now" inside a cross-origin iframe or a closed
+    # shadow root, and Enter in a card field there, were not checked
+    EXTRA_PAGES["/xo-widget"] = """<!doctype html><html><head><title>Checkout widget</title></head>
+<body style="margin:0"><form action="/xo-charged" target="_top" method="get">
+<input name="card" aria-label="Card number" style="position:absolute;left:0;top:0;width:200px;height:30px">
+<button type="submit" style="position:absolute;left:0;top:100px;width:200px;height:50px">Pay $500 now</button>
+</form></body></html>"""
+    EXTRA_PAGES["/xo-shop"] = f"""<!doctype html><html><head><title>XO shop</title></head><body style="margin:0">
+<iframe src="{_cross_site(site)}/xo-widget" style="position:absolute;left:100px;top:100px;width:400px;height:200px;border:0"></iframe>
+<pay-button style="position:absolute;left:700px;top:100px"></pay-button>
+<script>
+customElements.define('pay-button', class extends HTMLElement {{ constructor() {{ super();
+  const r = this.attachShadow({{mode: 'closed'}});
+  r.innerHTML = '<button style="width:200px;height:50px">Buy now</button>';
+  r.querySelector('button').onclick = () => {{ document.title = 'BOUGHT'; }}; }} }});
+</script></body></html>"""
+    EXTRA_PAGES["/xo-charged"] = "<html><head><title>CHARGED</title></head><body>charged</body></html>"
+    browser.call("navigate", {"url": f"{site}/xo-shop"})
+    time.sleep(0.5)
+    pay = browser.call("left_click", {"target": {"type": "coordinate", "x": 200, "y": 225}})
+    assert pay["needs_confirmation"] is True and '(button "Pay $500 now")' in pay["error"]
+    card = browser.call("left_click", {"target": {"type": "coordinate", "x": 150, "y": 115}})
+    assert card["ok"] and _text(card) == 'Clicked (150, 115) (textbox "Card number").'  # a field: fine
+    typed = browser.call("type", {"text": "4242\n"})
+    assert typed["needs_confirmation"] is True and '(button "Pay $500 now")' in typed["error"]
+    tabbed = browser.call("key", {"text": "Tab Enter"})  # the focus moves to "Pay" inside the frame
+    assert tabbed["needs_confirmation"] is True and '(button "Pay $500 now")' in tabbed["error"]
+    shadow = browser.call("left_click", {"target": {"type": "coordinate", "x": 800, "y": 125}})
+    assert shadow["needs_confirmation"] is True and '(button "Buy now")' in shadow["error"]
+    # the focused button inside the closed root: Enter and Space are checked on it too
+    browser.call("left_click", {"target": {"type": "coordinate", "x": 650, "y": 400}})
+    for _ in range(6):  # card field, "Pay $500 now" (both in the frame), then the shadow button
+        browser.call("key", {"text": "Tab"})
+        focused = browser.call("key", {"text": "space"})
+        if not focused["ok"] and '(button "Buy now")' in focused["error"]:
+            break
+    assert focused["needs_confirmation"] is True and '(button "Buy now")' in focused["error"]
+    assert browser.call("key", {"text": "Enter"})["needs_confirmation"] is True
+    assert _active_status(browser)["title"] == "XO shop"
+    assert not [h for h in HITS if h.startswith("/xo-charged")]
+
+
+@needs_browser
+def test_middle_click_mouse_down_up_and_drags_are_guarded(browser, site):
+    # review (HIGH): middle_click, left_mouse_down/up and left_click_drag never called the guard
+    EXTRA_PAGES["/mouse-guard"] = """<!doctype html><html><head><title>mouse guard</title></head><body style="margin:0">
+<a href="/mg-delete?id=7" style="position:absolute;left:10px;top:10px">Delete</a>
+<button style="position:absolute;left:300px;top:200px;width:200px;height:60px" onclick="document.title='BOUGHT'">Buy now</button>
+</body></html>"""
+    EXTRA_PAGES["/mg-delete"] = "<html><head><title>item 7 deleted</title></head><body>deleted</body></html>"
+    browser.call("navigate", {"url": f"{site}/mouse-guard"})
+    page = _text(browser.call("read_page"))
+    middle = browser.call("middle_click", {"target": {"type": "ref", "ref": _ref(page, 'link "Delete"')}})
+    assert middle["needs_confirmation"] is True and '(link "Delete")' in middle["error"]
+    down = browser.call("left_mouse_down", {"target": {"type": "coordinate", "x": 400, "y": 230}})
+    assert down["needs_confirmation"] is True and '(button "Buy now")' in down["error"]
+    up = browser.call("left_mouse_up", {"target": {"type": "coordinate", "x": 400, "y": 230}})
+    assert up["needs_confirmation"] is True   # no checked press at this point before it
+    drag = browser.call("left_click_drag", {"from": {"type": "coordinate", "x": 390, "y": 225},
+                                            "target": {"type": "coordinate", "x": 410, "y": 235}})
+    assert drag["needs_confirmation"] is True
+    onto = browser.call("left_click_drag", {"from": {"type": "coordinate", "x": 700, "y": 600},
+                                            "target": {"type": "coordinate", "x": 30, "y": 18}})
+    assert onto["needs_confirmation"] is True and '(link "Delete")' in onto["error"]
+    assert _active_status(browser)["title"] == "mouse guard"
+    # allowed: the checked press covers its release at the same point
+    down = browser.call("left_mouse_down", {"target": {"type": "coordinate", "x": 400, "y": 230}}, allow_sensitive=True)
+    assert down["ok"] and down["sensitive_done"] is True
+    up = browser.call("left_mouse_up", {"target": {"type": "coordinate", "x": 400, "y": 230}})
+    assert up["ok"] and up["sensitive_done"] is False
+    assert _active_status(browser)["title"] == "BOUGHT"
+    assert not [h for h in HITS if h.startswith("/mg-delete")]
+
+
+@needs_browser
+def test_keys_are_checked_on_the_element_that_has_the_focus_right_before(browser, site):
+    # review (HIGH): only Enter was checked, on the element focused BEFORE the sequence: "Tab Enter"
+    # bought, Space on a focused "Place order" ordered
+    EXTRA_PAGES["/keys-guard"] = """<!doctype html><html><head><title>keys guard</title></head><body style="margin:0">
+<input aria-label="Coupon code" style="position:absolute;left:10px;top:10px;width:200px;height:30px">
+<button style="position:absolute;left:300px;top:200px;width:200px;height:60px" onclick="document.title='BOUGHT'">Buy now</button>
+<a href="#" onclick="document.title='DELETED'; return false;" style="position:absolute;left:300px;top:400px">Delete account</a>
+</body></html>"""
+    url = f"{site}/keys-guard"
+
+    def focus_coupon():
+        browser.call("navigate", {"url": url})
+        assert browser.call("left_click", {"target": {"type": "coordinate", "x": 50, "y": 25}})["ok"]
+
+    focus_coupon()
+    tab_enter = browser.call("key", {"text": "Tab Enter"})
+    assert tab_enter["needs_confirmation"] is True and '(button "Buy now")' in tab_enter["error"]
+    assert "were already done" in tab_enter["error"]   # the Tab happened: the focus is on "Buy now"
+    focus_coupon()
+    assert browser.call("key", {"text": "Tab Tab Enter"})["error"].count('link "Delete account"') == 1
+    focus_coupon()
+    browser.call("key", {"text": "Tab"})
+    for refused in (browser.call("key", {"text": "space"}), browser.call("type", {"text": " "}),
+                    browser.call("hold_key", {"text": "space", "duration": 0.1}),
+                    browser.call("key", {"text": "NumpadEnter"})):
+        assert refused["needs_confirmation"] is True and '(button "Buy now")' in refused["error"], refused
+    assert _active_status(browser)["title"] == "keys guard"
+    # typing a sentence (spaces) into the coupon field is fine
+    focus_coupon()
+    typed = browser.call("type", {"text": "SAVE 10 NOW"})
+    assert typed["ok"] and _text(typed) == "Typed 11 characters."
+    # allowed: one activation; a second consequential key in the same action stops there
+    focus_coupon()
+    browser.call("key", {"text": "Tab"})
+    allowed = browser.call("key", {"text": "space Tab Enter"}, allow_sensitive=True)
+    assert allowed["ok"] and allowed["sensitive_done"] is True
+    assert "one confirmation covers one action" in _text(allowed)
+    assert _active_status(browser)["title"] == "BOUGHT"
+
+
+@needs_browser
+def test_a_click_on_a_container_checks_what_is_under_the_point(browser, site):
+    # review (MEDIUM): clicking cell "Delete" hit its button; clicking dialog "Checkout" hit "Pay now"
+    EXTRA_PAGES["/container-guard"] = """<!doctype html><html><head><title>files</title></head><body>
+<table border=1><tr><td style="width:300px">report.pdf</td>
+<td style="width:120px;height:40px;text-align:center"><button onclick="document.title='DELETED'">Delete</button></td></tr></table>
+<div role="dialog" aria-label="Checkout" style="position:absolute;left:100px;top:200px;width:300px;height:120px;display:flex;align-items:center;justify-content:center">
+<button onclick="document.title='PAID'">Pay now</button></div>
+</body></html>"""
+    browser.call("navigate", {"url": f"{site}/container-guard"})
+    page = _text(browser.call("read_page", {"filter": "all"}))
+    cell = browser.call("left_click", {"target": {"type": "ref", "ref": _ref(page, 'cell "Delete"')}})
+    assert cell["needs_confirmation"] is True and '(button "Delete")' in cell["error"]
+    dialog = browser.call("left_click", {"target": {"type": "ref", "ref": _ref(page, 'dialog "Checkout"')}})
+    assert dialog["needs_confirmation"] is True and '(button "Pay now")' in dialog["error"]
+    harmless = browser.call("left_click", {"target": {"type": "ref", "ref": _ref(page, 'cell "report.pdf"')}})
+    assert harmless["ok"]
+    assert _active_status(browser)["title"] == "files"
+
+
+@needs_browser
+def test_back_forward_and_reload_never_resend_a_form_unasked(browser, site):
+    # review (MEDIUM): an allowed order, then reload / back made POSTs #2 and #3 silently
+    EXTRA_PAGES["/post-shop"] = """<html><head><title>shop</title></head><body>
+<form method="post" action="/post-order"><button>Place order</button></form></body></html>"""
+    browser.call("navigate", {"url": f"{site}/post-shop"})
+    page = _text(browser.call("read_page", {"filter": "interactive"}))
+    before = len(POSTS)
+    order = browser.call("left_click", {"target": {"type": "ref", "ref": _ref(page, 'button "Place order"')}},
+                         allow_sensitive=True)
+    assert order["ok"] and order["sensitive_done"] is True and len(POSTS) == before + 1
+    reload = browser.call("navigate", {"url": "reload"})
+    assert reload["needs_confirmation"] is True
+    assert '(navigate "reload" would send the form of that page again (POST))' in reload["error"]
+    browser.call("navigate", {"url": f"{site}/other"})
+    back = browser.call("navigate", {"url": "back"})
+    assert back["needs_confirmation"] is True and 'navigate "back"' in back["error"]
+    assert len(POSTS) == before + 1
+    assert _active_status(browser)["title"] == "Other page"
+    again = browser.call("navigate", {"url": "back"}, allow_sensitive=True)
+    assert again["ok"] and again["sensitive_done"] is True and "sent again" in _text(again)
+    assert len(POSTS) == before + 2
+    plain = browser.call("navigate", {"url": "forward"})   # back to a GET page: nothing to confirm
+    assert plain["ok"] and plain["sensitive_done"] is False
+
+
+@needs_browser
+def test_registration_and_reply_fields_are_not_refused(browser, site):
+    # review (MEDIUM-LOW): a click into "Post code" was refused, an allowed click into "Write a
+    # reply" spent the allowance on focusing; (MEDIUM) a bare "Отправить" broke registration
+    EXTRA_PAGES["/register-ru"] = """<!doctype html><html><head><title>Регистрация</title></head><body>
+<form onsubmit="event.preventDefault(); document.title='REGISTERED'">
+<label>Email <input name="email"></label> <label>Post code <input name="zip"></label>
+<label>Пароль <input type="password" name="pw"></label>
+<label>Ответ на секретный вопрос <input name="answer"></label>
+<button type="submit">Отправить</button></form>
+<form onsubmit="event.preventDefault(); document.title='MESSAGE SENT'">
+<textarea aria-label="Сообщение"></textarea><button type="submit">Отправить</button></form>
+<textarea aria-label="Write a reply"></textarea>
+</body></html>"""
+    browser.call("navigate", {"url": f"{site}/register-ru"})
+    page = _text(browser.call("read_page", {"filter": "interactive"}))
+    assert browser.call("left_click", {"target": {"type": "ref", "ref": _ref(page, 'textbox "Post code"')}})["ok"]
+    reply = browser.call("left_click", {"target": {"type": "ref", "ref": _ref(page, 'textbox "Write a reply"')}},
+                         allow_sensitive=True)
+    assert reply["ok"] and reply["sensitive_done"] is False   # the allowance is still unused
+    answer = _ref(page, 'textbox "Ответ на секретный вопрос"')
+    browser.call("left_click", {"target": {"type": "ref", "ref": answer}})
+    browser.call("type", {"text": "Мурзик"})
+    entered = browser.call("key", {"text": "Enter"})          # submits the registration form
+    assert entered["ok"], entered
+    assert _active_status(browser)["title"] == "REGISTERED"
+    buttons = [line for line in page.splitlines() if 'button "Отправить"' in line]
+    register_submit, message_submit = (b.split("[", 1)[1].split("]", 1)[0] for b in buttons)
+    assert browser.call("left_click", {"target": {"type": "ref", "ref": register_submit}})["ok"]
+    message = browser.call("left_click", {"target": {"type": "ref", "ref": message_submit}})
+    assert message["needs_confirmation"] is True and '(button "Отправить")' in message["error"]
+
+
+@needs_browser
+def test_long_titles_never_break_tab_results(browser, site):
+    # review (LOW): a 4096+ character title cut on a space made every tab member fail
+    EXTRA_PAGES["/long-title"] = f"<html><head><title>{'a' * 4095} tail</title></head><body>long title</body></html>"
+    nav = browser.call("navigate", {"url": f"{site}/long-title"})
+    assert nav["ok"] and _active(_state(nav))["title"] == "a" * 4095
+    assert browser.call("list_tabs")["ok"]
+    created = browser.call("new_tab")
+    assert created["ok"] and len(created["content"]) == 1
+
+
+@needs_browser
+def test_refs_are_unique_across_tabs(browser, site):
+    # review (LOW): tab-2's ref_1 used while tab-1 was active clicked tab-1's element
+    EXTRA_PAGES["/refs-a"] = "<html><head><title>A</title></head><body><button onclick=\"document.title='A clicked'\">Archive</button></body></html>"
+    EXTRA_PAGES["/refs-b"] = "<html><head><title>B</title></head><body><button onclick=\"document.title='B clicked'\">Show details</button></body></html>"
+    browser.call("navigate", {"url": f"{site}/refs-a"})
+    first = browser.call("list_tabs")["content"][0]["tabs"][0]["tab_id"]
+    page_a = _text(browser.call("read_page", {"filter": "interactive"}))
+    browser.call("new_tab")
+    browser.call("navigate", {"url": f"{site}/refs-b"})
+    page_b = _text(browser.call("read_page", {"filter": "interactive"}))
+    ref_a, ref_b = _ref(page_a, "Archive"), _ref(page_b, "Show details")
+    assert ref_a != ref_b
+    browser.call("switch_tab", {"tab_id": first})
+    wrong = browser.call("left_click", {"target": {"type": "ref", "ref": ref_b}})
+    assert wrong["ok"] is False and wrong["error"] == bs.stale_ref_error(ref_b)
+    assert _active_status(browser)["title"] == "A"
+
+
+@needs_browser
+def test_session_cookies_survive_a_restart_with_a_persistent_profile(site):
+    # review (LOW): Chromium keeps only cookies with an expiry, so a session-cookie login ended at
+    # every idle exit or restart
+    EXTRA_PAGES["/login-session"] = lambda h: (
+        "<html><head><title>logged in</title></head><body>ok</body></html>", 200,
+        [("Set-Cookie", "session=s3cr3t; Path=/; HttpOnly"), ("Set-Cookie", "remember=r1; Max-Age=86400; Path=/")])
+    workdir = _workdir()
+    kept = Path(workdir, "profile", bs.SESSION_COOKIES_FILE)
+    try:
+        first = ServerProcess(workdir, profile="profile")
+        client = first.client()
+        assert client.call("navigate", {"url": f"{site}/login-session"})["ok"]
+        client.close()
+        first.stop()
+        assert kept.exists() and (kept.stat().st_mode & 0o777) == 0o600
+        assert "s3cr3t" not in first.logs()
+        second = ServerProcess(workdir, profile="profile")
+        assert not kept.exists()          # read once, then gone
+        client = second.client()
+        client.call("navigate", {"url": f"{site}/echo"})
+        text = _text(client.call("get_page_text"))
+        assert "session=s3cr3t" in text and "remember=r1" in text
+        client.close()
+        second.stop()
+        assert kept.exists()              # written again at this shutdown: still logged in next time
+        ephemeral = ServerProcess(workdir, profile=None)
+        client = ephemeral.client()
+        client.call("navigate", {"url": f"{site}/login-session"})
+        client.close()
+        ephemeral.stop()
+        assert "session cookie" not in ephemeral.logs()   # a throwaway profile keeps nothing
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+@needs_browser
+def test_force_state_reports_the_tabs_even_when_unchanged(browser, site):
+    # review (LOW): the next turn's first read_page carried no tab list when the last report went
+    # to another conversation; the bot now asks with force_state
+    browser.call("navigate", {"url": f"{site}/other"})
+    assert _state(browser.call("read_page")) is None           # unchanged since the last report
+    forced = browser.call("read_page", {})
+    assert _state(forced) is None
+    browser.counter += 1
+    request = {"id": str(browser.counter), "action": "read_page", "input": {}, "force_state": True}
+    browser.file.write((json.dumps(request) + "\n").encode())
+    browser.file.flush()
+    response = json.loads(browser.file.readline())
+    assert response["ok"] and bs.validate_content("read_page", response["content"]) == []
+    assert _active(_state(response))["url"] == f"{site}/other"
+    refused = {"id": "x", "action": "read_page", "input": {"depth": 0}, "force_state": True}
+    browser.file.write((json.dumps(refused) + "\n").encode())
+    browser.file.flush()
+    error = json.loads(browser.file.readline())
+    assert error["ok"] is False and "content" not in error    # never a browser_state on an error
+
+
+@needs_browser
+def test_coordinates_follow_the_viewport_of_a_popup(browser, site):
+    # minor (review): a popup opened with its own size has a smaller viewport than 1280x800
+    EXTRA_PAGES["/vp-opener"] = """<html><head><title>opener</title></head><body>
+<button onclick="window.open('/vp-pop', 'p', 'width=420,height=300')">Open</button></body></html>"""
+    EXTRA_PAGES["/vp-pop"] = "<html><head><title>pop</title></head><body>small window</body></html>"
+    browser.call("navigate", {"url": f"{site}/vp-opener"})
+    page = _text(browser.call("read_page"))
+    opened = browser.call("left_click", {"target": {"type": "ref", "ref": _ref(page, 'button "Open"')}})
+    assert _active(_state(opened))["title"] == "pop"
+    outside = browser.call("left_click", {"target": {"type": "coordinate", "x": 500, "y": 10}})
+    assert outside["error"] == "Error: Coordinate (500, 10) is outside the viewport (420x300)."
+    assert browser.call("zoom", {"region": [0, 0, 600, 100]})["error"].startswith("Error: region")
+    assert browser.call("left_click", {"target": {"type": "coordinate", "x": 100, "y": 100}})["ok"]
+
+
+@needs_browser
+def test_a_cross_origin_frame_the_guard_cannot_enter_counts_only_when_it_looks_like_payment(site):
+    # the last resort (no DevTools session for the frame): only payment-looking frames are refused
+    EXTRA_PAGES["/opaque-pay"] = "<html><body style='margin:0'><button style='width:300px;height:100px'>Go</button></body></html>"
+    EXTRA_PAGES["/opaque-video"] = EXTRA_PAGES["/opaque-pay"]
+    EXTRA_PAGES["/opaque-shop"] = f"""<!doctype html><html><head><title>opaque</title></head><body style="margin:0">
+<iframe title="Secure payment form" src="{_cross_site(site)}/opaque-pay" style="position:absolute;left:0;top:0;width:400px;height:200px;border:0"></iframe>
+<iframe title="Video" src="{_cross_site(site)}/opaque-video" style="position:absolute;left:500px;top:0;width:400px;height:200px;border:0"></iframe>
+</body></html>"""
+    workdir = _workdir()
+    proc = ServerProcess(workdir, profile=None, no_frame_sessions=True)
+    try:
+        client = proc.client()
+        client.call("navigate", {"url": f"{site}/opaque-shop"})
+        time.sleep(0.5)
+        pay = client.call("left_click", {"target": {"type": "coordinate", "x": 100, "y": 50}})
+        assert pay["needs_confirmation"] is True
+        assert '(frame "Secure payment form" (looks like a payment form))' in pay["error"]
+        assert client.call("left_click", {"target": {"type": "coordinate", "x": 600, "y": 50}})["ok"]
+        client.close()
+    finally:
+        proc.stop()
+        shutil.rmtree(workdir, ignore_errors=True)

@@ -128,10 +128,30 @@ def _clip(text: str, limit: int) -> str:
 
 
 def _result_text(content: Any) -> str:
-    """A tool result is a string or a list of content blocks."""
+    """A tool result is a string or a list of content blocks (text, images as ``[image]``, a
+    browser result's ``browser_state`` as its one-line summary)."""
     if isinstance(content, list):
-        return "\n".join(str(b.get("text", "")) if isinstance(b, dict) else str(b) for b in content)
+        from agents.content import result_preview  # no import-time side effects
+
+        return result_preview(content)
     return str(content)
+
+
+def _call_name(block: dict) -> str:
+    """``browser.type`` for a toolset member, the plain tool name otherwise (as in the trace)."""
+    name = str(block.get("name", "unknown"))
+    family = block.get("toolset_name")
+    return f"{family}.{name}" if family else name
+
+
+def _call_args(block: dict) -> Any:
+    """A tool call's arguments for the file; what a browser member typed into a page is masked."""
+    args = block.get("input")
+    if block.get("toolset_name"):
+        from agents.browser_tools import masked_input  # no import-time side effects
+
+        args = masked_input(block.get("name", ""), args)
+    return args
 
 
 def reasoning_text(messages: list) -> str:
@@ -145,7 +165,7 @@ def reasoning_text(messages: list) -> str:
     for msg in messages:
         for block in msg.get("content", []) if isinstance(msg.get("content"), list) else []:
             if isinstance(block, dict) and block.get("type") == "tool_use":
-                names[str(block.get("id"))] = str(block.get("name", "unknown"))
+                names[str(block.get("id"))] = _call_name(block)
 
     out: list[str] = []
     for msg in messages:
@@ -164,12 +184,12 @@ def reasoning_text(messages: list) -> str:
                 elif kind == "thinking" and str(block.get("thinking", "")).strip():
                     out.append(f"[{role} thinking]\n{_clip(block['thinking'], THINKING_CHARS)}")
                 elif kind == "tool_use":
-                    args = block.get("input")
+                    args = _call_args(block)
                     try:
                         rendered = json.dumps(args, ensure_ascii=False, indent=2)
                     except (TypeError, ValueError):
                         rendered = str(args)
-                    out.append(f"[Tool call: {block.get('name', 'unknown')}]\n{_clip(rendered, ARGS_CHARS)}")
+                    out.append(f"[Tool call: {_call_name(block)}]\n{_clip(rendered, ARGS_CHARS)}")
                 elif kind == "tool_result":
                     name = names.get(str(block.get("tool_use_id")), "unknown")
                     status = " — error" if block.get("is_error") else ""
@@ -280,7 +300,8 @@ async def run_turn(
     agent has nothing worth saying; nothing is sent, the status message is removed (or, with
     ``quiet_notice``, edited into that line: a turn the user started by a button expects some
     reply) and the result carries ``quiet=True``. The marker is stored on the turn record, so
-    Retry runs with it again.
+    Retry runs with it again. Such a turn never shows the browser's live view (it would stay
+    behind after a quiet run).
     """
     from stats import stats_tracker
     from agents import content as prompt_content  # no import-time side effects; after the patcher ran
@@ -324,6 +345,13 @@ async def run_turn(
     # Set once the status message is the answer (legacy) or the turn summary (rich): a cancel
     # or error after that (e.g. /cancel while the buttons go on) must not overwrite it.
     status_final = False
+    agent_settings = user_settings
+    if quiet_marker:
+        # A scheduled task runs unattended, and a quiet run must leave nothing in the chat: no
+        # live view of the browser (browser.stream off for this turn only; it changes neither the
+        # tools nor the system prompt, so the transcript's fingerprint stays).
+        browser = user_settings.get("browser") if isinstance(user_settings.get("browser"), dict) else {}
+        agent_settings = {**user_settings, "browser": {**browser, "stream": False}}
     try:
         agents = _agents()
         agent = agents.ChainOfThoughtAgent(
@@ -331,7 +359,7 @@ async def run_turn(
             model=ANTHROPIC_MODEL,
             user_id=user_id,
             sender=sender,
-            user_settings=user_settings,
+            user_settings=agent_settings,
             message_thread_id=thread_id,
         )
         response, messages = await agent.generate_response(prompt, update_status, on_text_chunk=on_text_chunk, trace=trace)

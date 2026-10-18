@@ -26,18 +26,22 @@ bot), no swap beyond their memory limit, a pid limit and labels ``generall.sandb
 
 Network: both join a user-defined bridge (``SANDBOX_NETWORK``, fixed ``SANDBOX_SUBNET``,
 inter-container traffic off). Since the bot container is privileged with host networking it
-inserts host iptables rules once (``apply_egress_filter``, idempotent): traffic from the subnet to
+inserts host iptables rules at setup and checks them again every ``EGRESS_RECHECK_SECONDS`` from
+``reap_idle`` (``apply_egress_filter``, idempotent; a host firewall reload drops them, and in
+``required`` mode a failed check stops every session): traffic from the subnet to
 private, loopback, link-local (cloud metadata), CGNAT, multicast and reserved ranges is dropped in
 ``DOCKER-USER`` (``FORWARD`` when Docker has no such chain), and traffic from the subnet to the
 host itself is dropped in ``INPUT`` (the local Bot API server listens there). Sandboxes resolve
 names through public resolvers (``SANDBOX_DNS``): Docker's embedded DNS forwards from the
 container's namespace, so a private host resolver would be cut off by the filter.
 
-Admission: a session starts only while ``MemAvailable`` (``/proc/meminfo``, host-wide even inside
-the bot container) minus ``SANDBOX_MEMORY_RESERVE_MB`` covers its memory limit and the count of
-running sessions of its kind is below the cap (auto: what the host's total memory can hold).
-Otherwise the least recently used session of that kind that has been idle for two minutes is
-stopped (its files and profile stay) and admission is retried once; then :class:`CapacityError`.
+Admission: a session starts only while the count of running sessions of its kind is below the cap
+(auto: what the host's total memory can hold), the memory limits of all running and starting
+sessions of both kinds plus its own fit in ``MemTotal`` minus ``SANDBOX_MEMORY_RESERVE_MB`` (one
+shared budget), and ``MemAvailable`` (``/proc/meminfo``, host-wide even inside the bot container)
+minus the reserve covers its limit. Otherwise the least recently used session of that kind that
+has been idle for two minutes is stopped (its files and profile stay) and admission is retried
+once; then :class:`CapacityError`.
 
 Idle: every call touches the session; ``reap_idle`` (the bot runs it every minute in a worker
 thread) stops sessions unused for ``SANDBOX_IDLE_SECONDS``. ``due_warnings`` tells the bot which
@@ -128,6 +132,7 @@ KINDS = (SHELL, BROWSER)
 AUTO_MAX_SHELLS, AUTO_MAX_BROWSERS = 16, 8            # upper bounds of the automatic caps
 UNKNOWN_MEM_MAX_SHELLS, UNKNOWN_MEM_MAX_BROWSERS = 4, 2  # caps when /proc/meminfo is unreadable
 EVICT_IDLE_SECONDS = 120          # a session idle this long may be stopped to make room
+EGRESS_RECHECK_SECONDS = 300      # reap_idle re-applies the egress rules this often (a firewall reload drops them)
 OUTPUT_CAP = 1024 * 1024          # bytes of command output returned (the rest is dropped)
 MAX_EXEC_TIMEOUT = 3600
 REPLAY_TIMEOUT = 900              # the package replay at session start
@@ -157,6 +162,8 @@ PIP_FILE = "installed_python_packages.txt"
 PACKAGE_FILES = {"apt": APT_FILE, "pip": PIP_FILE}
 
 BROWSER_DIED = "Error: the browser stopped unexpectedly; it will restart on the next action."
+CLOSED_WHILE_RUNNING = "Error: the sandbox was closed while the command was running; it did not finish."
+EXIT_UNKNOWN = "Error: the command's exit status is unknown (the sandbox may have been closed)"
 
 # Host ranges a sandbox must never reach (cloud metadata lives in 169.254.0.0/16).
 BLOCKED_RANGES = (
@@ -176,6 +183,15 @@ class SessionStartError(CapacityError):
 
 class _NotDelivered(OSError):
     """The browser server could not be reached at all: the request was never sent."""
+
+
+class _ExecLost(Exception):
+    """Docker failed after a shell command had started: it may have run (partly), so it is never
+    run again. ``error`` is docker's exception."""
+
+    def __init__(self, error: BaseException):
+        super().__init__(str(error))
+        self.error = error
 
 
 # --------------------------------------------------------------------------- memory
@@ -227,6 +243,10 @@ _PIP_NAME = re.compile(
     rf"(?:{_PIP_VERSION}(?:,{_PIP_VERSION})*)?$"
 )
 _PACKAGE_PATTERNS = {"apt": _APT_NAME, "pip": _PIP_NAME}
+# pip installs a requirement ending like an archive from that file in the cwd (the workspace),
+# not from PyPI: such names are refused, never saved and never replayed.
+_PIP_ARCHIVE_SUFFIXES = (".whl", ".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz", ".tar.xz", ".txz",
+                         ".tlz", ".tar.lz", ".tar.lzma", ".egg")
 MAX_PACKAGES_AT_ONCE = 50
 _package_locks: dict[str, threading.Lock] = {}
 _package_locks_guard = threading.Lock()
@@ -234,7 +254,9 @@ _package_locks_guard = threading.Lock()
 
 def valid_package(manager: str, token: str) -> bool:
     pattern = _PACKAGE_PATTERNS.get(manager)
-    return bool(pattern and len(token) <= 200 and pattern.match(token))
+    if not (pattern and len(token) <= 200 and pattern.match(token)):
+        return False
+    return not (manager == "pip" and token.lower().endswith(_PIP_ARCHIVE_SUFFIXES))
 
 
 def parse_packages(manager: str, text: Any) -> list[str]:
@@ -242,8 +264,8 @@ def parse_packages(manager: str, text: Any) -> list[str]:
 
     apt names are lower-cased (``name``, ``name:arch``, ``name=version``); pip takes requirement
     specifiers (``name``, ``name[extra]``, ``name==1.2``, ``name>=1,<2``). Anything else (options,
-    URLs, paths) raises ValueError with a readable reason: install_package never passes free text
-    to apt or pip."""
+    URLs, paths, archive file names such as ``x.whl`` or ``x.tar.gz``) raises ValueError with a
+    readable reason: install_package never passes free text to apt or pip."""
     if manager not in PACKAGE_FILES:
         raise ValueError('manager must be "apt" or "pip"')
     tokens = str(text or "").split()
@@ -576,19 +598,23 @@ def format_exec_result(exit_code: int | None, output: bytes | str | None, timeou
                        elapsed: float = 0.0, mem_mb: int | None = None) -> str:
     """The tool result of one command: its output, or one of the error formats.
 
-    0 → the output (``(no output)`` when empty); 124, or 137 once the time was up → the timeout
-    text (plus what was printed before); 137 earlier → killed (memory); other codes →
-    ``Error (exit code N):\\n<output>``, the format of the one-off containers."""
+    0 → the output (``(no output)`` when empty); 124 or 137 once the time was up (``elapsed`` ≥
+    ``timeout``) → the timeout text (plus what was printed before); 137 earlier → killed (memory);
+    None (docker reported no exit status) → an error saying so, never success; other codes, 124
+    from the command itself included → ``Error (exit code N):\\n<output>``, the format of the
+    one-off containers."""
     if isinstance(output, str):
         output = output.encode("utf-8", errors="replace")
     data = output or b""
     text = data[:OUTPUT_CAP].decode("utf-8", errors="replace")
     if len(data) > OUTPUT_CAP:
         text += "\n[output truncated at 1 MB]"
-    code = 0 if exit_code is None else int(exit_code)
+    if exit_code is None:
+        return f"{EXIT_UNKNOWN}:\n{text}"
+    code = int(exit_code)
     if code == 0:
         return text if text else "(no output)"
-    if code == 124 or (code == 137 and elapsed >= timeout):
+    if code in (124, 137) and elapsed >= timeout:
         message = timeout_message(timeout)
         return message + (f"\nOutput before the timeout:\n{text}" if text.strip() else "")
     if code == 137:
@@ -650,12 +676,13 @@ _egress_warned = False
 
 
 def apply_egress_filter(subnet: str, mode: str | None = None,
-                        run: Callable[[list[str]], int] | None = None) -> str:
+                        run: Callable[[list[str]], int] | None = None, *, recheck: bool = False) -> str:
     """Insert the egress rules for ``subnet`` unless present: "on", "off" (mode off) or "failed".
 
     Never raises: without iptables or the rights to use it (a local run) the failure is logged
     once as a WARNING and the bot goes on; whether sessions may still start is the caller's call
-    (``required`` mode refuses them)."""
+    (``required`` mode refuses them). ``recheck`` (the periodic check of a running manager) logs
+    only rules that had to be inserted again, not the "active" line."""
     global _egress_warned
     mode = (mode or EGRESS_FILTER).lower()
     if mode == "off":
@@ -663,6 +690,7 @@ def apply_egress_filter(subnet: str, mode: str | None = None,
     run = run or _run_quiet
     binary, chain = pick_iptables(run)
     problem = None
+    inserted = 0
     if binary is None:
         problem = "iptables is not available (or not permitted) in the bot container"
     else:
@@ -672,10 +700,17 @@ def apply_egress_filter(subnet: str, mode: str | None = None,
             if run(insert) != 0:
                 problem = f"'{' '.join(insert)}' failed"
                 break
+            inserted += 1
     if problem is None:
-        logger.info("Sandbox egress filter active for %s (%s, chain %s)", subnet, binary, chain)
+        if not recheck:
+            logger.info("Sandbox egress filter active for %s (%s, chain %s)", subnet, binary, chain)
+        elif inserted:
+            logger.warning("Sandbox egress filter: %s rule(s) for %s were missing (a firewall reload?) and were "
+                           "inserted again (%s, chain %s)", inserted, subnet, binary, chain)
         return "on"
-    if not _egress_warned:
+    if recheck:
+        logger.debug("Sandbox egress filter check failed: %s", problem)
+    elif not _egress_warned:
         _egress_warned = True
         logger.warning("Sandbox egress filter NOT active (%s): sandboxes can reach private networks "
                        "and the host. SANDBOX_EGRESS_FILTER=%s.", problem, mode)
@@ -686,22 +721,37 @@ def apply_egress_filter(subnet: str, mode: str | None = None,
 
 
 def _connect_unix(path: Path, timeout: float) -> socket.socket:
-    """Connect to a unix socket; a path too long for sockaddr_un goes through /proc/self/fd."""
+    """Connect to the unix socket ``path`` without following a link (the browser can write ctl/).
+
+    The directory is opened ``O_NOFOLLOW``, the entry must be a socket (checked without following
+    it) and the connect goes through ``/proc/self/fd``, which also keeps a deep path under the
+    sockaddr_un limit. Where ``O_PATH`` exists the entry itself is opened ``O_PATH | O_NOFOLLOW``
+    and connected through its descriptor, so a link swapped in after the check is not followed
+    either. A refused entry raises ``ConnectionRefusedError`` (the server counts as unreachable)."""
+    path = Path(path)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(timeout)
-    fd = None
+    dir_fd = entry_fd = None
+    o_path = getattr(os, "O_PATH", 0)
     try:
-        target = str(path)
-        if len(os.fsencode(os.path.abspath(target))) >= 100:
-            fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            target = f"/proc/self/fd/{fd}/{path.name}"
+        dir_fd = os.open(path.parent, os.O_RDONLY | _DIRECTORY | _NOFOLLOW)
+        if o_path:
+            entry_fd = os.open(path.name, o_path | _NOFOLLOW, dir_fd=dir_fd)
+            mode = os.fstat(entry_fd).st_mode
+            target = f"/proc/self/fd/{entry_fd}"
+        else:
+            mode = os.stat(path.name, dir_fd=dir_fd, follow_symlinks=False).st_mode
+            target = f"/proc/self/fd/{dir_fd}/{path.name}"
+        if not stat.S_ISSOCK(mode):
+            raise ConnectionRefusedError(errno.ECONNREFUSED, "not a socket", str(path))
         sock.connect(target)
     except BaseException:
         sock.close()
         raise
     finally:
-        if fd is not None:
-            os.close(fd)
+        for fd in (entry_fd, dir_fd):
+            if fd is not None:
+                os.close(fd)
     return sock
 
 
@@ -758,13 +808,27 @@ def _utc(ts: float | None) -> datetime | None:
 
 
 def _dir_size(path: Path) -> int:
+    """Bytes of the files under ``path``; 0 unless ``path`` is a real directory. Never follows a
+    link (the browser can write there): ``os.fwalk`` from an ``O_NOFOLLOW`` descriptor, sizes by
+    lstat relative to each directory's descriptor."""
+    try:
+        if not stat.S_ISDIR(os.lstat(path).st_mode):
+            return 0
+        top = os.open(path, os.O_RDONLY | _DIRECTORY | _NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return 0
     total = 0
-    for dirpath, _dirs, files in os.walk(path, followlinks=False):
-        for name in files:
-            try:
-                total += os.lstat(os.path.join(dirpath, name)).st_size
-            except OSError:
-                pass
+    try:
+        for _root, _dirs, files, root_fd in os.fwalk(".", dir_fd=top, follow_symlinks=False):
+            for name in files:
+                try:
+                    total += os.stat(name, dir_fd=root_fd, follow_symlinks=False).st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    finally:
+        os.close(top)
     return total
 
 
@@ -813,6 +877,7 @@ class SessionManager:
         self.egress_state = "off"
         self._clock = clock or time.time
         self._egress_runner = egress_runner
+        self._egress_checked: float | None = None  # when setup / the last re-check applied the rules
         self._lock = threading.Lock()
         self._sessions: dict[tuple[str, str], Session] = {}
         self._user_locks: dict[tuple[str, str], threading.Lock] = {}
@@ -823,9 +888,11 @@ class SessionManager:
     # ---- setup -----------------------------------------------------------------------------
 
     def setup(self) -> None:
-        """Create the sandbox network when missing and apply the egress filter (init_manager)."""
+        """Create the sandbox network when missing and apply the egress filter (init_manager);
+        ``reap_idle`` re-applies the filter every EGRESS_RECHECK_SECONDS afterwards."""
         self._ensure_network()
         self.egress_state = apply_egress_filter(self.subnet, EGRESS_FILTER, self._egress_runner)
+        self._egress_checked = self._clock()
 
     def _ensure_network(self) -> Any:
         name = self.network_name
@@ -881,9 +948,18 @@ class SessionManager:
             noun = "sandbox sessions" if kind == SHELL else "browsers"
             return (f"All {limit} {noun} this server can run are in use; no new {what} can start right now. "
                     "Try again in a few minutes.")
+        pending = sum(self._mem_of(k) * n for k, n in self._starting.items())
+        total = mem_total_mb()
+        if total is not None:
+            # one budget for both kinds: the memory limits of everything running or starting, plus
+            # this one, must fit next to the reserve (each kind's count cap alone assumes all of it)
+            budget = total - MEMORY_RESERVE_MB
+            committed = sum(s.mem_mb for s in self._sessions.values()) + pending
+            if committed + self._mem_of(kind) > budget:
+                return (f"The sandboxes already hold {committed} of the {max(0, budget)} MB this server gives them; "
+                        f"no new {what} can start right now. Try again in a few minutes.")
         available = mem_available_mb()
         if available is not None:
-            pending = sum(self._mem_of(k) * n for k, n in self._starting.items())
             if available - MEMORY_RESERVE_MB - pending < self._mem_of(kind):
                 return (f"The server is short on memory ({available} MB free); no new {what} can start "
                         "right now. Try again in a few minutes.")
@@ -938,12 +1014,19 @@ class SessionManager:
         session.last_used = self._clock()
         self._warned.pop(session.user_id, None)
 
-    def _check_startable(self) -> None:
+    def _start_refusal(self) -> str | None:
+        """Why no session may start or be kept from a start in flight (None = they may)."""
         if self._closed:
-            raise CapacityError("The sandbox is shutting down.")
+            return "The sandbox is shutting down."
         if EGRESS_FILTER == "required" and self.egress_state != "on":
-            raise CapacityError("The sandbox network filter is not active on this server, so sandbox sessions "
-                                "and the browser are disabled (SANDBOX_EGRESS_FILTER=required).")
+            return ("The sandbox network filter is not active on this server, so sandbox sessions "
+                    "and the browser are disabled (SANDBOX_EGRESS_FILTER=required).")
+        return None
+
+    def _check_startable(self) -> None:
+        reason = self._start_refusal()
+        if reason is not None:
+            raise CapacityError(reason)
 
     def _acquire(self, user_id: Any, kind: str, *, remember: bool | None = None, touch: bool = True) -> Session:
         """The user's running session of ``kind`` (started when needed), marked as in use.
@@ -969,9 +1052,18 @@ class SessionManager:
             finally:
                 self._unreserve(kind)
             with self._lock:
-                self._sessions[(uid, kind)] = session
-                session.in_flight += 1
-                self._touch_locked(session)
+                # shutdown_all (or a failed egress re-check in required mode) may have emptied the
+                # table while docker was starting this one: it must not outlive that
+                refusal = self._start_refusal()
+                if refusal is None:
+                    self._sessions[(uid, kind)] = session
+                    session.in_flight += 1
+                    self._touch_locked(session)
+            if refusal is not None:
+                logger.info("Stopping the %s session %s: it came up after starts were refused (%s)",
+                            kind, session.name, refusal)
+                self._stop(session, graceful=False)
+                raise CapacityError(refusal)
             return session
 
     def _release(self, session: Session, touch: bool = True) -> None:
@@ -1080,10 +1172,11 @@ class SessionManager:
         started = time.monotonic()
         code, output = self._exec_raw(session, replay_script(packages["apt"], packages["pip"]), REPLAY_TIMEOUT)
         logger.info("Package replay in %s exited %s after %.0f s", session.name, code, time.monotonic() - started)
-        if code:
+        if code != 0:
             tail = "\n".join(output.decode("utf-8", errors="replace").strip().splitlines()[-10:])[-1500:]
+            status = "exit status unknown" if code is None else f"exit code {code}"
             session.note = (f"\n[Note: a new sandbox session started for this command and reinstalling the saved "
-                            f"packages ({APT_FILE} / {PIP_FILE}) failed (exit code {code}). Last output:\n{tail}]")
+                            f"packages ({APT_FILE} / {PIP_FILE}) failed ({status}). Last output:\n{tail}]")
 
     def _start_browser(self, uid: str, remember: bool) -> Session:
         if not BROWSER_SERVER_SCRIPT.is_file():
@@ -1205,22 +1298,46 @@ class SessionManager:
 
     # ---- the shell ---------------------------------------------------------------------------
 
-    def _exec_raw(self, session: Session, command: str, timeout: int) -> tuple[int, bytes]:
-        result = session.container.exec_run(exec_argv(command, timeout), user="runner", workdir=WORKSPACE, demux=False)
-        exit_code = getattr(result, "exit_code", None)
-        output = getattr(result, "output", None)
-        if exit_code is None and isinstance(result, tuple):
-            exit_code, output = result
-        return (int(exit_code) if exit_code is not None else 0), (output or b"")
+    def _exec_raw(self, session: Session, command: str, timeout: int) -> tuple[int | None, bytes]:
+        """One ``docker exec`` of ``command`` in the session: (exit code, output), the exit code None
+        when docker reports none.
+
+        docker-py's ``exec_run`` calls, made one by one so a failure can be placed: errors of
+        ``exec_create`` and ``exec_start`` propagate as is (Docker answers 404/409 for a container
+        that is gone BEFORE it starts the stream, so such an error means nothing ran); once
+        ``exec_start`` returned, a failing ``exec_inspect`` (a 404 after the container was removed
+        mid-command: the stream just ends) raises :class:`_ExecLost`."""
+        container = session.container
+        api = container.client.api
+        created = api.exec_create(container.id, exec_argv(command, timeout), stdout=True, stderr=True,
+                                  user="runner", workdir=WORKSPACE)
+        exec_id = created["Id"]
+        output = api.exec_start(exec_id, demux=False)
+        try:
+            exit_code = (api.exec_inspect(exec_id) or {}).get("ExitCode")
+        except Exception as e:  # noqa: BLE001 - placed by the caller
+            raise _ExecLost(e) from e
+        return (int(exit_code) if exit_code is not None else None), (output or b"")
 
     def _run(self, user_id: Any, command: str, timeout: Any) -> tuple[str, int | None]:
-        """Run ``command`` in the user's shell session: (tool result text, exit code or None)."""
+        """Run ``command`` in the user's shell session: (tool result text, exit code or None).
+
+        A session found gone before the command started is replaced and the command run there
+        once; one that went away while it ran (closed by the user, the reaper, a shutdown, or
+        died) gives CLOSED_WHILE_RUNNING and never runs it twice."""
         seconds = clamp_timeout(timeout)
         for attempt in range(2):
             session = self._acquire(user_id, SHELL)
             started = time.monotonic()
             try:
                 code, output = self._exec_raw(session, command, seconds)
+            except _ExecLost as lost:
+                if _container_gone(lost.error):
+                    logger.warning("Sandbox session %s went away while a command ran (%s)", session.name, lost.error)
+                    self._discard(session)
+                    return CLOSED_WHILE_RUNNING, None
+                logger.error("Command in %s failed after it started: %s", session.name, lost.error)
+                return f"Error executing command: {lost.error}", None
             except Exception as e:  # noqa: BLE001
                 if _container_gone(e):
                     logger.warning("Sandbox session %s is gone (%s)", session.name, e)
@@ -1426,7 +1543,7 @@ class SessionManager:
         return {
             "shell": self._view(shell, now),
             "browser": browser_view,
-            "profile_bytes": _dir_size(profile) if profile.is_dir() else 0,
+            "profile_bytes": _dir_size(profile),  # 0 for a link: the browser can plant one there
             "packages": persisted_packages(self._user_dir(uid)),
             "idle_timeout_seconds": SESSION_IDLE_SECONDS,
             "warn_before_seconds": SESSION_WARN_BEFORE_SECONDS,
@@ -1496,9 +1613,44 @@ class SessionManager:
             if not any(u == uid for (u, _k) in self._sessions):
                 self._warned.pop(uid, None)
 
+    def _recheck_egress(self) -> list[Session]:
+        """Re-apply the egress rules when EGRESS_RECHECK_SECONDS passed since setup or the last check
+        (idempotent: ``-C`` first, ``-I`` only for a missing rule) and update ``egress_state``. In
+        required mode a failed check stops every session; returns the sessions stopped."""
+        now = self._clock()
+        if (self._egress_checked is None or EGRESS_FILTER == "off"
+                or now - self._egress_checked < EGRESS_RECHECK_SECONDS):
+            return []
+        self._egress_checked = now
+        before = self.egress_state
+        try:
+            state = apply_egress_filter(self.subnet, EGRESS_FILTER, self._egress_runner, recheck=True)
+        except Exception as e:  # noqa: BLE001 - a custom runner may raise
+            logger.warning("Sandbox egress filter check failed: %s", e)
+            state = "failed"
+        self.egress_state = state
+        if state == "on":
+            if before != "on":
+                logger.info("Sandbox egress filter active again for %s", self.subnet)
+            return []
+        if EGRESS_FILTER == "required":
+            with self._lock:
+                running = bool(self._sessions)
+            if running or before == "on":
+                logger.error("Sandbox egress filter is no longer active (its iptables rules could not be checked or "
+                             "inserted again); SANDBOX_EGRESS_FILTER=required: stopping every sandbox session")
+            return self._stop_all()
+        if before == "on":
+            logger.warning("Sandbox egress filter is no longer active (its iptables rules could not be checked or "
+                           "inserted again): sandboxes can reach private networks and the host")
+        return []
+
     def reap_idle(self) -> list[tuple[str, str]]:
         """Stop sessions unused for SESSION_IDLE_SECONDS with nothing in flight, and drop sessions
-        whose container died by itself. Returns the (user_id, kind) pairs that were stopped."""
+        whose container died by itself. Every EGRESS_RECHECK_SECONDS it first re-applies the
+        egress filter (``_recheck_egress``; required mode: a failed check stops every session).
+        Returns the (user_id, kind) pairs that were stopped."""
+        rechecked = [(s.user_id, s.kind) for s in self._recheck_egress()]
         now = self._clock()
         idle: list[tuple[Session, threading.Lock | None]] = []
         with self._lock:
@@ -1511,7 +1663,7 @@ class SessionManager:
                 del self._sessions[key]
                 idle.append((session, lock))
             others = [s for s in self._sessions.values() if not s.in_flight]
-        stopped: list[tuple[str, str]] = []
+        stopped: list[tuple[str, str]] = rechecked
         for session, lock in idle:
             try:
                 logger.info("Closing the idle %s session %s", session.kind, session.name)
@@ -1610,8 +1762,16 @@ class SessionManager:
         return removed
 
     def shutdown_all(self) -> None:
-        """Stop every session (bot shutdown); no new session starts afterwards."""
-        self._closed = True
+        """Stop every session (bot shutdown); no new session starts afterwards (a start already in
+        flight is stopped by ``_acquire`` when it comes up)."""
+        with self._lock:
+            self._closed = True
+        self._stop_all()
+        self.cleanup_stale()
+
+    def _stop_all(self) -> list[Session]:
+        """Take every session out of the table and stop it, browsers asked to save their cookies
+        first (all at once). Returns the sessions stopped."""
         with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
@@ -1630,7 +1790,7 @@ class SessionManager:
                 pass
         for session in sessions:
             self._stop(session, graceful=False)
-        self.cleanup_stale()
+        return sessions
 
 
 # --------------------------------------------------------------------------- process-wide instance

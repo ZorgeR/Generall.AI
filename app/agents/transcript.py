@@ -16,9 +16,10 @@ thinking block (``strip_thinking``) because the old blocks no longer match:
 * a compaction boundary (``prune``): only when the estimated size exceeds
   ``max_context_tokens`` or the transcript holds more than ``MAX_TRANSCRIPT_IMAGES``
   pictures (browser screenshots pile up fast), tool results older than the last
-  ``keep_tool_results_turns`` user turns are cleared to a short marker, image and
-  document blocks of those turns become a marker naming how to get the file back
-  (``clear_old_media``) and, if
+  ``keep_tool_results_turns`` user turns are cleared to a short marker (a browser
+  result keeps its ``browser_state``), image and document blocks of those turns become
+  a marker naming how to get the file back (``clear_old_media``), the oldest pictures
+  beyond ``IMAGE_PRUNE_TARGET`` follow (``clear_images_down_to``) and, if
   still above the target, the oldest half is summarized by the caller-supplied
   ``summarize`` coroutine into one user message, until the transcript is below
   ``PRUNE_TARGET_RATIO`` of the budget (so the next boundary is many turns away);
@@ -66,6 +67,10 @@ SCREENSHOT_CLEARED_MARKER = (
 # the API caps the images of one request. Old turns lose theirs first; if the kept turns alone
 # still hold more, older ones among them follow, the newest turn never.
 MAX_TRANSCRIPT_IMAGES = 40
+# A compaction leaves at most this many pictures (oldest cleared first, the newest turn never),
+# well under the cap: clearing to just under it made the next browsing turn cross it again, and
+# every crossing is a full cache miss that strips every thinking block.
+IMAGE_PRUNE_TARGET = MAX_TRANSCRIPT_IMAGES // 2
 SUMMARY_TAG = "earlier_conversation_summary"
 CONTEXT_OPEN = "<context>\n"  # the per-turn context block stored first in each user turn
 MEMORY_BULLET = "• "  # one memory line (summary or semantic hit) inside a context block
@@ -271,8 +276,26 @@ def cap_text(text: str, max_chars: int | None) -> str:
     return text[:max_chars] + f"\n…[truncated {len(text) - max_chars} characters]"
 
 
+def _cleared_result_content(block: dict) -> str | list[dict]:
+    """What a cleared tool result holds: the marker, plus the result's ``browser_state`` blocks.
+
+    A browser toolset result must keep its ``browser_state``: a tab member (new_tab, list_tabs,
+    switch_tab, close_tab) answers with exactly one such block and nothing else, which the API
+    requires, so a result made of state blocks only stays as it is (there is nothing to clear);
+    any other member's result becomes ``[marker, state]``."""
+    content = block.get("content")
+    states = [b for b in content if isinstance(b, dict) and b.get("type") == "browser_state"] if isinstance(content, list) else []
+    if not states:
+        return CLEARED_MARKER
+    if len(states) == len(content):
+        return content
+    return [{"type": "text", "text": CLEARED_MARKER}, *states]
+
+
 def clear_old_tool_results(messages: list[dict], keep_turns: int) -> int:
-    """Replace tool results older than the last ``keep_turns`` user turns with a marker."""
+    """Replace tool results older than the last ``keep_turns`` user turns with a marker (a browser
+    result keeps its ``browser_state`` blocks and its ``is_error`` flag, so it stays a valid toolset
+    result: see ``_cleared_result_content``)."""
     turn_starts = [i for i, m in enumerate(messages) if is_user_turn(m)]
     if len(turn_starts) <= keep_turns:
         return 0
@@ -282,9 +305,11 @@ def clear_old_tool_results(messages: list[dict], keep_turns: int) -> int:
         if not is_tool_result_message(m):
             continue
         for block in m["content"]:
-            if block.get("content") != CLEARED_MARKER:
-                block["content"] = CLEARED_MARKER
-                block.pop("is_error", None)
+            cleared_content = _cleared_result_content(block)
+            if block.get("content") != cleared_content:
+                block["content"] = cleared_content
+                if not block.get("toolset_name"):  # a failed tab member without is_error would lack its state
+                    block.pop("is_error", None)
                 cleared += 1
     return cleared
 
@@ -341,6 +366,36 @@ def clear_old_media(messages: list[dict], keep_turns: int) -> int:
     return cleared
 
 
+def clear_images_down_to(messages: list[dict], target: int) -> int:
+    """Replace the oldest image blocks (top level and inside tool results) with their marker until
+    at most ``target`` remain; the newest user turn keeps all of its own. Returns the number replaced."""
+    excess = count_images(messages) - target
+    turn_starts = [i for i, m in enumerate(messages) if is_user_turn(m)]
+    if excess <= 0 or not turn_starts:
+        return 0
+    cleared = 0
+    for m in messages[:turn_starts[-1]]:
+        content = m.get("content")
+        if m.get("role") != "user" or not isinstance(content, list):
+            continue
+        for i, block in enumerate(content):
+            if cleared >= excess:
+                return cleared
+            if isinstance(block, dict) and block.get("type") == "image":
+                content[i] = _media_cleared_block(block)
+                cleared += 1
+            elif isinstance(block, dict) and block.get("type") == "tool_result" and isinstance(block.get("content"), list):
+                inner = block["content"]
+                screenshot = bool(block.get("toolset_name"))  # a browser result: no file to reopen
+                for j, part in enumerate(inner):
+                    if cleared >= excess:
+                        return cleared
+                    if isinstance(part, dict) and part.get("type") == "image":
+                        inner[j] = _media_cleared_block(part, screenshot)
+                        cleared += 1
+    return cleared
+
+
 def split_for_summary(messages: list[dict]) -> tuple[list[dict], list[dict]]:
     """Oldest part (to summarize) and the rest, cut at a user-turn boundary near the middle."""
     turn_starts = [i for i, m in enumerate(messages) if is_user_turn(m)]
@@ -368,8 +423,9 @@ async def prune(
 ) -> dict:
     """Compaction boundary, in place. Below ``max_context_tokens`` and with at most
     ``MAX_TRANSCRIPT_IMAGES`` pictures nothing changes (the history stays append-only).
-    Otherwise: clear old tool results and old media; while the pictures are still too many,
-    clear the media of more recent turns too (never the newest turn); then, when the size
+    Otherwise: clear old tool results and old media; then, while more than
+    ``IMAGE_PRUNE_TARGET`` pictures are left, the oldest of the more recent turns' pictures too
+    (never the newest turn's), so the next boundary is several turns away; then, when the size
     was above ``max_context_tokens`` and is still above the target, summarize the oldest
     half until under ``PRUNE_TARGET_RATIO`` of the budget (a boundary set off by the
     pictures alone summarizes nothing). If anything was edited, strip every thinking block.
@@ -381,10 +437,8 @@ async def prune(
     target = int(max_context_tokens * PRUNE_TARGET_RATIO)
     stats["cleared"] = clear_old_tool_results(messages, keep_tool_results_turns)
     stats["cleared_media"] = clear_old_media(messages, keep_tool_results_turns)
-    keep = keep_tool_results_turns
-    while count_images(messages) > MAX_TRANSCRIPT_IMAGES and keep > 1:
-        keep -= 1
-        stats["cleared_media"] += clear_old_media(messages, keep)
+    # the boundary is paid for already (cache miss, thinking stripped): leave room for many turns
+    stats["cleared_media"] += clear_images_down_to(messages, IMAGE_PRUNE_TARGET)
     if over_budget and estimate_tokens(messages) > target and summarize is not None:
         for _ in range(4):  # a few rounds at most; each halves the transcript
             old, rest = split_for_summary(messages)
