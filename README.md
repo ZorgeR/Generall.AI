@@ -25,6 +25,9 @@ GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bo
 - **🖼️ More image formats**: JPG, HEIC, PNG, WebP, GIF and BMP, as photos or as files
 - **💬 Replies and forwards understood**: reply to a message (yours or the bot's), quote a part of it, or forward a
   post, and the agent knows what you mean
+- **🗣️ Keep talking while it works**: messages you send while the agent is busy reach it at its next step
+  (👀, then ✍ once read) and it adapts; long tool calls continue in the background and the agent tells you
+  when they finish
 - **🎨 Image Generation**: Create new images based on text descriptions or modifications of existing images
   - **🔄 Generate with gpt-image**: Create single images and variants with OpenAI's gpt-image models (`best` / `fast` engines)
   - **✨ Multimodal Generation with Gemini**: Generate stories with matching images using Google's Gemini image models (`story` engine)
@@ -279,6 +282,31 @@ agent gets who wrote the referenced message (you, the assistant, a channel), whe
 caption; nothing is downloaded from it, so reply with the file itself when you want a picture or a
 document looked at again.
 
+### 🗣️ Talk to it while it works
+
+You don't have to wait for an answer before writing again. While the agent works on your request, whatever
+else you send in the same chat (or forum topic), a correction, an extra detail, a photo, a voice note or "stop,
+use the other file", goes to the task it is working on:
+
+- **👀 then ✍**: 👀 on your message means it reached the running task, ✍ means the agent has read it. The
+  agent reads new messages at its next step (between two tool calls), adjusts its plan and covers them in its
+  answer; a quick question may get a short reply right away while the work goes on. Anything it did not get to
+  before finishing is answered next, in the order you sent it.
+- **Long steps run in the background**: a tool call still running after 30 seconds, or after a few seconds when
+  you have written something meanwhile, keeps running in the background while the agent goes on. It tells you
+  when the result is there: inside the same task if that is still working, otherwise as a new "🔔 Background
+  task finished" message (or not at all when there is nothing worth saying). The agent can also wait for, list
+  or cancel these tasks.
+- **Type instead of tapping**: when the agent asks a question with buttons, you can type your answer instead.
+  Browser approvals are the exception: buying, paying, sending a message or deleting something in the browser
+  needs a tap on ✅ Allow; typing "yes" is not enough.
+- **Stop or cancel**: 🛑 Stop ends only the current answer; messages it has not read yet are answered next and
+  background tasks keep running. `/cancel` stops everything: the current task, your queued and unread messages,
+  and the background tasks.
+
+Messages in another forum topic wait their turn as before (with a short "still working on…" notice), and so
+does a message sent while the bot is still downloading or transcribing an earlier one or delivering an answer.
+
 ### ⚡ Fast, Balanced and Deep
 
 The first row of `/settings` is a preset: **⚡ Fast** (the fast model answers everything, light
@@ -325,7 +353,8 @@ to your sandbox, and cannot reach private or local addresses. While it works you
 updates in place (turn it off in `/settings` → 🌐 Browser).
 
 - **Asks before it matters**: purchases, payments, sending messages, deleting things and account-security
-  changes need your ✅ Allow on a screenshot first. Registering, logging in and accepting terms do not.
+  changes need your ✅ Allow on a screenshot first (a tap: a typed "yes" does not count). Registering, logging in
+  and accepting terms do not.
 - **You help where only you can**: it sends you a captcha or asks for the username you want.
 - **Logins persist**: cookies stay between sessions until you tap 🧹 Forget browser logins in `/sandbox`
   (or turn off "Remember logins" in `/settings`).
@@ -561,6 +590,8 @@ parentheses; see the commented block in `.env.example`):
 
 - `MAX_CONCURRENT_TURNS`: agent turns running at the same time across all users (default: 8)
 - `MAX_SANDBOX_CONTAINERS`: one-off sandbox containers running at the same time (default: 4)
+- `TOOL_BACKGROUND_AFTER_SECONDS`: a tool call still running after this many seconds moves to the background and
+  reports when it finishes (default: 30; 0 = only when the user writes while it runs); at most 4 run per user
 
 ### 🧰 Sandbox sessions and the browser
 
@@ -617,7 +648,9 @@ parentheses; see the commented block in `.env.example`):
    manage reminders and scheduled tasks (push, edit, snooze), `/profile` to see what the bot remembers about
    you, `/usage` for your last 30 days, `/mcp` to connect tool servers, `/sandbox` to see, keep open or close
    your sandbox and browser and to forget the browser logins
-6. Use `/cancel` to stop the task that is running and clear your queue
+6. Keep writing while the agent works: it reads your new messages at its next step. Use `/cancel` to stop the
+   task that is running and clear your queue (unread messages and background tasks included); 🛑 Stop under the
+   status stops only the current answer
 7. Use `/settings` → Rich Messages to switch between rich and classic formatting
 8. While the agent works, the "Thinking…" message lists the tool calls as they run (✅ done, ⏳ running,
    ❌ failed, with a short argument preview and duration); tools requested together run in parallel.
@@ -632,9 +665,10 @@ parentheses; see the commented block in `.env.example`):
 
 ### ⏳ Queues and isolation
 
-Every chat has its own queue. Messages you send while the bot is still working on a previous one
-are answered immediately with a short "still working on…" notice (with a Stop button) and are then
-processed in order, each as its own turn. Queues are fully isolated: a long task for one user, such
+Every chat has its own queue. A message you send while the agent works on a previous one in the same
+chat or topic joins that task (see "Talk to it while it works"); otherwise it is answered immediately
+with a short "still working on…" notice (with a Stop button) and then processed in order as its own
+turn. Queues are fully isolated: a long task for one user, such
 as video generation or a sandboxed command, never delays other users. `MAX_CONCURRENT_TURNS`,
 `MAX_SANDBOX_CONTAINERS` and `TURN_TIMEOUT_SECONDS` in `.env` bound the whole process.
 
