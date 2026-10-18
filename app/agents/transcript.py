@@ -129,9 +129,24 @@ def is_tool_result_message(message: dict) -> bool:
     )
 
 
+def answers_tool_call(message: dict) -> bool:
+    """A user message that carries tool results: its content starts with a tool_result block. In a
+    live turn the user's messages and task notifications ride behind them (bot/inbox.py), so
+    unlike ``is_tool_result_message`` the rest of the content may be text, images or documents."""
+    content = message.get("content")
+    return (
+        message.get("role") == "user"
+        and isinstance(content, list)
+        and bool(content)
+        and isinstance(content[0], dict)
+        and content[0].get("type") == "tool_result"
+    )
+
+
 def is_user_turn(message: dict) -> bool:
-    """A real user message (the start of a turn), as opposed to a tool-result message."""
-    return message.get("role") == "user" and not is_tool_result_message(message)
+    """A real user message (the start of a turn), as opposed to one that carries tool results
+    (with or without what a live turn injected behind them)."""
+    return message.get("role") == "user" and not answers_tool_call(message)
 
 
 def is_context_block(block) -> bool:
@@ -302,9 +317,11 @@ def clear_old_tool_results(messages: list[dict], keep_turns: int) -> int:
     cutoff = turn_starts[-keep_turns] if keep_turns > 0 else len(messages)
     cleared = 0
     for m in messages[:cutoff]:
-        if not is_tool_result_message(m):
+        if not answers_tool_call(m):
             continue
         for block in m["content"]:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue  # what a live turn injected behind the results (old media: clear_old_media)
             cleared_content = _cleared_result_content(block)
             if block.get("content") != cleared_content:
                 block["content"] = cleared_content
