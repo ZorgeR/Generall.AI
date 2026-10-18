@@ -25,8 +25,10 @@ conversation (forum topics share one browser) or to a cancelled turn.
 Consequential actions (paying, sending, deleting, account changes) are refused by the browser
 server until the user allowed one through ``browser_confirm``: the allowance is one action,
 for ``ALLOWANCE_SECONDS``, and only for this turn (a new turn means a new instance), so a
-permission the agent did not use cannot leak into a later, different request. Best effort:
-the server recognises such actions by the element's name.
+permission the agent did not use cannot leak into a later, different request. Only a tap on
+"✅ Allow" grants it: a typed answer (``bot.questions.Answer`` with ``tapped`` False, e.g. "yes")
+goes back to the agent as text and allows nothing. Best effort: the server recognises such
+actions by the element's name.
 
 The live view: with ``browser.stream`` on, after each browser batch the current viewport is sent
 to the chat as ONE photo per turn ("🌐 title / url / ▶️ last action"), edited in place on later
@@ -601,6 +603,12 @@ class BrowserTools:
         if answer is None:
             return (f"No answer within {CONFIRM_TIMEOUT // 60} minutes: do not perform the action. Tell the user in "
                     f"your reply what is waiting for their permission: {summary}")
+        if not (isinstance(answer, questions.Answer) and answer.tapped):
+            # Typed text is not a permission, whatever it says: only the button grants one.
+            self._allow_until = 0.0
+            return (f"{questions.typed_result(answer)}. That is not a permission: do not perform the action. Only a "
+                    f'tap on "{ALLOW_OPTION}" allows it; if the text means yes, call browser_confirm again and ask them '
+                    "to tap the button, otherwise follow what they wrote.")
         if answer == ALLOW_OPTION:
             self._allow_until = self._clock() + ALLOWANCE_SECONDS
             return (f"The user allowed: {summary}. Do it now: repeat the action (the permission covers one "

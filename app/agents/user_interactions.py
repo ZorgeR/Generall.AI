@@ -298,6 +298,8 @@ class UserInteractions:
             return f"Error: could not ask the user: {e}"
         if answer is None:
             return f"No answer within {timeout} seconds. Continue without it: take the safe default or ask in your final reply."
+        if getattr(answer, "tapped", True) is False:
+            return questions.typed_result(answer)  # the user typed a reply instead of tapping
         return f'User chose: "{answer}"'
 
     async def _send_user_message(self, message: str) -> str:

@@ -84,6 +84,31 @@ async def test_cancel_stops_current_and_drops_queued():
     await qm.shutdown()
 
 
+async def test_cancel_calls_on_drop_of_every_dropped_job_only():
+    """A dropped job is told (a requeued inbox message stops its preparation); the running job, a
+    job that ran, and a failing hook change nothing else."""
+    qm = QueueManager(max_concurrent_turns=4, turn_timeout=5)
+    dropped: list[str] = []
+    gate = asyncio.Event()
+
+    async def wait(ctx: JobContext) -> None:
+        await gate.wait()
+
+    def broken() -> None:
+        raise RuntimeError("hook failed")
+
+    await qm.submit(Job(user_id="u1", label="ran", run=lambda ctx: asyncio.sleep(0), on_drop=lambda: dropped.append("ran")))
+    await asyncio.sleep(0.05)
+    await qm.submit(Job(user_id="u1", label="running", run=wait, on_drop=lambda: dropped.append("running")))
+    await qm.submit(Job(user_id="u1", label="a", run=wait, on_drop=broken))
+    await qm.submit(Job(user_id="u1", label="b", run=wait, on_drop=lambda: dropped.append("b")))
+    await qm.submit(Job(user_id="u1", label="c", run=wait))
+    await asyncio.sleep(0.05)
+    assert await qm.cancel("u1") == (True, 3)
+    assert dropped == ["b"] and qm.status("u1").pending == 0
+    await qm.shutdown()
+
+
 async def test_timeout_notifies_and_worker_continues():
     timed_out: list[str] = []
 

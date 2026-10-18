@@ -2,6 +2,8 @@ import anthropic
 from openai import OpenAI
 import os
 import asyncio
+import contextvars
+import time
 from dotenv import load_dotenv
 from .file_ops import FileOperations
 from .search_tools import SearchTools
@@ -19,7 +21,7 @@ from stats import stats_tracker
 from tavily import TavilyClient
 from typing import Dict, Any, Literal
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from pydantic import BaseModel
 from models import (
@@ -37,8 +39,9 @@ from models import (
     request_options_for,
     thinking_binding,
 )
-from agents.trace import TurnBudget
+from agents.trace import TurnBudget, describe_args
 from agents.subagent import SubagentTools
+from agents.task_tools import TASK_TOOL_NAMES, CallState, TaskTools, bind_call
 from agents import content as prompt_content
 from agents.mcp_tools import MCPTools
 from agents.profile_tools import ProfileTools, last_shown_profile_fingerprint, profile_block, profile_store
@@ -66,6 +69,45 @@ load_dotenv()
 
 max_agent_tools_iterations = os.getenv("MAX_AGENT_TOOLS_ITERATIONS")
 max_agent_critique_iterations = os.getenv("MAX_AGENT_CRITIQUE_ITERATIONS")
+
+
+def _env_seconds(name: str, default: float) -> float:
+    """A non-negative number of seconds from the environment (blank or invalid = ``default``)."""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        print(f"WARNING: {name}={raw!r} is not a number of seconds; using {default:g}")
+        return default
+
+
+# ---- live turns: background tool calls (agents.task_tools) --------------------
+# With a background host (bot/background.py, given by bot.agent_runner.run_turn), a tool call
+# still running after this many seconds is moved to the background: its tool_result becomes a
+# placeholder and the turn goes on; the host delivers the result later as a <task_notification>.
+# 0 turns this time trigger off (a call still goes to the background when the user writes).
+TOOL_BACKGROUND_AFTER_SECONDS = _env_seconds("TOOL_BACKGROUND_AFTER_SECONDS", 30.0)
+# A user message is waiting in the turn's inbox: a call that has run this long goes to the
+# background, so the agent reads the message after this batch instead of after the slow call.
+BACKGROUND_ON_MESSAGE_AFTER = 3.0
+BACKGROUND_POLL_SECONDS = 0.5  # re-check interval while the inbox cannot be awaited or the host is full
+BACKGROUND_LISTEN_SECONDS = 3600.0  # longest single inbox.wait of a watched call (cancelled when the call ends)
+# Tools that are never moved to the background: they talk to the user, wait for them, or manage
+# the background tasks themselves. Members of a client-side toolset (the browser) never go either.
+NEVER_BACKGROUND = frozenset({
+    "ask_user_choice", "browser_confirm", "browser_show_screenshot",
+    "send_user_telegram_message", "set_message_reaction", "send_voice_message",
+    *TASK_TOOL_NAMES,
+})
+BACKGROUND_PLACEHOLDER = (
+    "Still running in the background as task {task_id} (started {started} UTC). Its result will arrive as a "
+    "<task_notification> after a later tool call, or as a new message if this turn has ended. Meanwhile you can "
+    "answer the user, use other tools, or call wait_for_tasks."
+)
+USER_MESSAGE_OPEN = "<user_message"  # the first text block of a user message the inbox injects (bot/inbox.py)
+SENT_WHILE_WORKING = "\n\n[Sent while I was working]\n"  # memory files: the user's messages the turn read mid-way
 
 # Anthropic config (model names and request options live in models.py)
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
@@ -185,6 +227,47 @@ def display_input(block) -> dict:
     return args
 
 
+def background_args(block) -> str:
+    """One line describing a call's arguments for the background task list (what people see)."""
+    args = display_input(block)
+    line = describe_args(args, 200)
+    if line or not args:
+        return line
+    try:
+        text = json.dumps(args, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        text = str(args)
+    return text if len(text) <= 200 else text[:199] + "…"
+
+
+def background_placeholder(task_id: str, started_wall: float) -> str:
+    """The tool_result of a call handed to the background host."""
+    started = datetime.fromtimestamp(started_wall, timezone.utc).strftime("%H:%M:%S")
+    return BACKGROUND_PLACEHOLDER.format(task_id=task_id, started=started)
+
+
+def with_messages_read(question: str, inbox) -> str:
+    """``question`` followed by the messages the user sent while the turn ran and the agent read
+    (``inbox.drained_user_texts``), after ``SENT_WHILE_WORKING``; the bare question when none was
+    read (or there is no inbox). What the memory files keep, and what the judge and the critique
+    judge the answer against: the answer must cover those messages too."""
+    try:
+        texts = list(inbox.drained_user_texts or []) if inbox is not None else []
+    except Exception as e:  # noqa: BLE001 - the inbox is the bot's
+        print(f"WARNING: could not read the messages sent during the turn: {e}")
+        texts = []
+    texts = [str(t).strip() for t in texts if str(t or "").strip()]
+    if not texts:
+        return question
+    return f"{question}{SENT_WHILE_WORKING}" + "\n\n".join(texts)
+
+
+def _retrieve_result(task: asyncio.Task) -> None:
+    """Done callback of a call cancelled with its turn: read the outcome so asyncio does not log it."""
+    if not task.cancelled():
+        task.exception()
+
+
 # Streaming config: on by default (STREAMING_ENABLED=false turns the drafts off); bot/config.py
 # reads the same variable for the Telegram side, so the two defaults must agree.
 streaming_enabled = os.getenv("STREAMING_ENABLED", "true").lower() == "true"
@@ -266,6 +349,8 @@ class AgentAnthropic:
         self.on_recovery = None        # optional coroutine(note): told about every automatic retry (the status line)
         self.history_edited = False    # a request only went through without its thinking blocks: the stored prefix is stale
         self.prefix_len = None         # messages this turn started from (stored history + question): a thinking strip touches only these
+        self.inbox = None              # bot.inbox TurnInbox of a live turn: user messages / task notifications injected after tool results
+        self.background = None         # bot.background BackgroundHost: long tool calls are handed to it (run_tool_batch)
 
     async def critique_response(self, question: str, answer: str, dialog_history: list = [], trace=None) -> str:
         """
@@ -582,6 +667,143 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                     await on_event(event)
             return await stream.get_final_message()
 
+    # ---- live turns: the inbox and the background host ------------------------------------
+    def _user_waiting(self) -> bool:
+        try:
+            return bool(self.inbox is not None and self.inbox.has_user_messages())
+        except Exception as e:  # noqa: BLE001 - the inbox is the bot's; it never fails a tool call
+            print(f"WARNING: inbox.has_user_messages failed: {e}")
+            return False
+
+    def _inbox_pending(self) -> bool:
+        try:
+            return bool(self.inbox is not None and self.inbox.has_pending())
+        except Exception as e:  # noqa: BLE001
+            print(f"WARNING: inbox.has_pending failed: {e}")
+            return False
+
+    def _can_adopt(self) -> bool:
+        try:
+            return bool(self.background is not None and self.background.can_adopt())
+        except Exception as e:  # noqa: BLE001
+            print(f"WARNING: background.can_adopt failed: {e}")
+            return False
+
+    def _adopt(self, task: asyncio.Task, block, started_wall: float) -> str | None:
+        """Hand the running call to the background host; its task id, or None when it was not taken."""
+        try:
+            task_id = self.background.adopt(
+                task, tool_name=block.name, tool_use_id=block.id, display_args=background_args(block),
+                started=started_wall, max_chars=self.max_tool_result_chars,
+            )
+        except Exception as e:  # noqa: BLE001 - the call simply stays in the foreground
+            print(f"WARNING: could not move {block.name} to the background: {e}")
+            return None
+        return str(task_id) if task_id else None
+
+    def _watch_timeout(self, elapsed: float, waiting: bool, listen: bool) -> float | None:
+        """How long ``_watch_call`` may wait before it has to look again (None = until the call ends
+        or the inbox wakes it)."""
+        due: list[float] = []
+        if TOOL_BACKGROUND_AFTER_SECONDS > 0:
+            left = TOOL_BACKGROUND_AFTER_SECONDS - elapsed
+            due.append(left if left > 0 else BACKGROUND_POLL_SECONDS)  # past due: the host is full
+        if waiting:
+            left = BACKGROUND_ON_MESSAGE_AFTER - elapsed
+            due.append(left if left > 0 else BACKGROUND_POLL_SECONDS)
+        elif self.inbox is not None and (not listen or self._inbox_pending()):
+            # a task notification is pending (inbox.wait would return at once) or listening
+            # failed: look for a user message now and then instead
+            due.append(BACKGROUND_POLL_SECONDS)
+        return min(due) if due else None
+
+    async def _wait_call(self, task: asyncio.Task, timeout: float | None, listen: bool) -> bool:
+        """Wait until the call ends, ``timeout`` passes or (``listen``) the inbox gets something.
+        Returns whether listening to the inbox still works."""
+        listener = None
+        if listen and self.inbox is not None and not self._inbox_pending():
+            listener = asyncio.ensure_future(self.inbox.wait(timeout if timeout is not None else BACKGROUND_LISTEN_SECONDS))
+        try:
+            await asyncio.wait({task, listener} if listener is not None else {task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            if listener is not None and not listener.done():
+                listener.cancel()
+        if listener is None or not listener.done() or listener.cancelled():
+            return listen
+        error = listener.exception()
+        if error is not None:
+            print(f"WARNING: inbox.wait failed, polling instead: {error}")
+            return False
+        if not self._inbox_pending():
+            # woke with nothing pending (its own timeout, or an inbox that returns at once, e.g.
+            # a closed one): poll from now on rather than spin
+            return False
+        return listen
+
+    async def _watch_call(self, task: asyncio.Task, block, state: CallState, started_wall: float, started: float) -> str | None:
+        """Wait for one tool call of a live turn. It is handed to the background host (returns
+        its task id) once it has run ``TOOL_BACKGROUND_AFTER_SECONDS``, or ``BACKGROUND_ON_MESSAGE_AFTER``
+        while a user message waits in the inbox, and the host has room; otherwise returns None
+        when the call is done. Cancelled (Stop) before that, the call is cancelled with it; a call
+        handed over is the host's and is never cancelled here."""
+        listen = self.inbox is not None
+        adoptable = True
+        try:
+            while not task.done():
+                elapsed = time.monotonic() - started
+                waiting = self._user_waiting()
+                due = (TOOL_BACKGROUND_AFTER_SECONDS > 0 and elapsed >= TOOL_BACKGROUND_AFTER_SECONDS) or (
+                    waiting and elapsed >= BACKGROUND_ON_MESSAGE_AFTER
+                )
+                if adoptable and due and self._can_adopt():
+                    task_id = self._adopt(task, block, started_wall)
+                    if task_id is not None:
+                        state.background_id = task_id
+                        return task_id
+                    adoptable = False  # refused: this call runs to its end in the foreground
+                if not adoptable:
+                    await asyncio.wait({task})
+                    break
+                timeout = self._watch_timeout(elapsed, waiting, listen)
+                if waiting:  # a user message waits already: only the clock matters now
+                    await self._wait_call(task, timeout, False)
+                else:
+                    listen = await self._wait_call(task, timeout, listen)
+        except asyncio.CancelledError:
+            if not task.done():
+                task.cancel()
+                task.add_done_callback(_retrieve_result)
+            raise
+        return None
+
+    async def _drain_inbox(self) -> list:
+        """Everything the turn's inbox holds (the user's messages, finished background tasks), as
+        content blocks for the user message that carries this batch's tool results; [] without an
+        inbox. Empty text blocks are left out (the API refuses them; what is sent is stored)."""
+        if self.inbox is None:
+            return []
+        try:
+            blocks = await self.inbox.drain()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - a failing inbox must not end the turn
+            print(f"WARNING: inbox.drain failed: {e}")
+            return []
+        out = []
+        for block in blocks or []:
+            if not isinstance(block, dict) or not block.get("type"):
+                continue
+            if block.get("type") == "text" and not str(block.get("text") or "").strip():
+                continue
+            out.append(block)
+        return out
+
+    def _drained_user_count(self) -> int:
+        try:
+            return len(self.inbox.drained_user_texts or []) if self.inbox is not None else 0
+        except Exception:  # noqa: BLE001
+            return 0
+
     async def run_tool_batch(self, tool_blocks: list, trace=None, refresh=None) -> list:
         """Run every tool_use block of one assistant message.
 
@@ -599,6 +821,11 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         aborting the turn. ``trace`` (agents.trace.ToolTrace) records each call (toolset members
         as ``<toolset>.<member>``, typed text masked: ``display_input``); ``refresh(details)``
         re-renders the status message as calls finish.
+
+        With a background host (``self.background``, a live turn) every normal call outside
+        ``NEVER_BACKGROUND`` runs as its own task that ``_watch_call`` may hand to the host: its
+        result is then ``background_placeholder`` (the trace says "moved to the background as
+        t<N>"), the host delivers the real one later, and a Stop no longer cancels it.
         """
         results: dict[int, dict] = {}
 
@@ -630,10 +857,42 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
 
         async def run_one(index: int, block) -> None:
             call = start(block)
+            if self.background is not None and block.name not in NEVER_BACKGROUND:
+                await run_watched(index, block, call)
+                return
             try:
                 raw, is_error = await self.execute_tool(block.name, block.input), False
             except asyncio.CancelledError:
                 raise
+            except Exception as e:  # noqa: BLE001 - one broken tool must not kill the turn
+                raw, is_error = f"Error executing {block.name}: {e}", True
+            results[index] = finish(block, raw, is_error, call)
+            if refresh is not None:
+                await refresh(f"{block.name} finished")
+
+        async def run_watched(index: int, block, call) -> None:
+            # A live turn: the call runs as its own task (in a context that knows the call, see
+            # agents.task_tools.CallState) so it can be handed to the background host and keep
+            # running while the turn goes on (_watch_call).
+            state = CallState(block.name)
+            context = contextvars.copy_context()
+            context.run(bind_call, state)
+            started_wall, started = time.time(), time.monotonic()
+            task = asyncio.get_running_loop().create_task(self.execute_tool(block.name, block.input), context=context)
+            task_id = await self._watch_call(task, block, state, started_wall, started)
+            if task_id is not None:
+                note = f"moved to the background as {task_id}"
+                if call is not None:
+                    call.done(note, ok=True)
+                print(f"Tool name: {block.name}\nTool result: {note} after {time.monotonic() - started:.1f}s")
+                results[index] = {"type": "tool_result", "tool_use_id": block.id, "content": background_placeholder(task_id, started_wall)}
+                if refresh is not None:
+                    await refresh(f"{block.name} {note}")
+                return
+            try:
+                raw, is_error = task.result(), False
+            except asyncio.CancelledError:  # the call cancelled itself: the turn was not stopped
+                raw, is_error = f"Error executing {block.name}: the call was cancelled", True
             except Exception as e:  # noqa: BLE001 - one broken tool must not kill the turn
                 raw, is_error = f"Error executing {block.name}: {e}", True
             results[index] = finish(block, raw, is_error, call)
@@ -735,6 +994,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         tools_enabled = user_settings.get("tools").get("enabled", True)
         last_step_category = "initial"
         last_tool_name = ""
+        reading_shown = False  # the status says "reading your message" for the call that reads it
         
         for iteration in range(max_iterations):
             # Sanitize empty text blocks
@@ -747,7 +1007,9 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                     except (IndexError, KeyError, TypeError, AttributeError):
                         pass
 
-            if update_status:
+            if reading_shown:
+                reading_shown = False
+            elif update_status:
                 if last_step_category == "executing-tools":
                     await update_status(step=last_step_category, details=f"Processing tool results {last_tool_name}", iteration=cicles, critique=critique)
                 elif last_step_category == "critique":
@@ -864,11 +1126,26 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 await refresh("Running: " + names)
                 tool_result_blocks = await self.run_tool_batch(tool_blocks, trace=trace, refresh=refresh)
 
+                # A live turn: what arrived while the tools ran (the user's messages, finished
+                # background tasks) goes behind the tool results, in the SAME user message (the API
+                # takes text/image/document blocks after the tool_result blocks). It is stored
+                # exactly as sent, so the transcript stays append-only. Nothing is injected anywhere
+                # else: what is left when the turn ends becomes the next turn (bot/inbox.py).
+                before = self._drained_user_count()
+                injected = await self._drain_inbox()
+                read = sum(1 for b in injected if b.get("type") == "text" and str(b.get("text") or "").lstrip().startswith(USER_MESSAGE_OPEN))
+                if injected and not read:
+                    read = max(0, self._drained_user_count() - before)
+
                 # Send tool results back as proper tool_result message
                 processed_messages.append({
                     "role": "user",
-                    "content": tool_result_blocks
+                    "content": tool_result_blocks + injected
                 })
+                if read and update_status:
+                    reading_shown = True
+                    details = "Reading your new message" if read == 1 else f"Reading your {read} new messages"
+                    await update_status(step="reading your message", details=details, iteration=cicles, critique=critique)
                 
                 continue
 
@@ -882,7 +1159,8 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 last_step_category = "critique"
                 if update_status:
                     await update_status(step=last_step_category, details="Starting critique session", iteration=cicles, critique=critique)
-                critique_answer = await self.critique_response(question=question, answer=current_text, dialog_history=dialog_history, trace=trace)
+                # judged against what the user asked, the messages read mid-turn included
+                critique_answer = await self.critique_response(question=with_messages_read(question, self.inbox), answer=current_text, dialog_history=dialog_history, trace=trace)
                 print(f"\nCritique: {critique_answer}")
                 if critique_answer:
                     need_rewrite_answer = critique_answer.need_rewrite_answer
@@ -911,7 +1189,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                     last_step_category = "judge"
                     await update_status(step=last_step_category, details="Judge evaluating response", iteration=cicles, critique=critique)
                 
-                judge_decision = await self.judge_response(question=question, answer=current_text)
+                judge_decision = await self.judge_response(question=with_messages_read(question, self.inbox), answer=current_text)
                 if not judge_decision:
                     if judge < user_settings.get("judge").get("max_iteration"):
                         if update_status:
@@ -984,15 +1262,23 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
 
 
 class ChainOfThoughtAgent:
-    def __init__(self, model_type: str = "anthropic", model: str = ANTHROPIC_MODEL, user_id: str = "default", sender=None, user_settings: dict = None, message_thread_id: int = None):
+    def __init__(self, model_type: str = "anthropic", model: str = ANTHROPIC_MODEL, user_id: str = "default", sender=None, user_settings: dict = None, message_thread_id: int = None, inbox=None, background=None):
         """
         Args:
             sender: bot.sender.ChatSender bound to the user's chat; tools use it to send
                     messages, files and reactions. Never depends on an incoming update.
+            inbox: the turn's ``TurnInbox`` (bot/inbox.py, see agents.task_tools): what the user
+                    sends while the turn runs, and finished background tasks, reach the agent
+                    behind the next tool results. None (tests, other callers) = today's turn.
+            background: the user's ``BackgroundHost`` (bot/background.py): long tool calls are
+                    handed to it, and the task tools (wait_for_tasks, list_tasks, cancel_task)
+                    are offered. None = no background calls, no task tools.
         """
         self.model_type = model_type
         self.thread_id = message_thread_id
         self.sender = sender
+        self.inbox = inbox
+        self.background = background
 
         # Initialize tools
         self.user_id = user_id
@@ -1065,6 +1351,14 @@ class ChainOfThoughtAgent:
                 if browser_tools.browser_enabled(self.user_settings):
                     self.browser_tools = BrowserTools(user_id, sender, self.user_settings, manager)
                     self.agent.register_provider(self.browser_tools)
+            # A live turn (bot.agent_runner.run_turn): the inbox and the background host. The task
+            # tools exist only with a host; subagents get none of the three.
+            self.agent.inbox = inbox
+            self.agent.background = background
+            self.task_tools = None
+            if background is not None:
+                self.task_tools = TaskTools(background, inbox)
+                self.agent.register_provider(self.task_tools)
             if self.mode == "speed":
                 self.agent.thinking = False
             elif self.mode == "intelligence":
@@ -1073,6 +1367,13 @@ class ChainOfThoughtAgent:
                 self.agent.thinking = bool(self.user_settings.get("thinking").get("enabled", False))
         else:
             raise ValueError("Currently only Anthropic models are supported with the new tool pattern")
+
+    def _memory_question(self, question: str) -> str:
+        """The question as the memory files keep it (conversation file, its topic and summary,
+        the embeddings, dialog_history.json): with the messages the user sent while the turn ran
+        and the agent read (``with_messages_read``) after it. The transcript needs nothing:
+        it holds them where they were read."""
+        return with_messages_read(question, self.inbox)
 
     async def _save_conversation(self, question: str, response: str, messages: list):
         """Save conversation summary and full history"""
@@ -1559,13 +1860,14 @@ User message: {question}"""
             print(f"Transcript saved: {len(transcript.messages)} messages (~{estimate_tokens(transcript.messages)} tokens), prune={stats}")
         except Exception as e:  # noqa: BLE001
             print(f"WARNING: failed to save transcript: {e}")
+        memory_question = self._memory_question(question)
         try:
-            summary = await self._save_conversation(question, response, new_messages)
+            summary = await self._save_conversation(memory_question, response, new_messages)
             print(f"\nConversation saved. Summary: {summary}")
         except Exception as e:  # noqa: BLE001
             print(f"WARNING: failed to save long-term conversation memory: {e}")
         try:
-            self._append_legacy_dialog_history(question, response)
+            self._append_legacy_dialog_history(memory_question, response)
         except Exception as e:  # noqa: BLE001
             print(f"WARNING: failed to update dialog history: {e}")
         return response, new_messages
@@ -2088,8 +2390,9 @@ You have been asked to answer a query given sources. Consider the following when
 
         # Persist memory. The answer is already generated (and paid for), so a failure here
         # must never turn into an error for the user: log it and still return the response.
+        memory_question = self._memory_question(question)  # with what the user sent while the turn ran
         try:
-            summary = await self._save_conversation(question, response, thread_messages)
+            summary = await self._save_conversation(memory_question, response, thread_messages)
             print(f"\nConversation saved. Summary: {summary}")
         except Exception as e:
             print(f"WARNING: failed to save long-term conversation memory: {e}")
@@ -2099,7 +2402,7 @@ You have been asked to answer a query given sources. Consider the following when
             print(f"Saving reasoning context to: {self.short_term_memory_path / reasoning_save_filename}")
             self._save_short_term_memory(thread_messages)
 
-            dialog = [{"role": "user", "content": question}, {"role": "assistant", "content": response}]
+            dialog = [{"role": "user", "content": memory_question}, {"role": "assistant", "content": response}]
             dialog_history.extend(dialog)
 
             # Save question and response in json array

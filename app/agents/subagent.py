@@ -5,9 +5,17 @@ named subset), an empty conversation that is never persisted, the parent's
 trace (its tool lines render indented) and a slice of the parent's tool-call
 budget. It returns its final text as the tool result; files it creates are in
 the same workspace. Depth is one: a subagent gets no ``run_subagent`` tool. It never gets a
-provider with a client-side toolset (the browser, ``agents.browser_tools``) either.
+provider with a client-side toolset (the browser, ``agents.browser_tools``) either, nor the
+live-turn machinery: no inbox, no background host, no task tools (a provider that sets
+``inherit_to_subagents = False``, ``agents.task_tools.TaskTools``), nor any tool that talks to
+the user or waits for them (``agents.main.NEVER_BACKGROUND``: ``ask_user_choice``,
+``send_user_telegram_message``, ``send_voice_message``, ``set_message_reaction``, …): a
+``run_subagent`` call may be moved to the background at any moment, even while the child waits
+in one of them, and a question still open after its turn ended would take the user's next text
+as its answer. The child reports to the main agent instead.
 Several subagents requested in one assistant message run concurrently through
-the normal parallel tool execution.
+the normal parallel tool execution. A ``run_subagent`` call the parent moved to the background
+keeps running there, but no longer edits the parent's status message (its turn may be over).
 """
 from __future__ import annotations
 
@@ -15,6 +23,7 @@ import copy
 import logging
 from datetime import datetime, timezone
 
+from agents.task_tools import in_background
 from agents.trace import TurnBudget
 from models import ANTHROPIC_MODEL, ANTHROPIC_MODEL_FAST
 
@@ -32,7 +41,7 @@ SUBAGENT_SYSTEM = """You are a subagent of a persistent personal assistant. The 
 Rules:
 - Use the tools until the task is done, then answer with a complete, self-contained report: facts found, numbers, sources or URLs, and the paths of any files you created in the workspace.
 - Do not ask questions; state your assumptions instead.
-- Do not send messages to the user yourself unless the task explicitly says so.
+- You cannot reach the user (no messages, questions, voice notes or reactions): everything goes into your report.
 - Be concise but keep every detail the main agent needs to use your result.
 
 Current time in UTC+0: {now}
@@ -88,15 +97,22 @@ class SubagentTools:
 
     def _inherited_providers(self) -> list:
         """The parent's registered providers a subagent gets: all but those with a client-side
-        toolset (the browser). The browser is one per user and stateful, and its consequential
-        actions need the user's confirmation in the chat; a subagent must not drive it."""
+        toolset (the browser) and those that say ``inherit_to_subagents = False`` (the task tools
+        of a live turn: a subagent has no inbox and no background host). The browser is one per
+        user and stateful, and its consequential actions need the user's confirmation in the
+        chat; a subagent must not drive it."""
         return [
             (provider, blocking)
             for provider, blocking in getattr(self.parent, "extra_providers", [])
             if not (getattr(provider, "toolset", None) or getattr(provider, "toolset_name", None))
+            and getattr(provider, "inherit_to_subagents", True) is not False
         ]
 
     def _available_tool_names(self) -> set[str]:
+        """The tool names a subagent may get: the parent's slots and inherited providers, minus
+        the tools that talk to or wait for the user (``agents.main.NEVER_BACKGROUND``)."""
+        from agents.main import NEVER_BACKGROUND  # circular import at module level
+
         names: set[str] = set()
         for slot in PROVIDER_SLOTS:
             provider = getattr(self.parent, slot, None)
@@ -105,21 +121,39 @@ class SubagentTools:
         for provider, _blocking in self._inherited_providers():
             names.update(str(t.get("name") or "") for t in provider.tools_schema)
         names.discard("")
-        return names
+        return names - NEVER_BACKGROUND
 
     def _child(self, model: str, allowed: set[str] | None, budget: TurnBudget):
-        from agents.main import AgentAnthropic  # circular import at module level
+        from agents.main import NEVER_BACKGROUND, AgentAnthropic  # circular import at module level
 
         child = AgentAnthropic(model=model, user_id=self.parent.user_id)
         for slot in PROVIDER_SLOTS:
             setattr(child, slot, getattr(self.parent, slot, None))
         child.subagents = None  # depth 1: a subagent cannot spawn subagents
         child.extra_providers = self._inherited_providers()  # registered providers too, the browser excepted
-        child.allowed_tools = allowed
+        # never a tool that talks to or waits for the user (_available_tool_names), subset or not
+        child.allowed_tools = set(allowed) - NEVER_BACKGROUND if allowed is not None else self._available_tool_names()
         child.thinking = getattr(self.parent, "thinking", False)
         child.trace_depth = getattr(self.parent, "trace_depth", 0) + 1
         child.budget = budget
+        child.inbox = None       # the user's messages go to the main loop only
+        child.background = None  # the child's own calls always run to their end
         return child
+
+    def _status_hook(self):
+        """The parent's status callback for the child, silenced once this call was moved to the
+        background (agents.task_tools.in_background): the turn that owns the status message may
+        have ended, and its summary must not turn back into a progress view."""
+        update_status = self.update_status
+        if update_status is None:
+            return None
+
+        async def child_status(*args, **kwargs):
+            if in_background():
+                return
+            await update_status(*args, **kwargs)
+
+        return child_status
 
     async def run(self, args: dict) -> str:
         task = str(args.get("task") or "").strip()
@@ -158,7 +192,7 @@ class SubagentTools:
                 messages=[{"role": "user", "content": task}],
                 system_role=system,
                 question=task,
-                update_status=self.update_status,
+                update_status=self._status_hook(),
                 user_settings=settings,
                 trace=self.trace,
                 budget=budget,
