@@ -10,11 +10,12 @@ A single-process Python Telegram bot (aiogram 3, asyncio) that wraps a Claude
 tool-use agent. Users send text / voice / photos / video / audio / documents in
 Telegram; the bot builds a prompt of content blocks (text, plus the photos and PDFs
 themselves as image/document blocks, with the replied-to or forwarded message quoted
-in front), runs a per-message agent loop with 44 built-in tools (files, web search and
-a headless browser, code execution in a Docker sandbox, image/video generation, documents
-out as pdf/docx/xlsx, reminders and scheduled tasks in the user's time zone, SMS, S3, TTS,
-button questions, a user profile) plus
-the tools of the user's MCP servers, persists multi-layer memory per user on disk
+in front), runs a per-message agent loop with 47 built-in tools (files, web search and
+a headless page reader, code execution in a persistent per-user Docker sandbox, image/video
+generation, documents out as pdf/docx/xlsx, reminders and scheduled tasks in the user's time
+zone, SMS, S3, TTS, button questions, a user profile, the sandbox status) plus Anthropic's
+browser toolset (an interactive Chromium per user, in its own container, with saved logins)
+plus the tools of the user's MCP servers, persists multi-layer memory per user on disk
 (transcript, summaries + embeddings, profile), and replies in Telegram. Claude drives
 the tool loop; OpenAI (`gpt-6.1-sol`) is only consulted by the optional critique step,
 which can force a rewrite, and by the `describe_image` second opinion. OpenAI, Google
@@ -32,8 +33,10 @@ and memory_search, the MCP client and /mcp, the mode setting, the web/document t
 sandbox image tag, embeddings, time zones and the /reminders UI, scheduled tasks, the agent's retry
 loop and the error path (`test_timezones.py`, `test_reminders_ui.py`, `test_proactive_tasks.py`,
 `test_stream_retry.py`, `test_error_recovery.py`), whole turns on a fake client (`test_mode.py`: the tools and
-`<capabilities>` notes actually sent, a photo reaching the loop as an image block), and how these features meet
-(`tests/test_cross_features.py`).
+`<capabilities>` notes actually sent, a photo reaching the loop as an image block), the persistent sandbox
+sessions (`test_sessions.py`, with a fake Docker client), /sandbox and the idle warnings (`test_sandbox_ui.py`),
+the browser server inside the container (`test_browser_server.py`), the browser toolset in the agent loop
+(`test_browser_tools.py`, `test_toolset_loop.py`), and how these features meet (`tests/test_cross_features.py`).
 There is no CI, linter, formatter or type checking. Validate changes with the tests and
 the import smoke check at the end of this file.
 
@@ -130,6 +133,12 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
                             with +1h / +1d / Edit text (the next text message, _pending_edits, 5 min) / Delete / Disable,
                             ➕ New hint, snooze handling for fired reminders (reminder_snooze_), legacy-Markdown escaping
                             of zone names
+      sandbox_ui.py         /sandbox: ONE legacy-Markdown page from manager.status (sandbox, saved packages, browser tabs,
+                            stored logins, idle timeout; admins: server caps, free memory, egress filter) with sandbox_
+                            buttons (Keep open, Close, Forget logins + confirm, Refresh); reaper_loop = the "sandbox-reaper"
+                            task (every REAP_INTERVAL 60 s: reap_idle, then one warning per due_warnings entry with
+                            "👌 OK" / "⏳ Keep open 30 min", remembered in _warnings); session_manager() imports
+                            secure_container.sessions lazily (None = no manager: /sandbox says unavailable, hooks no-op)
       stats_ui.py           admin /stats: dashboard photo + text view, users page, per-user view, limits, block;
                             display names cached 1 h (successful lookups only)
   reminders_store.py        RemindersStore (`reminders_store` singleton): per-user locked JSON read/modify/write;
@@ -179,14 +188,24 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
     trace.py                ToolTrace/ToolCall/TurnBudget: per-turn tool calls, token usage, shared tool budget
     transcript.py           TranscriptStore + size control: one real API transcript per chat/topic (transcript mode);
                             prune clears old tool results AND old media blocks (clear_old_media)
+    browser_tools.py        BrowserTools: Anthropic's browser toolset (browser_toolset_20260801, javascript_exec/file_upload/
+                            read_console/read_network disabled) executed by SessionManager.browser_call, browser_confirm
+                            (screenshot + ✅ Allow / ❌ Cancel before a sensitive action), browser_show_screenshot, the live
+                            view photo (after_batch). SandboxTools: sandbox_status + the sandbox facts in prompt_notes.
+                            Finds secure_container.sessions through sys.modules only (never imports docker)
     subagent.py             SubagentTools: run_subagent tool (fresh AgentAnthropic, shared budget, nested trace; the
                             child inherits the registered providers)
     __init__.py             imports SystemTools; the package object is what the patcher needs
   secure_container/
     main.py                 initialize_secure_containers() / cleanup_containers()
     container_manager.py    ContainerManager: builds image "secure-container:<12-hex hash of the build context>" when
-                            that tag is missing (re-points :latest, prunes older tags), runs one throwaway Docker
-                            container per tool call, MAX_SANDBOX_CONTAINERS semaphore, run_script() for bundled scripts
+                            that tag is missing (re-points :latest, prunes older tags), creates the SessionManager
+                            (self.session_manager), run_command → the user's persistent session (one-off container as
+                            fallback: run_one_shot, MAX_SANDBOX_CONTAINERS semaphore), run_script() for bundled scripts
+    sessions.py             SessionManager (init_manager / get_manager): one persistent shell container and one browser
+                            container per user, memory-aware admission (CapacityError), idle reaping + warnings
+                            (reap_idle, due_warnings, extend), package persistence, the egress filter (iptables), the
+                            browser's unix-socket protocol (browser_call, browser_peek); sync and thread-safe
     tool_integrator.py      ToolIntegrator: monkey-patches tool classes at startup (see below)
     secure_tool_wrapper.py  SecureToolWrapper: thin routing layer to ContainerManager
     scripts/                scripts that run INSIDE the sandbox (stdlib + the image's libs only; print ONE JSON line last):
@@ -194,6 +213,11 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
                             {title, final_url, text, links, screenshot, error}; own 60 s deadline
       render_document.py    --format pdf|docx|xlsx --input --output [--title=] → {output, bytes, error}: HTML→PDF
                             (page.pdf), Markdown→DOCX (python-docx), Markdown→XLSX (openpyxl); own 75 s deadline
+      browser_server.py     the long-running browser of the browser container: Playwright Chromium with a persistent
+                            profile, one JSON request per line on a unix socket, executes the browser toolset members,
+                            guards sensitive actions, sends all traffic through its own filtering proxy (no private
+                            addresses), keeps session cookies across restarts, exits after its own idle time
+                            (copied in at every browser start; not a run_script script)
     Dockerfile, entrypoint.sh, requirements.txt   the sandbox image (python:3.12-slim + tools, Playwright Chromium at
                             /opt/pw-browsers, non-root user "runner", passwordless sudo for apt only)
   stats.py                  StatsTracker singleton: SQLite data/stats.db, per-user action limits, the /usage helpers
@@ -202,7 +226,7 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
   image_utils.py            JPEG/HEIC/PNG/WebP/GIF/BMP helpers (IMAGE_EXTENSIONS, flatten_to_rgb; pillow-heif registered
                             on import)
   voice/                    VoiceManager: ElevenLabs voice ids (voices.json) + per-user choice (config.json)
-  Dockerfile, requirements.txt   bot image (python:3.12-slim + git, docker.io, ffmpeg); timezonefinder is a commented,
+  Dockerfile, requirements.txt   bot image (python:3.12-slim + git, docker.io, ffmpeg, iptables for the egress filter); timezonefinder is a commented,
                             optional line there (time zone from a shared location)
 tests/                      pytest suite (pytest.ini sets pythonpath=app, asyncio_mode=auto)
 .github/workflows/deploy.yml  manual production deploy (workflow_dispatch, environment PROD), see "Running"
@@ -259,8 +283,23 @@ Deployment facts that are easy to get wrong:
   `data/stats.db` on import. The `bot` package has no import-time side effects.
 - Python ≥ 3.12 is required: `agents/main.py` uses nested same-quote f-strings (PEP 701).
 - Polling mode only; `DROP_PENDING_UPDATES=true` (default) discards messages sent while the bot was
-  down. The only scheduled work is the reminders loop every 10 s, plus a one-off refresh of the admin
+  down. The scheduled work is the reminders loop every 10 s, the `sandbox-reaper` every 60 s (closes idle
+  sandbox/browser sessions, sends the "closing in 5 minutes" warnings), plus a one-off refresh of the admin
   MCP servers' tool cache at startup (`mcp-admin-refresh`).
+- Persistent sandbox sessions (`secure_container/sessions.py`) need, on the Docker host: a free subnet for the
+  `generall-sandbox` bridge (`SANDBOX_SUBNET`, default 172.30.240.0/24), and for the egress filter iptables
+  rules written from the bot container (privileged, host network) into the same backend Docker uses
+  (`DOCKER-USER`, else `FORWARD`, plus `INPUT`). `SANDBOX_EGRESS_FILTER=best_effort` (default) logs one warning
+  and runs unfiltered when that fails; `required` refuses to start sessions instead and gives their one-off
+  fallback containers no network; the reaper re-checks the rules every 300 s (a host firewall reload drops
+  them; `required` then stops every session); check with /sandbox as
+  admin ("Private networks blocked"). Sandboxes resolve names through `SANDBOX_DNS` (public resolvers by
+  default) because the filter blocks private resolvers. Memory: a session starts only while
+  `MemAvailable` (host-wide, `/proc/meminfo`) minus `SANDBOX_MEMORY_RESERVE_MB` covers its limit (768 MB shell,
+  1536 MB browser) and the limits of all running sessions of both kinds, its own included, fit in `MemTotal`
+  minus that reserve (one shared budget); the automatic count caps follow `MemTotal` (8 GB: 8 shells, 4 browsers,
+  but not both at once: the budget holds e.g. 3 browsers and 2 shells). Two bot
+  instances must not share one Docker host: startup removes every container labelled `generall.sandbox`.
 - The sandbox image is tagged by the hash of its build context (`secure-container:<12 hex>` over
   Dockerfile, entrypoint.sh, requirements.txt). A deploy that changes any of them builds the new tag on
   the next startup by itself (slow: apt layers plus Chromium); no manual `docker rmi`. Scripts under
@@ -310,9 +349,13 @@ Deployment facts that are easy to get wrong:
 4. `bot.app.run()`: build `Bot` (local API session when configured), `Dispatcher`, include the root
    router, `delete_webhook(drop_pending_updates)`, `start_polling`. `on_startup` loads the auth store,
    configures ffmpeg for pydub, starts the reminders loop and the `mcp-admin-refresh` task
-   (`mcp_ui.refresh_admin_servers`), and registers the command menu (`register_commands` →
-   `set_my_commands(bot_commands())`; a refusal by an old local Bot API server is only logged);
-   `on_shutdown` cancels background tasks and running jobs; `main_bot` then calls `cleanup_containers()`.
+   (`mcp_ui.refresh_admin_servers`), `start_sandbox_sessions` (when a SessionManager exists: `cleanup_stale`
+   removes leftover session containers, awaited up to 120 s, then the `sandbox-reaper` task), and registers the
+   command menu (`register_commands` → `set_my_commands(bot_commands())`; a refusal by an old local Bot API
+   server is only logged); `on_shutdown` cancels background tasks and running jobs, then
+   `sandbox_ui.shutdown_sessions()` stops every session (browsers first asked to save their cookies);
+   `main_bot` then calls `cleanup_containers()`. The SessionManager itself is created in
+   `ContainerManager.__init__` (`sessions.init_manager`, failures logged: commands then run one-off).
 
 Consequences: the tool list the model actually sees is **not** what you read in `agents/*.py`
 alone; the source of truth is source file + `tool_integrator.py`. When you add or rename a method on
@@ -349,8 +392,10 @@ execution between host and sandbox.
   `to_thread`; media pre-processing uses `to_thread` for PIL/pydub/ffmpeg/pypdf/OpenAI/pandas, and
   `content.materialize` (base64 of the pictures) runs in a thread too. **Any new blocking call must be
   wrapped the same way**, otherwise it stalls every user again.
-- Global caps: `MAX_CONCURRENT_TURNS` (asyncio semaphore in `QueueManager`) and
-  `MAX_SANDBOX_CONTAINERS` (threading semaphore in `container_manager.py`). `TURN_TIMEOUT_SECONDS`
+- Global caps: `MAX_CONCURRENT_TURNS` (asyncio semaphore in `QueueManager`), the session caps of
+  `secure_container/sessions.py` (memory admission + `SANDBOX_MAX_SESSIONS` / `BROWSER_MAX_SESSIONS`) and
+  `MAX_SANDBOX_CONTAINERS` (threading semaphore in `container_manager.py`, one-off containers only:
+  `run_script`, the fallback). `TURN_TIMEOUT_SECONDS`
   cancels a stuck job and tells the user; the worker continues with the next job.
 - Agent reminders go through the same per-user queue (`bot/jobs.py`, label "scheduled agent task"), so they
   never interleave with the user's own turn. The job is `run_agent_reminder`: `run_turn(prompt=task_prompt(...),
@@ -414,8 +459,9 @@ worker → _run_text → prompt = message_context.with_reference(text, message, 
        │     (base64 image/document blocks, to_thread) behind the <context> text block; tool loop on the real
        │     transcript (tool results capped before the model sees them); history_edited → strip every thinking
        │     block of the stored transcript first (the prefix was sent stripped); then append the turn exactly as
-       │     sent, judge/critique/SYSTEM NOTICE included; prune only above max_context_tokens (clear old tool results AND
-       │     old image/document blocks → text markers, summarize oldest half, strip thinking); save;
+       │     sent, judge/critique/SYSTEM NOTICE included; prune only above max_context_tokens or 40 pictures (clear old
+       │     tool results AND old image/document blocks → text markers, pictures down to 20, summarize oldest half,
+       │     strip thinking); save;
        │     summaries/FAISS/dialog_history.json still written. LEGACY MODE below:
        ├─ semantic_search: FAISS hits appended to the system prompt (to_thread; failure → skipped)
        ├─ context_memory = fixed intro pair
@@ -458,7 +504,8 @@ worker → _run_text → prompt = message_context.with_reference(text, message, 
     turn_actions.parse_follow_ups(response) → (display, suggestions): the LAST <follow_ups> block is cut from
        the visible answer (always) and becomes ≤4 suggestions (none when follow_ups is off)
     quiet_marker given (scheduled tasks: bot/jobs.run_agent_reminder passes QUIET_MARKER "<no_update/>" with the
-       framing prompt, see "Queues") and display == marker → nothing sent, status deleted, TurnResult(quiet=True)
+       framing prompt, see "Queues") and display == marker → nothing sent, status deleted, TurnResult(quiet=True);
+       such a turn runs with browser.stream off (no live-view photo to leave behind)
     save_turn(): TurnRecord(id 12 hex, prompt (text view), prompt_blocks (media refs, Retry re-runs them), display,
        speak, thread, limit_reached, follow_ups) + reasoning text (if reasoning_context.enabled) → data/<uid>/turns/
        (to_thread, newest 50 kept)
@@ -571,6 +618,14 @@ A tool provider is duck-typed. It must expose:
   by `ChainOfThoughtAgent._provider_notes` inside the `<capabilities>` block of the static system prompt
   (so it is part of the cache prefix and of the transcript fingerprint: adding or changing notes strips
   stored thinking once). Per-turn text never belongs there.
+- Optional toolset (only `BrowserTools` today): a `toolset` attribute (a nameless `tools` entry such as
+  `{"type": "browser_toolset_20260801", "configs": {...}}`, appended by `get_tools_schema` after the provider's
+  own tools), `toolset_name` ("browser"), `async execute_member(name, input) -> (content, is_error)` and an
+  optional `async after_batch()`. The model's `tool_use` blocks for it carry `toolset_name`; they are stored
+  with it (append-only transcript) and their `tool_result` must echo `"toolset_name"`, normal results must
+  not. Member results may hold `text`, `image` and `browser_state` blocks. `allowed_tools` keeps a toolset
+  only when its `toolset_name` is allowed (subagents never get one). Helpers in `agents/main.py`:
+  `toolset_of`, `tool_display_name` (trace: `browser.<member>`), `block_input`, `toolset_provider`, `batch_units`.
 
 Tools that talk to the user receive a `sender` (`bot.sender.ChatSender`) in their constructor, never
 a Telegram update: `sender.send_text(md)`, `send_markdown(md)` (splits, fallback), `send_document(path|bytes,
@@ -606,18 +661,24 @@ shown as `[image]` in the trace (`content.result_preview`). Every call is record
 API even when `tools.enabled` is false. All `tool_use` blocks of one assistant message run **concurrently**
 (`AgentAnthropic.run_tool_batch`), so a provider must be safe to call from several tasks at once; an
 exception becomes a `tool_result` with `is_error: true`, a returned string starting with "Error" is passed
-through as content (shown ❌ in the trace).
+through as content (shown ❌ in the trace). Toolset members are the exception: one toolset's calls run in
+block order, one at a time (alongside the concurrent normal tools), and the first failure halts the rest,
+which get `is_error` with `NOT_EXECUTED` ("Not executed: an earlier action in this turn failed."); then
+`after_batch()` runs. A message with browser calls costs ONE `TurnBudget` unit and ONE
+`track_tool_used(uid, "browser")`, however many members it holds (a failing quota write, e.g. SQLite "database is
+locked", is logged and the batch runs on; for a normal tool it becomes that tool's error result).
 
-Effective tool list as the model sees it (after patching; 44 built-in tools plus the user's `mcp_*` ones):
+Effective tool list as the model sees it (after patching; 47 built-in tools, the browser toolset and the user's
+`mcp_*` ones):
 
 | Provider | Tools | Runs where |
 |---|---|---|
 | FileOperations | `list_files`, `create_file`, `read_file`, `download_file`, `download_webpage` (readable main content: `trafilatura.extract(include_tables=True)`, lazy import cached in `file_ops._TRAFILATURA`, BeautifulSoup page text when trafilatura is missing, raises or finds < `MIN_EXTRACTED_CHARS` 200 chars), `upload_to_s3`, `create_zip_archive`, `send_file_path_to_user_via_telegram` | bot process, paths resolved under `data/<uid>/` by `agents/paths.resolve_under` (escapes refused); the names download_file / download_webpage(save_to_file) / create_zip_archive write keep only their base name (`FileOperations._download_target` → `downloads/<name>`, so a link planted in downloads/ that points outside is refused) |
-| FileOperations | `create_directory`, `delete_file` | sandbox container (a fresh `docker run` per call), paths relative to `data/<uid>` |
+| FileOperations | `create_directory`, `delete_file` | the user's sandbox session (`run_command`), paths relative to `data/<uid>` |
 | SearchTools | `search_web` (Tavily), `deep_research` (Perplexity `sonar*`) | bot process, worker thread |
 | SearchTools | `memory_search` (query with `" | "` alternatives, case_sensitive, max_results 1..100 default 20): substring search over `conversations/*.json` (summary, topic, question, response), `profile.md` (field = section) and the text view of `transcripts/*.json` (user/assistant text only: no context blocks, tool results, thinking or media); JSON array of `{source, timestamp, topic, field, snippet}` newest first, or "No matches for …" | bot process, worker thread (reads every conversation file and transcript on each call through `agents.paths.regular_files`: a symlinked folder or file, or a FIFO, is skipped, because data/<uid> is the sandbox's workspace) |
-| CodeTools | `execute_python` (+`network_enabled`) | sandbox |
-| TerminalTools | `run_command` (no network option), `run_shell_script` (+`network_enabled`), `install_package` (apt, persisted, network on) | sandbox |
+| CodeTools | `execute_python` (+`network_enabled`, ignored in the session: it always has filtered internet) | the user's sandbox session |
+| TerminalTools | `run_command` (bash syntax works), `run_shell_script` (+`network_enabled`, ignored in the session), `install_package` (package_name, manager apt\|pip; persisted and reinstalled at every session start) | the user's sandbox session (a one-off container when none can start) |
 | TimeTools | `get_time_in_timezone`, `list_timezones` | bot process |
 | ImageTools | `generate_image` (no `images` → generate, one → edit, several → compose; engine `auto`/`best`/`fast`/`story`), `generate_story_images` | bot process (SDK calls in worker threads), never sandboxed, delivers each result itself as a document, once |
 | VideoTools | `video_generator`, `image_to_video_generator`, `video_from_reference_images`, `video_interpolation_generator`, `video_extension_generator` | bot process (Veo in worker threads, async polling up to 5 min) |
@@ -628,14 +689,16 @@ Effective tool list as the model sees it (after patching; 44 built-in tools plus
 | ProfileTools (registered, awaited) | `user_profile_read`, `user_profile_add(section, text)`, `user_profile_remove(section, needle)`, `user_profile_replace(section, old, new)`; needle = exact entry, a unique substring or a 1-based index; results = confirmation + the numbered section; registered always (the `profile` setting only gates the `<profile>` block in the context) | bot process, file I/O in to_thread |
 | MCPTools (registered, awaited) | `mcp_<server>_<tool>` for every tool of the user's enabled MCP servers and the admin's (names sanitized to `[a-zA-Z0-9_-]{1,64}`, collisions `_2`, `_3`…; description `[MCP <server>] …`; input_schema passed through, an empty object schema when missing/invalid); `prompt_notes` only when the user has MCP tools | bot process: schemas from the cached tool lists (NO network at turn start); one fresh connection per call (streamable HTTP or SSE by `transport`, stored headers) → `initialize` → `call_tool` → closed; `CALL_TIMEOUT` 60 s (`DISCOVER_TIMEOUT` 30 s); text → joined text, images → base64 `image` blocks (list result), embedded resources → their text or `[resource <uri>]`, `isError` → `Error: …`, unreachable → `Error: MCP server <name> unreachable: <reason>` (never raises; URLs in the reason redacted to scheme+host+path; the error is recorded in the store and shown by `/mcp`) |
 | WebTools (registered, blocking) | `browse_webpage` (url, wait_ms 0..10000 default 1500, screenshot, max_chars 500..100000 default 20000): page title, final URL, readable text (trafilatura on the rendered HTML), first 20 links, optional screenshot `downloads/screenshot_<hex>.png` (view with `view_image`; a failed screenshot keeps the page read and says "Screenshot: not saved") | sandbox: ONE container with network on, `mem_limit` 1g, timeout 75 s (script deadline 60 s) via `ContainerManager.run_script("browse.py", …)`; the bot process only formats the JSON |
+| SandboxTools (registered, awaited; only while sessions are on) | `sandbox_status`: when the sandbox and the browser close if unused (user's local time), memory, open tabs, stored logins size, saved packages, whether the user was warned; its `prompt_notes` carry the sandbox facts (30 min idle, the warning, what persists, fresh bash per command, `nohup` for background jobs, filtered internet, apt/pip persistence) | bot process (`manager.status` in to_thread); inherited by subagents |
+| BrowserTools (registered, awaited; only with `browser.enabled`) | the browser toolset members (`navigate`, `screenshot`, `zoom`, `left_click`, `right_click`, `middle_click`, `double_click`, `triple_click`, `hover`, `left_click_drag`, `left_mouse_down`, `left_mouse_up`, `mouse_move`, `scroll`, `scroll_to`, `type`, `key`, `hold_key`, `wait`, `read_page`, `find`, `get_page_text`, `form_input`, `new_tab`, `list_tabs`, `switch_tab`, `close_tab`; `javascript_exec`, `file_upload`, `read_console`, `read_network` disabled); `browser_confirm(summary)` (sends the current screenshot with ✅ Allow / ❌ Cancel through `bot/questions.ask`, 300 s; Allow = one sensitive action within 5 minutes, this turn only); `browser_show_screenshot(caption, region?)` (crop scaled up to 3x, e.g. a captcha for the user) | members: the user's browser container (`SessionManager.browser_call` in to_thread, 75 s); the two tools: bot process. Never given to subagents |
 | DocumentTools (registered, blocking) | `create_document` (format md\|html\|pdf\|docx\|xlsx, title, content Markdown, filename?) → `documents/<sanitized name>.<fmt>` (existing names get `-2`, `-3`); the tool sends the file itself and returns "Document saved to documents/… (<size> KB) and sent to the user." | md/html: bot process (python-markdown: tables, fenced_code, sane_lists, toc + embedded CSS); pdf/docx/xlsx: sandbox via `run_script("render_document.py", …)`, network off, 1g for pdf, timeout 90 s (script deadline 75 s) |
 
 Unreachable: all 11 `SystemTools` tools (`install_package`, `run_shell_script` duplicates plus
 `check_system_info`, `manage_service`, `monitor_process`, `network_diagnostics`,
 `list_installed_packages`, `remove_package`, `install_python_package`,
-`list_installed_python_packages`, `remove_python_package`). `ContainerManager` does honor a
-persisted pip list (`data/<uid>/installed_python_packages.txt`) at every sandbox run; no bot code
-writes it, but the model can create the file with `create_file` and it will then be replayed.
+`list_installed_python_packages`, `remove_python_package`). The persisted package lists
+(`installed_packages.txt`, `installed_python_packages.txt`) are written by `install_package` (manager apt or
+pip) and replayed once at every session start; a file the model writes with `create_file` is replayed too.
 
 ## Sandbox (secure_container) mechanics
 
@@ -650,19 +713,83 @@ writes it, but the model can create the file with `create_file` and it will then
   If building a new content tag fails and `secure-container:latest` exists, the bot logs an error and runs on
   `:latest` (`_fall_back_to_latest`; the tag goes into `_FAILED_BUILDS`, so the other ContainerManager
   instances do not build again; the next start retries). Only without any image does the constructor raise.
-- Every sandboxed call = one new container `secure-container-<uid>-<8 hex>`: bind-mount
-  `$WORKSPACE_ROOT/data/<uid>` → `/home/runner/workspace` (rw, shared), cwd there, user `runner`,
-  `mem_limit` = `DEFAULT_MEM_LIMIT` ("512m") unless the caller passes one (`run_command`/`run_script`
-  take `mem_limit`; the browser and the PDF renderer use "1g" because Chromium does not fit in 512 MB),
-  one CPU, `network_mode=none` unless `network_enabled` or packages must be installed, removed in
-  `finally`. `run_command` first acquires one of `MAX_SANDBOX_CONTAINERS` slots (blocking, in the calling
-  worker thread). `browse_webpage` and a pdf render hold a slot for 10-60 s each.
+- **Persistent sessions** (`secure_container/sessions.py`, `SANDBOX_SESSIONS=true`, the default): every user
+  has at most one shell container `sandbox-<uid>-<hex>` (`sleep infinity`, `init`, bind-mount
+  `$WORKSPACE_ROOT/data/<uid>` → `/home/runner/workspace` rw, user `runner`, `SANDBOX_SESSION_MEM_MB` 768 MB with
+  swap equal to it, 1 CPU, 512 pids, `oom_score_adj` 800, labels `generall.sandbox` / `generall.user`; no
+  `no-new-privileges`, because `sudo apt-get` needs setuid) and at most one browser container
+  `browser-<uid>-<hex>` (below). `run_command`, `execute_python`, `run_shell_script`, `install_package`,
+  `create_directory` and `delete_file` all go through `ContainerManager.run_command` →
+  `SessionManager.exec(uid, command, timeout)`: `exec_run` as `runner` in the workspace of
+  `bash -c <capture wrapper> sandbox-exec <t> <cmd>`, which runs `timeout -k 5 <t> bash -lc <cmd>` with
+  output to a temp file and stdin from /dev/null, then prints its first 1 MB. So shell syntax always works,
+  a background job (`nohup … &`) does not hold the call open, and a huge output never reaches the bot.
+  Each command is a fresh bash: files, installed packages and running background processes persist,
+  `cd` and exported variables do not. A session is started on demand (first command), replays the saved
+  packages once (900 s cap), and is stopped after `SANDBOX_IDLE_SECONDS` (1800) without use by the
+  `sandbox-reaper`; `SANDBOX_WARN_BEFORE_SECONDS` (300) before that the user gets a warning with
+  "👌 OK" / "⏳ Keep open 30 min" (`manager.extend`). A container found gone before the command started is
+  replaced and the command run there once; one that goes away while it runs (/sandbox Close or Forget, the
+  reaper, a shutdown, a crash) ends it with "Error: the sandbox was closed while the command was running; it did
+  not finish." and it is never run again (`_exec_raw` makes docker-py's `exec_create` / `exec_start` /
+  `exec_inspect` calls one by one: a 404/409 before the stream means nothing ran). A session whose start
+  completes after `shutdown_all` (or after `required` lost the filter) is stopped at once. Timeouts are clamped
+  to 3600 s.
+- **Admission** (`SessionManager`): a start needs `MemAvailable` − `SANDBOX_MEMORY_RESERVE_MB` ≥ the session's
+  limit, a free slot under the count cap (`SANDBOX_MAX_SESSIONS` / `BROWSER_MAX_SESSIONS`, 0 = automatic
+  from `MemTotal`: 8 GB → 8 shells and 4 browsers, at most 16 / 8), and room in ONE budget shared by both kinds:
+  the memory limits of every running and starting session plus its own ≤ `MemTotal` − the reserve (each count
+  cap alone assumes the whole budget, and `MemAvailable` hardly moves when an idle container starts). Refused →
+  one least-recently-used session of
+  the same kind idle ≥ 120 s is stopped and the start retried once, else `CapacityError` with a readable
+  reason (`SessionStartError`, a subclass, for Docker or filesystem failures). Busy sessions (a call in
+  flight) are never evicted or reaped.
+- **One-off containers** remain for `run_script` (always) and as the fallback of `run_command` /
+  `install_package` on `CapacityError` or with `SANDBOX_SESSIONS=false` (`run_one_shot`, `bash -lc`, a note
+  appended to the result): `secure-container-<uid>-<8 hex>`, the same mount, `mem_limit` =
+  `DEFAULT_MEM_LIMIT` ("512m") unless the caller passes one (the page reader and the PDF renderer use "1g"),
+  one CPU, `network_mode=none` unless `network_enabled`, removed in `finally`, behind one of
+  `MAX_SANDBOX_CONTAINERS` slots (blocking, in the calling worker thread). With network they join the
+  filtered `generall-sandbox` network whenever the SessionManager exists; with `SANDBOX_EGRESS_FILTER=required`
+  they get no network while the filter is not `on` (or there is no manager), so the fallback of a refused
+  session never runs unfiltered. The fallback reinstalls the saved packages first (`run_script` never) exactly
+  like a session start: `sessions.persisted_packages` (validated names, `read_regular`: no link, no FIFO) through
+  `sessions.replay_script` in a subshell of `temp_setup_<hex>.sh`, which forces network on (still none in the
+  case above).
+- **Network**: sessions run on the `SANDBOX_NETWORK` bridge (`SANDBOX_SUBNET`, `enable_icc` false, no IPv6)
+  with `SANDBOX_DNS` resolvers, so commands and the browser always have internet; the parameter
+  `network_enabled` is ignored in the session. The egress filter (`apply_egress_filter`, at manager setup)
+  inserts host iptables rules (idempotent: `-C` first) that drop traffic from the subnet to private,
+  loopback, link-local, CGNAT and multicast ranges (`BLOCKED_RANGES`; cloud metadata included) in
+  `DOCKER-USER` (or `FORWARD`) and to the host itself in `INPUT`. The backend (`iptables`, `-legacy`, `-nft`)
+  is the one whose tables hold Docker's chains. Result `on` / `off` / `failed` in `server_status()`; with
+  `required` a failed filter refuses every start. `reap_idle` re-applies the rules every
+  `EGRESS_RECHECK_SECONDS` (300; `-C` first, `-I` only for a missing rule, logged as a warning) and updates the
+  state; in `required` mode a failed re-check stops every session (an error in the log), and a later good one
+  allows starts again.
+- **Browser container** `browser-<uid>-<hex>` (`BROWSER_MEM_MB` 1536 MB, `no-new-privileges`, same network):
+  mounts only `data/_sandbox/<uid>/browser` → `/run/browser` (`ctl/browser.sock`, `profile/`, its own
+  `downloads/`), so the shell never sees the cookies and the browser never sees the workspace. No workspace
+  path is ever a mount source: the sandbox controls the links there, and Docker resolves a bind-mount source on
+  the host. Each `download_completed` an answer reports is moved by `browser_call` (`_collect_downloads` →
+  `move_download`: source a regular file opened `O_NOFOLLOW`, target created `O_EXCL | O_NOFOLLOW` in the real
+  workspace `downloads/`, a taken name gets `-2`, `-3`, at most `DOWNLOAD_MAX_BYTES` 512 MB) and its `path`
+  rewritten; one that cannot be moved becomes `download_failed`. Leftovers are swept in at the next start. At
+  each start `scripts/browser_server.py` is written in fresh, `ctl/`, `profile/` and `downloads/` are made real
+  0o777 directories, a stale socket and Chromium's `Singleton*` locks are removed, and the manager waits up to
+  40 s for `_ping`.
+  The server runs with `--idle-seconds` = the idle timeout + 60 and exits by itself after that.
+  `browser.remember` off = a throwaway profile. `close` / `forget_browser_profile` / the reaper ask it to
+  `_shutdown` first so the cookies are written (session cookies too: Chromium keeps only those with an
+  expiry, so the server writes the others to `profile/gall-session-cookies.json`, 0600, and adds them back at
+  the next start, deleting the file; never for a throwaway profile).
 - `ContainerManager.run_script(user_id, script_name, args=(), timeout=90, network_enabled=False, mem_limit=None)`
   copies ONE bundled script from `secure_container/scripts/` (`SCRIPTS_DIR`) into the workspace as
-  `temp_tool_<hex>.py` (unique per call), runs `python -I <file> <shlex-quoted args>` through `run_command` (isolated mode: the script's directory is the
-  user's workspace, so a workspace `json.py` or a `pip install --user` copy of a library would otherwise shadow
-  its imports)
-  (same slots, mount, package prelude), deletes the copy in `finally` and returns the raw logs.
+  `temp_tool_<hex>.py` (unique per call), runs `python -I <file> <shlex-quoted args>` in a one-off container
+  (isolated mode: the script's directory is the user's workspace, so a workspace `json.py` or a
+  `pip install --user` copy of a library would otherwise shadow its imports;
+  `run_one_shot`, same slots and mount, no package replay: the scripts use only the image's libraries),
+  deletes the copy in `finally` and returns the raw logs.
   `script_name` must be a bare file name of a bundled script; anything with a directory part (`../x.py`,
   absolute paths) is refused with "Error: sandbox script not found". Script output contract: the scripts
   print their result as the LAST line, one JSON object with `json.dumps` (`ensure_ascii=True`, so the line
@@ -674,28 +801,44 @@ writes it, but the model can create the file with `create_file` and it will then
   `documents/` (rendered files) and chmods them 777 so the container's `runner` can write there, through
   `paths.ensure_real_dir`: the sandbox can replace those folders with links, and a plain chmod by the root bot
   would follow them (e.g. to `/var/run/docker.sock`, which is the host's socket).
-- **`run_command` does not go through a shell**: docker-py `shlex.split`s the string and
-  `entrypoint.sh` does `exec "$@"`. Pipes, `&&`, redirects, `cd`, globs need `bash -c '...'` or
-  `run_shell_script`. Exception: when a persisted package list exists the command is embedded in a
-  bash prelude script, so shell syntax suddenly works.
+- Commands always run through `bash -lc`, in the session and in the one-off fallback alike, so pipes, `&&`,
+  redirects and globs work. `run_script` alone is `shlex`-split by docker-py (`entrypoint.sh` does
+  `exec "$@"`), which is why it quotes every argument.
 - Python code is written to `data/<uid>/temp_code_<hex>.py`, shell scripts to `temp_script_<hex>.sh`,
-  and a package-install prelude to `temp_setup_<hex>.sh`; all are deleted after the run. The name is
+  `run_script`'s copy to `temp_tool_<hex>.py` and a package-install prelude to `temp_setup_<hex>.sh`, each
+  created with its mode (0o755) by `sessions.write_new_file`, never chmodded by path (the session could swap
+  the file for a link in between); all are deleted in `finally` (unlink, which never follows). The name is
   unique per call (`ContainerManager._workspace_file`) because a batch of tool calls runs concurrently:
   fixed names were overwritten by whichever call wrote last, so every container ran that one command.
-- Persistence across runs is by re-installing: `installed_packages.txt` (apt, via `sudo apt-get`)
-  and `installed_python_packages.txt` (`pip install --user`) are replayed before **every** sandboxed
-  call (including `delete_file`/`create_directory`/`browse_webpage`/`create_document` renders) when
-  present, which forces network on and adds many seconds per call. `python3-*` apt packages also get a
-  best-effort `pip install --user <name-without-prefix>`.
-- Output = `container.logs()` (stdout+stderr), always prefixed by the entrypoint banner (~10 lines).
-  Tool results are therefore never clean JSON (the script tools parse the last JSON line, see above).
-  Non-zero exit → `Error (exit code N):\n<logs>`; a timeout → `Error executing command: <exc>` and the
+- Packages persist by re-installing: `install_package(package_name, manager="apt"|"pip", timeout=300)`
+  validates the names (no options, URLs or paths reach apt/pip, nor pip archive names such as `x.whl` or
+  `x.tar.gz`, which pip would install from the workspace), installs them in the session and, on
+  success, saves them to `installed_packages.txt` (`sudo apt-get`) or `installed_python_packages.txt`
+  (`pip install --user`), a new version replacing the old line. Both lists are replayed once per session
+  start; a failed replay is reported once, at the end of the next command's result. `python3-*` apt packages
+  also get a best-effort `pip install --user <name-without-prefix>`.
+- Session output = the wrapper's capture (stdout+stderr), no banner: the output, `(no output)`,
+  `Error (exit code N):\n<output>`, the timeout text with the `nohup` hint (exit 124 or 137 once the session's
+  time is up; a 124 earlier, e.g. from an inner `timeout 10 curl`, is a plain `Error (exit code 124)`),
+  "Error (exit code 137: the process was killed, probably for using more than the memory …)" (137 earlier) or
+  "Error: the command's exit status is unknown (the sandbox may have been closed):\n<output>" when Docker
+  reports no exit code (`install_package` then saves nothing). One-off output = `container.logs()`, prefixed by the entrypoint banner (~10 lines),
+  so the script tools parse the last JSON line; a one-off timeout → `Error executing command: <exc>` and the
   logs are lost with the container.
 - Security boundary: the sandbox covers `run_command`, `execute_python`, `run_shell_script`,
-  `install_package`, `delete_file`, `create_directory`, `browse_webpage` and the pdf/docx/xlsx renders of
-  `create_document`. `list_files`, `read_file`, `create_file`, downloads, zip, S3, `memory_search`, the
-  vision/profile tools, md/html rendering, MCP calls and every API-backed tool run in the bot container,
-  which is privileged with the Docker socket mounted.
+  `install_package`, `delete_file`, `create_directory`, `browse_webpage`, the pdf/docx/xlsx renders of
+  `create_document` and the whole browser toolset (its own container). `list_files`, `read_file`,
+  `create_file`, downloads, zip, S3, `memory_search`, the vision/profile tools, md/html rendering, MCP calls,
+  `browser_confirm` / `browser_show_screenshot` / `sandbox_status` and every API-backed tool run in the bot
+  container, which is privileged with the Docker socket mounted, so every bot-side file operation inside
+  `data/<uid>` or `data/_sandbox/<uid>` (both writable by a container) goes through the link-safe helpers of
+  `sessions.py` (`real_dir`, `read_regular`, `write_new_file`, `move_download`; `_dir_size` walks the browser
+  profile with `os.fwalk` from an `O_NOFOLLOW` descriptor; `_connect_unix` opens `ctl/` `O_NOFOLLOW` and the
+  socket `O_PATH | O_NOFOLLOW`, requires `S_ISSOCK` and connects through `/proc/self/fd`) or `agents.paths`
+  (`ensure_real_dir`, `regular_files`, `resolve_under`): a chmod, copy or read that followed a planted link
+  would act on its target as root. The shell session keeps `sudo` for apt;
+  the browser container has `no-new-privileges`; neither can reach private addresses while the egress filter
+  is on.
 
 ## Memory and on-disk data layout
 
@@ -711,6 +854,11 @@ data/
                                     may be absent
   mcp_servers.cache.json            (<admin file stem>.cache.json) their discovered tools: {"servers": [{name, tools, updated, error}]},
                                     written at startup (mcp-admin-refresh) and by the admin's /mcp refresh
+  _sandbox/<chat_id>/browser/       the browser container's mount (/run/browser), outside the user's workspace: ctl/browser.sock
+                                    (the control socket), profile/ (Chromium's persistent profile: cookies and logins, plus
+                                    gall-session-cookies.json between a shutdown and the next start; deleted by
+                                    🧹 Forget browser logins), downloads/ (in progress; finished files move to the workspace),
+                                    browser_server.py (written in at each start)
   <chat_id>/
     settings.json                   per-user settings (see table); merged over defaults on load, unknown keys preserved
     profile.md                      agent-managed profile: "## About", "## Preferences", "## Notes" (entries "- ...", Notes dated
@@ -757,8 +905,10 @@ data/
                                     documents/ also holds create_document outputs <name>.<md|html|pdf|docx|xlsx> (-2, -3 on a clash)
                                     and the transient render sources .render_<hex>.html|.md
     downloads/                      download_file / download_webpage(save_to_file) / create_zip_archive outputs, screenshot_<hex>.png
-                                    (browse_webpage)
-    installed_packages.txt, installed_python_packages.txt, temp_code_<hex>.py, temp_script_<hex>.sh,
+                                    (browse_webpage), files the interactive browser downloaded (moved here by the bot)
+    installed_packages.txt, installed_python_packages.txt   the persisted apt / pip names (install_package), one per line,
+                                    replayed at every session start
+    temp_code_<hex>.py, temp_script_<hex>.sh,
   temp_setup_<hex>.sh, temp_tool_<hex>.py (run_script copy) (unique per call: tool calls of one message run concurrently)
 temp_audio/ temp_photos/ temp_docs/   transient, cwd-relative, deleted in finally; describe_image's temp JPEG is in the system temp dir
 app/voice/config.json               MUTATED at runtime by /voice (per-user voice id). Lives inside the image, not data/.
@@ -813,7 +963,18 @@ Memory semantics worth knowing before touching `ChainOfThoughtAgent.generate_res
   the last N user turns (top level and inside `tool_result` content lists) become `IMAGE_CLEARED_MARKER` /
   `DOCUMENT_CLEARED_MARKER` text blocks naming `view_image` / `read_document`; `prune` reports
   `stats["cleared_media"]` and it counts as an edit that strips thinking. Tool results of those turns are
-  cleared wholesale first, so pictures inside them count under `cleared`. The last N turns are never touched.
+  cleared wholesale first, so pictures inside them count under `cleared`; a browser member's result keeps its
+  `browser_state` blocks (`_cleared_result_content`: a result of state blocks only, i.e. every tab member's,
+  stays as it is because the API wants exactly one; others become `[marker, state]`) and its `is_error`.
+  `clear_old_media` never touches the last N turns.
+  Screenshots make a second trigger necessary: `prune` also runs when the transcript holds more than
+  `transcript.MAX_TRANSCRIPT_IMAGES` (40) images (`count_images`, tool results included). Any compaction (either
+  trigger) clears old tool results and media as above, then the oldest pictures of the more recent turns until
+  at most `IMAGE_PRUNE_TARGET` (20) remain (`clear_images_down_to`; the newest turn keeps all of its own), so the
+  next browsing turns do not cross the cap again right away (clearing to just under it cost a cache miss and the
+  thinking blocks on every turn); cleared browser images become `SCREENSHOT_CLEARED_MARKER` ("take a new
+  screenshot"). A prune triggered only by images summarizes nothing; thinking is stripped as for any prune. The
+  cap is checked at turn end only.
 - Reloading `short_term_memory.json` keeps only messages whose first block is `text`. With thinking
   on, intermediate tool-calling assistant turns start with a `thinking` block and are dropped; the
   final answer (re-appended as text-only) is kept. Tool-result user messages are never reloaded.
@@ -867,6 +1028,7 @@ every `set`. `run_turn` saves once per turn so new defaults reach disk. Agent co
 | `ui` | advanced (false) | `/settings` page only: off hides the power settings (`Control.advanced`); the section summaries still show their values |
 | `rich_messages` | enabled (true) | answers as Telegram rich messages (native GFM); off = legacy Markdown v1 path; also selects the `<formatting>` prompt section and rich vs plain streaming drafts |
 | `image` | engine (`auto`), quality (`auto`), size (`2K`), max_variants (4), metadata (true) | defaults for `generate_image`; the agent may override engine/quality from the request, `max_variants` is a hard cap, `metadata` puts model/quality/size in the delivered file's caption |
+| `browser` | enabled (true), stream (true), remember (true) | enabled: `BrowserTools` is registered (the toolset, `browser_confirm`, `browser_show_screenshot`); stream: the live view photo during browsing (never in a turn with a quiet marker, i.e. scheduled tasks); remember: the browser keeps its profile (cookies, logins) in `data/_sandbox/<uid>/browser/profile`, off = a throwaway profile. /settings section "🌐 Browser" (token `browser`, actions toggle/stream/remember; legacy `show_browser_menu`); none advanced, not in presets. Toggling `enabled` changes the tool list, so stored thinking is stripped once |
 | `trace` | keep_summary (true) | end of turn: status shortened into the rich summary above the answer (expandable tool calls, thinking, tokens, action buttons); off = deleted (actions go under the answer) |
 | `follow_ups` | enabled (true) | `FOLLOW_UPS_GUIDE` in the system prompt and follow-up buttons under the answer; off = neither (a block the model still writes is hidden anyway) |
 | `transcript` | enabled (true), max_context_tokens (120000, 20k..400k), keep_tool_results_turns (3), max_tool_result_chars (20000, applied when the tool returns, before the model sees it) | transcript mode (real conversation replayed as is); when on, `dialog_history`/`reasoning_context` are ignored for the prompt (dialog_history.json is still kept current) and `summarization_history.size` = recent summaries in the `<memory>` block |
@@ -955,7 +1117,13 @@ SearchTools and the embeddings `OpenAI` are per instance; ElevenLabs is per call
 | `STREAMING_ENABLED` (true) | bot/config AND agents/main (read independently, both after dotenv; the two defaults must agree, `tests/test_mode.py` checks both in a fresh interpreter) | draft streaming: `send_rich_message_draft` in rich mode (thinking as `<tg-thinking>`), else `send_message_draft`; errors swallowed; `draft_id` = the job id with `can_stop` (Telegram's Stop on the draft); `false` = answers arrive whole |
 | `MCP_SERVERS_FILE` (`data/mcp_servers.json`) | bot/mcp_store (read at call time) | the admin's MCP servers file, offered to every user; may be absent; its tool cache is `<stem>.cache.json` next to it |
 | `MAX_CONCURRENT_TURNS` (8), `TURN_TIMEOUT_SECONDS` (1800), `DROP_PENDING_UPDATES` (true) | bot/config | queue caps, see "Queues" |
-| `MAX_SANDBOX_CONTAINERS` (4) | secure_container/container_manager | concurrent sandbox containers |
+| `MAX_SANDBOX_CONTAINERS` (4) | secure_container/container_manager | concurrent ONE-OFF sandbox containers (`run_script`, the fallback); sessions have their own caps below |
+| `SANDBOX_SESSIONS` (true) | secure_container/sessions | persistent per-user shell sessions; false = a throwaway container per command (and no `sandbox_status`) |
+| `SANDBOX_IDLE_SECONDS` (1800, min 60), `SANDBOX_WARN_BEFORE_SECONDS` (300, 0 = no warning) | sessions, sandbox_ui | idle time before a session closes; the warning with Keep open comes this long before |
+| `SANDBOX_SESSION_MEM_MB` (768), `BROWSER_MEM_MB` (1536), `SANDBOX_MEMORY_RESERVE_MB` (1536) | sessions | memory limit per shell / browser container; host memory kept free (admission reads `MemAvailable`, and the limits of all sessions together must fit in `MemTotal` minus the reserve) |
+| `SANDBOX_MAX_SESSIONS` (0), `BROWSER_MAX_SESSIONS` (0) | sessions | count caps; 0 = automatic from `MemTotal` (at most 16 / 8; 4 / 2 when `/proc/meminfo` is unreadable) |
+| `SANDBOX_NETWORK` (generall-sandbox), `SANDBOX_SUBNET` (172.30.240.0/24), `SANDBOX_DNS` (1.1.1.1,8.8.8.8; empty = Docker's) | sessions | the sessions' bridge network, its subnet (must not overlap other networks), their resolvers |
+| `SANDBOX_EGRESS_FILTER` (best_effort) | sessions | iptables rules keeping the sandbox subnet off private ranges and the host: best_effort (warn and continue when they cannot be written) \| required (no session starts then, one-off containers get no network, a failed re-check every 300 s stops every session) \| off |
 | `THREAD_POOL_SIZE` (32, min 8) | bot/app | size of the default executor used by `asyncio.to_thread` |
 | `WORKSPACE_ROOT` | secure_container | host path of the checkout (see Running); set in compose, not `.env.example` |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENAI_API_KEY_WHISPER`, `GOOGLE_API_KEY`, `TAVILY_API_KEY`, `PERPLEXITY_API_KEY`, `ELEVENLABS_API_KEY` | various | see models table; `OPENAI_API_KEY` and `GOOGLE_API_KEY` needed to import `agents.main` |
@@ -982,8 +1150,8 @@ name; a new temp dir needs its own `.gitignore` line).
 - Routers and middleware (`bot/handlers/__init__.py`): `public` (/start, /help, /invite: no auth; /help
   shows unauthorized users the invite flow), `admin` (/listusers, /stats: `AuthMiddleware(require_admin=True)`),
   `ui` (/voice, /timezone + `tz_` buttons, /settings, /reminders + the pending-edit text handler, /usage,
-  /profile, /mcp, /cancel, `queue_cancel`, Stop, shared locations (`F.location` → time zone), `ask_` answers,
-  Listen/Reasoning, `usage_`/`profile_`/`mcp_` buttons: `AuthMiddleware()`, also on the
+  /profile, /mcp, /sandbox, /cancel, `queue_cancel`, Stop, shared locations (`F.location` → time zone), `ask_`
+  answers, Listen/Reasoning, `usage_`/`profile_`/`mcp_`/`sandbox_` buttons: `AuthMiddleware()`, also on the
   `stopped_message_generation` observer), `chat` (content handlers and the turn-starting buttons
   Retry/Continue/follow-ups: `AuthMiddleware(check_limits=True)` on message AND callback_query). Handlers
   never check auth themselves; they receive `user_id` (str chat id) and, in `chat`, `limit` as kwargs.
@@ -997,10 +1165,10 @@ name; a new temp dir needs its own `.gitignore` line).
   [sse] | remove <name> | refresh [name] | help]`, `/reminders`, `/timezone [name|city]` (`commands.py`,
   `voice_router`: no argument → the saved zone and local time, a picker of `timezones.COMMON_ZONES` two per
   row (`tz_set_<index>`) and the hint to share a location or type a name; an argument → `valid_zone`, save,
-  confirm with the local time (`timezone_set_text`), or `TIMEZONE_UNKNOWN`), `/cancel`, `/stats` (admin),
-  `/listusers` (admin).
+  confirm with the local time (`timezone_set_text`), or `TIMEZONE_UNKNOWN`), `/sandbox` (`sandbox_ui`: the
+  sandbox and browser state, Keep open / Close / Forget logins), `/cancel`, `/stats` (admin), `/listusers` (admin).
 - Command menu: `commands.COMMANDS` (start, help, settings, usage, reminders, profile, timezone, voice, mcp,
-  cancel; descriptions ≤ 256 chars) is the one list: `bot_commands()` feeds `set_my_commands` at startup and
+  sandbox, cancel; descriptions ≤ 256 chars) is the one list: `bot_commands()` feeds `set_my_commands` at startup and
   `help_text` renders the command section of /help from it. /invite and the admin-only commands are not
   listed. Add a user command there and both the menu and /help show it.
 - Callback prefixes: `voice_`, `settings_` (incl. `settings_preset_<name>`, `settings_mode[_set_<v>]`),
@@ -1011,7 +1179,10 @@ name; a new temp dir needs its own `.gitignore` line).
   (`profile_refresh`, `profile_clear`, `profile_clear_yes`, `profile_cancel` → `profile_ui.profile_button`),
   `mcp_<action>[_<name>]` (`mcp_toggle_`, `mcp_refresh_`, `mcp_remove_` → confirm `mcp_rm_` / `mcp_back`,
   `mcp_refreshall` → `mcp_ui.mcp_button`; actions carry no underscore, names are `[a-z0-9_-]`), `tz_set_<index>`
-  (the /timezone picker → `commands.timezone_button`, an index into `COMMON_ZONES`). The reminders family
+  (the /timezone picker → `commands.timezone_button`, an index into `COMMON_ZONES`), `sandbox_<close|forget|
+  forget_yes|back|refresh|keep|ok>` (→ `sandbox_ui.sandbox_button`; `sandbox_keep` / `sandbox_ok` act on the idle
+  warning when the message is the remembered warning or starts with "⏳ Your ", else on the /sandbox page).
+  The reminders family
   (`reminders_ui.reminder_button`, parsed `split("_", 2)` → action + payload, a trailing `_<value>` taken off
   the payload with `rpartition`): `reminders_page_<n>`, `reminders_summary`, `reminders_new`, `reminder_info_<id>`,
   `reminder_delete_<id>`, `reminder_toggle_<id>`, `reminder_delay_<id>_<minutes>` (+1h = 60, +1d = 1440),
@@ -1022,8 +1193,8 @@ name; a new temp dir needs its own `.gitignore` line).
   `tests/test_cross_features.py::ROUTING` checks that every family reaches its own handler in router order
   (`MESSAGE_ROUTING` does the same for message handlers: plain text, text during a pending reminder edit,
   /reminders and /cancel during one, a location, a photo)
-  (rows exist for usage_, profile_, mcp_, setp_preset_, setp_ui_advanced, settings_preset_, settings_mode_set_,
-  tz_set_, reminder_snooze_, reminder_delay_, reminder_edit_, reminders_new). Read the chat from
+  (rows exist for usage_, profile_, mcp_, sandbox_, setp_preset_, setp_ui_advanced, settings_preset_,
+  settings_mode_set_, tz_set_, reminder_snooze_, reminder_delay_, reminder_edit_, reminders_new). Read the chat from
   `callback.message.chat.id` and guard `isinstance(callback.message, Message)`. Answer the callback best-effort
   (an old query raises).
 - Message handlers outside `chat`: `reminders_ui.reminder_edit_text` (`F.text & ~F.text.startswith("/")` AND
@@ -1259,9 +1430,11 @@ name; a new temp dir needs its own `.gitignore` line).
   them, empty text blocks are dropped when the assistant message is appended, and redacted_thinking blocks go
   back unchanged. The final answer is stored text-only; that is safe because no later block depends on it.
   The only edits are boundaries that strip every thinking block (`transcript.strip_thinking`): `prune` above
-  `max_context_tokens` (clear old tool results to `CLEARED_MARKER` and old image/document blocks to the
-  `*_CLEARED_MARKER` texts, then summarize the oldest half into one `<earlier_conversation_summary>` user
-  message, down to `PRUNE_TARGET_RATIO` of the budget), a change of `transcript.prefix_fingerprint`
+  `max_context_tokens` or `MAX_TRANSCRIPT_IMAGES` (clear old tool results to `CLEARED_MARKER`, a browser result
+  keeping its `browser_state` so it stays a valid toolset result, old image/document blocks and the pictures
+  beyond `IMAGE_PRUNE_TARGET` to the `*_CLEARED_MARKER` texts, then summarize the oldest half into one
+  `<earlier_conversation_summary>` user message, down to `PRUNE_TARGET_RATIO` of the budget), a change of
+  `transcript.prefix_fingerprint`
   (model, static system prompt or tool definitions, e.g. a new image preference, prompt type, rich-messages or
   follow-ups toggle, a mode switch to/from speed, an MCP server change, new provider notes, a new tool or a
   deploy), and the API refusing the stored blocks anyway (`AgentAnthropic.history_edited`, next bullet). Any
@@ -1299,7 +1472,61 @@ name; a new temp dir needs its own `.gitignore` line).
   the `logger.exception` line.
 - Subagents share the parent's `TurnBudget`: the child gets `min(max_tool_calls, remaining)` and its used calls
   are charged to the parent afterwards; a child never persists a transcript and runs with judge/critique off.
-  It inherits the registered providers (vision, profile, MCP, web, document) but not `run_subagent`.
+  It inherits the registered providers (vision, profile, MCP, web, document, sandbox status) but not
+  `run_subagent` and never `BrowserTools` (one browser per user, driven by the main agent only).
+- **Sandbox sessions are shared state.** Every command of a user runs in the same container, so a background
+  process, a full disk or a broken apt state survives until the session closes (/sandbox → Close, or idle).
+  Only the workspace and the saved package lists survive the session; `cd` and environment variables do not
+  even survive the command (each is a fresh `bash -lc`). Tests that build a `ContainerManager` without
+  `__init__` always use one-off containers; tests that build a manager call `sessions.reset_manager()`.
+- `sessions.check_user_id` accepts `^[A-Za-z0-9-][A-Za-z0-9_-]{0,63}$` (chat ids, negative ones included); a
+  leading `_` is refused because `data/_sandbox` lives next to the user directories.
+- The idle timer is per kind (`reap_idle` and `closes_at` use each session's own last use) while the warning is
+  per user (`due_warnings` uses the latest activity of both). A user who keeps using only the shell sees the
+  browser close at its own time without a warning; one `extend` lines both up again. Warnings live in memory
+  (`sandbox_ui._warnings`): after a restart an old button only answers with the current closing time.
+- The patcher's `install_package` signature is `(package_name, manager="apt", timeout=300)` end to end
+  (`tool_integrator`, `SecureToolWrapper`, `ContainerManager`, `SessionManager.install_package`); pass `manager`
+  and `timeout` by keyword if you touch it.
+- **Browser toolset ordering**: the model may put several browser actions in one message; they run one at a
+  time in block order and stop at the first failure (`NOT_EXECUTED`). Never move them into the concurrent
+  `gather` of normal tools. A `tool_result` of a member must carry `toolset_name` and only `text` / `image` /
+  `browser_state` blocks (a tab member's success: exactly one `browser_state`, which a cleared old result keeps);
+  a normal tool's result must not carry it. Any code that rewrites stored results must keep them valid.
+  Other members get `browser_state` only when the tabs changed since the server's last report, which may have
+  gone to another conversation (forum topics share one browser) or a cancelled turn, so `execute_member` sends
+  `force_state: true` until a member call of the turn succeeded (never a `browser_state` on an error).
+- Element refs (`ref_N`) come from ONE server-wide counter: a ref of another tab or an earlier page is reported
+  stale, never resolved to a different element.
+- The confirmation guard is best effort. `browser_server.py` refuses an action whose target or page looks like
+  buying, paying, sending a message, deleting or changing account security (`needs_confirmation`), and
+  `BrowserTools` allows ONE such action within 5 minutes after the user tapped ✅ Allow on `browser_confirm`,
+  in the same turn only. Registering, logging in and accepting terms are deliberately not sensitive (a bare
+  "Отправить" counts only in a message context: a message box, chat, comment or reply form; a click into a text
+  field never counts). Covered: left/middle/double clicks (the ref's element AND what is under its click point),
+  `left_mouse_down` / `left_mouse_up` / drags (press and release points), `form_input` on non-text controls,
+  Enter and Space in `key` / `type` / `hold_key` (re-checked on the element focused right before each one: "Tab
+  Enter" is caught; a second consequential key in one allowed call stops there), page confirm() dialogs, and
+  back/forward/reload that would re-send a POST (aborted in the route filter). The point and the focus are
+  resolved through DevTools (`_describe_at`: `DOM.getNodeForLocation`; `_describe_focused`: `DOM.describeNode`
+  shadow roots), so closed shadow roots and cross-site (out-of-process) frames are looked into; a cross-origin
+  frame that cannot be entered counts only when its URL/title/name looks like a payment form. Limits: names are
+  heuristics; a CSS-transformed iframe gets the point translated without the transform; a page that acts on
+  other keys or moves the focus by itself while letters are typed is not re-checked.
+- The live view is ONE silent photo per turn, edited in place (`ChatSender.edit_photo`, at most every 2.5 s,
+  skipped when nothing changed; a refused edit sends nothing more). Its caption never shows typed text. A turn
+  with a `quiet_marker` (scheduled tasks, their Retry) has none: `run_turn` hands the agent its settings with
+  `browser.stream` off for that turn (not saved; no fingerprint change), so a quiet run leaves nothing behind.
+- Typed text is masked wherever people see a call: `type`'s `text` and `form_input`'s `value`
+  (`browser_tools.TYPED_INPUTS`) show as `<N characters>` in the trace (status line, rich summary args JSON:
+  `main.display_input` → `masked_input`) and the reasoning file (`agent_runner._call_args`). The request and the
+  stored `tool_use` keep the real value (append-only), and so do stdout (`print("\nResponse:", response)`), the
+  transcript and the conversation files.
+- `secure_container.sessions` is found by `agents/browser_tools.py` through `sys.modules` only: the agent package
+  never imports docker. Without a manager (no Docker, tests, `init_manager` failed) neither `SandboxTools` nor
+  `BrowserTools` is registered and /sandbox says the sandbox is unavailable.
+- Two bot processes must not share a Docker host: `cleanup_stale` and the per-start orphan removal match on the
+  `generall.sandbox` label only.
 
 ## How to make common changes
 
@@ -1392,8 +1619,19 @@ name; a new temp dir needs its own `.gitignore` line).
   nothing for that user until the rebuild finishes); `EMBEDDING_DIMENSION` must still match the model's vector
   size (`_embed` refuses mismatched vectors, which fails the rebuild and is logged). Then update the table
   above and `tests/test_models.py`.
-- **Change sandbox limits/mounts/network**: `ContainerManager._run_command_in_slot`; the slot cap is
-  `MAX_SANDBOX_CONTAINERS`, the default memory `DEFAULT_MEM_LIMIT` (callers may pass `mem_limit`).
+- **Change sandbox limits/mounts/network**: persistent sessions in `secure_container/sessions.py` (the env
+  variables above, `SessionManager._start_shell` / `_start_browser` for mounts and container options,
+  `BLOCKED_RANGES` / `egress_rules` for the filter; `tests/test_sessions.py` uses a fake Docker client);
+  one-off containers in `ContainerManager._run_command_in_slot` (slot cap `MAX_SANDBOX_CONTAINERS`, default
+  memory `DEFAULT_MEM_LIMIT`, callers may pass `mem_limit`).
+- **Change what the browser can do**: the member implementations, the sensitive-action patterns and the
+  private-address check (`HostPolicy` + `EgressProxy`: Chromium's `--proxy-server` with `<-loopback>`, so
+  redirects, popups and workers are checked too; the route filter is the second layer) live in
+  `secure_container/scripts/browser_server.py` (`tests/test_browser_server.py`,
+  real Chromium when Playwright is installed); enabling a disabled member is the `configs` of
+  `BrowserTools.toolset` plus its implementation there. What the agent is told: `BrowserTools` /
+  `SandboxTools.prompt_notes`. Changing the server needs no image rebuild (it is copied in at every browser
+  start); a running browser keeps the old script until it closes.
 - **Change the sandbox image**: edit `secure_container/Dockerfile`, `entrypoint.sh` or `requirements.txt`; the
   tag changes with the content, so the next startup builds it (several minutes with Chromium) and re-points
   `:latest`. `tests/test_image_tag.py` covers the tagging.

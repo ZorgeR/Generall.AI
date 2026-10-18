@@ -19,7 +19,12 @@ class CodeTools:
         return [
             {
                 "name": "execute_python",
-                "description": "Execute Python code and return the output. Always store useful code in codebase folder.",
+                "description": (
+                    "Execute Python 3.12 code in the user's persistent sandbox session and return what it "
+                    "prints (stdout and stderr). The working directory is /home/runner/workspace, the "
+                    "user's files; packages installed with install_package (manager pip) are importable. "
+                    "Each call is a new Python process. Always store useful code in codebase folder."
+                ),
                 "input_schema": {
                     "type": "object",
                     "properties": {

@@ -17,18 +17,26 @@ class TerminalTools:
         return [
             {
                 "name": "run_command",
-                "description": "Execute a terminal/shell command and return the output.",
+                "description": (
+                    "Run a shell command in the user's persistent Linux sandbox session and return its "
+                    "output (stdout and stderr together). The command runs with bash (bash -lc) in "
+                    "/home/runner/workspace, the user's files, so pipes, &&, cd, globs and redirects work. "
+                    "Each call is a new bash process (cd and variables do not carry over), but files, "
+                    "installed packages and background processes stay while the session is open. The "
+                    "sandbox has internet access; private networks are blocked. Long jobs: start them in "
+                    "the background (nohup <command> > job.log 2>&1 &) and check job.log later."
+                ),
                 "input_schema": {
                     "type": "object",
                     "properties": {
                         "command": {
                             "type": "string",
-                            "description": "The command to execute.",
+                            "description": "The bash command line to run.",
                         },
                         "timeout": {
                             "type": "integer",
-                            "description": "Timeout in seconds (default: 120)",
-                            "default": 120
+                            "description": "Seconds before the command is stopped (default: 30, at most 3600)",
+                            "default": 30
                         }
                     },
                     "required": ["command"],

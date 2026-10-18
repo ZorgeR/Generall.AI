@@ -10,6 +10,7 @@ from bot.handlers import (
     profile_ui,
     questions_ui,
     reminders_ui,
+    sandbox_ui,
     settings_ui,
     stats_ui,
     turn_actions_ui,
@@ -41,6 +42,7 @@ def build_root_router() -> Router:
     ui.include_router(usage_ui.router)  # /usage
     ui.include_router(profile_ui.router)  # /profile, profile_ buttons
     ui.include_router(mcp_ui.router)  # /mcp, mcp_ buttons
+    ui.include_router(sandbox_ui.router)  # /sandbox, sandbox_ buttons (incl. the idle warnings)
     ui.include_router(messages.control_router)
     ui.include_router(questions_ui.router)  # ask_user_choice answers
     ui.include_router(turn_actions_ui.router)  # listen / reasoning file: no agent run, no quota

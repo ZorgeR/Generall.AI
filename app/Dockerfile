@@ -2,11 +2,13 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies. iptables: the bot (privileged, host network) inserts the sandbox
+# network's egress filter into the host's firewall at startup (secure_container/sessions.py).
 RUN apt-get update && apt-get install -y \
     git \
     docker.io \
     ffmpeg \
+    iptables \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first to leverage Docker cache

@@ -11,7 +11,7 @@ from aiogram.client.telegram import TelegramAPIServer
 from bot import runtime
 from bot.auth import auth
 from bot.config import config
-from bot.handlers import build_root_router
+from bot.handlers import build_root_router, sandbox_ui
 from bot.handlers.commands import bot_commands
 from bot.handlers.mcp_ui import refresh_admin_servers
 from bot.jobs import reminders_loop
@@ -57,9 +57,25 @@ async def on_startup(bot: Bot) -> None:
     runtime.background_tasks.append(asyncio.create_task(reminders_loop(bot, runtime.queue), name="reminders-loop"))
     # The admin's MCP servers (MCP_SERVERS_FILE) get their tool cache refreshed once, off the startup path.
     runtime.background_tasks.append(asyncio.create_task(refresh_admin_servers(), name="mcp-admin-refresh"))
+    await start_sandbox_sessions(bot)
     await register_commands(bot)
     me = await bot.me()
     logger.info("Bot @%s is running (streaming=%s, local_api=%s)", me.username, config.streaming_enabled, config.use_local_api)
+
+
+async def start_sandbox_sessions(bot: Bot) -> None:
+    """Persistent sandbox sessions (``secure_container.sessions``), when the manager exists.
+
+    Containers a previous run left behind are removed before polling starts (a new session could
+    otherwise be caught by the cleanup), then the ``sandbox-reaper`` task closes idle sessions and
+    warns their users first, every ``sandbox_ui.REAP_INTERVAL`` seconds. No manager: nothing to do.
+    Never raises.
+    """
+    manager = sandbox_ui.session_manager()
+    if manager is None:
+        return
+    await sandbox_ui.cleanup_stale(manager)
+    runtime.background_tasks.append(asyncio.create_task(sandbox_ui.reaper_loop(bot, manager), name="sandbox-reaper"))
 
 
 async def on_shutdown(bot: Bot) -> None:
@@ -70,6 +86,7 @@ async def on_shutdown(bot: Bot) -> None:
         await asyncio.gather(*runtime.background_tasks, return_exceptions=True)
     runtime.background_tasks.clear()
     await runtime.queue.shutdown()
+    await sandbox_ui.shutdown_sessions()  # after the jobs: no turn starts a session behind it
 
 
 def create_dispatcher() -> Dispatcher:

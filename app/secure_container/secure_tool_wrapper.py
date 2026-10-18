@@ -120,7 +120,7 @@ class SecureToolWrapper:
     
     def wrap_python_package_installation(self, user_id: str, package_name: str, timeout: int = 300) -> str:
         """
-        Wrap a pip package installation to run in a secure container.
+        Wrap a pip package installation (``wrap_package_installation(..., manager="pip")``).
 
         Args:
             user_id: User ID
@@ -130,23 +130,24 @@ class SecureToolWrapper:
         Returns:
             Installation output
         """
-        logger.info(f"Installing pip package {package_name} in secure container for user {user_id}")
-        return self.container_manager.install_python_package(user_id, package_name, timeout)
+        return self.wrap_package_installation(user_id, package_name, timeout=timeout, manager="pip")
 
-    def wrap_package_installation(self, user_id: str, package_name: str, timeout: int = 300) -> str:
+    def wrap_package_installation(self, user_id: str, package_name: str, timeout: int = 300,
+                                  manager: str = "apt") -> str:
         """
-        Wrap a package installation to run in a secure container.
-        
+        Wrap a package installation: apt or pip, in the user's sandbox session, saved for replay.
+
         Args:
             user_id: User ID
-            package_name: Name of the package to install
+            package_name: Package name(s), separated by spaces
             timeout: Timeout in seconds
-            
+            manager: "apt" (default) or "pip"
+
         Returns:
             Installation output
         """
-        logger.info(f"Installing package {package_name} in secure container for user {user_id}")
-        return self.container_manager.install_package(user_id, package_name, timeout)
+        logger.info(f"Installing {manager} package {package_name} in secure container for user {user_id}")
+        return self.container_manager.install_package(user_id, package_name, timeout=timeout, manager=manager)
     
     def cleanup(self):
         """Clean up all containers created by this wrapper"""

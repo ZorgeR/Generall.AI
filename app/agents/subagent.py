@@ -4,7 +4,8 @@ The subagent is a second ``AgentAnthropic`` with the same tool providers (or a
 named subset), an empty conversation that is never persisted, the parent's
 trace (its tool lines render indented) and a slice of the parent's tool-call
 budget. It returns its final text as the tool result; files it creates are in
-the same workspace. Depth is one: a subagent gets no ``run_subagent`` tool.
+the same workspace. Depth is one: a subagent gets no ``run_subagent`` tool. It never gets a
+provider with a client-side toolset (the browser, ``agents.browser_tools``) either.
 Several subagents requested in one assistant message run concurrently through
 the normal parallel tool execution.
 """
@@ -85,14 +86,25 @@ class SubagentTools:
             return f"Unknown tool: {tool_name}"
         return await self.run(tool_args or {})
 
+    def _inherited_providers(self) -> list:
+        """The parent's registered providers a subagent gets: all but those with a client-side
+        toolset (the browser). The browser is one per user and stateful, and its consequential
+        actions need the user's confirmation in the chat; a subagent must not drive it."""
+        return [
+            (provider, blocking)
+            for provider, blocking in getattr(self.parent, "extra_providers", [])
+            if not (getattr(provider, "toolset", None) or getattr(provider, "toolset_name", None))
+        ]
+
     def _available_tool_names(self) -> set[str]:
         names: set[str] = set()
         for slot in PROVIDER_SLOTS:
             provider = getattr(self.parent, slot, None)
             if provider is not None:
-                names.update(t["name"] for t in provider.tools_schema)
-        for provider, _blocking in getattr(self.parent, "extra_providers", []):
-            names.update(t["name"] for t in provider.tools_schema)
+                names.update(str(t.get("name") or "") for t in provider.tools_schema)
+        for provider, _blocking in self._inherited_providers():
+            names.update(str(t.get("name") or "") for t in provider.tools_schema)
+        names.discard("")
         return names
 
     def _child(self, model: str, allowed: set[str] | None, budget: TurnBudget):
@@ -102,7 +114,7 @@ class SubagentTools:
         for slot in PROVIDER_SLOTS:
             setattr(child, slot, getattr(self.parent, slot, None))
         child.subagents = None  # depth 1: a subagent cannot spawn subagents
-        child.extra_providers = list(getattr(self.parent, "extra_providers", []))  # registered providers too
+        child.extra_providers = self._inherited_providers()  # registered providers too, the browser excepted
         child.allowed_tools = allowed
         child.thinking = getattr(self.parent, "thinking", False)
         child.trace_depth = getattr(self.parent, "trace_depth", 0) + 1
