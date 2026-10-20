@@ -32,7 +32,7 @@ There is a pytest suite (`tests/`, run with `pytest` from the repo root) coverin
 settings, presets and the /settings page, auth, reminder store, text splitting, the model settings
 module, the /stats views and /usage, the Stop buttons, the turn buttons, `ask_user_choice`, the
 reply/forward preamble and /help, content blocks and media prompts, the vision tools, the profile
-and memory_search, the MCP client and /mcp, MCP OAuth sign-ins (`test_mcp_oauth.py`: the SDK's provider against a
+and memory_search, forum topic names and the `<context>` line naming the topic (`test_topics.py`), the MCP client and /mcp, MCP OAuth sign-ins (`test_mcp_oauth.py`: the SDK's provider against a
 fake OAuth + MCP server, storage, keys, refresh, copy-paste fallback, the move of the records out of the
 workspace, the URL binding, the shared-server guard, sign-out / removal racing a refresh or a sign-in) and their callback endpoint
 (`test_oauth_web.py`: routes, headers, TLS), the mode setting, the web/document tools and the
@@ -108,6 +108,11 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
                             Notes (+ any "## Title" the agent creates), "- " entries, dated Notes, 8 KB cap (oldest Notes
                             rotate out), atomic writes, per-user threading.Lock, fingerprint(text) = 12 hex; sync, callers
                             use to_thread
+    topics.py               TopicStore (`topic_store` singleton): data/<uid>/topics.json, the names of the user's forum
+                            topics (threads) by thread id, as seen in Telegram's service messages: set (created/renamed,
+                            a rename wins) / learn (the creation message a topic message points at, only fills a gap) /
+                            get; names cleaned to one line ≤ MAX_NAME_CHARS 128 on write AND read, MAX_TOPICS 500,
+                            read_regular_text (no link, ≤ 256 KB), mkstemp + os.replace; sync, callers use to_thread
     mcp_store.py            MCP server records + cached tool lists: per-user data/_mcp/<uid>.json (bot-only, outside the
                             workspace; _migrate moves an old data/<uid>/mcp.json there on the user's first load), the admin
                             file (MCP_SERVERS_FILE) + its .cache.json; sync I/O, per-user lock, atomic writes (mkstemp, 0600,
@@ -167,7 +172,9 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
                             turn); a typed text answers a waiting question; busy notice, /cancel (also drops
                             the inbox and cancels background tasks), Stop buttons (queue_stop_ callback,
                             stopped_message_generation update), on_location (a shared location sets the time zone; the
-                            agent never sees locations)
+                            agent never sees locations), on_topic_service (forum_topic_created / forum_topic_edited → the
+                            topic's name in bot/topics.py, no answer, no quota) and remember_topic (called by accept: the
+                            name of the creation message reply_to_message points at, when none is known)
       commands.py           /start, /help, /invite, /listusers, /voice, /timezone (picker tz_set_<i>, name or city
                             alias, confirmation with the local time); COMMANDS = the one list of user commands
                             (the Telegram command menu via bot_commands() and the command section of /help)
@@ -620,7 +627,9 @@ worker → _run_text → prompt = message_context.with_reference(text, message, 
        │     static prompt (time stripped) as ONE cached system block (ttl SYSTEM_CACHE_TTL); fingerprint of
        │     model + static prompt + tools changed → strip stored thinking; _request_context(question, status,
        │     messages) → <context> = UTC time + "Local time (<zone>): … (UTC+2)" or "User timezone: unknown (ask
-       │     once and save it with set_user_timezone)" (_render_context, settings timezone.name) + <memory> (recent
+       │     once and save it with set_user_timezone)" (_render_context, settings timezone.name) + in a forum topic
+       │     'Telegram thread (forum topic): "<name>", thread id <id>' (_topic_line from bot/topics.py, every turn;
+       │     "thread id <id> (name not known yet)" when no name was seen) + <memory> (recent
        │     summaries + FAISS hits not shown before) +
        │     <profile fingerprint="..."> (profile.enabled; only when the fingerprint differs from the last one shown
        │     in this transcript), stored as the first block of the new user turn; _decide_complexity: mode auto AND
@@ -1131,7 +1140,13 @@ data/
                                     "[YYYY-MM-DD] "), other "## Title" sections after them; ≤ 8 KB (oldest Notes rotated out); deleted
                                     when empty; edited only through bot/profile.ProfileStore (user_profile_* tools, /profile); read only
                                     as a regular file (read_regular_text: O_NOFOLLOW|O_NONBLOCK, so a symlink or
-                                    FIFO reads as empty), written via a mkstemp tmp file + os.replace
+                                    FIFO reads as empty), written via a mkstemp tmp file + os.replace; something the user wants
+                                    remembered for one forum topic goes into a section "## Topic <thread id>" (ProfileTools
+                                    prompt_notes), shown in every topic like the rest
+    topics.json                     {"topics": {"<thread id>": {name, implicit (Telegram's is_name_implicit: not chosen by the
+                                    user), updated (iso UTC)}}}: the forum topic names (bot/topics.py); the bot learns them only
+                                    from service messages, so a topic renamed while the bot was down keeps its old name until
+                                    the next rename; read link-safe, cleaned again on read (the sandbox can write it)
     mcp.json                        legacy: the user's MCP servers before they moved to data/_mcp/<chat_id>.json (moved away on the
                                     first load; a file of that name written here later is never read)
     conversations/conversation_<YYYYmmdd_HHMMSS>_<topic>.json
@@ -1192,7 +1207,9 @@ Memory semantics worth knowing before touching `ChainOfThoughtAgent.generate_res
   written (summaries, FAISS, dialog_history.json) but only read for the prompt when `transcript.enabled` is off.
 - Forum topics: `message_thread_id` prefixes the transcript and the two short-term files (`topic_<id>_...`), so
   a new topic is a fresh context; there is no `/new` command on purpose.
-  Conversation summaries and the FAISS index are shared across threads.
+  Conversation summaries and the FAISS index are shared across threads. The `<context>` block names the topic
+  (`ChainOfThoughtAgent._topic_line`, transcript and legacy mode); the profile is shared, with "Topic <id>" sections
+  for what belongs to one topic.
 - Summaries are read with `Path.glob` (unsorted) and sliced
   `[:-dialog_history.size][-summarization_history.size:]`. Sizes come clamped 1..50 from the UI;
   a hand-edited `dialog_history.size` of 0 yields nothing, and `summarization_history.size` of 0
@@ -1490,7 +1507,7 @@ name; a new temp dir needs its own `.gitignore` line).
   `tests/test_cross_features.py::ROUTING` checks that every family reaches its own handler in router order
   (`MESSAGE_ROUTING` does the same for message handlers: plain text, text during a pending reminder edit,
   /reminders and /cancel during one, a location, a photo, a pasted sign-in URL with and without a pending
-  sign-in)
+  sign-in, a forum topic created / renamed)
   (rows exist for usage_, profile_, mcp_ incl. mcp_signin_ / mcp_signout_, sandbox_, setp_preset_, setp_ui_advanced, settings_preset_,
   settings_mode_set_, tz_set_, reminder_snooze_, reminder_delay_, reminder_edit_, reminders_new). Read the chat from
   `callback.message.chat.id` and guard `isinstance(callback.message, Message)`. Answer the callback best-effort
@@ -1503,6 +1520,9 @@ name; a new temp dir needs its own `.gitignore` line).
   `messages.on_location` (`F.location`, `control_router`) sets the zone from a shared location
   (`zone_from_location` in `to_thread`) and confirms with `commands.timezone_set_text`, or asks for the name
   (`LOCATION_NO_FINDER`) when `timezonefinder` is missing; the location never reaches the agent.
+  `messages.on_topic_service` (`F.forum_topic_created | F.forum_topic_edited`, `control_router`) stores the topic's
+  name (`topic_store.set`; an edit without a name, i.e. only the icon, is ignored) and answers nothing; the service
+  message never reaches the agent and uses no quota.
   `mcp_ui.pasted_callback` (`F.text` AND the async filter `_pasted_while_pending`: the text starts with
   `http://localhost:8765/oauth/callback` and the chat has a pending MCP sign-in) is the copy-paste fallback: it
   deletes the message (it holds the code), resolves the login by its `state` (only that user's) and answers

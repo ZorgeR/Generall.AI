@@ -57,7 +57,11 @@ class ProfileTools:
         "how they like their answers, ongoing projects, preferences - save it with user_profile_add, quietly, "
         "without announcing it. Honour \"remember that ...\" (add) and \"forget that ...\" (user_profile_remove); "
         "when a fact changes, use user_profile_replace instead of adding a second entry. Keep entries short, one "
-        "fact per entry, never duplicate what the profile already says, and put dated observations in Notes."
+        "fact per entry, never duplicate what the profile already says, and put dated observations in Notes. "
+        "When the user writes in a Telegram thread (forum topic), the <context> block names it with its thread "
+        "id. Something the user wants remembered for this thread only goes into a section titled exactly "
+        "\"Topic <thread id>\" (e.g. \"Topic 42\"; the id stays when the thread is renamed); follow a "
+        "\"Topic N\" section only in the thread whose id is N."
     )
 
     def __init__(self, user_id: str, store: ProfileStore | None = None) -> None:

@@ -23,7 +23,10 @@ button stop the running job and clear the queue (the messages waiting in the run
 turn's inbox and the user's background tasks too); the Stop button in a turn's
 status (``queue_stop_<job token>``) and Telegram's Stop button on its streaming
 draft (a ``stopped_message_generation`` update) stop only that job (unread messages
-then become the next turns; background tasks keep running).
+then become the next turns; background tasks keep running). It also keeps the names of
+forum topics (``on_topic_service``: a topic created or renamed), and ``accept`` learns a
+topic's name from the creation message every topic message points at (``remember_topic``),
+so the agent's ``<context>`` block can name the topic (``bot.topics``).
 
 Every job puts the reply / forward preamble (``bot.message_context``) in front of
 its prompt, so a reply to an earlier message or a forwarded post reaches the agent
@@ -58,6 +61,7 @@ from bot.message_context import with_reference
 from bot.queue import STOP_CALLBACK_PREFIX, Job, JobContext, SubmitResult, job_id_from_token, next_seq
 from bot.runtime import queue
 from bot.sender import ChatSender
+from bot.topics import topic_store
 from bot.ui import answer_md, delete_quietly
 from image_utils import IMAGE_EXTENSIONS
 
@@ -307,6 +311,7 @@ async def accept(
     prepare: Callable[[], Awaitable[Prepared]], run: Callable[[JobContext], Awaitable[Any]], seq: int | None = None,
 ) -> None:
     """A content message: into the running turn of its topic (👀), else a queued job (busy notice as before)."""
+    await remember_topic(message, user_id)
     thread_id = _thread_id(message)
     target = inject_target(user_id, thread_id)
     if target is not None:
@@ -434,6 +439,41 @@ async def on_location(message: Message, user_id: str) -> None:
         return
     UserSettings(user_id).set("timezone", name, "name")
     await answer_md(message, timezone_set_text(name))
+
+
+# ---------------------------------------------------------------------------
+# forum topics: their names for the agent's <context> block (bot/topics.py)
+# ---------------------------------------------------------------------------
+async def remember_topic(message: Message, user_id: str) -> None:
+    """Learn the name of the message's forum topic from the creation message it points at
+    (``reply_to_message``, see ``message_context._is_topic_root``). Only fills a gap: after a
+    rename that message still carries the old name. Best effort, never stops the message."""
+    thread_id = _thread_id(message)
+    if thread_id is None:
+        return
+    created = getattr(getattr(message, "reply_to_message", None), "forum_topic_created", None)
+    if created is None:
+        return
+    try:
+        await asyncio.to_thread(topic_store.learn, user_id, thread_id, created.name, implicit=bool(created.is_name_implicit))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Could not store the name of topic %s of %s: %s", thread_id, user_id, e)
+
+
+@control_router.message(F.forum_topic_created | F.forum_topic_edited)
+async def on_topic_service(message: Message, user_id: str) -> None:
+    """A forum topic was created or renamed: keep its name. Nothing is answered, nothing reaches
+    the agent and no quota is used; an edit that only changed the icon carries no name."""
+    created = message.forum_topic_created
+    event = created or message.forum_topic_edited
+    thread_id = message.message_thread_id or (message.message_id if created is not None else None)
+    if event is None or not event.name or thread_id is None:
+        return
+    implicit = bool(getattr(event, "is_name_implicit", None))  # a rename (ForumTopicEdited) is always chosen
+    try:
+        await asyncio.to_thread(topic_store.set, user_id, thread_id, event.name, implicit=implicit)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Could not store the name of topic %s of %s: %s", thread_id, user_id, e)
 
 
 # ---------------------------------------------------------------------------

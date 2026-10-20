@@ -167,13 +167,14 @@ def _find(entries: list[str], needle) -> int | None:
     return matches[0] if len(matches) == 1 else None
 
 
-def read_regular_text(path: Path) -> str:
+def read_regular_text(path: Path, *, max_bytes: int | None = None) -> str:
     """The UTF-8 text of ``path``; "" when there is no such file.
 
     ``data/<uid>`` is the sandbox's workspace, so the file may have been replaced by a symbolic
     link (to another user's profile, to ``/proc/self/environ``) or a FIFO: the last component is
     never followed (``O_NOFOLLOW``) and anything but a regular file raises ``OSError``, so the
-    host never reads what the link points to. Bad UTF-8 raises ``UnicodeDecodeError``.
+    host never reads what the link points to. Bad UTF-8 raises ``UnicodeDecodeError``, a file over
+    ``max_bytes`` (when given) ``OSError``.
     """
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if not nofollow and path.is_symlink():  # no O_NOFOLLOW on this platform
@@ -183,8 +184,11 @@ def read_regular_text(path: Path) -> str:
     except FileNotFoundError:
         return ""
     with os.fdopen(fd, "rb") as f:
-        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+        info = os.fstat(f.fileno())
+        if not stat.S_ISREG(info.st_mode):
             raise OSError(f"{path} is not a regular file")
+        if max_bytes is not None and info.st_size > max_bytes:
+            raise OSError(f"{path} is over {max_bytes} bytes")
         return f.read().decode("utf-8")
 
 

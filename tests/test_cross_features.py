@@ -535,6 +535,8 @@ MESSAGE_ROUTING = {
     "pasted sign-in URL without a pending sign-in": (
         {"text": "http://localhost:8765/oauth/callback?code=c&state=s"}, "messages.on_text"),
     "plain text while a sign-in is pending": ({"text": "hello", "login": True}, "messages.on_text"),
+    "a forum topic created": ({"topic_created": "Travel plans"}, "messages.on_topic_service"),
+    "a forum topic renamed": ({"topic_edited": "Trips"}, "messages.on_topic_service"),
 }
 
 
@@ -546,7 +548,7 @@ def test_every_message_kind_reaches_its_own_handler(tmp_path):
         "import asyncio, json, sys, time\n"
         "from datetime import datetime, timezone\n"
         "from types import SimpleNamespace\n"
-        "from aiogram.types import Chat, Location, Message, PhotoSize, User\n"
+        "from aiogram.types import Chat, ForumTopicCreated, ForumTopicEdited, Location, Message, PhotoSize, User\n"
         "from bot import oauth_flow\n"
         "from bot.handlers import build_root_router, reminders_ui\n"
         "root = build_root_router()\n"
@@ -571,6 +573,10 @@ def test_every_message_kind_reaches_its_own_handler(tmp_path):
         "        extra['location'] = Location(latitude=spec['location'][0], longitude=spec['location'][1])\n"
         "    if spec.get('photo'):\n"
         "        extra['photo'] = [PhotoSize(file_id='f', file_unique_id='u', width=10, height=10)]\n"
+        "    if 'topic_created' in spec:\n"
+        "        extra['forum_topic_created'] = ForumTopicCreated(name=spec['topic_created'], icon_color=7322096)\n"
+        "    if 'topic_edited' in spec:\n"
+        "        extra['forum_topic_edited'] = ForumTopicEdited(name=spec['topic_edited'])\n"
         "    msg = Message(message_id=1, date=datetime.now(timezone.utc), chat=Chat(id=42, type='private'),\n"
         "                  from_user=User(id=42, is_bot=False, first_name='a'), **extra)\n"
         "    out = []\n"
@@ -602,3 +608,6 @@ def test_every_message_kind_reaches_its_own_handler(tmp_path):
     # the pasted-URL handler takes only a loopback callback URL, and only while a sign-in is pending
     for name in ("plain text", "pasted sign-in URL without a pending sign-in", "plain text while a sign-in is pending"):
         assert "mcp_ui.pasted_callback" not in found[name], (name, found[name])
+    # a topic's service messages only keep its name: no content handler, no agent turn
+    for name in ("a forum topic created", "a forum topic renamed"):
+        assert found[name] == ["messages.on_topic_service"], (name, found[name])
