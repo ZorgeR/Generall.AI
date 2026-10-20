@@ -1670,12 +1670,33 @@ User message: {question}"""
                 profile = profile_block(text, fp)
                 if fp != last_shown_profile_fingerprint(messages):
                     new_profile = profile
-        return self._render_context(recent, hits, profile), self._render_context(new_recent, new_hits, new_profile)
+        topic = await self._topic_line()
+        return (self._render_context(recent, hits, profile, topic),
+                self._render_context(new_recent, new_hits, new_profile, topic))
 
-    def _render_context(self, recent: list[str], hits: list[str], profile: str = "") -> str:
+    async def _topic_line(self) -> str:
+        """The ``<context>`` line naming the Telegram forum topic (thread) of this turn, "" outside
+        one. The name is what the bot saw in Telegram's service messages (``bot/topics.py``); it is
+        repeated every turn (a rename shows up at once) and quoted as JSON, so it stays one line."""
+        if self.thread_id is None:
+            return ""
+        from bot.topics import topic_store  # no import-time side effects
+
+        try:
+            topic = await asyncio.to_thread(topic_store.get, self.user_id, self.thread_id)
+        except Exception as e:  # noqa: BLE001 - the name is a nicety, never a reason to fail the turn
+            print(f"Could not read the topic name: {e}")
+            topic = None
+        label = "Telegram thread (forum topic)"
+        if topic is None:
+            return f"{label}: thread id {self.thread_id} (name not known yet)"
+        line = f"{label}: {json.dumps(topic.name, ensure_ascii=False)}, thread id {self.thread_id}"
+        return line + (" (named automatically by Telegram, not by the user)" if topic.implicit else "")
+
+    def _render_context(self, recent: list[str], hits: list[str], profile: str = "", topic: str = "") -> str:
         """The ``<context>`` block: UTC time, the user's local time (or the hint that the zone is
-        unknown, so the agent asks once and saves it with ``set_user_timezone``),
-        then the memory lines and the profile."""
+        unknown, so the agent asks once and saves it with ``set_user_timezone``), the forum topic
+        of the turn (``_topic_line``, when there is one), then the memory lines and the profile."""
         from bot import timezones  # stdlib-only helpers, no import-time side effects
 
         now_utc = timezones.now_local(None)
@@ -1685,6 +1706,8 @@ User message: {question}"""
         else:
             local_line = f"Local time ({timezones.zone_name(zone)}): {timezones.format_local(now_utc, zone, with_zone=False)}"
         parts = [f"Current time in UTC+0: {now_utc.strftime('%Y-%m-%d %H:%M:%S')}", local_line]
+        if topic:
+            parts.append(topic)
         memory: list[str] = []
         if recent:
             memory.append("Recent conversations (newest first):\n" + "\n".join(recent))
@@ -1697,15 +1720,15 @@ User message: {question}"""
         return "<context>\n" + "\n".join(parts) + "\n</context>"
 
     async def _legacy_context(self) -> str:
-        """The ``<context>`` block of a legacy-mode turn (transcript off): UTC and local time and
-        the profile (``profile.enabled``), which the static ``<capabilities>`` notes promise. No
-        memory lines: the legacy prompt carries the summaries and the semantic hits itself."""
+        """The ``<context>`` block of a legacy-mode turn (transcript off): UTC and local time, the
+        forum topic and the profile (``profile.enabled``), which the static ``<capabilities>`` notes
+        promise. No memory lines: the legacy prompt carries the summaries and the semantic hits itself."""
         profile = ""
         if (self.user_settings.get("profile") or {}).get("enabled", True):
             text = await asyncio.to_thread(profile_store.text, self.user_id)
             if text.strip():
                 profile = profile_block(text, profile_fingerprint(text))
-        return self._render_context([], [], profile)
+        return self._render_context([], [], profile, await self._topic_line())
 
     async def _summarize_messages(self, old: list[dict]) -> str:
         """Fast-model summary of the oldest part of a transcript (used by transcript.prune)."""
