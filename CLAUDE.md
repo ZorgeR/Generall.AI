@@ -10,10 +10,11 @@ A single-process Python Telegram bot (aiogram 3, asyncio) that wraps a Claude
 tool-use agent. Users send text / voice / photos / video / audio / documents in
 Telegram; the bot builds a prompt of content blocks (text, plus the photos and PDFs
 themselves as image/document blocks, with the replied-to or forwarded message quoted
-in front), runs a per-message agent loop with 50 built-in tools (files, web search and
+in front), runs a per-message agent loop with 52 built-in tools (files, web search and
 a headless page reader, code execution in a persistent per-user Docker sandbox, image/video
 generation, documents out as pdf/docx/xlsx, reminders and scheduled tasks in the user's time
-zone, SMS, S3, TTS, button questions, a user profile, the sandbox status, background tasks) plus Anthropic's
+zone, SMS, S3, TTS, button questions, a user profile, the sandbox status, background tasks, the user's other
+Telegram threads) plus Anthropic's
 browser toolset (an interactive Chromium per user, in its own container, with saved logins)
 plus the tools of the user's MCP servers (a bearer token or an OAuth sign-in in one tap), persists multi-layer memory per user on disk
 (transcript, summaries + embeddings, profile), and replies in Telegram. Claude drives
@@ -32,7 +33,8 @@ There is a pytest suite (`tests/`, run with `pytest` from the repo root) coverin
 settings, presets and the /settings page, auth, reminder store, text splitting, the model settings
 module, the /stats views and /usage, the Stop buttons, the turn buttons, `ask_user_choice`, the
 reply/forward preamble and /help, content blocks and media prompts, the vision tools, the profile
-and memory_search, forum topic names and the `<context>` line naming the topic (`test_topics.py`), the MCP client and /mcp, MCP OAuth sign-ins (`test_mcp_oauth.py`: the SDK's provider against a
+and memory_search, forum topic names, the `<context>` line naming the topic, memory lines and memory_search hits
+naming their thread, list_threads / read_thread (`test_topics.py`), the MCP client and /mcp, MCP OAuth sign-ins (`test_mcp_oauth.py`: the SDK's provider against a
 fake OAuth + MCP server, storage, keys, refresh, copy-paste fallback, the move of the records out of the
 workspace, the URL binding, the shared-server guard, sign-out / removal racing a refresh or a sign-in) and their callback endpoint
 (`test_oauth_web.py`: routes, headers, TLS), the mode setting, the web/document tools and the
@@ -229,6 +231,10 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
                             content, BeautifulSoup fallback), S3, zip, send file
     search_tools.py         SearchTools: Tavily search, Perplexity deep_research, memory_search (host: conversation
                             files, profile.md and the transcript text view)
+    thread_tools.py         ThreadTools: list_threads / read_thread (the user's other conversations: the main chat and
+                            the other Telegram threads, read link-safe from transcripts/, dialog_history.json without
+                            one), prompt_notes; conversation_thread (the thread of a semantic hit, from its conversation
+                            file), as_thread_id
     vision_tools.py         VisionTools: view_image (image block + dimensions), describe_image (second opinion, Claude or
                             GPT), read_document (PDF as document block or extracted text); host, never sandboxed
     profile_tools.py        ProfileTools: user_profile_read/add/remove/replace over bot/profile.py, prompt_notes,
@@ -630,7 +636,8 @@ worker → _run_text → prompt = message_context.with_reference(text, message, 
        │     once and save it with set_user_timezone)" (_render_context, settings timezone.name) + in a forum topic
        │     'Telegram thread (forum topic): "<name>", thread id <id>' (_topic_line from bot/topics.py, every turn;
        │     "thread id <id> (name not known yet)" when no name was seen) + <memory> (recent
-       │     summaries + FAISS hits not shown before) +
+       │     summaries + FAISS hits not shown before; a line from another conversation ends with [from <thread_label>]:
+       │     _from_elsewhere, the thread of a hit found by conversation_thread) +
        │     <profile fingerprint="..."> (profile.enabled; only when the fingerprint differs from the last one shown
        │     in this transcript), stored as the first block of the new user turn; _decide_complexity: mode auto AND
        │     no media → Haiku classifier (text view, context blocks excluded), else "complex"; "simple" → tool-less
@@ -865,7 +872,7 @@ the v3 wave goes through the **registry**:
   else awaited); `allowed_tools`, when set, filters the whole list (subagent subsets). A new provider is
   ONE line in `ChainOfThoughtAgent.__init__`, after the SubagentTools wiring: `VisionTools(user_id,
   sender)`, `ProfileTools(user_id)`, `MCPTools(user_id)` (awaited), `WebTools(user_id, sender)` and
-  `DocumentTools(user_id, sender)` (`blocking=True`), then `SandboxTools` / `BrowserTools` (with a session
+  `DocumentTools(user_id, sender)` and `ThreadTools(user_id, thread_id)` (`blocking=True`), then `SandboxTools` / `BrowserTools` (with a session
   manager) and `TaskTools(background, inbox)` (only when a background host was given). `SubagentTools._child`
   copies `extra_providers`, so subagents get the registered tools too (minus `run_subagent`, toolset providers and
   any provider with `inherit_to_subagents = False`: `TaskTools`), and never a tool in `NEVER_BACKGROUND`
@@ -905,16 +912,16 @@ completed|failed|cancelled elapsed=>`, images kept; a result starting with "Erro
 counted by `track_tool_used` when it started. Toolset members never go to the background. Without a host (tests,
 subagents) every call runs to its end as before.
 
-Effective tool list as the model sees it (after patching; 50 built-in tools, the browser toolset and the user's
+Effective tool list as the model sees it (after patching; 52 built-in tools, the browser toolset and the user's
 `mcp_*` ones; with no session manager there is no `sandbox_status` and no browser, with `browser.enabled` off no
-browser, with no background host no task tools: 44 at the least):
+browser, with no background host no task tools: 46 at the least):
 
 | Provider | Tools | Runs where |
 |---|---|---|
 | FileOperations | `list_files`, `create_file`, `read_file`, `download_file`, `download_webpage` (readable main content: `trafilatura.extract(include_tables=True)`, lazy import cached in `file_ops._TRAFILATURA`, BeautifulSoup page text when trafilatura is missing, raises or finds < `MIN_EXTRACTED_CHARS` 200 chars), `upload_to_s3`, `create_zip_archive`, `send_file_path_to_user_via_telegram` | bot process, paths resolved under `data/<uid>/` by `agents/paths.resolve_under` (escapes refused); the names download_file / download_webpage(save_to_file) / create_zip_archive write keep only their base name (`FileOperations._download_target` → `downloads/<name>`, so a link planted in downloads/ that points outside is refused) |
 | FileOperations | `create_directory`, `delete_file` | the user's sandbox session (`run_command`), paths relative to `data/<uid>` |
 | SearchTools | `search_web` (Tavily), `deep_research` (Perplexity `sonar*`) | bot process, worker thread |
-| SearchTools | `memory_search` (query with `" | "` alternatives, case_sensitive, max_results 1..100 default 20): substring search over `conversations/*.json` (summary, topic, question, response), `profile.md` (field = section) and the text view of `transcripts/*.json` (user/assistant text only: no context blocks, tool results, thinking or media); JSON array of `{source, timestamp, topic, field, snippet}` newest first, or "No matches for …" | bot process, worker thread (reads every conversation file and transcript on each call through `agents.paths.regular_files`: a symlinked folder or file, or a FIFO, is skipped, because data/<uid> is the sandbox's workspace) |
+| SearchTools | `memory_search` (query with `" | "` alternatives, case_sensitive, max_results 1..100 default 20): substring search over `conversations/*.json` (summary, topic, question, response), `profile.md` (field = section) and the text view of `transcripts/*.json` of every conversation (user/assistant text only: no context blocks, tool results, thinking or media); JSON array of `{source, timestamp, topic, field, snippet}` newest first, conversation and transcript hits with `thread` (`bot.topics.thread_label`: `the main chat` / `thread "<name>" (id N)` / `thread N`, " (current)" for the conversation of the turn: `SearchTools(user_id, thread_id)`; a transcript hit's `topic` is that label too), or "No matches for …" | bot process, worker thread (reads every conversation file and transcript on each call through `agents.paths.regular_files`: a symlinked folder or file, or a FIFO, is skipped, because data/<uid> is the sandbox's workspace) |
 | CodeTools | `execute_python` (+`network_enabled`, ignored in the session: it always has filtered internet) | the user's sandbox session |
 | TerminalTools | `run_command` (bash syntax works), `run_shell_script` (+`network_enabled`, ignored in the session), `install_package` (package_name, manager apt\|pip; persisted and reinstalled at every session start) | the user's sandbox session (a one-off container when none can start) |
 | TimeTools | `get_time_in_timezone`, `list_timezones` | bot process |
@@ -929,6 +936,7 @@ browser, with no background host no task tools: 44 at the least):
 | WebTools (registered, blocking) | `browse_webpage` (url, wait_ms 0..10000 default 1500, screenshot, max_chars 500..100000 default 20000): page title, final URL, readable text (trafilatura on the rendered HTML), first 20 links, optional screenshot `downloads/screenshot_<hex>.png` (view with `view_image`; a failed screenshot keeps the page read and says "Screenshot: not saved") | sandbox: ONE container with network on, `mem_limit` 1g, timeout 75 s (script deadline 60 s) via `ContainerManager.run_script("browse.py", …)`; the bot process only formats the JSON |
 | SandboxTools (registered, awaited; only while sessions are on) | `sandbox_status`: when the sandbox and the browser close if unused (user's local time), memory, open tabs, stored logins size, saved packages, whether the user was warned; its `prompt_notes` carry the sandbox facts (30 min idle, the warning, what persists, fresh bash per command, `nohup` for background jobs, filtered internet, apt/pip persistence) | bot process (`manager.status` in to_thread); inherited by subagents |
 | BrowserTools (registered, awaited; only with `browser.enabled`) | the browser toolset members (`navigate`, `screenshot`, `zoom`, `left_click`, `right_click`, `middle_click`, `double_click`, `triple_click`, `hover`, `left_click_drag`, `left_mouse_down`, `left_mouse_up`, `mouse_move`, `scroll`, `scroll_to`, `type`, `key`, `hold_key`, `wait`, `read_page`, `find`, `get_page_text`, `form_input`, `new_tab`, `list_tabs`, `switch_tab`, `close_tab`; `javascript_exec`, `file_upload`, `read_console`, `read_network` disabled); `browser_confirm(summary)` (sends the current screenshot with ✅ Allow / ❌ Cancel through `bot/questions.ask`, 300 s; Allow = one sensitive action within 5 minutes, this turn only; only a tap grants it: a typed answer, `Answer.tapped` False, returns the text with "That is not a permission" and clears any allowance); `browser_show_screenshot(caption, region?)` (crop scaled up to 3x, e.g. a captcha for the user) | members: the user's browser container (`SessionManager.browser_call` in to_thread, 75 s); the two tools: bot process. Never given to subagents |
+| ThreadTools (registered, blocking) | `list_threads` (the main chat and every thread with a transcript, a legacy dialog history or a stored name: label, last message time from the file's mtime, "current"; newest first); `read_thread(thread, max_messages 1..100 default 20)` (thread = id, `#42`, `thread 42`, an exact name, a unique part of one or "main"; the current conversation → "already in your context"): the user/assistant text of that transcript oldest first (`[<time> UTC] User: …` / `You: …`, tool calls and results left out, `<follow_ups>` cut, each message ≤ `MESSAGE_CHARS` 2000, the newest kept within `READ_BUDGET_CHARS` 16000); its `prompt_notes` say every thread is a separate conversation and to look it up instead of guessing | bot process, worker thread; `transcripts/` and `short_term_memory/` read through `regular_files` (a linked file reads as no messages) and listed without following links |
 | DocumentTools (registered, blocking) | `create_document` (format md\|html\|pdf\|docx\|xlsx, title, content Markdown, filename?) → `documents/<sanitized name>.<fmt>` (existing names get `-2`, `-3`); the tool sends the file itself and returns "Document saved to documents/… (<size> KB) and sent to the user." | md/html: bot process (python-markdown: tables, fenced_code, sane_lists, toc + embedded CSS); pdf/docx/xlsx: sandbox via `run_script("render_document.py", …)`, network off, 1g for pdf, timeout 90 s (script deadline 75 s) |
 | TaskTools (registered, awaited; only with a background host, never inherited by subagents) | `wait_for_tasks(timeout_seconds 5..600, default 120)`: "No background tasks are running." at once when none runs and the inbox holds nothing, else `inbox.wait` until something can be drained ("A background task finished; its notification follows." / "A new user message arrived; it follows.") or the timeout (names the tasks still running); without an inbox it polls the host every second; `list_tasks` (id · tool · status running\|done\|failed\|cancelled · duration · start · args); `cancel_task(task_id)` (`t3`, `T3` or `3`; "Task t3 was cancelled." or `Error: no running background task …`). Static `<live_turn>` `prompt_notes`: how injected `<user_message sent_during_turn="true" time="…">` blocks and `<task_notification>`s look, never ignore a message, answer quick questions with `send_user_telegram_message`, do not restart a backgrounded call, say a result will follow when answering while a task runs | bot process; the tasks themselves are the host's (`bot/background.py`) |
 
@@ -1209,7 +1217,10 @@ Memory semantics worth knowing before touching `ChainOfThoughtAgent.generate_res
   a new topic is a fresh context; there is no `/new` command on purpose.
   Conversation summaries and the FAISS index are shared across threads. The `<context>` block names the topic
   (`ChainOfThoughtAgent._topic_line`, transcript and legacy mode); the profile is shared, with "Topic <id>" sections
-  for what belongs to one topic.
+  for what belongs to one topic. A memory line (recent summary or semantic hit) from another conversation ends with
+  ` [from the main chat]` / ` [from thread "<name>" (id N)]` (`_from_elsewhere`; a hit whose conversation file is
+  gone gets no mark); `memory_search` hits carry `thread`; `list_threads` / `read_thread` read the others on request
+  (`agents/thread_tools.py`).
 - Summaries are read with `Path.glob` (unsorted) and sliced
   `[:-dialog_history.size][-summarization_history.size:]`. Sizes come clamped 1..50 from the UI;
   a hand-edited `dialog_history.size` of 0 yields nothing, and `summarization_history.size` of 0

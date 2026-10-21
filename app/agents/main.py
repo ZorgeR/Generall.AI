@@ -47,6 +47,7 @@ from agents.mcp_tools import MCPTools
 from agents.profile_tools import ProfileTools, last_shown_profile_fingerprint, profile_block, profile_store
 from agents.profile_tools import fingerprint as profile_fingerprint
 from agents.vision_tools import VisionTools
+from agents.thread_tools import ThreadTools, as_thread_id, conversation_thread
 from agents import browser_tools
 from agents.browser_tools import NOT_EXECUTED, BrowserTools, SandboxTools
 from agents.transcript import (
@@ -1283,7 +1284,7 @@ class ChainOfThoughtAgent:
         # Initialize tools
         self.user_id = user_id
         self.file_ops = FileOperations(user_id, sender)
-        self.search_tools = SearchTools(user_id)
+        self.search_tools = SearchTools(user_id, thread_id=message_thread_id)
         self.code_tools = CodeTools(user_id)
         self.terminal_tools = TerminalTools(user_id, sender)
         self.time_tools = TimeTools()
@@ -1336,6 +1337,9 @@ class ChainOfThoughtAgent:
             self.agent.register_provider(self.web_tools, blocking=True)
             self.document_tools = DocumentTools(user_id, sender)
             self.agent.register_provider(self.document_tools, blocking=True)
+            # The other conversations (the main chat, the other Telegram threads), read on request.
+            self.thread_tools = ThreadTools(user_id, self.thread_id)
+            self.agent.register_provider(self.thread_tools, blocking=True)
             # The persistent sandbox (secure_container.sessions): its facts and status whenever the
             # process has a session manager and commands run in sessions (SANDBOX_SESSIONS); the
             # interactive browser whenever there is a manager and the user's browser.enabled
@@ -1605,10 +1609,28 @@ User message: {question}"""
             return static_prompt
         return [{"type": "text", "text": static_prompt, "cache_control": {"type": "ephemeral", "ttl": SYSTEM_CACHE_TTL}}]
 
+    def _from_elsewhere(self, thread_id: int | None, names: dict) -> str:
+        """The end of a memory line from another conversation (the main chat or another Telegram
+        thread): " [from thread \"Travel plans\" (id 42)]"; "" for this conversation's own lines."""
+        if as_thread_id(thread_id) == as_thread_id(self.thread_id):
+            return ""
+        from bot.topics import thread_label
+
+        thread_id = as_thread_id(thread_id)
+        return f" [from {thread_label(thread_id, names.get(thread_id))}]"
+
     def _recent_summaries(self, limit: int) -> list[str]:
-        """Newest conversation summaries (the file name embeds the timestamp, so sorting by name works)."""
+        """Newest conversation summaries (the file name embeds the timestamp, so sorting by name works),
+        each from another conversation marked with where it comes from (``_from_elsewhere``)."""
         if limit <= 0 or not self.conversations_path.exists():
             return []
+        from bot.topics import topic_store
+
+        try:
+            names = topic_store.all(self.user_id)
+        except Exception as e:  # noqa: BLE001 - thread names are a nicety, the summaries are not
+            print(f"Could not read the thread names: {e}")
+            names = {}
         lines: list[str] = []
         for file in sorted(self.conversations_path.glob("conversation_*.json"), reverse=True)[:limit]:
             try:
@@ -1622,8 +1644,21 @@ User message: {question}"""
                 if not (q or r):
                     continue
                 summary = f"Q: {q} / A: {r}"
-            lines.append(f"{MEMORY_BULLET}[{data.get('timestamp', '')}] {data.get('topic') or 'general'}: {' '.join(summary.split())}")
+            origin = self._from_elsewhere(data.get("thread_id"), names)
+            lines.append(f"{MEMORY_BULLET}[{data.get('timestamp', '')}] {data.get('topic') or 'general'}: {' '.join(summary.split())}{origin}")
         return lines
+
+    def _hit_origins(self, hits: list[dict]) -> list[str]:
+        """``_from_elsewhere`` of each semantic hit: its conversation file names the thread
+        (``conversation_thread``); a hit whose file is gone gets no mark."""
+        from bot.topics import topic_store
+
+        names = topic_store.all(self.user_id)
+        origins = []
+        for conv in hits:
+            found, thread_id = conversation_thread(self.conversations_path, str(conv.get("timestamp") or ""), str(conv.get("topic") or ""))
+            origins.append(self._from_elsewhere(thread_id, names) if found else "")
+        return origins
 
     async def _semantic_hits(self, question: str, k: int) -> list[str]:
         try:
@@ -1631,11 +1666,17 @@ User message: {question}"""
         except Exception as e:  # noqa: BLE001
             print(f"Semantic search failed, continuing without it: {e}")
             return []
+        hits = hits or []
+        try:
+            origins = await asyncio.to_thread(self._hit_origins, hits)
+        except Exception as e:  # noqa: BLE001 - the mark is a nicety
+            print(f"Could not tell where the semantic hits come from: {e}")
+            origins = [""] * len(hits)
         lines = []
-        for conv in hits or []:
+        for conv, origin in zip(hits, origins):
             q = " ".join(str(conv.get("question", "")).split())[:200]
             a = " ".join(str(conv.get("answer", "")).split())[:300]
-            lines.append(f"{MEMORY_BULLET}[{conv.get('timestamp', '')}] Q: {q} / A: {a}")
+            lines.append(f"{MEMORY_BULLET}[{conv.get('timestamp', '')}] Q: {q} / A: {a}{origin}")
         return lines
 
     async def _request_context(self, question: str, update_status=None, messages: list[dict] | None = None) -> tuple[str, str]:
@@ -1654,7 +1695,7 @@ User message: {question}"""
         recent: list[str] = []
         hits: list[str] = []
         if s.get("summarization_history", {}).get("enabled", True) and s.get("short_term_memory", {}).get("enabled", True):
-            recent = self._recent_summaries(int(s.get("summarization_history", {}).get("size", 5)))
+            recent = await asyncio.to_thread(self._recent_summaries, int(s.get("summarization_history", {}).get("size", 5)))
         if s.get("semantic_search", {}).get("enabled", True):
             if update_status:
                 await update_status(step="initial", details="Searching memory", iteration=0, critique=0)

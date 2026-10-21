@@ -6,6 +6,7 @@ import importlib
 import json
 import os
 import re
+from datetime import datetime, timezone
 
 import pytest
 from aiogram.types import Message
@@ -263,3 +264,174 @@ def test_the_profile_notes_explain_topic_sections():
 
     notes = ProfileTools(USER).prompt_notes
     assert '"Topic <thread id>"' in notes and "<context>" in notes
+
+
+# ---- the other conversations: memory lines, memory_search, list_threads / read_thread ----------------
+from agents.search_tools import SearchTools  # noqa: E402
+from agents.thread_tools import READ_BUDGET_CHARS, ThreadTools, conversation_thread  # noqa: E402
+
+
+def context(time: str) -> dict:
+    return {"type": "text", "text": f"<context>\nCurrent time in UTC+0: {time}\n</context>"}
+
+
+def user(text: str, time: str | None = None) -> dict:
+    return {"role": "user", "content": ([context(time)] if time else []) + [{"type": "text", "text": text}]}
+
+
+def assistant(text: str) -> dict:
+    return {"role": "assistant", "content": [{"type": "text", "text": text}]}
+
+
+def write_transcript(base, thread_id, messages):
+    name = f"topic_{thread_id}_transcript.json" if thread_id else "transcript.json"
+    folder = base / USER / "transcripts"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / name).write_text(json.dumps({"messages": messages, "created": "2026-10-01T00:00:00+00:00"}))
+    return folder / name
+
+
+def write_conversation(base, timestamp, topic, thread_id, summary="", question="q", response="r"):
+    folder = base / USER / "conversations"
+    folder.mkdir(parents=True, exist_ok=True)
+    data = {"timestamp": timestamp, "thread_id": thread_id, "topic": topic, "summary": summary,
+            "question": question, "response": response, "full_history": []}
+    (folder / f"conversation_{timestamp}_{topic}.json").write_text(json.dumps(data))
+
+
+@pytest.fixture
+def chats(default_store, tmp_path):
+    """The main chat and two threads: "Travel plans" (42) and "Recipes" (51); 51 has never been talked in."""
+    base = tmp_path / "data"
+    default_store.set(USER, 42, "Travel plans")
+    default_store.set(USER, 51, "Recipes")
+    write_transcript(base, None, [
+        user("What is the capital of Portugal?", "2026-10-18 09:00:00"),
+        assistant("Lisbon.\n<follow_ups>\n- Tell me more\n</follow_ups>"),
+    ])
+    write_transcript(base, 42, [
+        user("Book me a flight to Lisbon on Friday", "2026-10-19 10:00:00"),
+        {"role": "assistant", "content": [{"type": "text", "text": "Searching."},
+                                         {"type": "tool_use", "id": "t1", "name": "search_web", "input": {"query": "flights"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "TAP 8:05 SECRET-RESULT"}]},
+        assistant("The TAP flight at 8:05 is the cheapest."),
+    ])
+    return base
+
+
+def test_conversation_thread_finds_the_file_of_a_hit(chats):
+    folder = chats / USER / "conversations"
+    write_conversation(chats, "20261019_100500", "lisbon_flight", 42)
+    write_conversation(chats, "20261018_090500", "portugal", None)
+    assert conversation_thread(folder, "20261019_100500", "lisbon_flight") == (True, 42)
+    assert conversation_thread(folder, "20261018_090500", "portugal") == (True, None)
+    assert conversation_thread(folder, "20261019_100500", "renamed_topic") == (True, 42)  # the only file of that second
+    assert conversation_thread(folder, "20990101_000000", "x") == (False, None)
+    assert conversation_thread(folder, "../../x", "x") == (False, None)  # not a timestamp: no glob outside
+
+
+async def test_memory_lines_from_other_conversations_say_where_they_come_from(make_agent, chats, monkeypatch):
+    write_conversation(chats, "20261019_100500", "lisbon_flight", 42, summary="Booked the TAP flight to Lisbon.")
+    write_conversation(chats, "20261018_090500", "portugal", None, summary="Capital of Portugal.")
+    write_conversation(chats, "20261017_090500", "pasta", 51, summary="Carbonara recipe.")
+    agent = make_agent(42)
+    recent = type(agent)._recent_summaries  # make_agent stubs it out on the instance
+    lines = recent(agent, 5)
+    assert lines == [
+        "• [20261019_100500] lisbon_flight: Booked the TAP flight to Lisbon.",  # this thread: no mark
+        "• [20261018_090500] portugal: Capital of Portugal. [from the main chat]",
+        '• [20261017_090500] pasta: Carbonara recipe. [from thread "Recipes" (id 51)]',
+    ]
+    # outside any thread, the main chat's lines are this conversation's own
+    assert recent(make_agent(None), 5)[0].endswith('[from thread "Travel plans" (id 42)]')
+
+    hits = [{"question": "Capital of Portugal?", "answer": "Lisbon", "timestamp": "20261018_090500", "topic": "portugal"},
+            {"question": "Lost one", "answer": "?", "timestamp": "20200101_000000", "topic": "gone"}]
+    monkeypatch.setattr(agent.conversation_embeddings, "search_conversations", lambda query, k: hits)
+    assert await agent._semantic_hits("portugal", 3) == [
+        "• [20261018_090500] Q: Capital of Portugal? / A: Lisbon [from the main chat]",
+        "• [20200101_000000] Q: Lost one / A: ?",  # its file is gone: no mark
+    ]
+
+
+def test_memory_search_names_the_thread_of_every_hit(chats):
+    write_conversation(chats, "20261019_100500", "lisbon_flight", 42, summary="Booked the TAP flight to Lisbon.")
+    found = json.loads(SearchTools(USER, thread_id=42).memory_search("lisbon"))
+    threads = {(h["source"], h["thread"]) for h in found}
+    assert threads == {
+        ("conversation", 'thread "Travel plans" (id 42) (current)'),
+        ("transcript", 'thread "Travel plans" (id 42) (current)'),
+        ("transcript", "the main chat"),  # no longer "current conversation" from inside a thread
+    }
+    assert not any("SECRET-RESULT" in h["snippet"] for h in found)  # tool results stay out, as before
+
+
+def test_list_threads(chats):
+    def at(path, when):
+        stamp = datetime.fromisoformat(when).replace(tzinfo=timezone.utc).timestamp()
+        os.utime(path, (stamp, stamp))
+
+    folder = chats / USER / "transcripts"
+    at(folder / "transcript.json", "2026-10-18T09:00:00")
+    at(folder / "topic_42_transcript.json", "2026-10-19T10:00:00")
+    lines = ThreadTools(USER, 51).list_threads().splitlines()
+    assert lines[1:4] == [
+        '- thread "Travel plans" (id 42) · last message 2026-10-19 10:00 UTC',
+        "- the main chat · last message 2026-10-18 09:00 UTC",
+        '- thread "Recipes" (id 51) · no messages kept · current',  # named, never talked in
+    ]
+    assert lines[-1].startswith("Read one with read_thread")
+
+
+def test_read_thread(chats):
+    tools = ThreadTools(USER, 51)
+    text = tools.read_thread("42")
+    assert text == (
+        'thread "Travel plans" (id 42): the last 2 of 2 messages, oldest first.\n\n'
+        "[2026-10-19 10:00 UTC] User: Book me a flight to Lisbon on Friday\n\n"
+        "You: Searching.\n\nThe TAP flight at 8:05 is the cheapest."
+    )
+    assert "SECRET-RESULT" not in text  # tool calls and their results are left out
+    for name in ("Travel plans", "travel", "#42", "thread 42"):
+        assert tools.read_thread(name) == text
+    main = tools.read_thread("main")
+    assert main.startswith("the main chat: the last 2 of 2 messages")
+    assert "Lisbon." in main and "follow_ups" not in main and "Tell me more" not in main
+    assert tools.read_thread("42", max_messages=1).startswith('thread "Travel plans" (id 42): the last 1 of 2 messages')
+    assert tools.read_thread("Recipes").startswith("That is the current conversation")
+    assert tools.read_thread("pasta") == 'Error: no thread named "pasta". Use list_threads to see them.'
+    assert tools.read_thread("99") == "No messages are kept for thread 99."
+    T.topic_store.set(USER, 60, "Travel diary")
+    assert tools.read_thread("travel").startswith("Error: several threads match")
+    assert tools.execute_tool("read_thread", {"thread": "Travel plans"}) == text
+    assert tools.execute_tool("list_threads", {}).startswith("Conversations with this user")
+
+
+def test_read_thread_keeps_the_newest_messages_within_its_budget(chats):
+    long = "x" * 1990
+    write_transcript(chats, 77, [m for i in range(40) for m in (user(f"{i} {long}", "2026-10-19 10:00:00"), assistant(f"answer {i}"))])
+    text = ThreadTools(USER).read_thread("77", max_messages=100)
+    assert len(text) <= READ_BUDGET_CHARS + 200
+    assert text.rstrip().endswith("You: answer 39")  # the end of the conversation is always there
+    assert "of 80 messages" in text
+
+
+def test_read_thread_falls_back_to_the_dialog_history_and_never_follows_a_link(chats, tmp_path):
+    folder = chats / USER / "short_term_memory"
+    folder.mkdir(parents=True)
+    (folder / "topic_88_dialog_history.json").write_text(json.dumps(
+        [{"role": "user", "content": "legacy question"}, {"role": "assistant", "content": "legacy answer"}]))
+    assert ThreadTools(USER).read_thread("88").endswith("User: legacy question\n\nYou: legacy answer")
+
+    secret = tmp_path / "other_user_transcript.json"
+    secret.write_text(json.dumps({"messages": [user("someone else's secret")]}))
+    (chats / USER / "transcripts" / "topic_99_transcript.json").symlink_to(secret)
+    assert ThreadTools(USER).read_thread("99") == "No messages are kept for thread 99."
+
+
+def test_the_agent_gets_the_thread_tools(make_agent):
+    agent = make_agent(42)
+    names = {tool.get("name") for tool in agent.agent.get_tools_schema()}
+    assert {"list_threads", "read_thread", "memory_search"} <= names
+    assert agent.search_tools.thread_id == 42 and agent.thread_tools.thread_id == 42
+    assert "read_thread" in ThreadTools.prompt_notes and "[from ...]" in ThreadTools.prompt_notes

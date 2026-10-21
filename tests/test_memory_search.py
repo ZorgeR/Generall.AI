@@ -85,7 +85,9 @@ def hits(result: str) -> list[dict]:
     data = json.loads(result)
     assert isinstance(data, list)
     for hit in data:
-        assert set(hit) == {"source", "timestamp", "topic", "field", "snippet"}
+        # the profile is shared by every conversation; the other hits say which one they come from
+        extra = set() if hit["source"] == "profile" else {"thread"}
+        assert set(hit) == {"source", "timestamp", "topic", "field", "snippet"} | extra
     return data
 
 
@@ -97,12 +99,13 @@ def test_finds_hits_in_conversations_profile_and_transcript_newest_first(tools):
     conversation_hits = [h for h in found if h["source"] == "conversation"]
     assert {h["field"] for h in conversation_hits} == {"summary", "question", "response", "topic"}
     assert all(h["timestamp"] == "2026-10-01 12:00:00" and h["topic"] == "lisbon_trip" for h in conversation_hits)
+    assert all(h["thread"] == "the main chat (current)" for h in conversation_hits)
     (profile_hit,) = [h for h in found if h["source"] == "profile"]
     assert profile_hit["field"] == "About" and profile_hit["snippet"] == "- Lives in Lisbon"
     assert profile_hit["timestamp"] == "2026-10-05 12:00:00"  # the file's last edit
     transcript_hits = [h for h in found if h["source"] == "transcript"]
     assert [h["field"] for h in transcript_hits] == ["user", "assistant"]
-    assert all(h["topic"] == "current conversation" for h in transcript_hits)
+    assert all(h["topic"] == h["thread"] == "the main chat (current)" for h in transcript_hits)
 
 
 def test_skips_context_blocks_tool_results_thinking_and_media(tools):
@@ -159,7 +162,7 @@ def test_profile_notes_and_topic_transcripts_are_searched(tools):
     assert note_hit["field"] == "Notes" and note_hit["timestamp"] == "2026-10-10 00:00:00"  # a dated note is as old as its date
     (topic_hit,) = [h for h in found if h["source"] == "transcript"]
     # no context block before it: the oldest content of that file, stamped with its creation time, not its last update
-    assert topic_hit["topic"] == "topic 7" and topic_hit["timestamp"] == "2026-10-11 09:30:00"
+    assert topic_hit["topic"] == topic_hit["thread"] == "thread 7" and topic_hit["timestamp"] == "2026-10-11 09:30:00"
     assert all(h["timestamp"] <= "2026-10-16 08:00:00" for h in found)
 
 
@@ -168,9 +171,9 @@ def test_messages_before_the_first_context_block_are_the_oldest(tools):
     context block: they take the file's `created` time ("" without one: sorted last), never
     `updated`, which would put the oldest content first."""
     summary_hit, legacy_hit = hits(tools.memory_search("apiary"))
-    assert summary_hit["topic"] == "current conversation" and summary_hit["timestamp"] == "2026-10-14 07:00:00"
+    assert summary_hit["topic"] == "the main chat (current)" and summary_hit["timestamp"] == "2026-10-14 07:00:00"
     assert summary_hit["snippet"].startswith("<earlier_conversation_summary>")
-    assert legacy_hit["topic"] == "topic 9" and legacy_hit["timestamp"] == "" and legacy_hit["field"] == "user"
+    assert legacy_hit["topic"] == "thread 9" and legacy_hit["timestamp"] == "" and legacy_hit["field"] == "user"
     mixed = hits(tools.memory_search("apiary | Lisbon flights"))
     assert [h["timestamp"] for h in mixed][:3] == ["2026-10-16 08:00:00", "2026-10-16 08:00:00", "2026-10-14 07:00:00"]
     assert mixed[-1] is not None and mixed[-1]["timestamp"] == ""  # the undated legacy message comes last

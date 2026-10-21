@@ -10,7 +10,8 @@ rename). No Bot API call returns it later, so the bot keeps what it saw::
 The key is the thread id (``message_thread_id``, the id of the creation message: unique in the
 chat, never reused). ``implicit`` is Telegram's ``is_name_implicit``: the name was not chosen by
 the user (a private-chat thread named after its first message). The agent's ``<context>`` block
-names the current topic from here (``ChainOfThoughtAgent._topic_line``).
+names the current topic from here (``ChainOfThoughtAgent._topic_line``), and ``thread_label`` is how
+memory lines, ``memory_search`` and the thread tools (``agents/thread_tools.py``) name a conversation.
 
 Two ways in: ``set`` for the service messages themselves (a rename always wins) and ``learn`` for
 the creation message a topic message points at, which only fills a gap: after a rename that
@@ -47,6 +48,19 @@ class Topic:
     implicit: bool = False
 
 
+MAIN_CHAT = "the main chat"
+
+
+def thread_label(thread_id: int | None, topic: Topic | None = None) -> str:
+    """How memory lines and the thread tools name a conversation: the main chat (no thread), a
+    thread by name and id, or by id alone when its name was never seen."""
+    if not thread_id:
+        return MAIN_CHAT
+    if topic is not None:
+        return f"thread {json.dumps(topic.name, ensure_ascii=False)} (id {thread_id})"
+    return f"thread {thread_id}"
+
+
 def clean_name(name) -> str:
     """One line of printable text, at most ``MAX_NAME_CHARS`` characters ("" for nothing usable)."""
     text = "".join(ch if ch.isprintable() else " " for ch in str(name or ""))
@@ -79,6 +93,16 @@ class TopicStore:
         if entry is None:
             return None
         return Topic(int(thread_id), entry["name"], entry["implicit"])
+
+    def all(self, user_id: str) -> dict[int, Topic]:
+        """Every stored topic of the user by thread id."""
+        with self._lock(user_id):
+            topics = self._load(user_id)
+        return {int(k): Topic(int(k), e["name"], e["implicit"]) for k, e in topics.items()}
+
+    def label(self, user_id: str, thread_id: int | None) -> str:
+        """``thread_label`` with the stored name."""
+        return thread_label(thread_id, self.get(user_id, thread_id) if thread_id else None)
 
     def set(self, user_id: str, thread_id: int | None, name, *, implicit: bool = False) -> bool:
         """Store the name a service message announced (created or renamed); True when it changed."""

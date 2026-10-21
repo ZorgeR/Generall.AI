@@ -8,6 +8,7 @@ import re
 import json
 from models import PERPLEXITY_MODEL, PERPLEXITY_MODELS, PERPLEXITY_REASONING_MODEL
 from agents.paths import regular_files
+from agents.thread_tools import as_thread_id
 from agents.transcript import is_context_block, is_tool_result_message, message_text
 
 MEMORY_SEARCH_MAX_RESULTS = 20
@@ -16,14 +17,16 @@ _ALTERNATIVES_RE = re.compile(r"\s+\|\s+")  # "lisbon | lisboa": any alternative
 _CONTEXT_TIME_RE = re.compile(r"Current time in UTC\+0: (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 _CONVERSATION_TS_RE = re.compile(r"^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})$")
 _NOTE_DATE_RE = re.compile(r"^-\s*\[(\d{4}-\d{2}-\d{2})\]")  # a dated profile note
+_TRANSCRIPT_NAME_RE = re.compile(r"^(?:topic_(\d+)_)?transcript\.json$")
 
 class SearchTools:
-    def __init__(self, user_id: str = None):
+    def __init__(self, user_id: str = None, thread_id: int | None = None):
         self.client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
         self.perplexity_api_key = os.getenv("PERPLEXITY_API_KEY")
         self.perplexity_url = "https://api.perplexity.ai/chat/completions"
         self.base_path = Path("./data") / str(user_id) # Base path for memory files
         self.user_id = user_id  # Store user_id as instance variable
+        self.thread_id = as_thread_id(thread_id)  # the conversation this turn is in (memory_search marks it)
 
     @property
     def tools_schema(self) -> List[Dict[str, Any]]:
@@ -33,11 +36,12 @@ class SearchTools:
                 "name": "memory_search",
                 "description": (
                     "Search your long-term memory: past conversation summaries, questions and answers, "
-                    "the user's profile and the current transcript. Use it before saying you do not remember "
-                    "something. Plain substring search (no regex); separate alternatives with ' | ', e.g. "
-                    "'Lisbon | Lisboa', and search in the user's language and in English. Returns a JSON "
-                    "array of hits, newest first: source (conversation | profile | transcript), timestamp, "
-                    "topic, field and a snippet around the match."
+                    "the user's profile and the transcripts of every conversation (the main chat and each "
+                    "Telegram thread). Use it before saying you do not remember something. Plain substring "
+                    "search (no regex); separate alternatives with ' | ', e.g. 'Lisbon | Lisboa', and search "
+                    "in the user's language and in English. Returns a JSON array of hits, newest first: source "
+                    "(conversation | profile | transcript), timestamp, topic, field, a snippet around the match "
+                    "and, except for the profile, the thread it comes from (\"(current)\" marks this conversation)."
                 ),
                 "input_schema": {
                     "type": "object",
@@ -308,7 +312,9 @@ class SearchTools:
         transcripts (user and assistant text blocks only: no context blocks, tool calls, tool
         results or base64 media). ``query`` may hold several alternatives separated by ``" | "``.
         Returns a JSON array of hits ``{source, timestamp, topic, field, snippet}`` newest first,
-        at most ``max_results``, or a "No matches ..." sentence.
+        at most ``max_results``, or a "No matches ..." sentence. Conversation and transcript hits also
+        carry ``thread`` (``bot.topics.thread_label``, " (current)" for this turn's conversation); a
+        transcript hit's ``topic`` is that label too.
         """
         terms = [t for t in (s.strip() for s in _ALTERNATIVES_RE.split(query or "")) if t]
         if not terms:
@@ -320,7 +326,10 @@ class SearchTools:
         flags = 0 if case_sensitive else re.IGNORECASE
         pattern = re.compile("|".join(re.escape(t) for t in sorted(terms, key=len, reverse=True)), flags)
         try:
-            hits = self._conversation_hits(pattern) + self._profile_hits(pattern) + self._transcript_hits(pattern)
+            from bot.topics import topic_store
+
+            names = topic_store.all(self.user_id)
+            hits = self._conversation_hits(pattern, names) + self._profile_hits(pattern) + self._transcript_hits(pattern, names)
         except Exception as e:  # noqa: BLE001 - a tool result, never an exception for the turn
             return f"Error performing memory search: {e}"
         if not hits:
@@ -341,6 +350,12 @@ class SearchTools:
             return None
         return {"source": source, "timestamp": timestamp, "topic": topic, "field": field, "snippet": self._snippet(text, match)}
 
+    def _thread(self, thread_id: int | None, names: dict) -> str:
+        from bot.topics import thread_label
+
+        label = thread_label(thread_id, names.get(thread_id))
+        return f"{label} (current)" if thread_id == self.thread_id else label
+
     @staticmethod
     def _conversation_timestamp(data: dict, path: Path) -> str:
         raw = str(data.get("timestamp") or "")
@@ -350,7 +365,7 @@ class SearchTools:
             return f"{y}-{mo}-{d} {h}:{mi}:{s}"
         return raw
 
-    def _conversation_hits(self, pattern: re.Pattern) -> list[dict]:
+    def _conversation_hits(self, pattern: re.Pattern, names: dict | None = None) -> list[dict]:
         hits: list[dict] = []
         # never through a link: data/<uid> is the sandbox's workspace (see agents.paths.regular_files)
         for path, raw in regular_files(self.base_path / "conversations", "conversation_*.json"):
@@ -362,10 +377,11 @@ class SearchTools:
                 continue
             timestamp = self._conversation_timestamp(data, path)
             topic = str(data.get("topic") or "general")
+            thread = self._thread(as_thread_id(data.get("thread_id")), names or {})
             for field in ("summary", "topic", "question", "response"):
                 hit = self._hit(pattern, data.get(field), "conversation", timestamp, topic, field)
                 if hit:
-                    hits.append(hit)
+                    hits.append({**hit, "thread": thread})
         return hits
 
     def _profile_hits(self, pattern: re.Pattern) -> list[dict]:
@@ -391,7 +407,7 @@ class SearchTools:
                 hits.append(hit)
         return hits
 
-    def _transcript_hits(self, pattern: re.Pattern) -> list[dict]:
+    def _transcript_hits(self, pattern: re.Pattern, names: dict | None = None) -> list[dict]:
         hits: list[dict] = []
         for path, raw in regular_files(self.base_path / "transcripts", "*transcript.json"):  # links skipped
             try:
@@ -400,7 +416,10 @@ class SearchTools:
                 continue
             if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
                 continue
-            topic = "current conversation" if path.name == "transcript.json" else path.name.replace("_transcript.json", "").replace("_", " ")
+            name = _TRANSCRIPT_NAME_RE.match(path.name)
+            if name is None:
+                continue
+            topic = self._thread(as_thread_id(name.group(1)), names or {})
             # Messages before the first context block are the OLDEST content (the summary prune
             # leaves on top, a transcript seeded from dialog_history.json): the file's creation time,
             # or nothing (sorted last), never its last update. A turn's own context block carries its time.
@@ -418,7 +437,7 @@ class SearchTools:
                 field = "user" if message.get("role") == "user" else "assistant"
                 hit = self._hit(pattern, message_text(message), "transcript", timestamp, topic, field)
                 if hit:
-                    hits.append(hit)
+                    hits.append({**hit, "thread": topic})
         return hits
 
     def deep_research(
