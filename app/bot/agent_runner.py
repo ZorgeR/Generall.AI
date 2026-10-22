@@ -33,11 +33,11 @@ same chat and topic is handed to the agent between two steps instead of waiting 
 turn of its own, and tool calls that run long continue in the background
 (``bot.background``). Both go to ``ChainOfThoughtAgent`` as ``inbox=`` / ``background=``
 (only when its constructor takes them). The inbox closes as soon as the agent returned,
-failed or was stopped; what it did not consume becomes the next turns, in order (dropped
-on /cancel and at shutdown). The messages it did consume are part of the turn record
-("[Sent while I was working]"), so Retry replays them. A scheduled task (or a notification
-turn) that read one and still answers the quiet marker stays quiet and hands the messages it read
-back to the queue: each gets a turn of its own on its prepared prompt, in arrival order.
+failed or was stopped; what it did not consume becomes the next turn, all of it together
+on the prompts it already prepared (dropped on /cancel and at shutdown). The messages it did
+consume are part of the turn record ("[Sent while I was working]"), so Retry replays them. A
+scheduled task (or a notification turn) that read one and still answers the quiet marker stays
+quiet and hands the messages it read back to the queue with the unread ones, as one turn.
 
 A call moved to the background keeps spending after the turn's usage was recorded (a video
 generation, a subagent, a slow image): from then on every addition to the turn's trace is
@@ -377,7 +377,7 @@ async def run_turn(
     agent has nothing worth saying; nothing is sent, the status message is removed (or, with
     ``quiet_notice``, edited into that line: a turn the user started by a button expects some
     reply) and the result carries ``quiet=True``; user messages the turn read meanwhile are
-    queued again as turns of their own (``inbox.requeue``). The marker is stored on the turn
+    queued again with the unread ones, as one turn (``inbox.finish``). The marker is stored on the turn
     record, so Retry runs with it again. Such a turn never shows the browser's live view (it
     would stay behind after a quiet run).
     """
@@ -427,9 +427,9 @@ async def run_turn(
     host: background.BackgroundHost | None = None  # the user's background host, bound to this turn
     host_turn = 0
 
-    def close_inbox() -> None:
-        # Leftovers become the next turns; at shutdown the queue is closing, so they are dropped.
-        inbox.finish(box, discard=ctx is not None and ctx.cancel_reason == "shutdown")
+    def close_inbox(read: list[inbox.InboxItem] | tuple = ()) -> None:
+        # Leftovers become the next turn; at shutdown the queue is closing, so they are dropped.
+        inbox.finish(box, discard=ctx is not None and ctx.cancel_reason == "shutdown", read=read)
 
     agent_settings = user_settings
     if quiet_marker:
@@ -457,7 +457,11 @@ async def run_turn(
             **live,
         )
         response, messages = await agent.generate_response(prompt, update_status, on_text_chunk=on_text_chunk, trace=trace)
-        close_inbox()  # what the agent did not read becomes the next turns, queued behind this one
+        quiet = bool(quiet_marker) and turn_actions.parse_follow_ups(response or "")[0].strip() == quiet_marker
+        # What the agent did not read becomes the next turn, queued behind this one. A quiet run
+        # (a scheduled task with nothing to say) hands back what it read too: those messages wait
+        # for an answer the run does not give. All of them together, in arrival order.
+        close_inbox(read=box.consumed_user_items if quiet and box is not None else ())
         _close_drafts(on_text_chunk)
         # The answer is complete (and already in memory): Stop no longer applies, so a late
         # press cannot cut the delivery short or resend the streamed part as "not saved".
@@ -474,15 +478,11 @@ async def run_turn(
         if not (user_settings.get("follow_ups") or {}).get("enabled", True):
             suggestions = []
         record_prompt, record_blocks = with_drained(prompt_text, prompt_blocks, box)
-        if quiet_marker and display.strip() == quiet_marker:
+        if quiet:
             # Nothing to tell the user: no answer, no voice, no buttons; the status goes away too
-            # (or says so, when the user pressed a button and waits for a reply).
+            # (or says so, when the user pressed a button and waits for a reply). The messages it
+            # read were handed back above.
             status_final = True
-            if box is not None and box.consumed_user_items:
-                # The user wrote while the task ran and the agent read it: those messages wait for
-                # an answer the quiet run does not give. Each becomes a turn of its own on its
-                # prepared prompt, in arrival order, ahead of anything sent later.
-                inbox.requeue(box.consumed_user_items)
             if quiet_notice:
                 await status_msg.set_text(quiet_notice)
             else:

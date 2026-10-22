@@ -1786,6 +1786,19 @@ User message: {question}"""
             return "complex"
         return await self._classify_complexity(question, history_view)
 
+    async def _read_early_messages(self, update_status=None) -> list:
+        """What the user sent while the turn was starting (bot/inbox.py), read once before the first
+        model call: it goes behind the question in the turn's user message, which is not sent yet, so
+        the classifier, the quick path and the model all see it and nothing stored changes. Later
+        messages are read at tool boundaries (``AgentAnthropic.generate_response``)."""
+        drain = getattr(self.agent, "_drain_inbox", None)
+        early = await drain() if drain is not None else []
+        read = sum(1 for b in early if b.get("type") == "text" and str(b.get("text") or "").lstrip().startswith(USER_MESSAGE_OPEN))
+        if read and update_status:
+            details = "Reading your new message" if read == 1 else f"Reading your {read} new messages"
+            await update_status(step="reading your message", details=details, iteration=0, critique=0)
+        return early
+
     async def _build_user_message(self, turn_context: str, blocks: list) -> dict:
         """The user turn exactly as sent: the <context> block first, then the prompt's blocks with
         media refs materialized into base64 image/document blocks (file reads in a thread), each
@@ -1822,17 +1835,20 @@ User message: {question}"""
 
         history_view = text_only_view(transcript.messages)
         blocks = question_blocks if question_blocks is not None else prompt_content.normalize(question)
-        has_media = any(prompt_content.is_media_ref(b) for b in blocks)
-        complexity = await self._decide_complexity(question, history_view, has_media=has_media)
+        early = await self._read_early_messages(update_status)
+        asked = with_messages_read(question, self.inbox)  # the question and what was read with it
+        has_media = any(prompt_content.is_media_ref(b) for b in blocks) or any(prompt_content.is_media_block(b) for b in early)
+        complexity = await self._decide_complexity(asked, history_view, has_media=has_media)
         # the context block is stored with the question: the transcript keeps what was sent
         user_message = await self._build_user_message(turn_context, blocks)
+        user_message["content"].extend(early)
         base_len = len(transcript.messages)
         response, new_messages = None, []
 
         if complexity == "simple":
             if update_status:
                 await update_status(step="initial", details=f"Quick response ({ANTHROPIC_MODEL_FAST})", iteration=0, critique=0)
-            simple_context = history_view + [{"role": "user", "content": f"{full_context}\n\n{question}"}]
+            simple_context = history_view + [{"role": "user", "content": f"{full_context}\n\n{asked}"}]
             response, _ = await self._simple_response(simple_context, static_prompt, question, on_text_chunk=on_text_chunk)
             if response is not None:
                 new_messages = [user_message, {"role": "assistant", "content": [{"type": "text", "text": response}]}]
@@ -2332,7 +2348,12 @@ You have been asked to answer a query given sources. Consider the following when
         
         # Pass user message separately, behind the per-turn <context> block (times, profile) as
         # in transcript mode; the quick path gets the same text. Memory keeps the bare question.
+        # What the user sent while the turn was starting goes behind it as text (this path never
+        # sends pictures; the message's text names their paths).
+        early = [b for b in await self._read_early_messages(update_status) if b.get("type") == "text"]
         turn_text = f"{await self._legacy_context()}\n\n{question}"
+        if early:
+            turn_text += "\n\n" + "\n\n".join(str(b.get("text") or "") for b in early)
         user_question = [{"role": "user", "content": turn_text}]
         context_memory.extend(user_question)
 
@@ -2355,7 +2376,7 @@ You have been asked to answer a query given sources. Consider the following when
             dialog_history = []
 
         # Route: classify complexity to decide fast vs full path
-        complexity = await self._decide_complexity(question, dialog_history)  # mode setting applies to the legacy path too
+        complexity = await self._decide_complexity(with_messages_read(question, self.inbox), dialog_history)  # mode setting applies to the legacy path too
         
         response = None
         

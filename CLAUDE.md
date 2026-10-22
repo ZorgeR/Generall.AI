@@ -26,7 +26,10 @@ Every chat has its own job queue: messages are processed strictly in order per
 user, and users never wait for each other. A message sent while the agent of the same chat and
 forum topic is working joins that running turn (the agent reads it after its next tool call)
 instead of waiting for a turn of its own, and a tool call that runs long moves to the background
-and reports back when it finishes ("live turns": `bot/inbox.py`, `bot/background.py`). See "Queues".
+and reports back when it finishes ("live turns": `bot/inbox.py`, `bot/background.py`). Messages sent
+together (a comment and the messages it forwards, quick texts in a row) become ONE turn: a message that
+starts a turn waits 1.5 s for the next one, each new one extends the wait (the message window,
+`bot/handlers/messages.py`). See "Queues".
 
 There is a pytest suite (`tests/`, run with `pytest` from the repo root) covering the queue,
 settings, presets and the /settings page, auth, reminder store, text splitting, the model settings
@@ -43,11 +46,14 @@ loop and the error path (`test_timezones.py`, `test_reminders_ui.py`, `test_proa
 sessions (`test_sessions.py`, with a fake Docker client), /sandbox and the idle warnings (`test_sandbox_ui.py`),
 the browser server inside the container (`test_browser_server.py`), the browser toolset in the agent loop
 (`test_browser_tools.py`, `test_toolset_loop.py`), live turns (`test_inbox.py`: joining the running turn,
-👀/✍, leftovers and their order, Stop / deadline / /cancel / shutdown, the turn record, typed answers, follow-ups;
+👀/✍, leftovers as one turn, Stop / deadline / /cancel / shutdown, the turn record, typed answers, follow-ups, the
+message window and `inbox.combine`; `test_mode.py`: what the agent reads before its first model call;
 `test_background_tasks.py`: the background host, notifications and notification turns; `test_live_turn_loop.py`:
 injection at tool boundaries and the background watcher in the agent loop; `test_task_tools.py`;
 `test_transcript_live_turn.py`: tool-result messages with injected blocks), and how these features meet
 (`tests/test_cross_features.py`).
+`tests/conftest.py` sets `MESSAGE_WINDOW_SECONDS=0` for the whole run (handlers queue or inject at once); the
+window's tests turn it on with `monkeypatch.setattr(messages, "MESSAGE_WINDOW", …)`.
 There is no CI, linter, formatter or type checking. Validate changes with the tests and
 the import smoke check at the end of this file.
 
@@ -74,7 +80,10 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
                             unready head, never skips it; an item leaves only once read, so a cancel mid-read leaves it a
                             leftover), wait(), has_user_messages (a ready, drainable one only), consumed_user_items,
                             close() → leftovers; registry open_inbox / current /
-                            accepts / deliver_task / finish / requeue / drop / discard / reset; reactions mark_seen 👀 and
+                            accepts / deliver_task / finish (read= consumed items handed back with the leftovers) /
+                            requeue (the user items as ONE turn: InboxItem.requeue_group) / drop / discard / reset;
+                            combine(list[Prepared]) → one Prepared (COMBINED_HEAD + <message n="i"> per message, media refs
+                            inside the tags; speak only when all speak); reactions mark_seen 👀 and
                             ✍ once drained; SENT_WHILE_WORKING "[Sent while I was working]"
     background.py           live turns: BackgroundHost per user (host_for binds bot/chat/topic each turn): adopts tool calls
                             the agent loop moved to the background (ids t1, t2, … per user, MAX_BACKGROUND_TASKS 4 running
@@ -168,9 +177,13 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
       messages.py           text/voice/video/audio/photo(+albums)/document handlers (block prompts: reply/forward
                             preamble + text + image_ref/document_ref), each split into prepare_<kind> (→ Prepared) and
                             the _run_<kind> job; accept / inject_target / inject (join the running turn: PREPARE_SLOTS 2
-                            preparations per user, _path_lock per saved document/audio file) / _run_prepared (a leftover's
-                            turn); a typed text answers a waiting question; busy notice, /cancel (also drops
-                            the inbox and cancels background tasks), Stop buttons (queue_stop_ callback,
+                            preparations per user, _path_lock per saved document/audio file) / _run_prepared (prepared
+                            messages as ONE turn: a turn's leftovers, a message window); the message window (_Window per
+                            chat + topic, MESSAGE_WINDOW 1.5 s from MESSAGE_WINDOW_SECONDS, extended by each message up to
+                            MESSAGE_WINDOW_MAX 30 s, held by an album still arriving: _album_arriving; _gather, _window_timer,
+                            _close_window, _drop_window / drop_windows; "typing…", then 👀 + WINDOW_STATUS count line);
+                            a typed text answers a waiting question; busy notice, /cancel (also drops
+                            the inbox and the message windows and cancels background tasks), Stop buttons (queue_stop_ callback,
                             stopped_message_generation update), on_location (a shared location sets the time zone; the
                             agent never sees locations), on_topic_service (forum_topic_created / forum_topic_edited → the
                             topic's name in bot/topics.py, no answer, no quota) and remember_topic (called by accept: the
@@ -487,7 +500,30 @@ execution between host and sandbox.
   `submit` / `submit_nowait` insert it before every pending job with a larger `seq` (`_UserQueue.pending` is the
   job list, the `asyncio.Queue` only holds one token per pending job). A job made when it is submitted just goes
   to the end; one submitted later for something that arrived earlier keeps its place (an inbox leftover, an
-  album flushed 10 s after its first photo, whose `_Album.seq` is that photo's arrival).
+  album flushed 10 s after its first photo, whose `_Album.seq` is that photo's arrival, a message window: the
+  smallest `seq` of its messages).
+- **The message window: messages sent together are one turn.** A content message that does not join a running
+  turn goes into the window of its chat and topic (`messages.accept` → `_gather`; `MESSAGE_WINDOW` =
+  `config.message_window_seconds`, env `MESSAGE_WINDOW_SECONDS`, default 1.5, 0 = off). The window closes
+  `MESSAGE_WINDOW` after its last message (each message moves `_Window.due`), at most `MESSAGE_WINDOW_MAX` (30 s)
+  after its first, and not while a photo album of that chat and topic is still being collected or handed over
+  (`_album_arriving`: `_albums` and `_albums_handing`; the album's 10 s flush adds it to the window, which then
+  waits `MESSAGE_WINDOW` more; with no window open an album goes straight on as before). Its messages are kept in
+  Telegram `message_id` order (concurrent forum handlers may finish `remember_topic` out of order). What the user
+  sees: the first message gets "typing…" (`ChatSender.typing`) and nothing else; from the second on every message
+  gets 👀 (`inbox.react`), its `prepare_<kind>` starts at once (`_start_preparing` → `_prepare_for_inbox`: the
+  PREPARE_SLOTS, the echo of a voice transcription), an album's "waiting for images" line is deleted, and ONE
+  status line counts them (`WINDOW_STATUS` "📥 *Got N messages.* I'll read them all together.", `_update_count`: one
+  Telegram call at a time). At the close (`_close_window`, no await between taking the window out of `_windows`
+  and handing its messages over): a turn of that topic running by now takes them (`inject` each, with its running
+  preparation as `future`; 👀 for the unseen; the count line deleted); else ONE message is queued as exactly the
+  job it was (`Job(run=entry.run)`, its own `_run_<kind>`), two or more as ONE job (label "N messages",
+  `_run_prepared` over their preparations with `status=` the count line, which `run_turn` makes the turn's status;
+  `on_drop` = `_drop_window`). One busy notice at most, on the first message. While a window collects for a topic,
+  `inject_target` returns None for it, so a later message of that topic waits in the window too. `/cancel` drops
+  every open window of the user (`drop_windows`: preparations cancelled, the count line edited to "🛑 Cancelled.",
+  counted as dropped messages). Not windowed: a message that joins a running turn, button presses (Retry,
+  Continue, follow-ups), scheduled tasks and notification turns.
 - **Live turns: joining the running turn.** `run_turn` opens an inbox (`bot/inbox.py`) right before it builds
   the agent and closes it the moment `generate_response` returned, failed or was cancelled. Meanwhile a new
   message of the same chat AND forum topic joins that turn instead of queueing: `messages.inject_target(user_id,
@@ -503,20 +539,23 @@ execution between host and sandbox.
   they take messages too. A message of another topic, one sent while a `_run_<kind>` job still prepares its
   media (no inbox yet) or while the answer is being delivered (inbox closed) is queued as before.
 - If the message does not join and the user already has a running or queued job, `messages.notify_busy`
-  immediately replies "⏳ I'm still working on your previous request (label, elapsed, step) …" with a Stop
-  button (`queue_cancel` callback). The new message is processed later as its own turn, in order.
-- Leftovers: what the inbox still holds when it closes (`inbox.finish`) is handed back in arrival order. Each
-  user item becomes a queued turn (`messages._requeue` → `Job(seq=item.seq, from_user=True)` running
-  `_run_prepared` on the `Prepared` it already has: nothing is downloaded or transcribed twice; a failed one just
-  sends its `error_text`), each task notification a notification turn (`background.submit_notification`). That
+  replies (once its message window closed) "⏳ I'm still working on your previous request (label, elapsed, step) …"
+  with a Stop button (`queue_cancel` callback). The new message is processed later as its own turn, in order.
+- Leftovers: what the inbox still holds when it closes (`inbox.finish`) is handed back in arrival order. The
+  user items together become ONE queued turn (`inbox.requeue` → the first item's `requeue_group` =
+  `messages._requeue_group` → `Job(seq=first.seq, from_user=True, label "N messages" for several)` running
+  `_run_prepared` on the `Prepared`s they already have, put into one prompt by `inbox.combine`: nothing is
+  downloaded or transcribed twice; a failed one is a note to the agent, all failed just sends their `error_text`;
+  one leftover is its own prompt as before), each task notification a notification turn (`background.submit_notification`). That
   happens after a normal end, a failure, Stop and the turn deadline (a Stop while `drain` is still reading a
   message leaves it a leftover: an item leaves the inbox only once read). `/cancel` drops them instead
   (`inbox.discard` runs before `queue.cancel`, so the cancelled turn finds its inbox closed), and so does
   shutdown (`run_turn` closes with `discard=True` when `ctx.cancel_reason == "shutdown"`). A requeued job carries
-  `Job.on_drop` = `inbox.drop([item])`: `/cancel` dropping it also cancels a preparation still in flight (no
-  echo, no transcription or description after the cancel). A quiet run (a scheduled task or notification turn
-  that answers the marker) requeues the user messages it DID read too (`inbox.consumed_user_items`), so they
-  get a real answer; the run itself stays silent.
+  `Job.on_drop` = `inbox.drop(items)`: `/cancel` dropping it also cancels a preparation still in flight (no
+  echo, no transcription or description after the cancel); cancelling it while it runs cancels them too
+  (`_run_prepared` awaits them in one `asyncio.gather`). A quiet run (a scheduled task or notification turn
+  that answers the marker) hands back the user messages it DID read too (`inbox.consumed_user_items`, passed
+  to `inbox.finish(read=…)` with the unread ones: one turn), so they get a real answer; the run itself stays silent.
 - **Live turns: background tool calls.** A call the agent loop moved to the background (see "The tool
   contract") belongs to the user's `BackgroundHost` (`bot/background.py`) from then on, across turns. When it
   ends, its `<task_notification>` goes to the inbox of the user's running turn in the topic it was started from
@@ -532,8 +571,9 @@ execution between host and sandbox.
   (`background.shutdown`). The cap of 4 running tasks is per user, but the task tools see the running turn's
   topic only (`running` / `list` / `cancel` filter on the topic `host_for` bound): `wait_for_tasks` in topic B
   neither waits for nor lists a task of topic A.
-- `/cancel` (and the busy notice's button) is `messages._cancel_for`: `inbox.discard`, `background.cancel_all`,
-  then `QueueManager.cancel`, which cancels the running task and drops the queue. The Stop buttons of a turn are
+- `/cancel` (and the busy notice's button) is `messages._cancel_for`: `inbox.discard`, `drop_windows`,
+  `background.cancel_all`, then `QueueManager.cancel`, which cancels the running task and drops the queue (a
+  queued job of several messages counts as one in the reply). The Stop buttons of a turn are
   `cancel_current(user_id, job_id)`: the running job only, and
   only while it is still the job the button names (queued messages run next, the turn's unread messages
   requeued among them by arrival, `seq`; its background tasks keep running). Two Stop buttons exist:
@@ -565,7 +605,7 @@ execution between host and sandbox.
 - Agent reminders go through the same per-user queue (`bot/jobs.py`, label "scheduled agent task"), so they
   never interleave with the user's own turn (it runs with `thread_id` None, so a message sent outside any forum
   topic while it runs joins it; when the agent read one and still answers the quiet marker, the run stays silent
-  and the message is requeued as a turn of its own). The job is `run_agent_reminder`: `run_turn(prompt=task_prompt(...),
+  and the message is requeued, with any it did not read, as one turn). The job is `run_agent_reminder`: `run_turn(prompt=task_prompt(...),
   header="🤖 *Scheduled task...*", quiet_marker=QUIET_MARKER)`, no announcement message; the framing prompt is
   "[Scheduled task] This is a task you scheduled earlier (id <id>; it is <local time>). Task: <text>. Do it
   now. If there is nothing new or worth telling the user, reply with exactly <no_update/> and nothing else."
@@ -588,7 +628,11 @@ messages.on_text (bot/handlers/messages.py)      [AuthMiddleware(check_limits=Tr
   stats_tracker.track_message_received
   questions.waiting_in(chat, topic) → questions.answer_in_text (the text answers that ask_user_choice) → return
   accept(): inject_target(user_id, topic) → inject(prepare=prepare_text) + 👀 → return   [joins the running turn]
-            else submit(Job(run=_run_text, thread_id, from_user=True)) → busy notice if needed → return
+            else _gather(): into the message window of chat + topic → return   ["typing…"; from the 2nd: 👀 + count]
+            (MESSAGE_WINDOW 0: submit(Job(run=_run_text, thread_id, from_user=True)) → busy notice if needed → return)
+  window closes (_close_window, see "Queues"): one message → submit(Job(run=_run_text, …)) → busy notice if needed;
+            several → Job(_run_prepared over their preparations, status=count line); a turn of the topic running by
+            now → inject each
 worker → _run_text → prompt = message_context.with_reference(text, message, bot.id): when the message replies to,
     quotes or forwards something, a plain-text preamble goes first (see "Media handlers" below), then a blank
     line and the user's text
@@ -632,9 +676,13 @@ worker → _run_text → prompt = message_context.with_reference(text, message, 
        │     "thread id <id> (name not known yet)" when no name was seen) + <memory> (recent
        │     summaries + FAISS hits not shown before) +
        │     <profile fingerprint="..."> (profile.enabled; only when the fingerprint differs from the last one shown
-       │     in this transcript), stored as the first block of the new user turn; _decide_complexity: mode auto AND
-       │     no media → Haiku classifier (text view, context blocks excluded), else "complex"; "simple" → tool-less
-       │     Haiku answer on the FULL context (profile every time); _build_user_message materializes the media refs
+       │     in this transcript), stored as the first block of the new user turn; _read_early_messages: ONE
+       │     _drain_inbox before the first model call (what the user sent while the turn was starting; status step
+       │     "reading your message"), its blocks go behind the question in this turn's user message (not sent yet, so
+       │     nothing stored changes); _decide_complexity on with_messages_read(question, inbox): mode auto AND
+       │     no media (refs or drained image/document blocks) → Haiku classifier (text view, context blocks excluded),
+       │     else "complex"; "simple" → tool-less Haiku answer on the FULL context (profile every time, the drained
+       │     texts too); _build_user_message materializes the media refs
        │     (base64 image/document blocks, to_thread) behind the <context> text block; tool loop on the real
        │     transcript (tool results capped before the model sees them); history_edited → strip every thinking
        │     block of the stored transcript first (the prefix was sent stripped); then append the turn exactly as
@@ -650,7 +698,8 @@ worker → _run_text → prompt = message_context.with_reference(text, message, 
        │     + short_term_memory.json messages whose FIRST block is text (reasoning_context)
        │     + the question                       (all three gated by short_term_memory.enabled too)
        │     the user turn = _legacy_context() (<context>: UTC time, local time/zone, <profile> when profile.enabled;
-       │     no memory lines) + a blank line + the question, quick path too; afterwards thread_messages gets the
+       │     no memory lines) + a blank line + the question (+ the TEXT blocks _read_early_messages drained, no
+       │     pictures on this path), quick path too; afterwards thread_messages gets the
        │     bare question back, so short_term_memory.json and the conversation file never store a context block
        ├─ _classify_complexity (Haiku, auto mode only) → "simple": tool-less Haiku answer; on any error fall back ↓
        ├─ AgentAnthropic.generate_response: prefix_len = len(incoming messages);
@@ -677,8 +726,9 @@ worker → _run_text → prompt = message_context.with_reference(text, message, 
        │        then injected = _drain_inbox() (the user's messages and task notifications, ready head only, in
        │        arrival order) and append ONE user msg = tool_results in block order + injected, stored as sent;
        │        a message read → status step "reading your message" ("Reading your new message" / "… N new
-       │        messages"); continue (cicles counts tool_use BLOCKS). Nothing is injected anywhere else: not before
-       │        the first call, not after end_turn, not into judge/critique re-prompts or the SYSTEM NOTICE call
+       │        messages"); continue (cicles counts tool_use BLOCKS). Nothing is injected anywhere else in the loop:
+       │        not after end_turn, not into judge/critique re-prompts or the SYSTEM NOTICE call (before the first
+       │        call ChainOfThoughtAgent._read_early_messages read the inbox once, into the turn's own user message)
        │     gate fails → tool_use blocks silently dropped, text goes on to critique/judge/return
        │        (budget spent → AgentAnthropic.limit_reached, which offers ▶️ Continue)
        │     else optional critique (OpenAI gpt-6.1-sol) / judge (Claude yes/no, same request_options_for) re-prompts → return
@@ -689,7 +739,8 @@ worker → _run_text → prompt = message_context.with_reference(text, message, 
           (a failed Haiku summary is logged, the answer is still returned; the memory files get _memory_question =
           with_messages_read: the question + "\n\n[Sent while I was working]\n" + the texts the agent read mid-turn)
           → (response, messages)
-    agent returned → close_inbox() (inbox.finish: leftovers become the next turns, see "Queues"), drafts closed,
+    agent returned → quiet = quiet_marker and the answer (follow-ups cut) is exactly it → close_inbox(read=
+       box.consumed_user_items if quiet) (inbox.finish: leftovers become the next turn, see "Queues"), drafts closed,
        ctx.stoppable = False, Stop removed from later status edits
     stats_tracker.track_message_sent
     record_usage(): one usage_events row per model of the turn (tokens, cache, tool calls, cost estimate); then
@@ -700,8 +751,8 @@ worker → _run_text → prompt = message_context.with_reference(text, message, 
     quiet_marker given (scheduled tasks: bot/jobs.run_agent_reminder passes QUIET_MARKER "<no_update/>" with the
        framing prompt, see "Queues"; background.py's notification turns pass it too) and display == marker →
        nothing sent, status deleted, TurnResult(quiet=True); such a turn runs with browser.stream off (no live-view
-       photo to leave behind). The user messages the agent read mid-turn (box.consumed_user_items) are requeued
-       (inbox.requeue: each a turn of its own on its prepared prompt, by arrival seq, ahead of later messages)
+       photo to leave behind). The user messages the agent read mid-turn (box.consumed_user_items) were handed back
+       with the unread ones by close_inbox above (one turn on their prepared prompts, at the first one's seq)
     save_turn(): TurnRecord(id 12 hex, prompt (text view), prompt_blocks (media refs, Retry re-runs them), display,
        speak, thread, limit_reached, follow_ups) + reasoning text (if reasoning_context.enabled) → data/<uid>/turns/
        (to_thread, newest 50 kept). with_drained(prompt_text, prompt_blocks, box): prompt + "\n\n[Sent while I was
@@ -749,8 +800,11 @@ reads instead, only for voice: "(voice message, transcribed) …"); `_run_<kind>
 and calls `run_turn`. The `on_<kind>` handlers call `accept(message, …, prepare=, run=)`: joining a running turn,
 `prepare_<kind>` runs as a task without status messages (`_prepare_for_inbox`: the echo goes out as a reply to the
 message; an exception or an unusable result becomes "(the user sent a <kind> that could not be processed:
-<reason>)" for the agent), else the `_run_<kind>` job is queued. A leftover runs as `_run_prepared` on the same
-`Prepared` (`prompt`, not `inject`; a failed one only sends its `error_text`). An album joins or queues ONE item at
+<reason>)" for the agent), else it goes into the message window and, when that closes, the `_run_<kind>` job is
+queued (alone) or its `prepare_<kind>` (started with the window's second message) becomes part of one
+`_run_prepared` turn. Leftovers run as ONE `_run_prepared` turn on the same `Prepared`s (one: its `prompt`, not
+`inject`, and a failed one only sends its `error_text`; several: `inbox.combine`, each message's `inject_prompt()`
+inside `<message n="i">`). An album joins, queues or enters an open window as ONE item at
 its 10 s flush, with its first photo's `seq` (the "waiting for images" message is deleted when it joins). Every job
 (text included) starts its prompt with the reply/forward preamble of `bot/message_context.py` when the
 message is a reply, quotes a part of one, or was forwarded (`with_reference(prompt, message, bot.id)`;
@@ -1273,7 +1327,9 @@ Memory semantics worth knowing before touching `ChainOfThoughtAgent.generate_res
 - Live turns in memory: a message the agent read mid-turn sits in the transcript where it was read, in the
   tool-result user message behind the `tool_result` blocks (`<user_message sent_during_turn="true" time="…">` text
   plus its materialized image/document blocks; a `<task_notification>` text plus its images), stored exactly as
-  sent. Such a message is NOT a turn start: tell it by its FIRST block (`transcript.answers_tool_call`), which
+  sent; one read before the first model call sits behind the question in the turn's own user message (a turn
+  start, as always). Messages that arrived together (the message window, leftovers) are one user turn of
+  `<message n="i">` sections (`inbox.combine`). Such a message is NOT a turn start: tell it by its FIRST block (`transcript.answers_tool_call`), which
   `is_user_turn`, `clear_old_tool_results` (clears its `tool_result` blocks and any `<task_notification>` text,
   down to the opening tag + `CLEARED_MARKER`, here and in a notification turn's user message; an injected
   `<user_message>` stays, old injected media goes through `clear_old_media`) and the prune's turn split use, so a prune never separates a
@@ -1427,6 +1483,7 @@ SearchTools and the embeddings `OpenAI` are per instance; ElevenLabs is per call
 | `MCP_TOKEN_KEY_OLD` (unset) | bot/mcp_store | comma-separated decrypt-only keys (rotation: values move to `MCP_TOKEN_KEY` on their next write); an invalid key is logged and skipped |
 | `COMPOSE_PROFILES`, `CLOUDFLARE_TUNNEL_TOKEN` | docker compose (from `.env`) | `COMPOSE_PROFILES=tunnel` starts the `cloudflared` service with `TUNNEL_TOKEN=$CLOUDFLARE_TUNNEL_TOKEN` (the bot ignores both) |
 | `MAX_CONCURRENT_TURNS` (8), `TURN_TIMEOUT_SECONDS` (1800), `DROP_PENDING_UPDATES` (true) | bot/config | queue caps, see "Queues" |
+| `MESSAGE_WINDOW_SECONDS` (1.5) | bot/config (read once at import; blank or not a number = 1.5, negative = 0) | the message window: a message that does not join a running turn waits this long for the next one of its chat and topic, each new one extends it (at most `messages.MESSAGE_WINDOW_MAX` 30 s), and they become one turn; 0 = off (every message queued at once, as before); `tests/conftest.py` sets 0 |
 | `TOOL_BACKGROUND_AFTER_SECONDS` (30) | agents/main (read once at import; blank or not a number = 30 with a printed warning for the latter, negative = 0) | live turns: a tool call still running after this many seconds moves to the background (`_watch_call`); 0 = no time trigger, a call still moves when the user writes meanwhile (`BACKGROUND_ON_MESSAGE_AFTER` 3 s, not configurable) |
 | `MAX_SANDBOX_CONTAINERS` (4) | secure_container/container_manager | concurrent ONE-OFF sandbox containers (`run_script`, the fallback); sessions have their own caps below |
 | `SANDBOX_SESSIONS` (true) | secure_container/sessions | persistent per-user shell sessions; false = a throwaway container per command (and no `sandbox_status`) |
@@ -1553,7 +1610,8 @@ name; a new temp dir needs its own `.gitignore` line).
   (keyword arguments are mandatory in aiogram).
 - Every content handler: track_message_received → `accept(message, bot, user_id, limit, label=, kind=,
   error_text=, prepare=partial(prepare_<kind>, …), run=partial(_run_<kind>, …))`, which joins the running turn
-  (`inject_target` → `inject` → `inbox.mark_seen`) or `submit`s `Job(…, thread_id=, from_user=True)`. The job
+  (`inject_target` → `inject` → `inbox.mark_seen`) or puts it into the message window (`_gather`), whose close
+  `submit`s `Job(…, thread_id=, from_user=True)` (with `MESSAGE_WINDOW` 0 at once, as before). The job
   function signature is `(bot, message, user_id, limit, ..., ctx)` via `functools.partial`; it creates its own
   `ChatSender`, its own status message, sets `ctx.set_progress(...)`, builds its prompt through `prepare_<kind>`
   (reply/forward preamble via `with_reference`, media as `content.image_ref`/`document_ref` blocks:
@@ -1658,7 +1716,7 @@ name; a new temp dir needs its own `.gitignore` line).
 - Quiet scheduled runs still cost: `track_message_sent`, the tool calls and the usage rows are recorded before
   `run_turn` looks at the marker, and the turn is stored in memory (see "Memory semantics"), so an hourly quiet
   task grows the transcript until `prune` summarizes it. A user message such a run read is in that stored turn
-  AND gets its own requeued turn, so the transcript holds it twice. The `agent_response` of a periodic task is overwritten
+  AND in the requeued turn after it, so the transcript holds it twice. The `agent_response` of a periodic task is overwritten
   by every run; `quiet_runs` only ever grows.
 - Cancellation cannot interrupt a tool call already inside a worker thread; the turn only ends when
   that call returns (sandbox containers run to their own timeout).
@@ -1930,11 +1988,24 @@ name; a new temp dir needs its own `.gitignore` line).
   `BrowserTools` is registered and /sandbox says the sandbox is unavailable.
 - Two bot processes must not share a Docker host: `cleanup_stale` and the per-start orphan removal match on the
   `generall.sandbox` label only.
-- **Live turns read messages at tool boundaries only.** A message that arrives while the model writes its final
-  answer, during a turn without tool calls (the quick Haiku path, `tools.enabled` off) or after the last batch is
-  not read by that turn: it becomes the next turn (leftover). Never inject anywhere else (before the first call,
-  into judge/critique re-prompts, the SYSTEM NOTICE call): the injected blocks must ride in the tool-result
-  message, which is what keeps the transcript append-only and the thinking blocks valid.
+- **Live turns read messages at tool boundaries only**, plus once before the first model call
+  (`ChainOfThoughtAgent._read_early_messages`, into the turn's own user message, which is not sent yet; like any
+  drain it waits up to `DRAIN_WAIT` 3 s for a message at the head that is still being prepared). A message
+  that arrives after that while the model writes its final answer, during a turn without tool calls (the quick
+  Haiku path, `tools.enabled` off) or after the last batch is not read by that turn: it becomes the next turn
+  (leftover). Never inject anywhere else (into an already sent message, judge/critique re-prompts, the SYSTEM
+  NOTICE call): the injected blocks must ride in the tool-result message (or the unsent first one), which is what
+  keeps the transcript append-only and the thinking blocks valid. The `<live_turn>` notes still say "after a tool
+  call" only: changing them strips every user's stored thinking once (a static-prompt change), and a
+  `<user_message sent_during_turn="true">` behind the question explains itself.
+- **The message window delays every turn a user starts by `MESSAGE_WINDOW`** (1.5 s; the "typing…" action covers
+  it), a photo album by its own 10 s flush plus nothing more unless a window is open for its topic. A window only
+  ever holds messages of one chat and topic. Its state (`_windows`, `_albums_handing`) lives in memory per event
+  loop: a restart loses an open window's messages (like `DROP_PENDING_UPDATES` would). Everything that changes a
+  window happens before the handler's first await, and `_close_window` hands the messages over without awaiting
+  after it took the window out of `_windows`; keep both, or a message can slip between a window and its turn. A
+  window's messages are prepared from its second message on, so a single message never is (its `_run_<kind>` does
+  that, with the status lines it always had).
 - Tools that talk to the user or wait for them go in `NEVER_BACKGROUND`. A question, a confirmation or a
   "working on it" message moved to the background would be answered with a placeholder while the user still
   sees it pending, and its real result would arrive as a notification later. A subagent never gets them at all:
@@ -1958,7 +2029,8 @@ name; a new temp dir needs its own `.gitignore` line).
   stops there: nothing behind it (a notification included) overtakes it; it is read at a later boundary or
   becomes a leftover.
 - An album's slot is its first photo's `seq`, but it reaches the turn (or the queue) only at the 10 s flush: a
-  text sent during that window and drained before the flush is read first.
+  text sent during that window and drained before the flush is read first. A message window open for its topic
+  waits for it (`_album_arriving`) and orders it by its first photo's `message_id`.
 - Messages of different forum topics are not ordered against each other: a topic-B message queued behind a
   running topic-A turn waits while later topic-A messages join that turn and are answered first.
 - The inbox and host registries (`inbox._open`, `background._hosts` / `_batches`) belong to one event loop and are
@@ -2065,8 +2137,9 @@ name; a new temp dir needs its own `.gitignore` line).
   `bot.inbox.Prepared` (prompt, `speak`, `error_text`, `reason`, optional `echo` / `inject`) without sending
   status messages itself (report through `progress`), a `_run_<kind>(bot, message, user_id, limit, ctx)` job that
   wraps it in the status messages and calls `run_turn`, and an `@router.message(F.<kind>)` handler that tracks it
-  and calls `accept(..., prepare=, run=)`, so the message can join a running turn (the inject path) or queue.
-  Tests in `tests/test_inbox.py`.
+  and calls `accept(..., prepare=, run=)`, so the message can join a running turn (the inject path), go into the
+  message window with others (`prepare`, then `inbox.combine`) or queue alone (`run`). `prepare_<kind>` must not
+  depend on running inside the job: it also runs as a task while the window is open. Tests in `tests/test_inbox.py`.
 - **Add a background job**: an `async` loop started from `bot/app.py:on_startup` and appended to
   `runtime.background_tasks`; to run the agent from it, submit a `Job` to `runtime.queue`.
 - **Add an image engine**: a row in `models.IMAGE_BACKENDS` (model id, provider, which operations and knobs it

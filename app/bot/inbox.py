@@ -13,12 +13,13 @@ Order is the user's: items are kept by their arrival number (``bot.queue.next_se
 item may still be *preparing* (a photo download, a voice transcription: an asyncio task
 producing a ``Prepared``) and ``drain`` stops at the first item that is not ready (after
 waiting up to ``DRAIN_WAIT`` for it), so nothing overtakes it. What the turn did not
-consume is handed back at ``close()``: each user item becomes a queued turn of its own
-(``requeue``, with the prompt it already prepared: nothing is downloaded or transcribed
-twice), inserted in the queue by its arrival number, and task notifications become
-"background task finished" turns. ``/cancel`` drops them instead (``discard``). A run that
-ends quiet (a scheduled task or a notification turn answering the quiet marker) hands back
-the user messages it did read as well (``consumed_user_items``, ``bot.agent_runner``).
+consume is handed back at ``close()``: the user items together become ONE queued turn
+(``requeue_group``, with the prompts they already prepared: nothing is downloaded or
+transcribed twice, ``combine`` puts them in one prompt), inserted in the queue at the first
+one's arrival number, and task notifications become "background task finished" turns.
+``/cancel`` drops them instead (``discard``). A run that ends quiet (a scheduled task or a
+notification turn answering the quiet marker) hands back the user messages it did read as
+well (``consumed_user_items``, ``bot.agent_runner``).
 
 The formats, which the agent core passes through without parsing::
 
@@ -29,6 +30,18 @@ The formats, which the agent core passes through without parsing::
 
 followed by the message's image/document blocks (materialized), and a notification
 (built by ``bot.background``) as one text block plus the result's images.
+
+Several messages that become one turn (sent together within the message window of
+``bot/handlers/messages.py``, or a turn's leftovers) are one prompt (``combine``)::
+
+    The user sent 3 messages one after another; read them together as one request.
+
+    <message n="1">
+    <its text, the reply/forward preamble included>
+    </message>
+    <message n="2">
+    ... its image/document refs inside the tags ...
+    </message>
 
 No import-time side effects and no ``agents`` imports at module level.
 """
@@ -87,6 +100,53 @@ class Prepared:
         return self.inject if self.inject is not None else self.prompt
 
 
+COMBINED_HEAD = "The user sent {count} messages one after another; read them together as one request."
+COMBINED_KIND = "messages"
+
+
+def combined_label(count: int) -> str:
+    return f"{count} messages"
+
+
+def combine(items: list[Prepared]) -> Prepared:
+    """Several prepared messages as ONE prompt, in the given order; one message is returned as it is.
+
+    Each message is wrapped in ``<message n="i">`` with its media refs inside the tags; it is its
+    ``inject_prompt()`` (a voice message marked as transcribed, a failed one as a short note the
+    agent reads). A string when there is no media, else blocks. The answer is spoken only when
+    every usable message asked for it (all voice or video). Not ``ok`` when none was usable: its
+    ``error_text`` lists theirs.
+    """
+    if len(items) == 1:
+        return items[0]
+    from agents import content
+
+    label = combined_label(len(items))
+    usable = [p for p in items if p.ok]
+    if not usable:
+        errors = list(dict.fromkeys(p.error_text for p in items if p.error_text))
+        return Prepared(
+            prompt=None, kind=COMBINED_KIND, label=label, error_text="\n".join(errors) or None,
+            reason="none of the messages could be processed",
+        )
+    blocks: list[dict] = [content.text_block(COMBINED_HEAD.format(count=len(items)))]
+    for n, prepared in enumerate(items, 1):
+        part = content.normalize(prepared.inject_prompt())
+        body = "\n\n".join(str(b.get("text", "")) for b in part if b.get("type") == "text" and str(b.get("text", "")).strip())
+        blocks.append(content.text_block(f'<message n="{n}">\n{body}'))
+        blocks.extend(b for b in part if b.get("type") != "text")
+        blocks.append(content.text_block("</message>"))
+    merged: list[dict] = []
+    for block in blocks:  # adjacent text blocks as one: a string prompt when there is no media
+        if merged and block.get("type") == "text" and merged[-1].get("type") == "text":
+            glue = "\n" if block["text"] == "</message>" else "\n\n"
+            merged[-1] = content.text_block(f"{merged[-1]['text']}{glue}{block['text']}")
+        else:
+            merged.append(block)
+    prompt: str | list = merged[0]["text"] if len(merged) == 1 else merged
+    return Prepared(prompt=prompt, kind=COMBINED_KIND, label=label, speak=all(p.speak for p in usable))
+
+
 def failed_text(kind: str, reason: str | None) -> str:
     """What the running turn reads for a message that could not be prepared."""
     reason = " ".join(str(reason or "unknown error").split())
@@ -110,8 +170,9 @@ def ready_future(value: Any) -> asyncio.Future:
 @dataclass(eq=False)
 class InboxItem:
     """One delivery: a user message (its future gives a ``Prepared``) or a task notification
-    (its future gives the API blocks). ``requeue`` turns a leftover into a queued turn; ``drop``
-    is called when it is thrown away (/cancel, shutdown)."""
+    (its future gives the API blocks). ``requeue`` turns a leftover into a queued turn;
+    ``requeue_group`` queues several user leftovers (this one first) as ONE turn and wins over
+    ``requeue``; ``drop`` is called when it is thrown away (/cancel, shutdown)."""
 
     kind: str
     future: asyncio.Future
@@ -119,6 +180,7 @@ class InboxItem:
     thread_id: int | None = None
     label: str = "message"
     requeue: Callable[[], None] | None = None
+    requeue_group: Callable[[list["InboxItem"]], None] | None = None
     drop: Callable[[], None] | None = None
     # reactions (user items): where the message is, and the 👀 call made on arrival
     bot: Any = None
@@ -425,9 +487,20 @@ def deliver_task(user_id: str, thread_id: int | None, item: InboxItem) -> bool:
 
 
 def requeue(leftovers: list[InboxItem]) -> None:
-    """Hand leftovers back in order: each becomes a queued turn (never raises, never suspends)."""
+    """Hand leftovers back in order (never raises, never suspends): the user messages become ONE
+    queued turn together (``requeue_group`` of the first, at its arrival number), each task
+    notification and each item with only ``requeue`` a queued turn of its own."""
+    group = sorted((i for i in leftovers if i.kind == USER and i.requeue_group is not None), key=lambda i: i.seq)
+    if group:
+        try:
+            group[0].requeue_group(group)
+        except Exception as e:  # noqa: BLE001 - e.g. the queue is closed (shutdown)
+            logger.warning("Could not requeue %d leftover message(s): %s", len(group), e)
+            for item in group:
+                _drop_one(item)
+    grouped = {id(i) for i in group}
     for item in leftovers:
-        if item.requeue is None:
+        if id(item) in grouped or item.requeue is None:
             continue
         try:
             item.requeue()
@@ -453,15 +526,16 @@ def drop(leftovers: list[InboxItem]) -> int:
     return sum(1 for i in leftovers if i.kind == USER)
 
 
-def finish(inbox: TurnInbox | None, *, discard: bool = False) -> None:
-    """Close ``inbox`` (a no-op when it is None or closed) and requeue, or drop, what is left."""
+def finish(inbox: TurnInbox | None, *, discard: bool = False, read: list[InboxItem] | tuple = ()) -> None:
+    """Close ``inbox`` (a no-op when it is None or closed) and requeue, or drop, what is left.
+    ``read``: consumed user items to hand back with the leftovers, as the same turn (a quiet run)."""
     if inbox is None or inbox.closed:
         return
     leftovers = inbox.close()
     if discard:
         drop(leftovers)
     else:
-        requeue(leftovers)
+        requeue([*read, *leftovers])
 
 
 def discard(user_id: str) -> int:

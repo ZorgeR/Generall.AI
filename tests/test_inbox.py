@@ -65,6 +65,7 @@ class FakeBot:
     def __init__(self, payloads: dict[str, bytes] | None = None):
         self.payloads = payloads or {}
         self.calls: list[tuple[str, dict]] = []
+        self.actions: list[dict] = []  # chat actions ("typing…"), kept apart from the messages
         self.downloads: list[str] = []
         self._id = 500
 
@@ -73,6 +74,7 @@ class FakeBot:
         return SimpleNamespace(message_id=self._id)
 
     async def send_chat_action(self, **kw):
+        self.actions.append(kw)
         return True
 
     async def send_message(self, **kw):
@@ -248,6 +250,12 @@ def ready_item(text: str, *, seq=None, thread_id=None, kind=inbox.USER, message_
         kind=kind, future=inbox.ready_future(value), thread_id=thread_id, bot=bot, chat_id=42, message_id=message_id,
         **({"seq": seq} if seq is not None else {}),
     )
+
+
+def turn_prompt_text(turn: dict) -> str:
+    from agents import content
+
+    return content.prompt_text(turn["prompt"])
 
 
 def texts_of(blocks: list[dict]) -> list[str]:
@@ -446,7 +454,14 @@ async def test_an_earlier_queued_message_of_the_topic_keeps_later_ones_queued(mo
     assert [t["prompt"] for t in later_turns] == ["after it"]
 
 
-async def test_unread_messages_become_the_next_turns_in_order(monkeypatch, qm, later_turns, quiet_media):
+def combined(*bodies: str) -> str:
+    """The prompt of several text messages as one turn (``inbox.combine``)."""
+    parts = [inbox.COMBINED_HEAD.format(count=len(bodies))]
+    parts += [f'<message n="{n}">\n{body}\n</message>' for n, body in enumerate(bodies, 1)]
+    return "\n\n".join(parts)
+
+
+async def test_unread_messages_become_one_next_turn_in_order(monkeypatch, qm, later_turns, quiet_media):
     started, gate = asyncio.Event(), asyncio.Event()
 
     async def behaviour(kw, prompt, update_status):
@@ -465,9 +480,11 @@ async def test_unread_messages_become_the_next_turns_in_order(monkeypatch, qm, l
     await until(lambda: inbox.current(USER) is None)
     await messages.on_text(msg(13, text="sent after the turn"), bot, USER)
     await idle(qm)
-    assert [t["prompt"] for t in later_turns] == ["call mom tonight", "second", "sent after the turn"]
-    assert [t["reply_to_message_id"] for t in later_turns] == [11, 12, 13]
-    assert later_turns[0]["speak"] is True and later_turns[1]["speak"] is False
+    assert [t["prompt"] for t in later_turns] == [
+        combined("(voice message, transcribed) call mom tonight", "second"), "sent after the turn",
+    ]
+    assert [t["reply_to_message_id"] for t in later_turns] == [11, 13]  # the first of them
+    assert later_turns[0]["speak"] is False  # a typed message among them: answered in text
     assert quiet_media.transcribe.await_count == 1 and bot.downloads == ["v"]  # prepared once, reused
     assert any("Transcription" in t for t in bot.texts())  # the transcription is shown once ready
 
@@ -501,7 +518,7 @@ async def test_a_leftover_still_preparing_is_awaited_not_redone(monkeypatch, qm,
     assert later_turns == []  # the voice turn waits for its transcription; the text waits behind it
     release.set()
     await idle(qm)
-    assert [t["prompt"] for t in later_turns] == ["slow words", "behind the voice"]
+    assert [t["prompt"] for t in later_turns] == [combined("(voice message, transcribed) slow words", "behind the voice")]
     assert quiet_media.transcribe.await_count == 1
 
 
@@ -522,9 +539,13 @@ async def test_photo_and_document_leftovers_reuse_their_files(monkeypatch, qm, l
     await asyncio.sleep(0.05)
     gate.set()
     await idle(qm)
-    photo, document = (t["prompt"] for t in later_turns)
-    assert photo[0]["text"].startswith("what is it?\n\nUser attached 1 image(s)") and photo[1]["kind"] == "image"
-    assert document[1] == {"type": "media_ref", "kind": "document", "path": f"data/{USER}/documents/report.pdf", "title": "report.pdf"}
+    (turn,) = later_turns  # one turn for both, each picture inside its message's tags
+    head, image, middle, document, tail = turn["prompt"]
+    assert head["text"].startswith(f'{inbox.COMBINED_HEAD.format(count=2)}\n\n<message n="1">\nwhat is it?\n\nUser attached 1 image(s)')
+    assert image["kind"] == "image" and image["path"].endswith("_v.jpg")
+    assert middle["text"].startswith('</message>\n\n<message n="2">\nUser sent a PDF: report.pdf')
+    assert document == {"type": "media_ref", "kind": "document", "path": f"data/{USER}/documents/report.pdf", "title": "report.pdf"}
+    assert tail == {"type": "text", "text": "</message>"}
     assert sorted(bot.downloads) == ["d", "p1"]
 
 
@@ -747,10 +768,11 @@ async def test_messages_sent_during_a_turn_are_prepared_two_at_a_time(monkeypatc
     for i in range(10):
         await messages.on_voice(msg(100 + i, voice={"file_id": f"v{i}", "file_unique_id": f"u{i}", "duration": 3}), bot, USER)
     await asyncio.sleep(0.1)
-    gate.set()  # the turn ends: the rest are leftovers awaited by their own turns, still two at a time
+    gate.set()  # the turn ends: the rest are leftovers awaited by the next turn, still two at a time
     await idle(qm)
     assert live["max"] == 2 and messages.PREPARE_SLOTS == 2
-    assert quiet_media.transcribe.await_count == 10 and len(later_turns) == 10
+    assert quiet_media.transcribe.await_count == 10 and len(later_turns) == 1
+    assert later_turns[0]["prompt"].count("(voice message, transcribed) words") == 10
 
 
 async def test_two_documents_of_the_same_name_are_never_downloaded_at_once(monkeypatch, qm, later_turns, quiet_media):
@@ -781,7 +803,7 @@ async def test_two_documents_of_the_same_name_are_never_downloaded_at_once(monke
     gate.set()
     await idle(qm)
     assert bot.downloads == ["d1", "d2"] and peak["value"] == 1
-    assert len(later_turns) == 2
+    assert len(later_turns) == 1 and turn_prompt_text(later_turns[0]).count("report.pdf") >= 2
 
 
 async def test_slash_cancel_stops_preparing_the_messages_requeued_from_a_turn(monkeypatch, qm, later_turns, quiet_media):
@@ -799,7 +821,7 @@ async def test_slash_cancel_stops_preparing_the_messages_requeued_from_a_turn(mo
     async def behaviour(kw, prompt, update_status):
         started.set()
         await gate.wait()
-        return "Done.", []  # never drains: both voice notes become turns of their own
+        return "Done.", []  # never drains: both voice notes become the next turn
 
     use_agent(monkeypatch, behaviour)
     bot = FakeBot()
@@ -809,12 +831,12 @@ async def test_slash_cancel_stops_preparing_the_messages_requeued_from_a_turn(mo
         await messages.on_voice(msg(11 + i, voice={"file_id": f"v{i}", "file_unique_id": f"u{i}", "duration": 3}), bot, USER)
     gate.set()
 
-    def leftovers_queued() -> bool:
+    def leftovers_running() -> bool:
         status = qm.status(USER)
-        return inbox.current(USER) is None and status.current is not None and status.current.label == messages.VOICE_KIND and status.pending == 1
+        return inbox.current(USER) is None and status.current is not None and status.current.label == "2 messages" and status.pending == 0
 
-    await until(leftovers_queued)  # the first awaits its transcription, the second waits behind it
-    assert await messages._cancel_for(USER) == "🛑 Stopped the current task and dropped 1 queued message(s)."
+    await until(leftovers_running)  # one turn for both, awaiting their transcriptions
+    assert await messages._cancel_for(USER) == "🛑 Stopped the current task."
     release.set()
     await idle(qm)
     await asyncio.sleep(0.05)
@@ -873,8 +895,8 @@ async def test_a_failed_turn_record_keeps_them_too(monkeypatch, qm):
 
 
 async def test_a_quiet_task_that_read_a_message_stays_quiet_and_requeues_it(monkeypatch, qm, later_turns):
-    """The task's run says nothing; the message it read gets a turn of its own on its prepared
-    prompt, ahead of a message the run did not read and of one sent after it."""
+    """The task's run says nothing; the message it read and the one it did not read become the next
+    turn together, on their prepared prompts, ahead of one sent after it."""
     started, gate, read, finish = asyncio.Event(), asyncio.Event(), asyncio.Event(), asyncio.Event()
 
     async def behaviour(kw, prompt, update_status):
@@ -907,8 +929,8 @@ async def test_a_quiet_task_that_read_a_message_stays_quiet_and_requeues_it(monk
     assert result.quiet is True and result.response == ""
     # the run sent nothing but its status line (which it removes): no answer of its own
     assert [kw["text"] for kw in bot.of("send_message")] == [agent_runner.THINKING] and bot.of("send_rich_message") == []
-    assert [t["prompt"] for t in later_turns] == ["are you there?", "and this", "sent after it"]
-    assert [t["reply_to_message_id"] for t in later_turns] == [11, 12, 13]
+    assert [t["prompt"] for t in later_turns] == [combined("are you there?", "and this"), "sent after it"]
+    assert [t["reply_to_message_id"] for t in later_turns] == [11, 13]
 
 
 async def test_a_quiet_task_nobody_wrote_to_stays_quiet(monkeypatch):
@@ -999,3 +1021,250 @@ async def test_a_follow_up_button_joins_the_running_turn_and_retry_queues(monkey
     assert [t["prompt"] for t in later_turns] == ["old"]  # Retry queued and ran after the turn
     echo = next(kw for kw in bot.of("send_message") if kw["text"] == "💬 Make it shorter")
     assert echo and bot.reactions()[0][1] == "👀"
+
+
+# ---- the message window: messages sent together are one turn ---------------------------------------------------
+FORWARDED = {"type": "user", "date": 1760700000, "sender_user": {"id": 99, "is_bot": False, "first_name": "Bob"}}
+PREAMBLE = "[Forwarded from Bob (2025-10-17 11:20 UTC)]"
+
+
+@pytest.fixture
+def window(monkeypatch) -> float:
+    """The message window on (tests/conftest.py turns it off for the rest): 0.15 s, 2 s at most."""
+    monkeypatch.setattr(messages, "MESSAGE_WINDOW", 0.15)
+    monkeypatch.setattr(messages, "MESSAGE_WINDOW_MAX", 2.0)
+    return 0.15
+
+
+def forwarded(message_id: int, text: str, **fields) -> Message:
+    return msg(message_id, text=text, forward_origin=FORWARDED, **fields)
+
+
+def voice(message_id: int) -> Message:
+    return msg(message_id, voice={"file_id": f"v{message_id}", "file_unique_id": f"u{message_id}", "duration": 3})
+
+
+def message_count(prompt) -> int:
+    from agents import content
+
+    text = content.prompt_text(prompt)
+    return text.count("<message n=") if text.startswith(inbox.COMBINED_HEAD.split("{")[0]) else 1
+
+
+async def test_a_comment_and_the_messages_it_forwards_are_one_turn(qm, later_turns, window):
+    bot = FakeBot()
+    # "forward with a comment" in Telegram: the comment, then each forwarded message, all at once
+    await asyncio.gather(
+        messages.on_text(msg(10, text="what do you think about this?"), bot, USER),
+        messages.on_text(forwarded(11, "the deploy is broken"), bot, USER),
+        messages.on_text(forwarded(12, "since yesterday"), bot, USER),
+    )
+    assert later_turns == [] and not qm.is_busy(USER)  # still collecting
+    assert bot.reactions() == [(10, "👀"), (11, "👀"), (12, "👀")]  # the first one too, once the second came
+    assert [a["action"] for a in bot.actions] == ["typing"]  # for the first message
+    await until(lambda: later_turns)
+    await idle(qm)
+    (turn,) = later_turns
+    assert turn["prompt"] == combined(
+        "what do you think about this?", f"{PREAMBLE}\n\nthe deploy is broken", f"{PREAMBLE}\n\nsince yesterday",
+    )
+    assert turn["reply_to_message_id"] == 10 and turn["speak"] is False and qm.notices == []
+    # one status line counting them, handed to the turn as its status
+    assert len(bot.of("send_message")) == 1 and turn["status"] is not None
+    assert bot.texts()[-1] == messages.WINDOW_STATUS.format(count=3)
+
+
+async def test_one_message_waits_out_the_window_then_runs_as_always(qm, later_turns, window):
+    bot = FakeBot()
+    await messages.on_text(msg(10, text="hello"), bot, USER)
+    assert later_turns == [] and bot.calls == [] and [a["action"] for a in bot.actions] == ["typing"]  # no 👀, no count
+    await until(lambda: later_turns)
+    await idle(qm)
+    assert [(t["prompt"], t["reply_to_message_id"], t.get("status")) for t in later_turns] == [("hello", 10, None)]
+
+
+async def test_each_message_extends_the_window_up_to_its_limit(monkeypatch, qm, later_turns):
+    monkeypatch.setattr(messages, "MESSAGE_WINDOW", 0.3)
+    monkeypatch.setattr(messages, "MESSAGE_WINDOW_MAX", 2.0)
+    bot = FakeBot()
+    for i in range(3):  # 0.15 s apart, each within 0.3 s of the one before: still one window
+        await messages.on_text(msg(10 + i, text=f"part {i}"), bot, USER)
+        await asyncio.sleep(0.15)
+    assert later_turns == []  # 0.45 s after the first message, 0.15 after the last
+    await until(lambda: later_turns)
+    assert [t["prompt"] for t in later_turns] == [combined("part 0", "part 1", "part 2")]
+
+    later_turns.clear()
+    monkeypatch.setattr(messages, "MESSAGE_WINDOW_MAX", 0.5)
+    for i in range(8):  # one every 0.15 s for more than a second: the window closes at its limit
+        await messages.on_text(msg(30 + i, text=f"more {i}"), bot, USER)
+        await asyncio.sleep(0.15)
+    await until(lambda: sum(message_count(t["prompt"]) for t in later_turns) == 8)
+    await idle(qm)
+    assert len(later_turns) >= 2 and all(message_count(t["prompt"]) < 8 for t in later_turns)
+    from agents import content
+
+    sent = "\n".join(content.prompt_text(t["prompt"]) for t in later_turns)
+    assert [sent.index(f"more {i}") for i in range(8)] == sorted(sent.index(f"more {i}") for i in range(8))
+
+
+async def test_the_window_keeps_the_order_they_were_sent_in(qm, later_turns, window):
+    bot = FakeBot()
+    await messages.on_text(msg(12, text="second"), bot, USER)  # e.g. a forum message whose handler ran later
+    await messages.on_text(msg(11, text="first"), bot, USER)
+    await until(lambda: later_turns)
+    assert later_turns[0]["prompt"] == combined("first", "second") and later_turns[0]["reply_to_message_id"] == 11
+
+
+async def test_a_message_for_a_running_turn_joins_it_at_once(monkeypatch, qm, later_turns, window):
+    started, gate, drained = asyncio.Event(), asyncio.Event(), {}
+
+    async def behaviour(kw, prompt, update_status):
+        started.set()
+        await gate.wait()
+        drained["blocks"] = await kw["inbox"].drain()
+        return "Done.", []
+
+    use_agent(monkeypatch, behaviour)
+    bot = FakeBot()
+    await qm.submit(turn_job(bot))
+    await started.wait()
+    typing = len(bot.actions)
+    await messages.on_text(msg(11, text="also this"), bot, USER)
+    assert bot.reactions() == [(11, "👀")] and len(bot.actions) == typing  # joined: no window
+    gate.set()
+    await idle(qm)
+    assert "also this" in texts_of(drained["blocks"])[0] and later_turns == []
+
+
+async def test_a_window_hands_its_messages_to_a_turn_of_their_topic_that_started_meanwhile(monkeypatch, qm, later_turns, window):
+    started, gate, drained = asyncio.Event(), asyncio.Event(), {}
+
+    async def behaviour(kw, prompt, update_status):
+        started.set()
+        await gate.wait()
+        drained["blocks"] = await kw["inbox"].drain()
+        return "Done.", []
+
+    class Bot(FakeBot):
+        count_line = None
+
+        async def send_message(self, **kw):
+            sent = await super().send_message(**kw)
+            if kw["text"].startswith("📥"):
+                self.count_line = sent.message_id
+            return sent
+
+    use_agent(monkeypatch, behaviour)
+    bot = Bot()
+    await messages.on_text(msg(10, text="first"), bot, USER)  # opens the window
+    await qm.submit(turn_job(bot))  # a turn of the same chat starts meanwhile (e.g. a scheduled task)
+    await started.wait()
+    await messages.on_text(msg(11, text="second"), bot, USER)
+    assert not inbox.current(USER).has_pending()  # an earlier message waits in the window: this one waits with it
+    await until(lambda: inbox.current(USER).has_pending())  # the window closed into the running turn
+    gate.set()
+    await idle(qm)
+    texts = texts_of(drained["blocks"])
+    assert "first" in texts[0] and "second" in texts[1] and later_turns == []
+    assert bot.count_line in [kw["message_id"] for kw in bot.of("delete_message")]  # the turn has its own status
+
+
+async def test_slash_cancel_drops_the_messages_in_the_window(qm, later_turns, quiet_media, window):
+    release = asyncio.Event()
+
+    async def transcribe(path):
+        await release.wait()
+        return "words"
+
+    quiet_media.transcribe.side_effect = transcribe
+    bot = FakeBot()
+    await messages.on_voice(voice(10), bot, USER)
+    await messages.on_text(msg(11, text="and this"), bot, USER)
+    await until(lambda: quiet_media.transcribe.await_count == 1)  # prepared from the second message on
+    await until(lambda: any(t.startswith("📥") for t in bot.texts()))
+    assert await messages._cancel_for(USER) == "🛑 Dropped 2 queued message(s)."
+    release.set()
+    await asyncio.sleep(window * 3)
+    assert later_turns == [] and not qm.is_busy(USER)
+    assert not [t for t in bot.texts() if "Transcription" in t]  # its preparation was stopped
+    assert bot.texts()[-1] == messages.WINDOW_CANCELLED
+
+
+async def test_messages_sent_together_while_a_turn_works_are_one_queued_turn(monkeypatch, qm, later_turns, window):
+    started = asyncio.Event()
+
+    async def behaviour(kw, prompt, update_status):
+        started.set()
+        await asyncio.sleep(30)
+
+    use_agent(monkeypatch, behaviour)
+    bot = FakeBot()
+    await qm.submit(turn_job(bot, thread_id=5))
+    await started.wait()
+    await asyncio.gather(*(messages.on_text(msg(10 + i, topic=9, text=f"part {i}"), bot, USER) for i in range(3)))
+    await until(lambda: qm.status(USER).pending == 1)  # the window closed: ONE queued turn
+    assert qm.notices == [10]  # one busy notice, on the first of them
+    assert await messages._cancel_for(USER) == "🛑 Stopped the current task and dropped 1 queued message(s)."
+    await idle(qm)
+    await until(lambda: messages.WINDOW_CANCELLED in bot.texts())  # the count line says so
+    assert later_turns == []
+
+
+async def test_a_comment_waits_for_the_album_sent_with_it(monkeypatch, qm, later_turns, quiet_media, window):
+    monkeypatch.setattr(messages, "MEDIA_GROUP_TIMEOUT", 0.4)
+    waiting = SimpleNamespace(message_id=900, edit_text=AsyncMock(), delete=AsyncMock())
+    monkeypatch.setattr(messages, "answer_md", AsyncMock(return_value=waiting))
+    bot = FakeBot({"p1": png_bytes(), "p2": png_bytes()})
+    await messages.on_text(msg(10, text="look at these"), bot, USER)
+    for i, file_id in enumerate(("p1", "p2")):
+        photo = [{"file_id": file_id, "file_unique_id": f"{file_id}u", "width": 10, "height": 10}]
+        await messages.on_photo(msg(20 + i, photo=photo, media_group_id="g1"), bot, USER)
+    await asyncio.sleep(window * 2)
+    assert later_turns == []  # the window waits for the album
+    await until(lambda: later_turns)
+    await idle(qm)
+    (turn,) = later_turns
+    blocks = turn["prompt"]
+    assert [b["type"] for b in blocks] == ["text", "media_ref", "media_ref", "text"]
+    assert blocks[0]["text"].startswith(
+        f'{inbox.COMBINED_HEAD.format(count=2)}\n\n<message n="1">\nlook at these\n</message>\n\n<message n="2">\nUser sent 2 photo(s).'
+    )
+    assert blocks[-1] == {"type": "text", "text": "</message>"}
+    assert waiting.delete.await_count == 1  # the count line replaces "waiting for images"
+
+
+async def test_voice_messages_sent_together_are_echoed_and_answered_by_voice(qm, later_turns, quiet_media, window):
+    bot = FakeBot()
+    await messages.on_voice(voice(10), bot, USER)
+    await messages.on_voice(voice(11), bot, USER)
+    await until(lambda: later_turns)
+    await idle(qm)
+    (turn,) = later_turns
+    heard = "(voice message, transcribed) call mom tonight"
+    assert turn["prompt"] == combined(heard, heard) and turn["speak"] is True  # all of them voice: a voice answer
+    assert len([t for t in bot.texts() if "Transcription" in t]) == 2 and quiet_media.transcribe.await_count == 2
+
+
+def test_combine_wraps_each_message_and_keeps_its_media_inside_its_tags():
+    from agents import content
+
+    one = Prepared(prompt="hello")
+    assert inbox.combine([one]) is one
+    photo = Prepared(prompt=[content.text_block("User sent 1 photo(s)."), content.image_ref("images/a_v.jpg")])
+    spoken = Prepared(prompt="call mom", inject="(voice message, transcribed) call mom", speak=True)
+    failed = Prepared(prompt=None, kind="voice message", reason="it could not be transcribed", error_text="❌ Failed")
+    out = inbox.combine([one, photo, spoken, failed])
+    assert out.ok and out.speak is False and out.label == "4 messages"
+    head, image, tail = out.prompt
+    assert head["text"] == f'{inbox.COMBINED_HEAD.format(count=4)}\n\n<message n="1">\nhello\n</message>\n\n<message n="2">\nUser sent 1 photo(s).'
+    assert image == content.image_ref("images/a_v.jpg")
+    assert tail["text"] == (
+        '</message>\n\n<message n="3">\n(voice message, transcribed) call mom\n</message>\n\n'
+        '<message n="4">\n(the user sent a voice message that could not be processed: it could not be transcribed)\n</message>'
+    )
+
+
+def test_combine_of_nothing_usable_reports_their_errors():
+    out = inbox.combine([Prepared(prompt=None, error_text="❌ A"), Prepared(prompt=None, error_text="❌ A"), Prepared(prompt=None, error_text="❌ B")])
+    assert not out.ok and out.error_text == "❌ A\n❌ B"
