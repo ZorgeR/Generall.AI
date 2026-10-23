@@ -788,6 +788,20 @@ async def prepare_text(bot: Bot, message: Message, user_id: str) -> Prepared:
     return Prepared(prompt=with_reference(message.text or "", message, _bot_id(bot)), kind=TEXT_KIND, label=TEXT_KIND)
 
 
+def _answer_item(message: Message, bot: Bot, user_id: str, limit: int | None, thread_id: int | None) -> inbox.InboxItem | None:
+    """A typed answer to a waiting question, delivered to the running turn of its topic (the turn
+    that asked); None when there is none to take it. No 👀: the question shows "Answered in text",
+    and ✍ follows once the agent read it. No suspension point: the caller settles the question next."""
+    target = inbox.current(user_id)
+    if target is None or not target.accepts(thread_id):
+        return None
+    return inject(
+        target, bot, user_id, limit, chat_id=message.chat.id, thread_id=thread_id, message_id=message.message_id,
+        sent_at=message.date, label=TEXT_KIND, kind=TEXT_KIND, error_text="❌ Error processing text message",
+        prepared=Prepared(prompt=with_reference(message.text or "", message, _bot_id(bot)), kind=TEXT_KIND, label=TEXT_KIND),
+    )
+
+
 async def _run_text(bot: Bot, message: Message, user_id: str, limit: int | None, ctx: JobContext) -> None:
     await run_turn(
         bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=with_reference(message.text or "", message, _bot_id(bot)),
@@ -801,8 +815,14 @@ async def on_text(message: Message, bot: Bot, user_id: str, limit: int | None = 
     _stats().track_message_received(user_id, "text")
     thread_id = _thread_id(message)
     if questions.waiting_in(message.chat.id, thread_id):
-        # An ask_user_choice question waits here: the text is its answer, not a new request.
-        if await questions.answer_in_text(bot, message.chat.id, thread_id, message.text or ""):
+        # An ask_user_choice question waits here: the text is its answer, not a new request. It
+        # reaches the turn as a message of its own, read right after the tool results; the tool
+        # result only points at it (never quote the user inside a tool result).
+        item = _answer_item(message, bot, user_id, limit, thread_id)
+        if await questions.answer_in_text(bot, message.chat.id, thread_id, message.text or "", delivered=item is not None):
+            return
+        if item is not None:
+            await inbox.mark_seen(item)  # the question was gone after all: an ordinary message of the turn
             return
     await accept(
         message, bot, user_id, limit, label=TEXT_KIND, kind=TEXT_KIND, error_text="❌ Error processing text message",

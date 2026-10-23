@@ -944,7 +944,10 @@ async def test_a_quiet_task_nobody_wrote_to_stays_quiet(monkeypatch):
 
 
 # ---- a waiting ask_user_choice question takes a typed answer ----------------------------------------------------
-async def test_a_typed_text_answers_the_waiting_question_instead_of_joining_the_turn(qm, env, later_turns):
+async def test_a_typed_text_answers_the_waiting_question_as_a_message_of_the_turn(qm, env, later_turns):
+    """The typed answer settles the question, and its words reach the turn as a <user_message> of their
+    own, read right after the tool results: the tool result only points at it (the model resists
+    instructions inside a tool result, so a reply quoted there could be ignored)."""
     box = inbox.open_inbox(USER, None)
     bot = FakeBot()
     task = asyncio.create_task(questions.ask(ChatSender(bot, 42, rich=False), "Which one?", ["A", "B"], 60))
@@ -953,11 +956,51 @@ async def test_a_typed_text_answers_the_waiting_question_instead_of_joining_the_
     assert not task.done()
     await messages.on_text(msg(12, text="neither, use C"), bot, USER)
     answer = await task
-    assert answer == "neither, use C" and answer.tapped is False
+    assert answer == "neither, use C" and answer.tapped is False and answer.delivered is True
+    assert questions.typed_result(answer) == questions.TYPED_DELIVERED and "use C" not in questions.typed_result(answer)
+    assert bot.reactions() == []  # no 👀: the question itself shows "Answered in text"
+    blocks = await box.drain()
+    assert len(blocks) == 1 and blocks[0]["text"].startswith('<user_message sent_during_turn="true"')
+    assert "neither, use C" in blocks[0]["text"] and box.drained_user_texts == ["neither, use C"]
+    await until(lambda: bot.reactions() == [(12, inbox.READ_REACTION)])  # ✍ once read
     await idle(qm)
-    assert not box.has_pending() and [t["prompt"] for t in later_turns] == ["not here"]  # the other topic: a turn
+    assert [t["prompt"] for t in later_turns] == ["not here"]  # the other topic: a turn
     assert questions.final_text(SimpleNamespace(question="Which one?"), questions.TYPED_LINE) in bot.texts()
     assert [c for c in env.calls if c[0] == "track_message_received"] == [("track_message_received", (USER, "text"))] * 2
+    inbox.finish(box, discard=True)
+
+
+async def test_a_typed_answer_without_a_turn_to_take_it_stays_in_the_tool_result(qm, env, later_turns):
+    """No running turn of that topic (the question outlived it, a test without one): the text is the
+    tool's result as before, and it is not queued as a turn of its own either."""
+    bot = FakeBot()
+    task = asyncio.create_task(questions.ask(ChatSender(bot, 42, rich=False), "Which one?", ["A", "B"], 60))
+    await until(lambda: questions.waiting_in(42, None) is not None)
+    await messages.on_text(msg(12, text="neither, use C"), bot, USER)
+    answer = await task
+    assert answer.delivered is False and questions.typed_result(answer) == 'User answered in text instead of tapping a button: "neither, use C"'
+    await idle(qm)
+    assert later_turns == [] and inbox.current(USER) is None
+
+
+async def test_a_typed_answer_to_a_question_that_just_ended_joins_the_turn_as_a_message(qm, env, later_turns, monkeypatch):
+    """The question went away between the check and the answer (a timeout, a tap): the text, already
+    handed to the turn, stays an ordinary message of it, with 👀."""
+    box = inbox.open_inbox(USER, None)
+    bot = FakeBot()
+    monkeypatch.setattr(questions, "waiting_in", lambda chat_id, thread_id: object())
+
+    async def gone(*a, **k):
+        return False
+
+    monkeypatch.setattr(questions, "answer_in_text", gone)
+    await messages.on_text(msg(12, text="and C too"), bot, USER)
+    assert bot.reactions() == [(12, inbox.SEEN_REACTION)]
+    blocks = await box.drain()
+    assert len(blocks) == 1 and "and C too" in blocks[0]["text"]
+    await idle(qm)
+    assert later_turns == []
+    inbox.finish(box, discard=True)
 
 
 async def test_the_tool_reports_a_typed_answer_and_a_tap_as_before(monkeypatch):
@@ -973,6 +1016,10 @@ async def test_the_tool_reports_a_typed_answer_and_a_tap_as_before(monkeypatch):
     args = {"question": "Which one?", "options": ["A", "B"]}
     assert await tools.execute_tool("ask_user_choice", args) == 'User answered in text instead of tapping a button: "use C"'
     assert await tools.execute_tool("ask_user_choice", args) == 'User chose: "A"'
+    script.append(questions.Answer("use C", tapped=False, delivered=True))  # the text went to the turn as a message
+    assert await tools.execute_tool("ask_user_choice", args) == questions.TYPED_DELIVERED
+    assert questions.Answer("A", tapped=True, delivered=True).delivered is False  # a tap carries no message
+
 
 
 async def test_a_tap_resolves_with_a_tapped_answer():

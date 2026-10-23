@@ -21,10 +21,14 @@ message run concurrently, so several questions may be pending in one chat.
 A user may type instead of tapping: while a question waits in a chat (and forum
 topic), a plain text message there answers it (``answer_in_text``, called by the text
 handler before the message could join the running turn): the newest waiting
-question gets the text, its message ends as "💬 Answered in text", and the tool call
-reads ``User answered in text instead of tapping a button: "<text>"``. ``ask`` returns
-an ``Answer``: the option or the text, with ``tapped`` telling which, so a tool that
-must only act on a tap (``browser_confirm``) can tell a typed "yes" from the button.
+question gets the text and its message ends as "💬 Answered in text". The user's words
+never go inside the tool result: the handler delivers the text to the running turn as a
+message of its own (``delivered``), which the agent reads right after the tool results, and
+the tool call only reads ``TYPED_DELIVERED`` (the model resists instructions inside tool
+results, so a reply quoted there could be ignored). Without a running turn to take it the
+tool reads ``User answered in text instead of tapping a button: "<text>"`` as before.
+``ask`` returns an ``Answer``: the option or the text, with ``tapped`` telling which, so a
+tool that must only act on a tap (``browser_confirm``) can tell a typed "yes" from the button.
 No import-time side effects and no ``agents`` imports.
 """
 from __future__ import annotations
@@ -77,6 +81,10 @@ CANCELLED_LINE = "🛑 Cancelled"
 EXPIRED_LINE = "⌛ This question has expired."
 TYPED_LINE = "💬 Answered in text"
 TYPED_RESULT = 'User answered in text instead of tapping a button: "{}"'
+TYPED_DELIVERED = (
+    "User answered in text instead of tapping a button: their message follows the tool results "
+    "(a <user_message> block); read it as their reply to this question"
+)
 MAX_TYPED = 4000  # characters of a typed answer handed to the tool
 
 _CALLBACK_RE = re.compile(r"ask_([0-9a-f]{8})_(\d{1,2})")
@@ -84,18 +92,24 @@ _CALLBACK_RE = re.compile(r"ask_([0-9a-f]{8})_(\d{1,2})")
 
 class Answer(str):
     """What ``ask`` returns: the option the user tapped (``tapped`` True) or the text they typed
-    instead (``tapped`` False). It is the string itself, so ``answer == option`` keeps working."""
+    instead (``tapped`` False). It is the string itself, so ``answer == option`` keeps working.
+    ``delivered``: the typed text also reached the running turn as a message of its own."""
 
     tapped: bool
+    delivered: bool
 
-    def __new__(cls, value: str, *, tapped: bool) -> "Answer":
+    def __new__(cls, value: str, *, tapped: bool, delivered: bool = False) -> "Answer":
         answer = super().__new__(cls, value)
         answer.tapped = bool(tapped)
+        answer.delivered = bool(delivered) and not answer.tapped
         return answer
 
 
 def typed_result(answer: str) -> str:
-    """The tool result for a typed answer."""
+    """The tool result for a typed answer: a pointer to the user's message when it was delivered
+    to the turn, else (no running turn took it) the text itself. No final period."""
+    if getattr(answer, "delivered", False):
+        return TYPED_DELIVERED
     return TYPED_RESULT.format(answer)
 
 
@@ -173,15 +187,16 @@ def waiting_in(chat_id: int, thread_id: int | None) -> PendingQuestion | None:
     return max(waiting, key=lambda p: p.created_at) if waiting else None
 
 
-def resolve_text(chat_id: int, thread_id: int | None, text: str) -> PendingQuestion | None:
-    """Answer the newest waiting question of that chat and topic with typed ``text``; the question, or None."""
+def resolve_text(chat_id: int, thread_id: int | None, text: str, *, delivered: bool = False) -> PendingQuestion | None:
+    """Answer the newest waiting question of that chat and topic with typed ``text``; the question, or None.
+    ``delivered``: the caller handed the text to the running turn as a message of its own."""
     text = (text or "").strip()
     pending = waiting_in(chat_id, thread_id) if text else None
     if pending is None:
         return None
     if len(text) > MAX_TYPED:
         text = text[: MAX_TYPED - 1] + "…"
-    pending.future.set_result(Answer(text, tapped=False))
+    pending.future.set_result(Answer(text, tapped=False, delivered=delivered))
     return pending
 
 
@@ -192,12 +207,14 @@ class _MessageRef:
         self.message_id = message_id
 
 
-async def answer_in_text(bot, chat_id: int, thread_id: int | None, text: str) -> bool:
+async def answer_in_text(bot, chat_id: int, thread_id: int | None, text: str, *, delivered: bool = False) -> bool:
     """A plain text message answers the question waiting there (the text handler calls this first).
 
-    True when it did: the tool call wakes with the text and the question loses its buttons.
+    True when it did: the tool call wakes with the text and the question loses its buttons. The
+    answer is settled before the first await, so a caller that delivered the text to the turn just
+    before (``delivered``) knows at once which way it went.
     """
-    pending = resolve_text(chat_id, thread_id, text)
+    pending = resolve_text(chat_id, thread_id, text, delivered=delivered)
     if pending is None:
         return False
     from bot.sender import ChatSender  # no import-time side effects either way

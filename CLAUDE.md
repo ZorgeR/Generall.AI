@@ -10,7 +10,7 @@ A single-process Python Telegram bot (aiogram 3, asyncio) that wraps a Claude
 tool-use agent. Users send text / voice / photos / video / audio / documents in
 Telegram; the bot builds a prompt of content blocks (text, plus the photos and PDFs
 themselves as image/document blocks, with the replied-to or forwarded message quoted
-in front), runs a per-message agent loop with 50 built-in tools (files, web search and
+in front), runs a per-message agent loop with 51 built-in tools (files, web search and
 a headless page reader, code execution in a persistent per-user Docker sandbox, image/video
 generation, documents out as pdf/docx/xlsx, reminders and scheduled tasks in the user's time
 zone, SMS, S3, TTS, button questions, a user profile, the sandbox status, background tasks) plus Anthropic's
@@ -50,7 +50,7 @@ the browser server inside the container (`test_browser_server.py`), the browser 
 message window and `inbox.combine`; `test_mode.py`: what the agent reads before its first model call;
 `test_background_tasks.py`: the background host, notifications and notification turns; `test_live_turn_loop.py`:
 injection at tool boundaries and the background watcher in the agent loop; `test_task_tools.py`;
-`test_transcript_live_turn.py`: tool-result messages with injected blocks), and how these features meet
+`test_transcript_live_turn.py`: tool-result messages with injected blocks, system notices), and how these features meet
 (`tests/test_cross_features.py`).
 `tests/conftest.py` sets `MESSAGE_WINDOW_SECONDS=0` for the whole run (handlers queue or inject at once); the
 window's tests turn it on with `monkeypatch.setattr(messages, "MESSAGE_WINDOW", …)`.
@@ -84,13 +84,17 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
                             requeue (the user items as ONE turn: InboxItem.requeue_group) / drop / discard / reset;
                             combine(list[Prepared]) → one Prepared (COMBINED_HEAD + <message n="i"> per message, media refs
                             inside the tags; speak only when all speak); reactions mark_seen 👀 and
-                            ✍ once drained; SENT_WHILE_WORKING "[Sent while I was working]"
+                            ✍ once drained; SENT_WHILE_WORKING "[Sent while I was working]"; a TASK item's future may give
+                            a callable (the notice, rendered at drain time)
     background.py           live turns: BackgroundHost per user (host_for binds bot/chat/topic each turn): adopts tool calls
                             the agent loop moved to the background (ids t1, t2, … per user, MAX_BACKGROUND_TASKS 4 running
-                            in all topics), running / list / cancel (the bound turn's topic only), cancel_all, cancel_turn
-                            (a failed turn's adoptions); a finished call → notification_blocks (<task_notification>) to the
-                            running turn of its topic, else a queued "background task finished" turn (submit_notification,
-                            NOTIFICATION_PROMPT, quiet marker); shutdown() (also refuses and cancels later adoptions)
+                            in all topics), running / list / cancel / unread / read (the bound turn's topic only), cancel_all,
+                            cancel_turn (a failed turn's adoptions); a finished call keeps its raw result on the record
+                            (read → result_blocks, what get_task_result returns) and sends only a notice of facts
+                            (notice_blocks: {"type": "system_notice", text: notice_text}, none once the result was read) to
+                            the running turn of its topic, else a queued "background task finished" turn
+                            (submit_notification(records), notification_prompt: NOTIFICATION_PROMPT with the facts, tasks
+                            read meanwhile left out, quiet marker); shutdown() (also refuses and cancels later adoptions)
     sender.py               ChatSender: the one object handlers AND tools use to send text/media/reactions;
                             send_markdown renders LLM answers as rich messages with tiered fallback
     rich.py                 rich-message helpers: split/convert (telegramify-markdown), inline media extraction,
@@ -145,7 +149,8 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
     questions.py            ask_user_choice backend: in-memory pending questions (Future per question, chat + topic), ask_*
                             callback data, rich button rows / inline keyboard, timeout and cancel outcomes; ask() returns an
                             Answer (str subclass, .tapped: a tap, or text typed instead: answer_in_text / resolve_text /
-                            waiting_in, typed_result)
+                            waiting_in, typed_result; .delivered: the typed text also went to the running turn as a
+                            message of its own → typed_result = TYPED_DELIVERED, a pointer, never the text)
     status.py               StatusMessage: rich status edited in place (progress blocks + Stop button → end-of-turn
                             summary with expandable tool calls, thinking, tokens/cost, action row; fail() = the error
                             text + Retry row through the same _final_edit fallbacks) with legacy-Markdown fallback
@@ -233,7 +238,10 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
                             persistence). The 4 system prompts live here; providers add their own instructions via
                             prompt_notes (the <capabilities> block). Live turns: _drain_inbox after each tool batch,
                             the background watcher (_watch_call, TOOL_BACKGROUND_AFTER_SECONDS, NEVER_BACKGROUND,
-                            background_placeholder), ChainOfThoughtAgent(inbox=, background=), with_messages_read (the
+                            background_placeholder), split_notices + notice_messages (the inbox's notice blocks → one
+                            {"role": "system"} message after the user message, or a <bot_notice> block for a model without
+                            them: models.supports_system_messages; _request_messages(messages, model) converts stored ones
+                            for such a model), ChainOfThoughtAgent(inbox=, background=), with_messages_read (the
                             question + what was read mid-turn: memory files, judge, critique)
     content.py              prompt / tool-result content blocks: text_block, image_ref, document_ref (stored media_ref
                             form), materialize (base64 image/document API blocks), prompt_text (text view), strip_media,
@@ -264,11 +272,14 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
     video_tools.py          VideoTools: Google Veo 3.1 text→video, image→video, extend, interpolate
     user_interactions.py    UserInteractions: mid-run Telegram messages, TTS voice, reactions, set_user_timezone,
                             schedule_reminder (local time, timezone, weekdays), send file from content,
-                            ask_user_choice (via bot/questions.py; a typed answer comes back as typed_result);
+                            ask_user_choice (via bot/questions.py; a typed answer comes back as typed_result: a pointer
+                            to the <user_message> that follows the tool results, or the text when no turn took it);
                             prompt_notes on zones and quiet scheduled tasks
-    task_tools.py           TaskTools (wait_for_tasks, list_tasks, cancel_task; static <live_turn> prompt_notes; registered
-                            only with a background host, inherit_to_subagents = False), the TurnInbox / BackgroundHost
-                            protocols the agent core codes against, CallState + in_background() (a ContextVar of the call)
+    task_tools.py           TaskTools (wait_for_tasks, get_task_result, list_tasks, cancel_task; static <live_turn>
+                            prompt_notes; registered only with a background host, inherit_to_subagents = False), the
+                            TurnInbox / BackgroundHost protocols the agent core codes against (host: unread / read too),
+                            NOTICE_BLOCK "system_notice" (an inbox block the agent core sends as a system message),
+                            CallState + in_background() (a ContextVar of the call)
     embeddings.py           ConversationEmbeddings: OpenAI text-embedding-3-small + FAISS IndexFlatIP (cosine) per user;
                             model-tagged metadata, stale detection, one background rebuild per user per process
     system_tools.py         SystemTools: apt/pip/service/network tools — NOT wired into the agent
@@ -280,7 +291,8 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
     trace.py                ToolTrace/ToolCall/TurnBudget: per-turn tool calls, token usage, shared tool budget;
                             on_late_usage (set after the turn's usage was recorded: later additions go there too)
     transcript.py           TranscriptStore + size control: one real API transcript per chat/topic (transcript mode);
-                            prune clears old tool results (old <task_notification> blocks too, to their opening tag) AND
+                            prune clears old tool results (old <task_notification> blocks of transcripts made before the
+                            system notices too, to their opening tag) AND
                             old media blocks (clear_old_media); answers_tool_call
                             (a user message whose FIRST block is a tool_result, injected blocks may follow) vs
                             is_tool_result_message (tool_result blocks only)
@@ -546,7 +558,8 @@ execution between host and sandbox.
   `messages._requeue_group` → `Job(seq=first.seq, from_user=True, label "N messages" for several)` running
   `_run_prepared` on the `Prepared`s they already have, put into one prompt by `inbox.combine`: nothing is
   downloaded or transcribed twice; a failed one is a note to the agent, all failed just sends their `error_text`;
-  one leftover is its own prompt as before), each task notification a notification turn (`background.submit_notification`). That
+  one leftover is its own prompt as before), each task notice a notification turn (`background.submit_notification`, none
+  when the result was read meanwhile). That
   happens after a normal end, a failure, Stop and the turn deadline (a Stop while `drain` is still reading a
   message leaves it a leftover: an item leaves the inbox only once read). `/cancel` drops them instead
   (`inbox.discard` runs before `queue.cancel`, so the cancelled turn finds its inbox closed), and so does
@@ -558,19 +571,28 @@ execution between host and sandbox.
   to `inbox.finish(read=…)` with the unread ones: one turn), so they get a real answer; the run itself stays silent.
 - **Live turns: background tool calls.** A call the agent loop moved to the background (see "The tool
   contract") belongs to the user's `BackgroundHost` (`bot/background.py`) from then on, across turns. When it
-  ends, its `<task_notification>` goes to the inbox of the user's running turn in the topic it was started from
-  (`inbox.deliver_task`); with none, it queues a "background task finished" turn: `Job(label "background task
-  result", thread_id)` → `_run_notification` → `run_turn(prompt=[NOTIFICATION_PROMPT, *notification blocks],
-  header=NOTIFICATION_HEADER, quiet_marker=QUIET_MARKER)` ("🔔 *Background task finished*"; `<no_update/>` keeps
-  it silent). Notifications that finish while that job is still queued join it (`_Batch`); a task the agent
-  cancelled itself (`cancel_task`) is reported to a running turn only. Like scheduled tasks, notification turns
+  ends, its raw result stays on its record until the agent reads it (`get_task_result`, or `wait_for_tasks` returns
+  it: `host.read` → `result_blocks`, text capped at the call's `max_chars`, images kept, always inside a
+  `tool_result`), and only a notice of facts announces the end ("The background task t3 (run_command) completed
+  after 42 s. Read its result with get_task_result (task_id "t3")."; failed: "Read the error …"; cancelled: no
+  read hint). The notice goes to the inbox of the user's running turn in the topic it was started from
+  (`inbox.deliver_task`; its blocks are built when drained, so a result read meanwhile gives none), and the agent
+  core sends it as a `system` message; with no such turn it queues a "background task finished" turn:
+  `Job(label "background task result", thread_id)` → `_run_notification` → `run_turn(prompt=notification_prompt(…)`
+  (`NOTIFICATION_PROMPT` with one "- The background task … completed after N s." line per task, a plain string),
+  `header=NOTIFICATION_HEADER, quiet_marker=QUIET_MARKER)` ("🔔 *Background task finished*"; `<no_update/>` keeps it
+  silent). Tasks that finish while that job is still queued join it (`_Batch.records`); one read before the job
+  starts is left out, and with none left there is no turn; a task the agent cancelled itself (`cancel_task`) is
+  reported to a running turn only. A turn with an unread result (`host.unread()`) or a notice never takes the
+  quick tool-less path (`_decide_complexity(needs_tools=…)`). Finished records are kept up to `MAX_LISTED` (20),
+  read ones pruned first. Like scheduled tasks, notification turns
   call no `track_message_received`. Stop never touches background tasks; `/cancel` cancels the user's silently
   and forgets a queued notification turn (`background.cancel_all`; the reply adds "cancelled N background
   task(s)"); a turn that fails cancels, silently, the ones it adopted itself (`host.cancel_turn(host.turn)`; a
   turn whose answer already went out keeps them), since its Retry starts them again; shutdown cancels everyone's
   (`background.shutdown`). The cap of 4 running tasks is per user, but the task tools see the running turn's
-  topic only (`running` / `list` / `cancel` filter on the topic `host_for` bound): `wait_for_tasks` in topic B
-  neither waits for nor lists a task of topic A.
+  topic only (`running` / `list` / `cancel` / `unread` / `read` filter on the topic `host_for` bound):
+  `wait_for_tasks` in topic B neither waits for, lists nor reads a task of topic A.
 - `/cancel` (and the busy notice's button) is `messages._cancel_for`: `inbox.discard`, `drop_windows`,
   `background.cancel_all`, then `QueueManager.cancel`, which cancels the running task and drops the queue (a
   queued job of several messages counts as one in the reply). The Stop buttons of a turn are
@@ -679,8 +701,10 @@ worker → _run_text → prompt = message_context.with_reference(text, message, 
        │     in this transcript), stored as the first block of the new user turn; _read_early_messages: ONE
        │     _drain_inbox before the first model call (what the user sent while the turn was starting; status step
        │     "reading your message"), its blocks go behind the question in this turn's user message (not sent yet, so
-       │     nothing stored changes); _decide_complexity on with_messages_read(question, inbox): mode auto AND
-       │     no media (refs or drained image/document blocks) → Haiku classifier (text view, context blocks excluded),
+       │     nothing stored changes), a task notice among them as a {"role": "system"} message right after it
+       │     (split_notices / notice_messages); _decide_complexity on with_messages_read(question, inbox): mode auto AND
+       │     no media (refs or drained image/document blocks) AND no notice or unread background result
+       │     (needs_tools: host.unread()) → Haiku classifier (text view, context blocks and system messages excluded),
        │     else "complex"; "simple" → tool-less Haiku answer on the FULL context (profile every time, the drained
        │     texts too); _build_user_message materializes the media refs
        │     (base64 image/document blocks, to_thread) behind the <context> text block; tool loop on the real
@@ -723,8 +747,11 @@ worker → _run_text → prompt = message_context.with_reference(text, message, 
        │        user message can be read from the inbox (has_user_messages: ready, not one still being
        │        prepared), and host.can_adopt() → host.adopt(task, …) and its tool_result is
        │        background_placeholder(tN) (trace: "moved to the background as tN")
-       │        then injected = _drain_inbox() (the user's messages and task notifications, ready head only, in
-       │        arrival order) and append ONE user msg = tool_results in block order + injected, stored as sent;
+       │        then injected, notices = split_notices(_drain_inbox()) (the user's messages and task notices, ready
+       │        head only, in arrival order) and append ONE user msg = tool_results in block order + injected (the
+       │        user's words never inside a tool_result), then the notices as ONE {"role": "system"} message
+       │        (facts only: no tool output; a <bot_notice> text block at the end of that user message instead for a
+       │        model without system messages, models.supports_system_messages), stored as sent;
        │        a message read → status step "reading your message" ("Reading your new message" / "… N new
        │        messages"); continue (cicles counts tool_use BLOCKS). Nothing is injected anywhere else in the loop:
        │        not after end_turn, not into judge/critique re-prompts or the SYSTEM NOTICE call (before the first
@@ -944,22 +971,24 @@ locked", is logged and the batch runs on; for a normal tool it becomes that tool
 Background calls (live turns: `AgentAnthropic.background` is the user's `BackgroundHost`, which `run_turn` passes
 on every turn, `takes_live_turn`): every normal call whose name is not in `NEVER_BACKGROUND` (`ask_user_choice`,
 `browser_confirm`, `browser_show_screenshot`, `send_user_telegram_message`, `set_message_reaction`,
-`send_voice_message` and the three task tools) runs as its own asyncio task, created in a copied context that carries a `task_tools.CallState`, and
+`send_voice_message` and the four task tools) runs as its own asyncio task, created in a copied context that carries a `task_tools.CallState`, and
 `_watch_call` waits for it. Once it has run `TOOL_BACKGROUND_AFTER_SECONDS` (30; 0 = never by time), or
 `BACKGROUND_ON_MESSAGE_AFTER` (3 s) while `inbox.has_user_messages()` (a message ready to read; one still being
 prepared does not count, the watcher polls every 0.5 s while `has_pending()`), and `host.can_adopt()` (fewer than 4
 running, not shutting down), the task is handed over: `host.adopt(task, tool_name, tool_use_id, display_args, started, max_chars)`
 returns `tN`, `CallState.background_id` is set (so `task_tools.in_background()` is true inside the call), the
-`tool_result` is `background_placeholder` ("Still running in the background as task tN (started HH:MM:SS UTC). Its
-result will arrive as a <task_notification> …") and the trace shows "moved to the background as tN". A full host
+`tool_result` is `background_placeholder` ("Still running in the background as task tN (started HH:MM:SS UTC). A
+system message will say when it has ended, … then read its result with get_task_result. …") and the trace shows
+"moved to the background as tN". A full host
 keeps the call in the foreground until it has room (re-checked every 0.5 s); a host that raises or returns no id
-leaves it there to its end (during shutdown the host cancels the task it refuses: the call ends as cancelled). The host gets the raw `execute_tool` result (or exception) and caps its text at the
-turn's `max_tool_result_chars` itself (`notification_blocks`: `<task_notification id= tool= status=
-completed|failed|cancelled elapsed=>`, images kept; a result starting with "Error" counts as failed). The call was
+leaves it there to its end (during shutdown the host cancels the task it refuses: the call ends as cancelled). The host gets the raw `execute_tool` result (or exception), keeps it, and caps its text at the
+turn's `max_tool_result_chars` itself when the agent reads it (`result_blocks`: "Result of the background task tN
+(<tool>) completed after N s:" + the text, images kept; a result starting with "Error" counts as failed); the end
+itself is announced by a notice of facts only, a `system` message (see "Queues"). The call was
 counted by `track_tool_used` when it started. Toolset members never go to the background. Without a host (tests,
 subagents) every call runs to its end as before.
 
-Effective tool list as the model sees it (after patching; 50 built-in tools, the browser toolset and the user's
+Effective tool list as the model sees it (after patching; 51 built-in tools, the browser toolset and the user's
 `mcp_*` ones; with no session manager there is no `sandbox_status` and no browser, with `browser.enabled` off no
 browser, with no background host no task tools: 44 at the least):
 
@@ -975,7 +1004,7 @@ browser, with no background host no task tools: 44 at the least):
 | ImageTools | `generate_image` (no `images` → generate, one → edit, several → compose; engine `auto`/`best`/`fast`/`story`), `generate_story_images` | bot process (SDK calls in worker threads), never sandboxed, delivers each result itself as a document, once |
 | VideoTools | `video_generator`, `image_to_video_generator`, `video_from_reference_images`, `video_interpolation_generator`, `video_extension_generator` | bot process (Veo in worker threads, async polling up to 5 min) |
 | SMSTools | `send_sms` | bot process, worker thread |
-| UserInteractions | `send_user_telegram_message`, `send_voice_message`, `set_message_reaction`, `set_user_timezone` (IANA name or city/country alias via `timezones.valid_zone`; saves settings `timezone.name` in to_thread and returns the user's local time, `Error: unknown time zone …` otherwise), `schedule_reminder` (reminder_text; reminder_time `YYYY-MM-DD HH:MM[:SS]` read in the user's zone, or in the optional `timezone` param, unless it carries a `Z`/`±HH:MM` offset, which wins; reminder_type user\|agent; is_periodic + period_type hourly\|daily\|weekly\|monthly + period_interval; `weekdays` [0=Mon..6=Sun] for daily periodic reminders only, the first run moved to an allowed day by `first_allowed_trigger`; stores UTC plus the zone; confirms in local time; user reminders fire with snooze buttons, agent tasks run as scheduled tasks and may answer `<no_update/>`), `send_file_content_to_user_via_telegram`, `ask_user_choice` (question + 2-8 option buttons, waits for the tap up to `timeout_seconds` 30..900, default 300; returns `User chose: "<option>"`, `User answered in text instead of tapping a button: "<text>"` when the user typed a plain text in that chat and topic instead, a no-answer notice or `Error: …`); its `prompt_notes` (static) tell the model to infer or ask for the zone once and save it, to schedule and confirm in local time, and to answer exactly `<no_update/>` on an uneventful scheduled run | bot process |
+| UserInteractions | `send_user_telegram_message`, `send_voice_message`, `set_message_reaction`, `set_user_timezone` (IANA name or city/country alias via `timezones.valid_zone`; saves settings `timezone.name` in to_thread and returns the user's local time, `Error: unknown time zone …` otherwise), `schedule_reminder` (reminder_text; reminder_time `YYYY-MM-DD HH:MM[:SS]` read in the user's zone, or in the optional `timezone` param, unless it carries a `Z`/`±HH:MM` offset, which wins; reminder_type user\|agent; is_periodic + period_type hourly\|daily\|weekly\|monthly + period_interval; `weekdays` [0=Mon..6=Sun] for daily periodic reminders only, the first run moved to an allowed day by `first_allowed_trigger`; stores UTC plus the zone; confirms in local time; user reminders fire with snooze buttons, agent tasks run as scheduled tasks and may answer `<no_update/>`), `send_file_content_to_user_via_telegram`, `ask_user_choice` (question + 2-8 option buttons, waits for the tap up to `timeout_seconds` 30..900, default 300; returns `User chose: "<option>"`, `TYPED_DELIVERED` ("User answered in text instead of tapping a button: their message follows the tool results (a <user_message> block); read it as their reply to this question") when the user typed a plain text in that chat and topic instead and the running turn took it as a message, `User answered in text instead of tapping a button: "<text>"` when no turn took it, a no-answer notice or `Error: …`); its `prompt_notes` (static) tell the model to infer or ask for the zone once and save it, to schedule and confirm in local time, and to answer exactly `<no_update/>` on an uneventful scheduled run | bot process |
 | SubagentTools | `run_subagent` (task, tools subset, model main/fast, max_tool_calls) | bot process: a fresh `AgentAnthropic` with the same providers (registered ones included), empty non-persisted context, budget slice of the parent's `TurnBudget`, trace depth 1; main agent only (a subagent has no `run_subagent`); model "main" is `ANTHROPIC_MODEL` whatever the mode |
 | VisionTools (registered, awaited) | `view_image` (path, max_px 128..2048, default `MAX_IMAGE_RESOLUTION_VISION`) → `[image block, text "<rel path> · WxH px (shown at wxh)"]` (JPEG/PNG/GIF/WebP within the limits and upright pass through unchanged, else re-encoded as JPEG); `describe_image` (path, question?, model anthropic\|openai) → text from `bot.media.describe_image_anthropic/openai` (temp JPEG in the system temp dir; the OpenAI call writes its own usage row); `read_document` (path, question?) → a PDF within the limits as `[document block, text "<name> · N pages"]`, else extracted text capped at `vision_tools.EXTRACTED_TEXT_CAP` (60000), unknown types through `describe_document` | bot process, never sandboxed; paths via `resolve_under` with images/downloads/documents fallbacks |
 | ProfileTools (registered, awaited) | `user_profile_read`, `user_profile_add(section, text)`, `user_profile_remove(section, needle)`, `user_profile_replace(section, old, new)`; needle = exact entry, a unique substring or a 1-based index; results = confirmation + the numbered section; registered always (the `profile` setting only gates the `<profile>` block in the context) | bot process, file I/O in to_thread |
@@ -984,7 +1013,7 @@ browser, with no background host no task tools: 44 at the least):
 | SandboxTools (registered, awaited; only while sessions are on) | `sandbox_status`: when the sandbox and the browser close if unused (user's local time), memory, open tabs, stored logins size, saved packages, whether the user was warned; its `prompt_notes` carry the sandbox facts (30 min idle, the warning, what persists, fresh bash per command, `nohup` for background jobs, filtered internet, apt/pip persistence) | bot process (`manager.status` in to_thread); inherited by subagents |
 | BrowserTools (registered, awaited; only with `browser.enabled`) | the browser toolset members (`navigate`, `screenshot`, `zoom`, `left_click`, `right_click`, `middle_click`, `double_click`, `triple_click`, `hover`, `left_click_drag`, `left_mouse_down`, `left_mouse_up`, `mouse_move`, `scroll`, `scroll_to`, `type`, `key`, `hold_key`, `wait`, `read_page`, `find`, `get_page_text`, `form_input`, `new_tab`, `list_tabs`, `switch_tab`, `close_tab`; `javascript_exec`, `file_upload`, `read_console`, `read_network` disabled); `browser_confirm(summary)` (sends the current screenshot with ✅ Allow / ❌ Cancel through `bot/questions.ask`, 300 s; Allow = one sensitive action within 5 minutes, this turn only; only a tap grants it: a typed answer, `Answer.tapped` False, returns the text with "That is not a permission" and clears any allowance); `browser_show_screenshot(caption, region?)` (crop scaled up to 3x, e.g. a captcha for the user) | members: the user's browser container (`SessionManager.browser_call` in to_thread, 75 s); the two tools: bot process. Never given to subagents |
 | DocumentTools (registered, blocking) | `create_document` (format md\|html\|pdf\|docx\|xlsx, title, content Markdown, filename?) → `documents/<sanitized name>.<fmt>` (existing names get `-2`, `-3`); the tool sends the file itself and returns "Document saved to documents/… (<size> KB) and sent to the user." | md/html: bot process (python-markdown: tables, fenced_code, sane_lists, toc + embedded CSS); pdf/docx/xlsx: sandbox via `run_script("render_document.py", …)`, network off, 1g for pdf, timeout 90 s (script deadline 75 s) |
-| TaskTools (registered, awaited; only with a background host, never inherited by subagents) | `wait_for_tasks(timeout_seconds 5..600, default 120)`: "No background tasks are running." at once when none runs and the inbox holds nothing, else `inbox.wait` until something can be drained ("A background task finished; its notification follows." / "A new user message arrived; it follows.") or the timeout (names the tasks still running); without an inbox it polls the host every second; `list_tasks` (id · tool · status running\|done\|failed\|cancelled · duration · start · args); `cancel_task(task_id)` (`t3`, `T3` or `3`; "Task t3 was cancelled." or `Error: no running background task …`). Static `<live_turn>` `prompt_notes`: how injected `<user_message sent_during_turn="true" time="…">` blocks and `<task_notification>`s look, never ignore a message, answer quick questions with `send_user_telegram_message`, do not restart a backgrounded call, say a result will follow when answering while a task runs | bot process; the tasks themselves are the host's (`bot/background.py`) |
+| TaskTools (registered, awaited; only with a background host, never inherited by subagents) | `wait_for_tasks(timeout_seconds 5..600, default 120)`: the unread results of finished tasks at once (as blocks, marked read), "No background tasks are running." at once when none runs and the inbox holds nothing, else `inbox.wait` until something can be drained: a finished task → its result (or "A background task ended with nothing to read …" for a cancel or a result read already), "A new user message arrived; it follows." or the timeout (names the tasks still running); without an inbox it polls the host every second; `get_task_result(task_id)` (a finished task's result as tool-result content, marked read: `host.read`; a running one: "Task t3 (tool) is still running (…). A system message will say when it ends …"; unknown: `Error: no background task …`; pruned or cancelled: `Error: the result of task t3 is no longer available.`); `list_tasks` (id · tool · status running\|done\|failed\|cancelled · duration · "result not read yet" · start · args); `cancel_task(task_id)` (`t3`, `T3` or `3`; "Task t3 was cancelled." or `Error: no running background task …`). Static `<live_turn>` `prompt_notes`: how injected `<user_message sent_during_turn="true" time="…">` blocks look (also a typed answer to `ask_user_choice`), never ignore a message, answer quick questions with `send_user_telegram_message`, do not restart a backgrounded call, the system message when a task ends carries no output (read it with `get_task_result`), say a result will follow when answering while a task runs | bot process; the tasks themselves are the host's (`bot/background.py`) |
 
 Unreachable: all 11 `SystemTools` tools (`install_package`, `run_shell_script` duplicates plus
 `check_system_info`, `manage_service`, `monitor_process`, `network_diagnostics`,
@@ -1215,8 +1244,9 @@ data/
                                     transcript mode: {version, user_id, thread_id, created, updated, model, seeded_from,
                                     fingerprint, messages:[exact API messages, as sent]}; append-only, pruned only above
                                     max_context_tokens; atomic write; in a live turn a tool-result user message may carry
-                                    injected blocks behind its tool_result blocks (<user_message …>, <task_notification …>,
-                                    their images/documents)
+                                    injected blocks behind its tool_result blocks (<user_message …> and its images/documents)
+                                    and be followed by {"role": "system", "content": "<the bot's notice>"} (a background task
+                                    ended); transcripts written before the system notices may hold <task_notification …> texts
     embeddings/faiss_index.bin, metadata.json
                                     IndexFlatIP(1536) over L2-normalized vectors (cosine) of "Topic/Question/Answer/Summary" texts with
                                     text-embedding-3-small; metadata.json = {version: 2, model, dimension, updated, items: [{question,
@@ -1326,12 +1356,18 @@ Memory semantics worth knowing before touching `ChainOfThoughtAgent.generate_res
   returned, and only skips the delivery). "Background task finished" notification turns are ordinary turns too.
 - Live turns in memory: a message the agent read mid-turn sits in the transcript where it was read, in the
   tool-result user message behind the `tool_result` blocks (`<user_message sent_during_turn="true" time="…">` text
-  plus its materialized image/document blocks; a `<task_notification>` text plus its images), stored exactly as
-  sent; one read before the first model call sits behind the question in the turn's own user message (a turn
-  start, as always). Messages that arrived together (the message window, leftovers) are one user turn of
+  plus its materialized image/document blocks), stored exactly as sent; one read before the first model call sits
+  behind the question in the turn's own user message (a turn start, as always). A background task's notice is the
+  `{"role": "system"}` message right after that user message (facts only; its output is in the `tool_result` of the
+  `get_task_result` / `wait_for_tasks` call that read it). `AgentAnthropic.generate_response` keeps a system message
+  where it is (only a LEADING one is the system prompt); `text_only_view`, `memory_search`, the summaries and the
+  legacy reasoning-context reload leave system messages out (without their tool results they would follow an
+  assistant message, where the API refuses one); a prune never starts the kept part with one (it cuts at turn
+  starts); `_request_messages(…, model)` sends a stored one as a `<bot_notice>` user block to a model without
+  system messages. Messages that arrived together (the message window, leftovers) are one user turn of
   `<message n="i">` sections (`inbox.combine`). Such a message is NOT a turn start: tell it by its FIRST block (`transcript.answers_tool_call`), which
-  `is_user_turn`, `clear_old_tool_results` (clears its `tool_result` blocks and any `<task_notification>` text,
-  down to the opening tag + `CLEARED_MARKER`, here and in a notification turn's user message; an injected
+  `is_user_turn`, `clear_old_tool_results` (clears its `tool_result` blocks and any old-format `<task_notification>`
+  text, down to the opening tag + `CLEARED_MARKER`, here and in a notification turn's user message; an injected
   `<user_message>` stays, old injected media goes through `clear_old_media`) and the prune's turn split use, so a prune never separates a
   `tool_use` from its result. `is_tool_result_message` (tool_result blocks only) still decides what `text_only_view`
   and `memory_search` skip, so the injected text is searchable. The memory files (conversation file, its Haiku
@@ -1434,9 +1470,11 @@ options that belong to a model live next to it: `anthropic_request_options(think
 the matching ceiling, `request_options_for(model, thinking)` / `max_tokens_for(model, thinking)` the same
 for ANY Anthropic model (`{}` and `ANTHROPIC_MAX_TOKENS_FAST` for `ANTHROPIC_MODEL_FAST`, which is what the
 loop, the final call and the judge use, so speed mode works), `anthropic_text(message)` the text blocks (the
-first block may be thinking), and `openai_reasoning_options(model)` returns `{"reasoning_effort":
-OPENAI_REASONING_EFFORT}` for the two OpenAI reasoning models and `{}` for anything else. No other file holds
-a model literal.
+first block may be thinking), `supports_system_messages(model)` whether the model takes a mid-conversation
+`{"role": "system"}` message (`SYSTEM_MESSAGE_MODEL_PREFIXES`: Opus 5.x, Opus 4.8, Fable 5, Mythos 5, Sonnet 5.5,
+Haiku 5.5; not Sonnet 5; a Bedrock `…anthropic.` prefix is ignored; a change of model there needs a new prefix),
+and `openai_reasoning_options(model)` returns `{"reasoning_effort": OPENAI_REASONING_EFFORT}` for the two OpenAI
+reasoning models and `{}` for anything else. No other file holds a model literal.
 
 | Purpose | Model / API (default; env override) | Request options | Used by |
 |---|---|---|---|
@@ -1627,12 +1665,17 @@ name; a new temp dir needs its own `.gitignore` line).
   `bot.set_message_reaction`, best effort (`inbox.react` never raises: old clients, no rights).
 - Typed answers: a plain text (not a command) in a chat and topic where an `ask_user_choice` question is on screen
   and waiting answers the newest such question (`on_text` checks `questions.waiting_in` and calls
-  `answer_in_text` BEFORE `accept`): the question message ends as "💬 Answered in text" without buttons, the
-  tool reads `User answered in text instead of tapping a button: "<text>"` (cut at `MAX_TYPED` 4000 characters)
-  and the text neither joins the turn nor queues as a message. Voice notes, photos and other kinds do not answer
-  it; a pending reminder `✏️ Edit text` (ui router) still takes the text first. `browser_confirm` allows only on a tap
-  (`isinstance(answer, questions.Answer) and answer.tapped`): a typed "yes" is passed to the agent as text and
-  allows nothing.
+  `answer_in_text` BEFORE `accept`): the question message ends as "💬 Answered in text" without buttons. The user's
+  words never go inside the tool result (the model resists instructions there, so a reply quoted in it could be
+  ignored): `messages._answer_item` first hands the text to the running turn of that topic as an ordinary inbox item
+  (no 👀, ✍ once read; no suspension point before the question is settled), the answer is resolved with
+  `delivered=True` and the tool reads `questions.TYPED_DELIVERED` (a pointer to the `<user_message>` that follows the
+  tool results). With no turn to take it the tool reads `User answered in text instead of tapping a button: "<text>"`
+  as before (cut at `MAX_TYPED` 4000 characters), and the text never queues as a message; a question that went away
+  between the check and the answer leaves the delivered text an ordinary message of the turn (👀). Voice notes,
+  photos and other kinds do not answer it; a pending reminder `✏️ Edit text` (ui router) still takes the text first.
+  `browser_confirm` allows only on a tap (`isinstance(answer, questions.Answer) and answer.tapped`): a typed "yes"
+  reaches the agent as a message (or as text) and allows nothing.
 - Action-limit accounting counts **every** `stats_events` row in 30 days: each received message,
   sent message, tool call (`memory_search`, `view_image`, `user_profile_*` and `mcp_*` included), describe
   call (now only the document fallback path and video frames) and media group. A turn with 20 tool calls
@@ -1881,7 +1924,8 @@ name; a new temp dir needs its own `.gitignore` line).
   legacy Markdown; `status.plain_header` strips the marks for rich blocks.
 - Transcript mode: `AgentAnthropic.generate_response` returns ALL messages (incoming + appended); the transcript
   path slices `[base_len:]` and keeps every one of them, judge/critique/SYSTEM NOTICE (`_ephemeral`) included,
-  so never insert or drop messages in the request path. `_request_messages` only strips keys starting with `_`.
+  so never insert or drop messages in the request path. `_request_messages` only strips keys starting with `_`
+  (and, for a model without system messages, sends a stored system notice as a `<bot_notice>` user block).
 - **Preserved thinking (Sonnet 5.5): the transcript is append-only.** The API binds each thinking block to the
   model, system prompt, tools and every message before it; a changed one is a 400 for accounts created on or
   after 2026-08-31 (older accounts are not enforced). So the stored transcript is exactly what was sent: the
@@ -1994,10 +2038,12 @@ name; a new temp dir needs its own `.gitignore` line).
   that arrives after that while the model writes its final answer, during a turn without tool calls (the quick
   Haiku path, `tools.enabled` off) or after the last batch is not read by that turn: it becomes the next turn
   (leftover). Never inject anywhere else (into an already sent message, judge/critique re-prompts, the SYSTEM
-  NOTICE call): the injected blocks must ride in the tool-result message (or the unsent first one), which is what
-  keeps the transcript append-only and the thinking blocks valid. The `<live_turn>` notes still say "after a tool
-  call" only: changing them strips every user's stored thinking once (a static-prompt change), and a
-  `<user_message sent_during_turn="true">` behind the question explains itself.
+  NOTICE call): the injected blocks must ride in the tool-result message (or the unsent first one), and a notice in
+  the system message right after it, which is what keeps the transcript append-only and the thinking blocks valid.
+  Never put tool output or a background result into either (it belongs in a `tool_result`: `get_task_result`), and
+  never the user's words into a `tool_result` (a typed answer to a question is a `<user_message>` of its own).
+  A mid-conversation system message must follow a user message and be followed by an assistant message: the loop
+  always calls the model right after one (the forced final call appends its "Processing..." assistant message first).
 - **The message window delays every turn a user starts by `MESSAGE_WINDOW`** (1.5 s; the "typing…" action covers
   it), a photo album by its own 10 s flush plus nothing more unless a window is open for its topic. A window only
   ever holds messages of one chat and topic. Its state (`_windows`, `_albums_handing`) lives in memory per event
@@ -2041,7 +2087,8 @@ name; a new temp dir needs its own `.gitignore` line).
   is no `await` between `inject_target` and `inject`. Notification turns call no `track_message_received`, like
   scheduled tasks.
 - The task tools and their `<live_turn>` notes are part of the tool list and the static prompt, so the first turn
-  of every transcript after the deploy that added them strips the stored thinking once (fingerprint change). For
+  of every transcript after a deploy that changes them (adding `get_task_result` and the system notices did) strips
+  the stored thinking once (fingerprint change). For
   the same reason `run_turn` must pass the same `inbox=` / `background=` on every turn: a path that gave the agent
   no host would drop the task tools and flip the fingerprint back and forth.
 

@@ -1,11 +1,13 @@
 """Live turns in the agent core: the inbox and background tool calls.
 
 ``AgentAnthropic.generate_response`` drains the turn's inbox (``TurnInbox``, bot/inbox.py) after
-each tool batch and sends what it holds BEHIND the tool results in the same user message, stored
-exactly as sent (transcript and legacy mode); never before the first call, never after the last.
-``run_tool_batch`` hands a normal call to the ``BackgroundHost`` (bot/background.py) once it ran
-``TOOL_BACKGROUND_AFTER_SECONDS``, or ``BACKGROUND_ON_MESSAGE_AFTER`` while a user message waits:
-the result becomes a placeholder, the host's task still yields the tool's raw result, and a Stop
+each tool batch and sends the user's messages BEHIND the tool results in the same user message,
+and the bot's notices (a background task ended: facts only, no output) as a ``system`` message
+right after it (a ``<bot_notice>`` block for a model without system messages), all stored exactly
+as sent (transcript and legacy mode); never after the last call. ``run_tool_batch`` hands a normal
+call to the ``BackgroundHost`` (bot/background.py) once it ran ``TOOL_BACKGROUND_AFTER_SECONDS``,
+or ``BACKGROUND_ON_MESSAGE_AFTER`` while a user message waits: the result becomes a placeholder,
+the host's task still yields the tool's raw result (read later with get_task_result), and a Stop
 cancels only the calls that were not handed over. ``NEVER_BACKGROUND`` tools and toolset members
 always run in the foreground. Without inbox and host (tests, subagents, other callers) nothing
 changes. The bot side is faked here; only the protocols in agents.task_tools are used.
@@ -47,15 +49,29 @@ def user_block(text):
     return {"type": "text", "text": f"{USER_TAG}\n{text}\n</user_message>"}
 
 
-def notification_block(task_id, result="ok"):
-    return {"type": "text", "text": f'<task_notification id="{task_id}" tool="run_command" status="completed" elapsed="95s">\n<result>\n{result}\n</result>\n</task_notification>'}
+def notice_text(task_id):
+    return f'The background task {task_id} (run_command) completed after 95 s. Read its result with get_task_result (task_id "{task_id}").'
+
+
+def notice_block(task_id):
+    """What the bot's inbox hands over when a background task ended: facts, never its output."""
+    return {"type": task_tools.NOTICE_BLOCK, "text": notice_text(task_id)}
+
+
+def system_notice(*task_ids):
+    return {"role": "system", "content": "\n".join(notice_text(t) for t in task_ids)}
+
+
+def result_block(task_id, result):
+    return {"type": "text", "text": f"Result of the background task {task_id} (run_command) completed after 95 s:\n\n{result}"}
 
 
 class FakeInbox:
-    """Items in arrival order; ``wait`` wakes on a delivery; ``drain`` hands everything over."""
+    """Items in arrival order; ``wait`` wakes on a delivery; ``drain`` hands everything over. A task's
+    notice is rendered when drained, like the real inbox's: none once its result was read."""
 
     def __init__(self):
-        self.items: list[tuple[str, list[dict], str]] = []  # (kind, blocks, text view)
+        self.items: list[tuple[str, list[dict] | object, str]] = []  # (kind, blocks or a callable, text view)
         self.drains = 0
         self.waits = 0
         self.texts: list[str] = []
@@ -65,8 +81,8 @@ class FakeInbox:
         self.items.append(("message", [user_block(text), *media], text))
         self.event.set()
 
-    def deliver_task(self, task_id, result="ok"):
-        self.items.append(("task", [notification_block(task_id, result)], ""))
+    def deliver_task(self, task_id, host=None):
+        self.items.append(("task", lambda: [] if host is not None and task_id in host.read_ids else [notice_block(task_id)], ""))
         self.event.set()
 
     def reset(self):
@@ -81,7 +97,7 @@ class FakeInbox:
 
     async def drain(self):
         self.drains += 1
-        blocks = [b for _, item, _ in self.items for b in item]
+        blocks = [b for _, item, _ in self.items for b in (item() if callable(item) else item)]
         self.texts += [text for kind, _, text in self.items if kind == "message"]
         self.items.clear()
         self.event.clear()
@@ -106,6 +122,20 @@ class FakeHost:
         self.cap = cap
         self.adopted: list[dict] = []
         self.t0 = time.monotonic()
+        self.results: dict[str, str] = {}  # finished tasks: id -> output
+        self.read_ids: set[str] = set()
+
+    def finish(self, task_id, result):
+        self.results[task_id] = result
+
+    def unread(self):
+        return [t for t in self.results if t not in self.read_ids]
+
+    def read(self, task_id):
+        if task_id not in self.results:
+            return None
+        self.read_ids.add(task_id)
+        return [result_block(task_id, self.results[task_id])]
 
     def can_adopt(self):
         return sum(1 for a in self.adopted if not a["task"].done()) < self.cap
@@ -117,7 +147,7 @@ class FakeHost:
 
     def list(self):
         return [{"id": a["id"], "tool": a["tool_name"], "args": a["display_args"],
-                 "status": "running" if not a["task"].done() else "done", "elapsed_s": 1} for a in self.adopted]
+                 "status": "done" if a["id"] in self.results or a["task"].done() else "running", "elapsed_s": 1} for a in self.adopted]
 
     def cancel(self, task_id):
         for a in self.adopted:
@@ -332,9 +362,11 @@ async def test_the_forced_final_call_injects_nothing(agents_main):
     response, messages = await run_loop(agent, settings({("tools", "max_iteration"): 1}))
     assert response == "summary" and agent.limit_reached
     assert inbox.drains == 1  # after the one batch, never for the SYSTEM NOTICE
-    notice = agent.client.requests[1]["messages"][-1]
-    assert notice["content"][0]["text"].startswith("SYSTEM NOTICE") and len(notice["content"]) == 1
-    assert agent.client.requests[1]["messages"][-3]["content"][1] == notification_block("t9")
+    sent = agent.client.requests[1]["messages"]
+    assert sent[-1]["content"][0]["text"].startswith("SYSTEM NOTICE") and len(sent[-1]["content"]) == 1
+    assert sent[-2]["role"] == "assistant"  # the bot's notice is followed by an assistant message, as the API wants
+    assert sent[-3] == system_notice("t9")
+    assert sent[-4]["content"] == [{"type": "tool_result", "tool_use_id": "c1", "content": "slow done"}]
 
 
 async def test_status_reads_your_message_once_per_injection(agents_main):
@@ -355,8 +387,10 @@ async def test_status_reads_your_message_once_per_injection(agents_main):
     assert reading == [("reading your message", "Reading your 2 new messages")]  # once; a notification alone says nothing
     i = updates.index(reading[0])
     assert updates[i + 1][0] == "executing-tools" and updates[i + 1][1] == "Executing tools"  # the next call's own status was skipped
-    second = agent.client.requests[2]["messages"][-1]["content"]
-    assert [b.get("type") for b in second] == ["tool_result", "text"] and second[1] == notification_block("t2")
+    first = agent.client.requests[1]["messages"]
+    assert [b.get("type") for b in first[-2]["content"]] == ["tool_result", "text", "text"] and first[-1] == system_notice("t1")
+    second = agent.client.requests[2]["messages"]
+    assert [b.get("type") for b in second[-2]["content"]] == ["tool_result"] and second[-1] == system_notice("t2")
 
 
 async def test_an_inbox_without_user_tags_still_counts_drained_messages(agents_main):
@@ -393,9 +427,9 @@ async def test_a_failing_inbox_never_ends_the_turn(agents_main):
 
 # ---- background calls -----------------------------------------------------------------------------
 PLACEHOLDER_RE = re.compile(
-    r"^Still running in the background as task (t\d+) \(started \d\d:\d\d:\d\d UTC\)\. Its result will arrive as a "
-    r"<task_notification> after a later tool call, or as a new message if this turn has ended\. Meanwhile you can "
-    r"answer the user, use other tools, or call wait_for_tasks\.$"
+    r"^Still running in the background as task (t\d+) \(started \d\d:\d\d:\d\d UTC\)\. A system message will say "
+    r"when it has ended, after a later tool call, or a new turn if this one has ended; then read its result with "
+    r"get_task_result\. Meanwhile you can answer the user, use other tools, or call wait_for_tasks\.$"
 )
 
 
@@ -433,9 +467,9 @@ def test_the_placeholder_names_the_start_in_utc(agents_main):
 
     started = datetime(2026, 10, 18, 12, 1, 5, tzinfo=timezone.utc).timestamp()
     assert agents_main.background_placeholder("t3", started) == (
-        "Still running in the background as task t3 (started 12:01:05 UTC). Its result will arrive as a <task_notification> "
-        "after a later tool call, or as a new message if this turn has ended. Meanwhile you can answer the user, use other "
-        "tools, or call wait_for_tasks."
+        "Still running in the background as task t3 (started 12:01:05 UTC). A system message will say when it has ended, "
+        "after a later tool call, or a new turn if this one has ended; then read its result with get_task_result. "
+        "Meanwhile you can answer the user, use other tools, or call wait_for_tasks."
     )
 
 
@@ -597,7 +631,7 @@ async def test_a_host_that_refuses_leaves_the_call_in_the_foreground(agents_main
 
 def test_never_background_names(agents_main):
     assert agents_main.NEVER_BACKGROUND >= {
-        "ask_user_choice", "browser_confirm", "browser_show_screenshot", "wait_for_tasks", "list_tasks", "cancel_task",
+        "ask_user_choice", "browser_confirm", "browser_show_screenshot", "wait_for_tasks", "get_task_result", "list_tasks", "cancel_task",
         "send_user_telegram_message", "set_message_reaction", "send_voice_message",
     }
     assert agents_main.TOOL_BACKGROUND_AFTER_SECONDS == 30.0 or os.getenv("TOOL_BACKGROUND_AFTER_SECONDS")
@@ -749,7 +783,7 @@ def test_defaults_are_unchanged_without_inbox_or_host(agents_main, monkeypatch):
     inbox, host = FakeInbox(), FakeHost()
     live, _, _ = make_chain(agents_main, monkeypatch, [], inbox, host)
     assert live.agent.inbox is inbox and live.agent.background is host and live.inbox is inbox
-    assert tool_names(live) == tool_names(plain) + ["wait_for_tasks", "list_tasks", "cancel_task"]
+    assert tool_names(live) == tool_names(plain) + ["wait_for_tasks", "get_task_result", "list_tasks", "cancel_task"]
     notes = live._provider_notes()
     assert notes.count("<live_turn>") == 1 and notes == make_chain(agents_main, monkeypatch, [], FakeInbox(), FakeHost())[0]._provider_notes()
 
@@ -764,7 +798,8 @@ async def test_without_a_host_no_call_ever_goes_to_the_background(agents_main, m
 
 
 async def test_task_tools_in_the_loop(agents_main, monkeypatch):
-    """wait_for_tasks is a normal tool call: the notification it waited for follows its result."""
+    """wait_for_tasks is a normal tool call that returns the result it waited for, inside its own
+    tool_result; the notice of that task, read already, is not sent at all."""
     inbox, host = FakeInbox(), FakeHost()
     chain, client, _ = make_chain(agents_main, monkeypatch, [
         reply(call("w1", "wait_for_tasks", timeout_seconds=30), stop="tool_use"), reply(text("t1 finished: ok")),
@@ -774,17 +809,143 @@ async def test_task_tools_in_the_loop(agents_main, monkeypatch):
     async def finish_later():
         await asyncio.sleep(0.1)
         host.adopted[0]["task"].set_result("ok")
-        inbox.deliver_task("t1", "build ok")
+        host.finish("t1", "build ok")
+        inbox.deliver_task("t1", host)
 
     finisher = asyncio.get_running_loop().create_task(finish_later())
     response, _ = await chain.generate_response("wait for the build")
     await finisher
     assert response == "t1 finished: ok"
-    sent = client.requests[1]["messages"][-1]["content"]
-    assert sent == [
-        {"type": "tool_result", "tool_use_id": "w1", "content": "A background task finished; its notification follows."},
-        notification_block("t1", "build ok"),
+    sent = client.requests[1]["messages"]
+    assert sent[-1]["content"] == [{"type": "tool_result", "tool_use_id": "w1", "content": [result_block("t1", "build ok")]}]
+    assert all(m["role"] != "system" for m in sent) and host.unread() == []
+
+
+async def test_get_task_result_reads_what_a_notice_announced(agents_main, monkeypatch):
+    """A task ends during the turn: a system message says so after the next tool call, and the
+    agent reads the output with get_task_result, as a tool result; nothing of the output is ever
+    outside one."""
+    inbox, host = FakeInbox(), FakeHost()
+    chain, client, _ = make_chain(agents_main, monkeypatch, [
+        reply(call("c1", "get_time_in_timezone", timezone="UTC"), stop="tool_use"),
+        reply(call("r1", "get_task_result", task_id="t1"), stop="tool_use"),
+        reply(text("the build is ok")),
+    ], inbox, host)
+    host.adopted.append({"id": "t1", "task": asyncio.get_running_loop().create_future(), "tool_name": "run_command", "display_args": "make"})
+    original = chain.agent.execute_tool
+
+    async def run_tool(name, args):
+        if name == "get_time_in_timezone":
+            host.finish("t1", "build ok")
+            inbox.deliver_task("t1", host)
+            return "12:00"
+        return await original(name, args)
+
+    monkeypatch.setattr(chain.agent, "execute_tool", run_tool)
+    response, _ = await chain.generate_response("build it")
+    assert response == "the build is ok"
+    second = client.requests[1]["messages"]
+    assert second[-2]["content"] == [{"type": "tool_result", "tool_use_id": "c1", "content": "12:00"}]
+    assert second[-1] == system_notice("t1") and "build ok" not in json.dumps(second)
+    third = client.requests[2]["messages"]
+    assert third[-1]["content"] == [{"type": "tool_result", "tool_use_id": "r1", "content": [result_block("t1", "build ok")]}]
+    assert third[-3] == system_notice("t1") and third[-2]["role"] == "assistant"
+    messages = stored().messages
+    assert messages[: len(third)] == third  # the system message is stored where it was sent
+
+    # the next turn replays it where it is; the system prompt stays the static one
+    again, client2, _ = make_chain(agents_main, monkeypatch, [reply(text("you're welcome"))], FakeInbox(), FakeHost())
+    await again.generate_response("thanks")
+    request = client2.requests[0]
+    assert request["messages"][: len(third)] == third
+    assert request["system"] == client.requests[0]["system"] and "build ok" not in json.dumps(request["system"])
+
+
+async def test_a_model_without_system_messages_gets_the_notice_as_a_marked_block(agents_main, monkeypatch):
+    monkeypatch.setattr(agents_main, "supports_system_messages", lambda model: False)
+    inbox = FakeInbox()
+    agent = make_agent(agents_main, [reply(call("c1", "slow"), stop="tool_use"), reply(text("done"))], inbox)
+    agent.user_interactions.on_start = lambda name, args: (inbox.deliver_user("and B"), inbox.deliver_task("t4"))
+    await run_loop(agent)
+    sent = agent.client.requests[1]["messages"]
+    assert sent[-1]["content"] == [
+        {"type": "tool_result", "tool_use_id": "c1", "content": "slow done"}, user_block("and B"),
+        {"type": "text", "text": f"<bot_notice>\n{notice_text('t4')}\n</bot_notice>"},
     ]
+    assert all(m["role"] != "system" for m in sent)
+
+
+def test_a_stored_system_notice_is_sent_as_a_block_to_a_model_without_them(agents_main, monkeypatch):
+    """A transcript made with a model that takes system messages, sent to one that does not (an env
+    override, speed mode on another fast model): the notice goes as a marked user block."""
+    stored_messages = [
+        {"role": "user", "content": [{"type": "text", "text": "q"}]},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "c1", "name": "slow", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1", "content": "ok"}]},
+        system_notice("t1"),
+        {"role": "assistant", "content": [{"type": "text", "text": "a"}], "_ephemeral": True},
+    ]
+    request = agents_main.AgentAnthropic._request_messages
+    assert request(stored_messages, "claude-sonnet-5-5")[3] == system_notice("t1")
+    assert request(stored_messages)[3] == system_notice("t1")
+    old = request(stored_messages, "claude-sonnet-5")
+    assert old[3] == {"role": "user", "content": [{"type": "text", "text": f"<bot_notice>\n{notice_text('t1')}\n</bot_notice>"}]}
+    assert "_ephemeral" not in old[4] and stored_messages[3] == system_notice("t1")  # the stored copy is untouched
+
+
+@pytest.mark.parametrize("model, ok", [
+    ("claude-sonnet-5-5", True), ("claude-haiku-5-5", True), ("claude-opus-5-5", True), ("claude-opus-5", True),
+    ("claude-opus-4-8", True), ("claude-fable-5-1", True), ("claude-mythos-5", True), ("anthropic.claude-haiku-5-5", True),
+    ("us.anthropic.claude-sonnet-5-5", True), ("claude-sonnet-5", False), ("claude-sonnet-4-6", False),
+    ("claude-haiku-4-5", False), ("", False), (None, False),
+])
+def test_which_models_take_system_messages(model, ok):
+    from models import supports_system_messages
+
+    assert supports_system_messages(model) is ok
+
+
+async def test_a_notice_read_before_the_first_call_follows_the_turns_first_message(agents_main, monkeypatch):
+    """A task that ended while no tool ran (between turns, while the turn started): its notice is a
+    system message right after the question; the quick path, which has no tools, is skipped."""
+    inbox, host = FakeInbox(), FakeHost()
+    host.finish("t2", "42 files")
+    inbox.deliver_user("and count them")
+    inbox.deliver_task("t2", host)
+    chain, client, _ = make_chain(agents_main, monkeypatch, [reply(text("42 files"))], inbox, host)
+    asked = []
+
+    async def classify(question, history=None):
+        asked.append(question)
+        return "simple"
+
+    monkeypatch.setattr(chain, "_classify_complexity", classify)
+    response, _ = await chain.generate_response("how many files?")
+    assert response == "42 files" and asked == []  # straight to the full agent
+    sent = client.requests[0]["messages"]
+    assert sent[-1] == system_notice("t2")
+    assert sent[-2]["role"] == "user" and sent[-2]["content"][-1] == user_block("and count them")
+    assert stored().messages[: len(sent)] == sent
+
+
+async def test_an_unread_result_alone_also_skips_the_quick_path(agents_main, monkeypatch):
+    """The notice went to a turn that ended before reading the result: the next turn must be able to."""
+    host = FakeHost()
+    host.finish("t5", "done")
+    chain, client, _ = make_chain(agents_main, monkeypatch, [reply(text("ok"))], FakeInbox(), host)
+    asked = []
+
+    async def classify(question, history=None):
+        asked.append(question)
+        return "simple"
+
+    monkeypatch.setattr(chain, "_classify_complexity", classify)
+    await chain.generate_response("and?")
+    assert asked == [] and len(client.requests) == 1 and client.requests[0].get("tools")
+    host.read("t5")
+    again, _, _ = make_chain(agents_main, monkeypatch, [], FakeInbox(), host)
+    monkeypatch.setattr(again, "_classify_complexity", classify)
+    assert await again._decide_complexity("x", [], needs_tools=again._has_unread_results()) == "simple"
 
 
 async def test_subagents_get_no_inbox_host_or_task_tools(agents_main, monkeypatch):
@@ -954,6 +1115,30 @@ async def test_legacy_mode_injects_through_the_same_loop(agents_main, monkeypatc
     assert saved[0].endswith("time?\n\n[Sent while I was working]\nand B")
     with open("data/42/short_term_memory/dialog_history.json", encoding="utf-8") as f:
         assert json.load(f)[-2]["content"] == saved[0]
+
+
+async def test_legacy_mode_sends_notices_as_system_messages_and_never_reloads_them(agents_main, monkeypatch):
+    inbox, host = FakeInbox(), FakeHost()
+    s = settings({("transcript", "enabled"): False, ("semantic_search", "enabled"): False})
+    chain, client, _ = make_chain(agents_main, monkeypatch, [
+        reply(call("c1", "get_time_in_timezone", timezone="UTC"), stop="tool_use"), reply(text("12:00")),
+    ], inbox, host, s)
+
+    async def run_tool(name, args):
+        host.finish("t1", "ok")
+        inbox.deliver_task("t1", host)
+        return "12:00"
+
+    monkeypatch.setattr(chain.agent, "execute_tool", run_tool)
+    await chain.generate_response("time?")
+    assert client.requests[1]["messages"][-1] == system_notice("t1")
+
+    # the next legacy turn reloads text turns only: a notice without its tool results would follow
+    # an assistant message, where the API refuses it
+    again, client2, _ = make_chain(agents_main, monkeypatch, [reply(text("hi"))], FakeInbox(), FakeHost(), s)
+    await again.generate_response("thanks")
+    sent = client2.requests[0]["messages"]
+    assert all(m["role"] in ("user", "assistant") for m in sent) and "get_task_result" not in json.dumps(sent)
 
 
 async def test_memory_keeps_the_bare_question_when_nothing_was_read(agents_main, monkeypatch):

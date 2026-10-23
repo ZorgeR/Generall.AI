@@ -406,8 +406,8 @@ class SearchTools:
             # or nothing (sorted last), never its last update. A turn's own context block carries its time.
             timestamp = str(data.get("created") or "")[:19].replace("T", " ")
             for message in data["messages"]:
-                if not isinstance(message, dict) or is_tool_result_message(message):
-                    continue
+                if not isinstance(message, dict) or message.get("role") not in ("user", "assistant") or is_tool_result_message(message):
+                    continue  # tool results and the bot's system notices are not the conversation
                 content = message.get("content")
                 if message.get("role") == "user" and isinstance(content, list):
                     for block in content:

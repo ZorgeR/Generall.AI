@@ -301,12 +301,12 @@ use the other file", goes to the task it is working on:
   answer; a quick question may get a short reply right away while the work goes on. Whatever it did not get to
   before finishing is answered next, all of it together, in the order you sent it.
 - **Long steps run in the background**: a tool call still running after 30 seconds, or after a few seconds when
-  you have written something meanwhile, keeps running in the background while the agent goes on. It tells you
-  when the result is there: inside the same task if that is still working, otherwise as a new "🔔 Background
-  task finished" message (or not at all when there is nothing worth saying). The agent can also wait for, list
-  or cancel these tasks.
-- **Type instead of tapping**: when the agent asks a question with buttons, you can type your answer instead.
-  Browser approvals are the exception: buying, paying, sending a message or deleting something in the browser
+  you have written something meanwhile, keeps running in the background while the agent goes on. When it
+  finishes the agent is told and reads the result: inside the same task if that is still working, otherwise as
+  a new "🔔 Background task finished" message (or not at all when there is nothing worth saying). The agent can
+  also wait for, list or cancel these tasks.
+- **Type instead of tapping**: when the agent asks a question with buttons, you can type your answer instead;
+  the agent reads it as your message (✍ once read), so it can be as long or specific as you like. Browser approvals are the exception: buying, paying, sending a message or deleting something in the browser
   needs a tap on ✅ Allow; typing "yes" is not enough.
 - **Stop or cancel**: 🛑 Stop ends only the current answer; messages it has not read yet are answered next and
   background tasks keep running. `/cancel` stops everything: the current task, your queued and unread messages,

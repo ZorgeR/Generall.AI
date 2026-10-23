@@ -51,7 +51,8 @@ logger = logging.getLogger(__name__)
 
 TRANSCRIPT_VERSION = 1
 CLEARED_MARKER = "[tool result cleared to save context; call the tool again if you need it]"
-# A finished background task's result as a live turn delivers it (bot/background.py): one text block
+# A finished background task's result as live turns delivered it before the results moved into
+# get_task_result's tool results (transcripts written then still hold them): one text block
 # '<task_notification id="t3" tool="..." status="..." elapsed="...">\n<result>…</result>\n</task_notification>'.
 TASK_NOTIFICATION_OPEN = "<task_notification"
 IMAGE_CLEARED_MARKER = (
@@ -214,10 +215,12 @@ def prefix_fingerprint(model: str, system: str, tools: list[dict]) -> str:
 
 
 def text_only_view(messages: list[dict]) -> list[dict]:
-    """User/assistant text turns only (for models or paths that cannot take tool blocks)."""
+    """User/assistant text turns only (for models or paths that cannot take tool blocks). The bot's
+    ``system`` notices are left out: without the tool results around them they would sit where the
+    API refuses a system message (after an assistant message)."""
     out: list[dict] = []
     for m in messages:
-        if is_tool_result_message(m):
+        if m.get("role") not in ("user", "assistant") or is_tool_result_message(m):
             continue
         text = message_text(m).strip()
         if not text:
@@ -336,10 +339,11 @@ def _clear_notifications(content: list) -> int:
 def clear_old_tool_results(messages: list[dict], keep_turns: int) -> int:
     """Replace tool results older than the last ``keep_turns`` user turns with a marker (a browser
     result keeps its ``browser_state`` blocks and its ``is_error`` flag, so it stays a valid toolset
-    result: see ``_cleared_result_content``). A finished background task's result is a tool result
-    too: its ``<task_notification>`` text block (behind tool results, or in a "background task
-    finished" turn) keeps only its opening tag (``_cleared_notification``); its pictures are left
-    to ``clear_old_media``."""
+    result: see ``_cleared_result_content``). A finished background task's result delivered the old
+    way is a tool result too: its ``<task_notification>`` text block (behind tool results, or in a
+    "background task finished" turn) keeps only its opening tag (``_cleared_notification``); its
+    pictures are left to ``clear_old_media``. Today's results come back as get_task_result's tool
+    results, and its notices are short system messages, which stay."""
     turn_starts = [i for i, m in enumerate(messages) if is_user_turn(m)]
     if len(turn_starts) <= keep_turns:
         return 0

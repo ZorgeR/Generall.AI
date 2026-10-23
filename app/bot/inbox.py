@@ -6,8 +6,10 @@ the same forum topic is not queued as a turn of its own: the handler delivers it
 (``bot/handlers/messages.py``) and reacts 👀. The agent loop calls ``drain()`` at each
 tool boundary and appends what it returns to the user message that carries the tool
 results, so the model reads the message between two steps; the user then sees ✍.
-Finished background tasks (``bot.background``) arrive here too, as ``<task_notification>``
-items.
+Finished background tasks (``bot.background``) arrive here too: their item gives a notice
+block (``agents.task_tools.NOTICE_BLOCK``, facts only), which the agent core sends as a
+separate ``system`` message, never in the user's words; the output itself is read with
+``get_task_result``.
 
 Order is the user's: items are kept by their arrival number (``bot.queue.next_seq``), an
 item may still be *preparing* (a photo download, a voice transcription: an asyncio task
@@ -28,8 +30,9 @@ The formats, which the agent core passes through without parsing::
     <text or caption, "(voice message, transcribed) ...", or the photo/document prompt text>
     </user_message>
 
-followed by the message's image/document blocks (materialized), and a notification
-(built by ``bot.background``) as one text block plus the result's images.
+followed by the message's image/document blocks (materialized), and a task's notice
+(built by ``bot.background`` when it is read, so a result the agent has already read gives
+nothing) as ``{"type": NOTICE_BLOCK, "text": "The background task t3 (…) completed after 42 s. …"}``.
 
 Several messages that become one turn (sent together within the message window of
 ``bot/handlers/messages.py``, or a turn's leftovers) are one prompt (``combine``)::
@@ -169,8 +172,8 @@ def ready_future(value: Any) -> asyncio.Future:
 
 @dataclass(eq=False)
 class InboxItem:
-    """One delivery: a user message (its future gives a ``Prepared``) or a task notification
-    (its future gives the API blocks). ``requeue`` turns a leftover into a queued turn;
+    """One delivery: a user message (its future gives a ``Prepared``) or a finished task (its future
+    gives the blocks, or a callable that builds them when the item is read). ``requeue`` turns a leftover into a queued turn;
     ``requeue_group`` queues several user leftovers (this one first) as ONE turn and wins over
     ``requeue``; ``drop`` is called when it is thrown away (/cancel, shutdown)."""
 
@@ -404,6 +407,8 @@ class TurnInbox:
                 return None
             try:
                 blocks = item.future.result()
+                if callable(blocks):
+                    blocks = blocks()  # rendered now: the agent may have read the result meanwhile
             except Exception as e:  # noqa: BLE001
                 logger.error("A task notification for %s could not be read: %s", self.user_id, e)
                 return []

@@ -65,3 +65,31 @@ def test_old_task_notifications_are_cleared_like_tool_results():
     assert recent[2]["content"][1] == note("t5")  # within the last two turns
     assert T.clear_old_tool_results(messages, keep_turns=2) == 0  # idempotent
     assert T.clear_old_media(messages, keep_turns=2) == 1 and behind[2]["content"][2]["text"] == T.IMAGE_CLEARED_MARKER
+
+
+def notice(task_id):
+    return {"role": "system", "content": f'The background task {task_id} (run_command) completed after 95 s. Read its result with get_task_result (task_id "{task_id}").'}
+
+
+def test_a_system_notice_is_no_turn_start_and_no_text_turn():
+    """The bot's notice (a background task ended) sits between the tool results and the next
+    assistant message: a prune never starts a kept part with it, the text-only views (the quick
+    path, summaries) leave it out, and the size estimate still counts it."""
+    first = turn(1)
+    first.insert(3, notice("t1"))
+    messages = first + turn(2) + turn(3)
+    assert [i for i, m in enumerate(messages) if T.is_user_turn(m)] == [0, 5, 9]
+    old, rest = T.split_for_summary(messages)
+    assert rest[0]["role"] == "user" and rest[0]["content"][0]["text"] == "question 2"
+    view = T.text_only_view(messages)
+    assert all(m["role"] in ("user", "assistant") for m in view) and "get_task_result" not in str(view)
+    assert T.estimate_tokens(messages) > T.estimate_tokens([m for m in messages if m["role"] != "system"])
+    assert T.clear_old_tool_results(messages, keep_turns=1) == 2 and messages[3] == notice("t1")  # facts only: kept
+    assert T.strip_thinking(messages) == 0 and messages[3] == notice("t1")
+
+
+def test_sanitize_keeps_a_system_notice_in_place():
+    messages = turn(1)
+    messages.insert(3, notice("t1"))
+    out = T.sanitize_turn(messages, "answer 1")
+    assert out[3] == notice("t1") and out[-1]["content"][0]["text"] == "answer 1"

@@ -269,6 +269,23 @@ def anthropic_text(message) -> str:
     )
 
 
+# Models that take a ``{"role": "system", ...}`` message inside ``messages`` (no beta header):
+# the bot's notices (a background task finished) go there, apart from the user's words. Any
+# other model gets them as a marked text block in the user message instead. Prefixes, so a
+# newer snapshot of the same family matches; Claude Sonnet 5 is not one of them.
+SYSTEM_MESSAGE_MODEL_PREFIXES = (
+    "claude-opus-5", "claude-opus-4-8", "claude-fable-5", "claude-mythos-5", "claude-sonnet-5-5", "claude-haiku-5-5",
+)
+
+
+def supports_system_messages(model: str | None) -> bool:
+    """The model accepts mid-conversation ``system`` messages (a provider prefix such as
+    ``anthropic.`` or ``us.anthropic.`` on Bedrock, or a path, is ignored)."""
+    name = str(model or "").strip().lower().rsplit("/", 1)[-1]
+    name = name.rpartition("anthropic.")[2]
+    return name.startswith(SYSTEM_MESSAGE_MODEL_PREFIXES)
+
+
 def openai_reasoning_options(model: str) -> dict:
     """kwargs for ``chat.completions.create`` / ``.parse`` on an OpenAI model.
 

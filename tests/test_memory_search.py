@@ -60,6 +60,8 @@ def workspace(tmp_path, monkeypatch):
                 {"type": "tool_use", "id": "t1", "name": "schedule_reminder", "input": {"text": "Lisbon flights"}},
             ]},
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": f"Reminder set: Lisbon flights {TOOL_ONLY}"}]},
+            # the bot's notice of a background task: not the conversation either
+            {"role": "system", "content": f"The background task t1 (run_command) completed after 5 s, Lisbon {TOOL_ONLY}."},
             {"role": "assistant", "content": [{"type": "text", "text": "Done, reminder set."}]},
         ],
     }
