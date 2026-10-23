@@ -261,6 +261,12 @@ async def test_only_a_tap_on_allow_grants_the_allowance(answers):
     await t.execute_member("left_click", {"target": {"type": "ref", "ref": "ref_1"}})
     assert manager.requests[0]["allow_sensitive"] is False
 
+    # the typed text reached the turn as a message of its own: the result points at it, still no permission
+    answers.script.append(questions.Answer("yes, go ahead", tapped=False, delivered=True))
+    result = await t.confirm("Pay 10 EUR")
+    assert result.startswith(questions.TYPED_DELIVERED + ". That is not a permission") and "go ahead" not in result
+    assert not t.allowance_active()
+
 
 async def test_a_plain_string_from_a_stand_in_is_no_tap(monkeypatch):
     """The allowance needs an ``Answer`` that says it was tapped: anything else allows nothing."""

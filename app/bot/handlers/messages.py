@@ -1,8 +1,20 @@
 """Inbound content handlers: text, voice, video, audio, photos/albums, documents.
 
 Handlers validate quickly, enqueue a job on the user's queue and return.
-If the user already has a job running they get a busy notice immediately;
+If the user already has a job running they get a busy notice;
 the new message is processed as its own turn once the queue reaches it.
+
+Messages sent together become ONE turn (the message window): a message that does not join a
+running turn waits ``MESSAGE_WINDOW`` seconds (1.5) for the next one of its chat and topic, each
+new one extends the wait (at most ``MESSAGE_WINDOW_MAX`` in all), and a photo album still
+arriving holds it. A comment and the messages it forwards, or three short texts typed in a row,
+are one request. While it waits the user sees "typing…" for the first message, then 👀 on each
+and one status line counting them ("📥 Got 3 messages. …"), which becomes the turn's status.
+When the window closes, one message is queued as the job it always was (``_run_<kind>``); two or
+more were prepared meanwhile (``prepare_<kind>``) and run as one turn on one prompt
+(``_run_prepared``, ``bot.inbox.combine``). Messages that arrive while a turn of their topic
+runs join that turn instead (below); a window whose topic got a running turn meanwhile hands its
+messages to that turn when it closes.
 
 Unless that job is a turn of the same chat and forum topic whose agent is still working
 (``inject_target``: its inbox is open and no earlier message of that topic is still
@@ -14,13 +26,13 @@ never written by two of them at the same time: ``_path_lock``); the agent reads 
 tool boundary (✍). Every kind of message is split
 that way: ``prepare_<kind>`` builds a ``bot.inbox.Prepared`` (the prompt, the voice reply
 flag, the error to show), and the ``_run_<kind>`` job wraps it in status messages and runs
-the turn. A message the turn did not read is queued as a turn of its own on the prompt it
-already prepared (``_run_prepared``), in arrival order. A plain text sent while an
+the turn. The messages the turn did not read are queued together as ONE turn on the prompts
+they already prepared (``_run_prepared``), at the first one's place. A plain text sent while an
 ``ask_user_choice`` question waits in that chat and topic answers the question instead.
 
 ``control_router`` (auth only) stops work: ``/cancel`` and the busy notice's
 button stop the running job and clear the queue (the messages waiting in the running
-turn's inbox and the user's background tasks too); the Stop button in a turn's
+turn's inbox or in a message window, and the user's background tasks too); the Stop button in a turn's
 status (``queue_stop_<job token>``) and Telegram's Stop button on its streaming
 draft (a ``stopped_message_generation`` update) stop only that job (unread messages
 then become the next turns; background tasks keep running). It also keeps the names of
@@ -41,6 +53,7 @@ extracted text; a PDF too large to attach falls back to the description path.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import logging
 import os
 import shutil
@@ -56,6 +69,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from bot import background, inbox, media, questions
 from bot.agent_runner import THINKING, run_turn
+from bot.config import config
 from bot.inbox import Prepared
 from bot.message_context import with_reference
 from bot.queue import STOP_CALLBACK_PREFIX, Job, JobContext, SubmitResult, job_id_from_token, next_seq
@@ -165,12 +179,14 @@ _locks_loop: asyncio.AbstractEventLoop | None = None
 
 
 def _same_loop() -> None:
-    """asyncio locks belong to one event loop: a new loop (every test) starts with none."""
+    """asyncio locks and tasks belong to one event loop: a new loop (every test) starts with none."""
     global _locks_loop
     loop = asyncio.get_running_loop()
     if loop is not _locks_loop:
         _prepare_slots.clear()
         _path_locks.clear()
+        _windows.clear()
+        _albums_handing.clear()
         _locks_loop = loop
 
 
@@ -216,10 +232,13 @@ def inject_target(user_id: str, thread_id: int | None) -> inbox.TurnInbox | None
     """The running turn a new message of this topic joins, or None (queue it as today).
 
     The turn's inbox must be open for this topic and no earlier message (or button press) of
-    the user in this topic may still be queued: that one is answered first, and this one after it.
+    the user in this topic may still be queued or waiting in its message window: that one is
+    answered first, and this one after it (or with it).
     """
     target = inbox.current(user_id)
     if target is None or not target.accepts(thread_id):
+        return None
+    if _collecting(user_id, thread_id) is not None:
         return None
     pending = getattr(queue, "has_pending_user_jobs", None)
     if pending is not None and pending(user_id, thread_id):
@@ -254,16 +273,18 @@ def inject(
     target: inbox.TurnInbox, bot: Bot, user_id: str, limit: int | None, *, chat_id: int, thread_id: int | None,
     message_id: int | None, sent_at: Any = None, label: str, kind: str, error_text: str,
     prepare: Callable[[], Awaitable[Prepared]] | None = None, prepared: Prepared | None = None, seq: int | None = None,
+    future: asyncio.Future | None = None,
 ) -> inbox.InboxItem:
-    """Deliver a message to the running turn: ``prepared`` as it is, or ``prepare`` run in the background.
+    """Deliver a message to the running turn: ``prepared`` as it is, ``future`` (a preparation already
+    running), or ``prepare`` run in the background.
 
     No suspension point between ``inject_target`` and this call, so nothing can slip in between.
-    A leftover (the turn ended before reading it) is queued as a turn of its own on the same
-    prepared prompt (``_run_prepared``), in arrival order.
+    The leftovers (the turn ended before reading them) are queued together as one turn on the
+    same prepared prompts (``_run_prepared``), at the first one's place.
     """
     if prepared is not None:
         future = inbox.ready_future(prepared)
-    else:
+    elif future is None:
         echo = ChatSender(bot, chat_id, thread_id, message_id)
         future = asyncio.create_task(
             _prepare_for_inbox(prepare, kind=kind, label=label, error_text=error_text, echo=echo, user_id=user_id),
@@ -273,44 +294,74 @@ def inject(
         kind=inbox.USER, future=future, thread_id=thread_id, label=label, bot=bot, chat_id=chat_id, message_id=message_id,
         sent_at=sent_at, **({"seq": seq} if seq is not None else {}),
     )
-    item.requeue = partial(_requeue, bot, user_id, chat_id, thread_id, message_id, limit, item)
+    item.requeue_group = partial(_requeue_group, bot, user_id, chat_id, thread_id, limit)
     target.deliver(item)
     return item
 
 
-def _requeue(bot: Bot, user_id: str, chat_id: int, thread_id: int | None, reply_to: int | None, limit: int | None, item: inbox.InboxItem) -> None:
-    # /cancel dropping the queued job also stops its preparation (no echo, no transcription or
+def _requeue_group(bot: Bot, user_id: str, chat_id: int, thread_id: int | None, limit: int | None, items: list[inbox.InboxItem]) -> None:
+    """Messages the running turn did not read, as ONE queued turn at the first one's place (``inbox.requeue``)."""
+    # /cancel dropping the queued job also stops their preparations (no echo, no transcription or
     # description after the cancel); a running one is stopped with the job (_run_prepared awaits it).
+    first = items[0]
     queue.submit_nowait(Job(
-        user_id=user_id, label=item.label, seq=item.seq, thread_id=thread_id, from_user=True,
-        run=partial(_run_prepared, bot, user_id, chat_id, thread_id, reply_to, limit, item.future),
-        on_drop=partial(inbox.drop, [item]),
+        user_id=user_id, label=first.label if len(items) == 1 else inbox.combined_label(len(items)), seq=first.seq,
+        thread_id=thread_id, from_user=True,
+        run=partial(_run_prepared, bot, user_id, chat_id, thread_id, first.message_id, limit, [i.future for i in items]),
+        on_drop=partial(inbox.drop, list(items)),
     ))
 
 
 async def _run_prepared(
     bot: Bot, user_id: str, chat_id: int, thread_id: int | None, reply_to: int | None, limit: int | None,
-    future: asyncio.Future, ctx: JobContext,
+    futures: list[asyncio.Future], ctx: JobContext, *, status: Message | None = None,
 ) -> None:
-    """A message the running turn did not read, as a turn of its own (its preparation is reused)."""
-    if future.cancelled():
-        return
+    """Messages prepared ahead as ONE turn of their own: what a running turn did not read, or the
+    messages of a message window. Their preparations are reused (awaited when still running), their
+    prompts put together (``inbox.combine``; one message is its own prompt). ``status`` (the
+    window's count line) becomes the turn's status."""
+    sender = ChatSender(bot, chat_id, thread_id, reply_to)
     ctx.set_progress("preparing")
-    prepared: Prepared = await future  # usually done long ago; a cancel of this job cancels it too
-    if not prepared.ok:
-        await ChatSender(bot, chat_id, thread_id, reply_to).send_text(prepared.error_text or "❌ Could not process this message.", markdown=False)
+    live = [f for f in futures if not f.cancelled()]
+    try:
+        # Usually done long ago. One gather: a cancel of this job cancels every preparation still
+        # running at once (no echo, no transcription after a /cancel); one dropped elsewhere is skipped.
+        results = await asyncio.gather(*live, return_exceptions=True)
+    except asyncio.CancelledError:
+        if status is not None:
+            await sender.edit_text(status, "🛑 Stopped.", markdown=False)
+        raise
+    prepared: list[Prepared] = []
+    for result in results:
+        if isinstance(result, asyncio.CancelledError):
+            continue  # that preparation was dropped, not this job
+        if isinstance(result, BaseException):
+            result = Prepared(prompt=None, reason=inbox.failure_reason(result))
+        prepared.append(result if isinstance(result, Prepared) else Prepared(prompt=result))
+    if not prepared:
+        return
+    combined = inbox.combine(prepared)
+    if not combined.ok:
+        text = combined.error_text or "❌ Could not process this message."
+        if status is not None:
+            await sender.edit_text(status, text, markdown=False)
+        else:
+            await sender.send_text(text, markdown=False)
         return
     await run_turn(
-        bot=bot, user_id=user_id, chat_id=chat_id, prompt=prepared.prompt, thread_id=thread_id,
-        reply_to_message_id=reply_to, ctx=ctx, limit=limit, speak=prepared.speak,
+        bot=bot, user_id=user_id, chat_id=chat_id, prompt=combined.prompt, thread_id=thread_id,
+        reply_to_message_id=reply_to, ctx=ctx, limit=limit, speak=combined.speak, status=status,
     )
 
 
 async def accept(
     message: Message, bot: Bot, user_id: str, limit: int | None, *, label: str, kind: str, error_text: str,
     prepare: Callable[[], Awaitable[Prepared]], run: Callable[[JobContext], Awaitable[Any]], seq: int | None = None,
+    window: bool = True, waiting: Message | None = None,
 ) -> None:
-    """A content message: into the running turn of its topic (👀), else a queued job (busy notice as before)."""
+    """A content message: into the running turn of its topic (👀); else into the message window of its
+    chat and topic (``window`` and ``MESSAGE_WINDOW`` on: messages sent together become one turn);
+    else a queued job (busy notice as before). ``waiting``: an album's "waiting for images" line."""
     await remember_topic(message, user_id)
     thread_id = _thread_id(message)
     target = inject_target(user_id, thread_id)
@@ -321,17 +372,268 @@ async def accept(
         )
         await inbox.mark_seen(item)
         return
+    if window and MESSAGE_WINDOW > 0:
+        entry = _Entry(
+            message=message, label=label, kind=kind, error_text=error_text, prepare=prepare, run=run,
+            seq=seq if seq is not None else next_seq(), waiting=waiting,
+        )
+        await _gather(bot, user_id, limit, thread_id, entry)
+        return
     job = Job(user_id=user_id, label=label, run=run, thread_id=thread_id, from_user=True, **({"seq": seq} if seq is not None else {}))
     await submit(message, job)
+
+
+# ---------------------------------------------------------------------------
+# messages sent together: one turn (the message window)
+# ---------------------------------------------------------------------------
+MESSAGE_WINDOW = config.message_window_seconds  # seconds a message waits for the next one (MESSAGE_WINDOW_SECONDS; 0 = off)
+MESSAGE_WINDOW_MAX = 30.0  # the window never stays open longer, however often it is extended
+WINDOW_STATUS = "📥 *Got {count} messages.* I'll read them all together."
+WINDOW_CANCELLED = "🛑 Cancelled."
+
+
+@dataclass(eq=False)
+class _Entry:
+    """One message waiting in a window: what ``accept`` would have queued or injected."""
+
+    message: Message
+    label: str
+    kind: str
+    error_text: str
+    prepare: Callable[[], Awaitable[Prepared]]
+    run: Callable[[JobContext], Awaitable[Any]]
+    seq: int
+    waiting: Message | None = None  # an album's "waiting for images" line (the count replaces it)
+    future: asyncio.Future | None = None  # its preparation, started once the window holds two messages
+
+
+@dataclass(eq=False)
+class _Window:
+    """The messages of one chat and topic that arrived together (``MESSAGE_WINDOW`` apart at most)."""
+
+    bot: Bot
+    user_id: str
+    chat_id: int
+    thread_id: int | None
+    limit: int | None
+    opened: float
+    due: float
+    entries: list[_Entry] = field(default_factory=list)  # by Telegram message id: the order they were sent in
+    status: Message | None = None  # the count line, once there are two
+    shown: int = 0  # the count it shows
+    status_task: asyncio.Task | None = None
+    timer: asyncio.Task | None = None
+    closed: bool = False
+    handed: bool = False  # its messages are queued or in a running turn: nothing may drop them any more
+
+
+_windows: dict[tuple[str, int | None], _Window] = {}
+_albums_handing: dict[tuple[int, int | None], int] = {}  # albums of a chat and topic being handed over (flushed)
+
+
+def _collecting(user_id: str, thread_id: int | None) -> _Window | None:
+    """The open message window of the user's topic, if any."""
+    _same_loop()
+    return _windows.get((str(user_id), thread_id))
+
+
+def _album_arriving(chat_id: int, thread_id: int | None) -> bool:
+    """A photo album of this chat and topic is still being collected or handed over: a window waits for it."""
+    if _albums_handing.get((chat_id, thread_id)):
+        return True
+    return any(a.message.chat.id == chat_id and _thread_id(a.message) == thread_id for a in _albums.values())
+
+
+def _start_preparing(window: _Window, entry: _Entry) -> asyncio.Task:
+    echo = ChatSender(window.bot, window.chat_id, window.thread_id, entry.message.message_id)
+    return asyncio.create_task(
+        _prepare_for_inbox(
+            entry.prepare, kind=entry.kind, label=entry.label, error_text=entry.error_text, echo=echo, user_id=window.user_id,
+        ),
+        name=f"prepare-{window.user_id}-{entry.label}",
+    )
+
+
+async def _gather(bot: Bot, user_id: str, limit: int | None, thread_id: int | None, entry: _Entry) -> None:
+    """Put ``entry`` into the window of its chat and topic (opened when there is none) and extend it.
+
+    The user sees "typing…" for the first message. From the second on, the window is one turn of
+    several messages: each message gets 👀 and its preparation starts (download, transcription), and
+    one status line counts them. Everything that changes the window happens before the first await.
+    """
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    key = (str(user_id), thread_id)
+    window = _collecting(user_id, thread_id)
+    if window is None:
+        window = _windows[key] = _Window(
+            bot=bot, user_id=str(user_id), chat_id=entry.message.chat.id, thread_id=thread_id, limit=limit, opened=now, due=now,
+        )
+        window.timer = asyncio.create_task(_window_timer(key, window), name=f"message-window-{user_id}")
+    ids = [e.message.message_id for e in window.entries]
+    window.entries.insert(bisect.bisect_right(ids, entry.message.message_id), entry)
+    window.due = min(now + MESSAGE_WINDOW, window.opened + MESSAGE_WINDOW_MAX)
+    if len(window.entries) == 1:
+        await ChatSender(bot, window.chat_id, thread_id).typing()
+        return
+    fresh = [e for e in window.entries if e.future is None]  # the first message too, once the second arrives
+    for e in fresh:
+        e.future = _start_preparing(window, e)
+    waiting = [e.waiting for e in fresh if e.waiting is not None]
+    for e in fresh:
+        e.waiting = None
+    _show_count(window)
+    await asyncio.gather(
+        *(inbox.react(bot, window.chat_id, e.message.message_id, inbox.SEEN_REACTION) for e in fresh),
+        *(delete_quietly(w) for w in waiting),  # the count says it now
+    )
+
+
+def _show_count(window: _Window) -> None:
+    if window.status_task is None or window.status_task.done():
+        window.status_task = asyncio.create_task(_update_count(window), name=f"message-window-status-{window.user_id}")
+
+
+async def _update_count(window: _Window) -> None:
+    """The count line follows the window: one Telegram call at a time, the latest count wins."""
+    while not window.closed and window.shown != len(window.entries):
+        count = len(window.entries)
+        sender = ChatSender(window.bot, window.chat_id, window.thread_id, window.entries[0].message.message_id)
+        text = WINDOW_STATUS.format(count=count)
+        try:
+            if window.status is None:
+                window.status = await sender.send_text(text)
+            else:
+                await sender.edit_text(window.status, text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - the count is a courtesy
+            logger.debug("Could not show the message count to %s: %s", window.user_id, e)
+            return
+        window.shown = count
+
+
+async def _window_timer(key: tuple[str, int | None], window: _Window) -> None:
+    """Close the window once nothing arrived for ``MESSAGE_WINDOW`` (or at ``MESSAGE_WINDOW_MAX``);
+    an album of the same chat and topic still arriving keeps it open."""
+    loop = asyncio.get_running_loop()
+    deadline = window.opened + MESSAGE_WINDOW_MAX
+    while True:
+        delay = window.due - loop.time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+            continue
+        if _album_arriving(window.chat_id, window.thread_id) and loop.time() < deadline:
+            window.due = min(loop.time() + MESSAGE_WINDOW, deadline)
+            continue
+        break
+    try:
+        await _close_window(key, window)
+    except Exception as e:  # noqa: BLE001 - e.g. the queue is closed (shutdown)
+        if window.handed:
+            logger.warning("After handing over the messages of %s: %s", window.user_id, e)
+        else:
+            logger.warning("Could not hand over the messages of %s (%d): %s", window.user_id, len(window.entries), e)
+            _drop_window(window, notify=False)
+
+
+async def _close_window(key: tuple[str, int | None], window: _Window) -> None:
+    """The window closed: its messages join a turn of their topic that started meanwhile, or become ONE
+    queued turn (a single message: exactly the job it would have been without the window)."""
+    while window.status_task is not None and not window.status_task.done():
+        await asyncio.wait({window.status_task})
+    # From here on nothing is awaited until the messages are handed over: none can slip in between.
+    if _windows.get(key) is window:
+        del _windows[key]
+    window.closed = True
+    entries = list(window.entries)
+    if not entries:
+        return
+    first = entries[0]
+    seq = min(e.seq for e in entries)
+    target = inject_target(window.user_id, window.thread_id)
+    if target is not None:
+        # A turn of this topic started while the window was open (it came right after an earlier
+        # window): the messages join it like any message sent during a turn.
+        items = [
+            inject(
+                target, window.bot, window.user_id, window.limit, chat_id=window.chat_id, thread_id=window.thread_id,
+                message_id=e.message.message_id, sent_at=e.message.date, label=e.label, kind=e.kind,
+                error_text=e.error_text, prepare=e.prepare, future=e.future, seq=e.seq,
+            )
+            for e in entries
+        ]
+        window.handed = True
+        unseen = [item for item, e in zip(items, entries) if e.future is None]
+        await asyncio.gather(
+            *(inbox.mark_seen(item) for item in unseen),
+            ChatSender(window.bot, window.chat_id, window.thread_id).delete([window.status]),  # the turn has its own status
+            *(delete_quietly(e.waiting) for e in entries if e.waiting is not None),
+        )
+        return
+    if len(entries) == 1:
+        job = Job(user_id=window.user_id, label=first.label, run=first.run, thread_id=window.thread_id, from_user=True, seq=seq)
+    else:
+        job = Job(
+            user_id=window.user_id, label=inbox.combined_label(len(entries)), thread_id=window.thread_id, from_user=True, seq=seq,
+            run=partial(
+                _run_prepared, window.bot, window.user_id, window.chat_id, window.thread_id, first.message.message_id,
+                window.limit, [e.future for e in entries], status=window.status,
+            ),
+            on_drop=partial(_drop_window, window),
+        )
+    result = queue.submit_nowait(job)
+    window.handed = True
+    if result.was_busy:
+        await notify_busy(first.message, result)
+
+
+def _drop_window(window: _Window, notify: bool = True) -> int:
+    """Throw a window's messages away (/cancel, or its queued turn dropped): their preparations stop,
+    the count line says so. Never suspends; the number of messages."""
+    window.closed = True
+    for task in (window.timer, window.status_task):
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+    for e in window.entries:
+        if e.future is not None and not e.future.done():
+            e.future.cancel()
+    leftovers = [e.waiting for e in window.entries if e.waiting is not None]
+    if leftovers or (notify and window.status is not None):
+        task = asyncio.create_task(_tidy_dropped(window, leftovers, notify))
+        _tidying.add(task)
+        task.add_done_callback(_tidying.discard)
+    return len(window.entries)
+
+
+_tidying: set[asyncio.Task] = set()
+
+
+async def _tidy_dropped(window: _Window, waiting: list[Message], notify: bool) -> None:
+    for message in waiting:
+        await delete_quietly(message)
+    if notify and window.status is not None:
+        await ChatSender(window.bot, window.chat_id, window.thread_id).edit_text(window.status, WINDOW_CANCELLED, markdown=False)
+
+
+def drop_windows(user_id: str) -> int:
+    """/cancel: the user's open message windows (every topic) are dropped; the number of messages."""
+    _same_loop()
+    dropped = 0
+    for key in [k for k in _windows if k[0] == str(user_id)]:
+        dropped += _drop_window(_windows.pop(key))
+    return dropped
 
 
 # ---------------------------------------------------------------------------
 # /cancel
 # ---------------------------------------------------------------------------
 async def _cancel_for(user_id: str) -> str:
-    # Messages waiting in the running turn's inbox are dropped with the queue (not requeued when
-    # the turn stops), and the user's background tasks end without a notification.
+    # Messages waiting in the running turn's inbox or in a message window are dropped with the
+    # queue (not requeued when the turn stops), and the user's background tasks end without a
+    # notification.
     dropped_unread = inbox.discard(user_id)
+    dropped_unread += drop_windows(user_id)
     stopped_tasks = background.cancel_all(user_id)
     cancelled, dropped = await queue.cancel(user_id, reason="user")
     dropped += dropped_unread
@@ -486,6 +788,20 @@ async def prepare_text(bot: Bot, message: Message, user_id: str) -> Prepared:
     return Prepared(prompt=with_reference(message.text or "", message, _bot_id(bot)), kind=TEXT_KIND, label=TEXT_KIND)
 
 
+def _answer_item(message: Message, bot: Bot, user_id: str, limit: int | None, thread_id: int | None) -> inbox.InboxItem | None:
+    """A typed answer to a waiting question, delivered to the running turn of its topic (the turn
+    that asked); None when there is none to take it. No 👀: the question shows "Answered in text",
+    and ✍ follows once the agent read it. No suspension point: the caller settles the question next."""
+    target = inbox.current(user_id)
+    if target is None or not target.accepts(thread_id):
+        return None
+    return inject(
+        target, bot, user_id, limit, chat_id=message.chat.id, thread_id=thread_id, message_id=message.message_id,
+        sent_at=message.date, label=TEXT_KIND, kind=TEXT_KIND, error_text="❌ Error processing text message",
+        prepared=Prepared(prompt=with_reference(message.text or "", message, _bot_id(bot)), kind=TEXT_KIND, label=TEXT_KIND),
+    )
+
+
 async def _run_text(bot: Bot, message: Message, user_id: str, limit: int | None, ctx: JobContext) -> None:
     await run_turn(
         bot=bot, user_id=user_id, chat_id=message.chat.id, prompt=with_reference(message.text or "", message, _bot_id(bot)),
@@ -499,8 +815,14 @@ async def on_text(message: Message, bot: Bot, user_id: str, limit: int | None = 
     _stats().track_message_received(user_id, "text")
     thread_id = _thread_id(message)
     if questions.waiting_in(message.chat.id, thread_id):
-        # An ask_user_choice question waits here: the text is its answer, not a new request.
-        if await questions.answer_in_text(bot, message.chat.id, thread_id, message.text or ""):
+        # An ask_user_choice question waits here: the text is its answer, not a new request. It
+        # reaches the turn as a message of its own, read right after the tool results; the tool
+        # result only points at it (never quote the user inside a tool result).
+        item = _answer_item(message, bot, user_id, limit, thread_id)
+        if await questions.answer_in_text(bot, message.chat.id, thread_id, message.text or "", delivered=item is not None):
+            return
+        if item is not None:
+            await inbox.mark_seen(item)  # the question was gone after all: an ordinary message of the turn
             return
     await accept(
         message, bot, user_id, limit, label=TEXT_KIND, kind=TEXT_KIND, error_text="❌ Error processing text message",
@@ -849,12 +1171,13 @@ async def _run_images(
 
 async def _accept_images(
     message: Message, bot: Bot, user_id: str, limit: int | None, refs: list[Any], caption: str | None, *,
-    label: str, status: Message | None = None, seq: int | None = None,
+    label: str, status: Message | None = None, seq: int | None = None, window: bool = True,
 ) -> None:
     await accept(
         message, bot, user_id, limit, label=label, kind=_images_kind(len(refs)), error_text=IMAGES_ERROR,
         prepare=partial(prepare_images, bot, message, user_id, list(refs), caption),
         run=partial(_run_images, bot, message, user_id, limit, list(refs), caption, status), seq=seq,
+        window=window, waiting=status,
     )
 
 
@@ -881,15 +1204,28 @@ async def _flush_album(bot: Bot, key: tuple[int, str]) -> None:
     album = _albums.pop(key, None)
     if album is None or not album.refs:
         return
-    _stats().track_media_group_processed(album.user_id, len(album.refs))
-    label = f"photo album ({len(album.refs)} images)"
-    if inject_target(album.user_id, _thread_id(album.message)) is not None and album.waiting is not None:
-        # The album joins the running turn: the "waiting for images" line has nothing more to say.
-        await delete_quietly(album.waiting)
-        album.waiting = None
-    await _accept_images(
-        album.message, bot, album.user_id, album.limit, album.refs, album.caption, label=label, status=album.waiting, seq=album.seq,
-    )
+    thread_id = _thread_id(album.message)
+    topic = (album.message.chat.id, thread_id)
+    _albums_handing[topic] = _albums_handing.get(topic, 0) + 1  # a message window of this topic waits for it
+    try:
+        _stats().track_media_group_processed(album.user_id, len(album.refs))
+        label = f"photo album ({len(album.refs)} images)"
+        if inject_target(album.user_id, thread_id) is not None and album.waiting is not None:
+            # The album joins the running turn: the "waiting for images" line has nothing more to say.
+            await delete_quietly(album.waiting)
+            album.waiting = None
+        # It waited for its own pictures already: it goes into a message window only when one is
+        # open for its topic (messages sent with it, e.g. a comment or forwards, wait for it there).
+        await _accept_images(
+            album.message, bot, album.user_id, album.limit, album.refs, album.caption, label=label, status=album.waiting,
+            seq=album.seq, window=_collecting(album.user_id, thread_id) is not None,
+        )
+    finally:
+        left = _albums_handing.get(topic, 0) - 1
+        if left > 0:
+            _albums_handing[topic] = left
+        else:
+            _albums_handing.pop(topic, None)
 
 
 async def collect_album(message: Message, bot: Bot, user_id: str, limit: int | None, ref: Any, caption: str | None) -> None:

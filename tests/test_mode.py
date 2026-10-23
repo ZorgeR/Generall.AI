@@ -211,11 +211,11 @@ async def run_turn(agents_main, monkeypatch, user_settings, script=None):
     return request
 
 
-async def run_turn_client(agents_main, monkeypatch, user_settings, script=None, classify=never, question="what time is it?"):
+async def run_turn_client(agents_main, monkeypatch, user_settings, script=None, classify=never, question="what time is it?", inbox=None):
     """Runs the turn on ``question`` (a string or content blocks) and returns the fake client (loop
     requests in ``requests``, judge calls in ``created``). ``classify`` stands in for the Haiku
-    classifier; the default fails if it runs."""
-    agent = agents_main.ChainOfThoughtAgent(user_id="42", user_settings=user_settings)
+    classifier; the default fails if it runs. ``inbox``: the turn's ``bot.inbox.TurnInbox``."""
+    agent = agents_main.ChainOfThoughtAgent(user_id="42", user_settings=user_settings, inbox=inbox)
     client = FakeClient(script or [answer("done")])
     agent.agent.client = client
 
@@ -346,3 +346,65 @@ async def test_the_turn_sends_every_provider_tool_and_the_capabilities_notes(age
     for provider in (VisionTools, ProfileTools, UserInteractions):
         assert str(provider.prompt_notes).strip() in system, provider.__name__
     assert MCPTools("42").prompt_notes.strip() in system
+
+
+# ---- messages sent while the turn starts ------------------------------------------------------------
+def inbox_with(*texts):
+    """A real turn inbox already holding ``texts``, as if the user wrote them while the turn was starting."""
+    from bot import inbox
+
+    box = inbox.TurnInbox("42", None, base="data/42")
+    for text in texts:
+        box.deliver(inbox.InboxItem(kind=inbox.USER, future=inbox.ready_future(inbox.Prepared(prompt=text))))
+    return box
+
+
+async def test_messages_sent_while_the_turn_starts_go_with_the_question(agents_main, monkeypatch):
+    """Read once before the first model call: behind the question in the turn's own user message
+    (not sent yet, so nothing stored changes), where the classifier and the model see them."""
+    from agents.transcript import transcript_store
+
+    asked = []
+
+    async def classify(question, history):
+        asked.append(question)
+        return "complex"
+
+    box = inbox_with("and in Paris?")
+    client = await run_turn_client(agents_main, monkeypatch, settings("auto"), classify=classify, inbox=box)
+    (request,) = client.requests
+    user = request["messages"][-1]
+    assert [b["type"] for b in user["content"]] == ["text", "text", "text"]
+    assert user["content"][1]["text"].endswith("what time is it?")
+    injected = user["content"][2]["text"]
+    assert injected.startswith('<user_message sent_during_turn="true"') and "\nand in Paris?\n" in injected
+    assert "what time is it?" in asked[0] and asked[0].endswith("and in Paris?")  # the classifier saw both
+    assert transcript_store.load("42", None).messages[0]["content"][2]["text"] == injected  # stored as sent
+    assert not box.has_pending() and box.drained_user_texts == ["and in Paris?"]
+
+
+async def test_the_quick_answer_sees_them_too(agents_main, monkeypatch):
+    from agents.transcript import transcript_store
+
+    quick = FakeClient([answer("done")])
+    monkeypatch.setattr(agents_main, "anthropic_client", quick)
+    box = inbox_with("and in Paris?")
+    client = await run_turn_client(agents_main, monkeypatch, settings("auto"), classify=simple, inbox=box)
+    assert client.requests == []  # the tool loop never ran
+    (request,) = quick.created
+    assert request["messages"][-1]["content"][0]["text"].endswith("what time is it?\n\n[Sent while I was working]\nand in Paris?")
+    stored = transcript_store.load("42", None).messages[0]["content"]
+    assert stored[-1]["text"].startswith("<user_message") and "and in Paris?" in stored[-1]["text"]
+
+
+async def test_legacy_mode_reads_them_as_text_behind_the_question(agents_main, monkeypatch):
+    user_settings = settings("intelligence")
+    user_settings["transcript"]["enabled"] = False
+    user_settings["semantic_search"]["enabled"] = False
+    box = inbox_with("and in Paris?")
+    client = await run_turn_client(agents_main, monkeypatch, user_settings, inbox=box)
+    (request,) = client.requests
+    content = request["messages"][-1]["content"]
+    text = content if isinstance(content, str) else content[0]["text"]
+    assert "what time is it?" in text and text.rstrip().endswith("and in Paris?\n</user_message>")
+    assert box.drained_user_texts == ["and in Paris?"]

@@ -282,6 +282,14 @@ agent gets who wrote the referenced message (you, the assistant, a channel), whe
 caption; nothing is downloaded from it, so reply with the file itself when you want a picture or a
 document looked at again.
 
+### 📥 Messages sent together are one request
+
+Forward a few messages with a comment, or type three short lines in a row, and the agent reads them all
+as one request instead of answering each one alone. A message waits 1.5 seconds for the next one, and
+every new one extends the wait (30 seconds at most); a photo album still arriving is waited for too. You
+see "typing…" at once, then 👀 on each message and one "📥 Got 3 messages" line, which becomes the
+answer's status. `MESSAGE_WINDOW_SECONDS` sets the wait (0 turns it off).
+
 ### 🗣️ Talk to it while it works
 
 You don't have to wait for an answer before writing again. While the agent works on your request, whatever
@@ -290,15 +298,15 @@ use the other file", goes to the task it is working on:
 
 - **👀 then ✍**: 👀 on your message means it reached the running task, ✍ means the agent has read it. The
   agent reads new messages at its next step (between two tool calls), adjusts its plan and covers them in its
-  answer; a quick question may get a short reply right away while the work goes on. Anything it did not get to
-  before finishing is answered next, in the order you sent it.
+  answer; a quick question may get a short reply right away while the work goes on. Whatever it did not get to
+  before finishing is answered next, all of it together, in the order you sent it.
 - **Long steps run in the background**: a tool call still running after 30 seconds, or after a few seconds when
-  you have written something meanwhile, keeps running in the background while the agent goes on. It tells you
-  when the result is there: inside the same task if that is still working, otherwise as a new "🔔 Background
-  task finished" message (or not at all when there is nothing worth saying). The agent can also wait for, list
-  or cancel these tasks.
-- **Type instead of tapping**: when the agent asks a question with buttons, you can type your answer instead.
-  Browser approvals are the exception: buying, paying, sending a message or deleting something in the browser
+  you have written something meanwhile, keeps running in the background while the agent goes on. When it
+  finishes the agent is told and reads the result: inside the same task if that is still working, otherwise as
+  a new "🔔 Background task finished" message (or not at all when there is nothing worth saying). The agent can
+  also wait for, list or cancel these tasks.
+- **Type instead of tapping**: when the agent asks a question with buttons, you can type your answer instead;
+  the agent reads it as your message (✍ once read), so it can be as long or specific as you like. Browser approvals are the exception: buying, paying, sending a message or deleting something in the browser
   needs a tap on ✅ Allow; typing "yes" is not enough.
 - **Stop or cancel**: 🛑 Stop ends only the current answer; messages it has not read yet are answered next and
   background tasks keep running. `/cancel` stops everything: the current task, your queued and unread messages,

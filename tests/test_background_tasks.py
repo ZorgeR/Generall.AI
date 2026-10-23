@@ -1,7 +1,9 @@
-"""Tool calls moved to the background (bot/background.py): ids and the cap, the <task_notification>
-format, delivery to the running turn of the task's topic or a "background task finished" turn
-through the queue, notifications joining a queued one, cancel_task, /cancel (cancels them),
-the Stop button (keeps them), shutdown, and run_turn handing the agent its inbox and host."""
+"""Tool calls moved to the background (bot/background.py): ids and the cap, the notice of a task
+that ended (facts only, never its output) and the result read with get_task_result (``read``),
+delivery of the notice to the running turn of the task's topic or a "background task finished"
+turn through the queue, tasks joining a queued one, no notice or turn for a result already read,
+cancel_task, /cancel (cancels them), the Stop button (keeps them), shutdown, and run_turn handing
+the agent its inbox and host."""
 import asyncio
 import sys
 import time
@@ -117,8 +119,17 @@ def adopt(h, coro, tool="run_command", max_chars=None, started=None) -> str:
     )
 
 
-def notification_text(blocks) -> str:
-    return blocks[0]["text"]
+def notice(task_id, tool="run_command", outcome="completed after 0 s", read="its result"):
+    """The block the inbox hands over for a task that ended (the agent core sends it as a system message)."""
+    text = f"The background task {task_id} ({tool}) {outcome}."
+    if read:
+        text += f' Read {read} with get_task_result (task_id "{task_id}").'
+    return {"type": "system_notice", "text": text}
+
+
+def facts(*task_ids) -> str:
+    return background.NOTIFICATION_PROMPT.format(
+        facts="\n".join(f"- The background task {t} (run_command) completed after 0 s." for t in task_ids))
 
 
 # ---- the host ------------------------------------------------------------------------------------
@@ -153,11 +164,12 @@ async def test_a_finished_task_reaches_the_running_turn_of_its_topic():
     h = host(thread_id=5)
     task_id = adopt(h, result_after("built in 95 s", 0.01))
     assert await box.wait(2) == "task"
-    blocks = await box.drain()
-    text = notification_text(blocks)
-    assert text.startswith(f'<task_notification id="{task_id}" tool="run_command" status="completed" elapsed="')
-    assert text.endswith("<result>\nbuilt in 95 s\n</result>\n</task_notification>")
-    assert h.list()[0]["status"] == "done"
+    assert await box.drain() == [notice(task_id)]  # facts only: the output is read with get_task_result
+    assert h.unread() == [task_id] and h.list()[0]["status"] == "done" and h.list()[0]["unread"] is True
+    assert h.read(task_id) == [{"type": "text", "text": f"Result of the background task {task_id} (run_command) completed after 0 s:\n\nbuilt in 95 s"}]
+    assert h.unread() == [] and h.list()[0]["unread"] is False
+    assert h.read(task_id)[0]["text"].endswith("built in 95 s")  # it can be read again
+    assert h.read("t99") is None
 
 
 async def test_results_are_capped_and_images_kept_and_errors_are_failures():
@@ -167,12 +179,32 @@ async def test_results_are_capped_and_images_kept_and_errors_are_failures():
     adopt(h, result_after("Error (exit code 2):\nno such file"))
     adopt(h, result_after(ValueError("boom")))
     await until(lambda: len(box._items) == 3)
-    blocks = await box.drain()
-    assert blocks[0]["text"].count("x") == 10 and "[truncated 40 characters]" in blocks[0]["text"]
-    assert blocks[1] == IMAGE  # images follow their notification's text block
-    assert 'status="failed"' in blocks[2]["text"] and "Error (exit code 2)" in blocks[2]["text"]
-    assert 'status="failed"' in blocks[3]["text"] and "Error: ValueError: boom" in blocks[3]["text"]
+    assert await box.drain() == [notice("t1"), notice("t2", outcome="failed after 0 s", read="the error"),
+                                 notice("t3", outcome="failed after 0 s", read="the error")]
+    first = h.read("t1")
+    assert first[0]["text"].count("x") == 10 and "[truncated 40 characters]" in first[0]["text"]
+    assert first[1] == IMAGE  # images follow the result's text block
+    assert "Error (exit code 2)" in h.read("t2")[0]["text"]
+    assert "Error: ValueError: boom" in h.read("t3")[0]["text"]
     assert [e["status"] for e in h.list()] == ["done", "failed", "failed"]
+
+
+async def test_a_result_read_before_its_notice_is_not_announced(qm, turns):
+    """wait_for_tasks (or get_task_result) handed the result over before the inbox was drained: the
+    notice is built when it is read, so it is empty, and a leftover notice queues no turn."""
+    box = inbox.open_inbox(USER, None)
+    h = host()
+    adopt(h, result_after("ok"))
+    await until(lambda: box.has_pending())
+    assert h.read("t1")
+    assert await box.drain() == []
+
+    adopt(h, result_after("later"))
+    await until(lambda: box.has_pending())
+    h.read("t2")
+    inbox.finish(box)  # the turn ended with the notice unread, the result read
+    await asyncio.sleep(0.05)
+    assert turns == [] and qm.status(USER).pending == 0
 
 
 async def test_an_idle_user_gets_a_background_task_finished_turn(qm, turns):
@@ -180,8 +212,7 @@ async def test_an_idle_user_gets_a_background_task_finished_turn(qm, turns):
     adopt(h, result_after("report.pdf is ready"))
     await until(lambda: turns)
     (turn,) = turns
-    assert turn["prompt"][0]["text"] == background.NOTIFICATION_PROMPT
-    assert "report.pdf is ready" in turn["prompt"][1]["text"] and turn["prompt"][1]["text"].startswith("<task_notification")
+    assert turn["prompt"] == facts("t1") and "report.pdf" not in turn["prompt"]  # the agent reads it with get_task_result
     assert turn["header"] == background.NOTIFICATION_HEADER and turn["quiet_marker"] == agent_runner.QUIET_MARKER
     assert turn["thread_id"] == 7 and turn["chat_id"] == 42 and turn["limit"] == 50 and turn["ctx"] is not None
 
@@ -200,8 +231,33 @@ async def test_notifications_join_a_notification_turn_that_has_not_started(qm, t
     assert qm.status(USER).pending == 1  # one turn for both
     gate.set()
     await until(lambda: turns)
-    texts = [b["text"] for b in turns[0]["prompt"]]
-    assert len(texts) == 3 and "first" in texts[1] and "second" in texts[2]
+    assert turns[0]["prompt"] == facts("t1", "t2")
+
+
+async def test_a_queued_notification_turn_leaves_out_what_was_read_meanwhile(qm, turns):
+    gate = asyncio.Event()
+
+    async def busy(ctx):
+        await gate.wait()
+
+    await qm.submit(Job(user_id=USER, label="something else", run=busy))
+    h = host()
+    adopt(h, result_after("first"))
+    adopt(h, result_after("second"))
+    await until(lambda: all(e["status"] == "done" for e in h.list()))
+    h.read("t1")  # e.g. a turn in this topic read it with get_task_result
+    gate.set()
+    await until(lambda: turns)
+    assert turns[0]["prompt"] == facts("t2")
+
+    gate.clear()
+    await qm.submit(Job(user_id=USER, label="something else", run=busy))
+    adopt(h, result_after("third"))
+    await until(lambda: h.list()[-1]["status"] == "done")  # its notification turn is queued by now
+    assert h.read("t3")
+    gate.set()
+    await until(lambda: qm.status(USER).pending == 0 and not qm.is_busy(USER))
+    assert len(turns) == 1  # nothing left to tell: no turn
 
 
 async def test_a_running_turn_of_another_topic_does_not_get_it(qm, turns):
@@ -219,7 +275,7 @@ async def test_an_unread_notification_becomes_a_turn_when_the_turn_ends(qm, turn
     await until(lambda: box.has_pending())
     inbox.finish(box)
     await until(lambda: turns)
-    assert "late result" in turns[0]["prompt"][1]["text"]
+    assert turns[0]["prompt"] == facts("t1")
 
 
 async def test_cancel_task_reports_to_a_running_turn_only(qm, turns):
@@ -233,7 +289,8 @@ async def test_cancel_task_reports_to_a_running_turn_only(qm, turns):
     task_id = adopt(h, asyncio.sleep(30))
     h.cancel(task_id)
     assert await box.wait(2) == "task"
-    assert 'status="cancelled"' in (await box.drain())[0]["text"]
+    assert await box.drain() == [notice(task_id, outcome="was cancelled after 0 s", read=None)]
+    assert h.unread() == []  # nothing to read
 
 
 # ---- /cancel, Stop, shutdown -------------------------------------------------------------------------------
@@ -310,7 +367,7 @@ async def test_slash_cancel_forgets_a_queued_notification_turn(qm, turns):
     await messages._cancel_for(USER)
     adopt(h, result_after("after the cancel"))  # must not join the dropped turn
     await until(lambda: turns)
-    assert len(turns) == 1 and "after the cancel" in turns[0]["prompt"][1]["text"]
+    assert len(turns) == 1 and turns[0]["prompt"] == facts("t2")
 
 
 async def test_shutdown_cancels_every_task_silently(qm, turns):
@@ -366,8 +423,10 @@ async def test_the_task_tools_of_a_turn_see_only_its_topic(qm, turns):
     assert time.monotonic() - t0 < 1
 
     mine = adopt(h, result_after("tests passed", 0.1))  # t2, topic 9
-    assert await tools.wait_for_tasks(5) == "A background task finished; its notification follows."
-    assert mine in (await box.drain())[0]["text"]
+    assert await tools.wait_for_tasks(5) == [
+        {"type": "text", "text": f"Result of the background task {mine} (run_command) completed after 0 s:\n\ntests passed"}]
+    assert await box.drain() == []  # its notice says nothing more: the result was handed over
+    assert host(thread_id=5).read(mine) is None and host(thread_id=9).unread() == []  # another topic cannot read it
     gate = asyncio.Event()
     for _ in range(3):
         adopt(h, gate.wait())
@@ -550,8 +609,9 @@ class _SlowTool:
 
 async def test_the_agent_loop_reads_the_real_inbox_and_hands_calls_to_the_real_host(monkeypatch, tmp_path):
     """End to end over the protocols: a user message makes the loop move a long call to the host and
-    is injected behind the placeholder result; the call's result comes back as a notification at the
-    next tool boundary; the turn record side sees the drained text."""
+    is injected behind the placeholder result; at the next tool boundary a system message says the
+    call ended (no output), and the agent reads its result with get_task_result, inside a tool
+    result; the turn record side sees the drained text."""
     import copy
     import importlib
     import os
@@ -576,13 +636,17 @@ async def test_the_agent_loop_reads_the_real_inbox_and_hands_calls_to_the_real_h
 
     from types import SimpleNamespace as NS
 
+    from agents.task_tools import TaskTools
+
     agent = agents_main.AgentAnthropic(user_id=USER)
     agent.client = _Client([
         _reply(NS(type="tool_use", id="c1", name="slow", input={"delay": 0.6}), stop="tool_use"),
         _reply(NS(type="tool_use", id="c2", name="slow", input={"delay": 0.9}), stop="tool_use"),
+        _reply(NS(type="tool_use", id="r1", name="get_task_result", input={"task_id": "t1"}), stop="tool_use"),
         _reply(NS(type="text", text="all done")),
     ])
     agent.user_interactions = _SlowTool(on_start)
+    agent.register_provider(TaskTools(h, box))
     agent.inbox, agent.background = box, h
     from agents.trace import ToolTrace
 
@@ -594,8 +658,12 @@ async def test_the_agent_loop_reads_the_real_inbox_and_hands_calls_to_the_real_h
     second = agent.client.requests[1]["messages"][-1]["content"]
     assert second[0]["tool_use_id"] == "c1" and "Still running in the background as task t1" in str(second[0]["content"])
     assert second[1]["text"].startswith('<user_message sent_during_turn="true"') and "how is it going?" in second[1]["text"]
-    third = agent.client.requests[2]["messages"][-1]["content"]
-    assert third[0] == {"type": "tool_result", "tool_use_id": "c2", "content": "slow 0.9 done"}
-    assert third[1]["text"].startswith('<task_notification id="t1" tool="slow" status="completed"')
-    assert "slow 0.6 done" in third[1]["text"]
-    assert box.drained_user_texts == ["how is it going?"] and h.list()[0]["status"] == "done"
+    third = agent.client.requests[2]["messages"]
+    assert third[-2]["content"] == [{"type": "tool_result", "tool_use_id": "c2", "content": "slow 0.9 done"}]
+    assert third[-1] == {"role": "system", "content": 'The background task t1 (slow) completed after 1 s. Read its result with get_task_result (task_id "t1").'}
+    assert "slow 0.6 done" not in str(third)
+    fourth = agent.client.requests[3]["messages"]
+    assert fourth[-1]["content"] == [{"type": "tool_result", "tool_use_id": "r1", "content": [
+        {"type": "text", "text": "Result of the background task t1 (slow) completed after 1 s:\n\nslow 0.6 done"}]}]
+    assert messages[: len(fourth)] == fourth  # returned (and stored) exactly as sent
+    assert box.drained_user_texts == ["how is it going?"] and h.list()[0]["status"] == "done" and h.unread() == []

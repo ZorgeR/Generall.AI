@@ -27,6 +27,17 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_seconds(name: str, default: float) -> float:
+    """A duration in seconds; blank or not a number = ``default``, negative = 0."""
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return max(0.0, float(value.strip()))
+    except ValueError:
+        return default
+
+
 def _env_list(name: str) -> frozenset[str]:
     value = os.getenv(name) or ""
     return frozenset(item.strip() for item in value.split(",") if item.strip())
@@ -49,6 +60,7 @@ class Config:
     elevenlabs_api_key: str | None
     max_image_resolution_vision: int
     data_dir: str = "data"
+    message_window_seconds: float = 1.5
 
     def validate(self) -> list[str]:
         """Return a list of fatal configuration problems (empty when fine)."""
@@ -79,6 +91,7 @@ def load_config() -> Config:
         thread_pool_size=max(8, _env_int("THREAD_POOL_SIZE", 32)),
         elevenlabs_api_key=os.getenv("ELEVENLABS_API_KEY") or None,
         max_image_resolution_vision=_env_int("MAX_IMAGE_RESOLUTION_VISION", 1024) or 1024,
+        message_window_seconds=_env_seconds("MESSAGE_WINDOW_SECONDS", 1.5),
     )
 
 

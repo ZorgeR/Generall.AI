@@ -37,11 +37,12 @@ from models import (
     max_tokens_for,
     openai_reasoning_options,
     request_options_for,
+    supports_system_messages,
     thinking_binding,
 )
 from agents.trace import TurnBudget, describe_args
 from agents.subagent import SubagentTools
-from agents.task_tools import TASK_TOOL_NAMES, CallState, TaskTools, bind_call
+from agents.task_tools import NOTICE_BLOCK, TASK_TOOL_NAMES, CallState, TaskTools, bind_call
 from agents import content as prompt_content
 from agents.mcp_tools import MCPTools
 from agents.profile_tools import ProfileTools, last_shown_profile_fingerprint, profile_block, profile_store
@@ -86,8 +87,9 @@ def _env_seconds(name: str, default: float) -> float:
 # ---- live turns: background tool calls (agents.task_tools) --------------------
 # With a background host (bot/background.py, given by bot.agent_runner.run_turn), a tool call
 # still running after this many seconds is moved to the background: its tool_result becomes a
-# placeholder and the turn goes on; the host delivers the result later as a <task_notification>.
-# 0 turns this time trigger off (a call still goes to the background when the user writes).
+# placeholder and the turn goes on; when it ends a notice (a system message, facts only) says so,
+# and the agent reads the result with get_task_result. 0 turns this time trigger off (a call still
+# goes to the background when the user writes).
 TOOL_BACKGROUND_AFTER_SECONDS = _env_seconds("TOOL_BACKGROUND_AFTER_SECONDS", 30.0)
 # A user message is waiting in the turn's inbox: a call that has run this long goes to the
 # background, so the agent reads the message after this batch instead of after the slow call.
@@ -102,11 +104,14 @@ NEVER_BACKGROUND = frozenset({
     *TASK_TOOL_NAMES,
 })
 BACKGROUND_PLACEHOLDER = (
-    "Still running in the background as task {task_id} (started {started} UTC). Its result will arrive as a "
-    "<task_notification> after a later tool call, or as a new message if this turn has ended. Meanwhile you can "
-    "answer the user, use other tools, or call wait_for_tasks."
+    "Still running in the background as task {task_id} (started {started} UTC). A system message will say when it "
+    "has ended, after a later tool call, or a new turn if this one has ended; then read its result with "
+    "get_task_result. Meanwhile you can answer the user, use other tools, or call wait_for_tasks."
 )
 USER_MESSAGE_OPEN = "<user_message"  # the first text block of a user message the inbox injects (bot/inbox.py)
+# A bot notice for a model without mid-conversation system messages: a marked text block in the
+# user message instead (models.supports_system_messages).
+BOT_NOTICE_TEMPLATE = "<bot_notice>\n{}\n</bot_notice>"
 SENT_WHILE_WORKING = "\n\n[Sent while I was working]\n"  # memory files: the user's messages the turn read mid-way
 
 # Anthropic config (model names and request options live in models.py)
@@ -260,6 +265,39 @@ def with_messages_read(question: str, inbox) -> str:
     if not texts:
         return question
     return f"{question}{SENT_WHILE_WORKING}" + "\n\n".join(texts)
+
+
+def split_notices(blocks: list) -> tuple[list, list[str]]:
+    """The blocks the inbox handed over, split into what goes into the user message (the user's
+    messages, their media) and the texts of the bot's notices (``NOTICE_BLOCK``: a background task
+    ended), which go into a separate system message."""
+    user, notices = [], []
+    for block in blocks or []:
+        if isinstance(block, dict) and block.get("type") == NOTICE_BLOCK:
+            text = str(block.get("text") or "").strip()
+            if text:
+                notices.append(text)
+        else:
+            user.append(block)
+    return user, notices
+
+
+def notice_messages(model: str, user_message: dict, notices: list[str]) -> list[dict]:
+    """Deliver the bot's notices after ``user_message``: one ``system`` message to append right after
+    it (it follows a user message and is followed by the model's reply, as the API requires), or,
+    for a model without mid-conversation system messages, a marked text block added to
+    ``user_message`` itself (nothing to append). Never inside the user's own blocks."""
+    if not notices:
+        return []
+    text = "\n".join(notices)
+    if supports_system_messages(model):
+        return [{"role": "system", "content": text}]
+    content = user_message.get("content")
+    if isinstance(content, list):
+        content.append({"type": "text", "text": BOT_NOTICE_TEMPLATE.format(text)})
+    else:
+        user_message["content"] = [{"type": "text", "text": str(content or "")}, {"type": "text", "text": BOT_NOTICE_TEMPLATE.format(text)}]
+    return []
 
 
 def _retrieve_result(task: asyncio.Task) -> None:
@@ -572,10 +610,20 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         return f"Unknown tool: {tool_name}"
 
     @staticmethod
-    def _request_messages(messages: list) -> list:
+    def _request_messages(messages: list, model: str | None = None) -> list:
         """The messages actually sent: private ``_…`` keys stripped, nothing else changed (the
-        transcript stores exactly what was sent, which keeps thinking blocks valid)."""
-        return [{k: v for k, v in m.items() if not str(k).startswith("_")} for m in messages]
+        transcript stores exactly what was sent, which keeps thinking blocks valid). For a ``model``
+        without mid-conversation system messages, a stored bot notice (``notice_messages``, made
+        while a model that takes them ran) goes as a marked user text block instead; the API joins
+        it to the user message before it."""
+        out = [{k: v for k, v in m.items() if not str(k).startswith("_")} for m in messages]
+        if model is None or supports_system_messages(model):
+            return out
+        return [
+            {"role": "user", "content": [{"type": "text", "text": BOT_NOTICE_TEMPLATE.format(m.get("content") or "")}]}
+            if m.get("role") == "system" else m
+            for m in out
+        ]
 
     async def _stream_message(self, kwargs: dict, on_event=None):
         """One streamed Messages API call with automatic recovery; returns the final message.
@@ -777,9 +825,10 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         return None
 
     async def _drain_inbox(self) -> list:
-        """Everything the turn's inbox holds (the user's messages, finished background tasks), as
-        content blocks for the user message that carries this batch's tool results; [] without an
-        inbox. Empty text blocks are left out (the API refuses them; what is sent is stored)."""
+        """Everything the turn's inbox holds (the user's messages, notices of finished background
+        tasks), as blocks; [] without an inbox. ``split_notices`` separates the notices (a system
+        message) from what goes into the user message. Empty text blocks are left out (the API
+        refuses them; what is sent is stored)."""
         if self.inbox is None:
             return []
         try:
@@ -960,8 +1009,12 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
         
         # Process messages to ensure proper format
         for msg in messages:
-            if msg["role"] == "system":
-                system = msg["content"]
+            if msg["role"] == "system" and not processed_messages:
+                system = msg["content"]  # a leading system message is the system prompt
+            elif msg["role"] == "system":
+                # a bot notice inside the conversation (notice_messages): kept where it is, as sent
+                if str(msg.get("content") or "").strip():
+                    processed_messages.append({"role": "system", "content": msg["content"]})
             else:
                 # Handle both string and structured content
                 if isinstance(msg["content"], str):
@@ -1030,7 +1083,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             # Build common API kwargs
             api_kwargs = {
                 "model": self.model,
-                "messages": self._request_messages(processed_messages),
+                "messages": self._request_messages(processed_messages, self.model),
                 "system": system,
                 "tools": self.get_tools_schema(),
                 "tool_choice": tool_choice,
@@ -1126,22 +1179,23 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
                 await refresh("Running: " + names)
                 tool_result_blocks = await self.run_tool_batch(tool_blocks, trace=trace, refresh=refresh)
 
-                # A live turn: what arrived while the tools ran (the user's messages, finished
-                # background tasks) goes behind the tool results, in the SAME user message (the API
-                # takes text/image/document blocks after the tool_result blocks). It is stored
+                # A live turn: what the user sent while the tools ran goes behind the tool results,
+                # in the SAME user message (the API takes text/image/document blocks after the
+                # tool_result blocks; never inside one, where the model would treat the user's words
+                # as untrusted tool output). The bot's notices (a background task ended) go into a
+                # separate system message after it, never next to the user's words. Both are stored
                 # exactly as sent, so the transcript stays append-only. Nothing is injected anywhere
                 # else: what is left when the turn ends becomes the next turn (bot/inbox.py).
                 before = self._drained_user_count()
-                injected = await self._drain_inbox()
+                injected, notices = split_notices(await self._drain_inbox())
                 read = sum(1 for b in injected if b.get("type") == "text" and str(b.get("text") or "").lstrip().startswith(USER_MESSAGE_OPEN))
                 if injected and not read:
                     read = max(0, self._drained_user_count() - before)
 
                 # Send tool results back as proper tool_result message
-                processed_messages.append({
-                    "role": "user",
-                    "content": tool_result_blocks + injected
-                })
+                tool_message = {"role": "user", "content": tool_result_blocks + injected}
+                processed_messages.append(tool_message)
+                processed_messages.extend(notice_messages(self.model, tool_message, notices))
                 if read and update_status:
                     reading_shown = True
                     details = "Reading your new message" if read == 1 else f"Reading your {read} new messages"
@@ -1239,7 +1293,7 @@ Judge's decision (ONLY answer "Yes" or "No"):"""
             # prefix) is what keeps the model from calling a tool.
             final_kwargs = {
                 "model": self.model,
-                "messages": self._request_messages(processed_messages),
+                "messages": self._request_messages(processed_messages, self.model),
                 "system": system,
                 "tools": self.get_tools_schema(),
                 "tool_choice": {"type": "none"},
@@ -1778,13 +1832,40 @@ User message: {question}"""
         mode = str(value or "auto").strip().lower()
         return mode if mode in ("speed", "intelligence") else "auto"
 
-    async def _decide_complexity(self, question: str, history_view: list, *, has_media: bool = False) -> str:
+    async def _decide_complexity(self, question: str, history_view: list, *, has_media: bool = False, needs_tools: bool = False) -> str:
         """Quick fast-model answer or the full agent for this turn. A prompt with pictures or
         documents always takes the full agent (the quick path is text-only), and so does every
-        turn in speed and intelligence mode: only auto asks the classifier."""
-        if has_media or self._mode_of(getattr(self, "user_settings", None)) != "auto":
+        turn in speed and intelligence mode: only auto asks the classifier. ``needs_tools``: there
+        is something only a tool can read (a finished background task's result), and the quick
+        path has no tools."""
+        if has_media or needs_tools or self._mode_of(getattr(self, "user_settings", None)) != "auto":
             return "complex"
         return await self._classify_complexity(question, history_view)
+
+    def _has_unread_results(self) -> bool:
+        """The user's background host holds finished results of this topic the agent has not read."""
+        unread = getattr(getattr(self, "background", None), "unread", None)
+        if unread is None:
+            return False
+        try:
+            return bool(unread())
+        except Exception as e:  # noqa: BLE001 - the host is the bot's
+            print(f"WARNING: could not ask the background host for unread results: {e}")
+            return False
+
+    async def _read_early_messages(self, update_status=None) -> list:
+        """What the user sent while the turn was starting (bot/inbox.py), read once before the first
+        model call: it goes behind the question in the turn's user message, which is not sent yet, so
+        the classifier, the quick path and the model all see it and nothing stored changes; a notice
+        among the blocks (``split_notices``) goes into a system message after that user message.
+        Later messages are read at tool boundaries (``AgentAnthropic.generate_response``)."""
+        drain = getattr(self.agent, "_drain_inbox", None)
+        early = await drain() if drain is not None else []
+        read = sum(1 for b in early if b.get("type") == "text" and str(b.get("text") or "").lstrip().startswith(USER_MESSAGE_OPEN))
+        if read and update_status:
+            details = "Reading your new message" if read == 1 else f"Reading your {read} new messages"
+            await update_status(step="reading your message", details=details, iteration=0, critique=0)
+        return early
 
     async def _build_user_message(self, turn_context: str, blocks: list) -> dict:
         """The user turn exactly as sent: the <context> block first, then the prompt's blocks with
@@ -1822,17 +1903,21 @@ User message: {question}"""
 
         history_view = text_only_view(transcript.messages)
         blocks = question_blocks if question_blocks is not None else prompt_content.normalize(question)
-        has_media = any(prompt_content.is_media_ref(b) for b in blocks)
-        complexity = await self._decide_complexity(question, history_view, has_media=has_media)
+        early, notices = split_notices(await self._read_early_messages(update_status))
+        asked = with_messages_read(question, self.inbox)  # the question and what was read with it
+        has_media = any(prompt_content.is_media_ref(b) for b in blocks) or any(prompt_content.is_media_block(b) for b in early)
+        complexity = await self._decide_complexity(asked, history_view, has_media=has_media, needs_tools=bool(notices) or self._has_unread_results())
         # the context block is stored with the question: the transcript keeps what was sent
         user_message = await self._build_user_message(turn_context, blocks)
+        user_message["content"].extend(early)
+        turn_start = [user_message, *notice_messages(self.agent.model, user_message, notices)]
         base_len = len(transcript.messages)
         response, new_messages = None, []
 
         if complexity == "simple":
             if update_status:
                 await update_status(step="initial", details=f"Quick response ({ANTHROPIC_MODEL_FAST})", iteration=0, critique=0)
-            simple_context = history_view + [{"role": "user", "content": f"{full_context}\n\n{question}"}]
+            simple_context = history_view + [{"role": "user", "content": f"{full_context}\n\n{asked}"}]
             response, _ = await self._simple_response(simple_context, static_prompt, question, on_text_chunk=on_text_chunk)
             if response is not None:
                 new_messages = [user_message, {"role": "assistant", "content": [{"type": "text", "text": response}]}]
@@ -1841,7 +1926,7 @@ User message: {question}"""
             self.agent.budget = TurnBudget(int(self.user_settings.get("tools", {}).get("max_iteration", 20)))
             self.agent.max_tool_result_chars = int(ts.get("max_tool_result_chars", 20000))
             response, all_messages = await self.agent.generate_response(
-                messages=transcript.messages + [user_message],
+                messages=transcript.messages + turn_start,
                 system_role=self._system_blocks(static_prompt),
                 question=question,
                 update_status=update_status,
@@ -2324,15 +2409,26 @@ You have been asked to answer a query given sources. Consider the following when
             short_term_memory = self._load_short_term_memory()
             print(f"Reasoning context loaded: {len(short_term_memory)} messages")
 
-            # load array of previous messages in context_memory
+            # load array of previous messages in context_memory (user and assistant only: a stored
+            # system notice would no longer follow a user message once the tool results are left out)
             for message in short_term_memory:
+                if not isinstance(message, dict) or message.get("role") not in ("user", "assistant"):
+                    continue
                 text = self._get_msg_text(message)
                 if text:
                     context_memory.append({"role": message["role"], "content": text})
         
         # Pass user message separately, behind the per-turn <context> block (times, profile) as
         # in transcript mode; the quick path gets the same text. Memory keeps the bare question.
+        # What the user sent while the turn was starting goes behind it as text (this path never
+        # sends pictures; the message's text names their paths).
+        early_blocks, notices = split_notices(await self._read_early_messages(update_status))
+        early = [b for b in early_blocks if b.get("type") == "text"]
         turn_text = f"{await self._legacy_context()}\n\n{question}"
+        if early:
+            turn_text += "\n\n" + "\n\n".join(str(b.get("text") or "") for b in early)
+        if notices:  # this path keeps text-only turns: the notice as a marked block of its own
+            turn_text += "\n\n" + BOT_NOTICE_TEMPLATE.format("\n".join(notices))
         user_question = [{"role": "user", "content": turn_text}]
         context_memory.extend(user_question)
 
@@ -2355,7 +2451,9 @@ You have been asked to answer a query given sources. Consider the following when
             dialog_history = []
 
         # Route: classify complexity to decide fast vs full path
-        complexity = await self._decide_complexity(question, dialog_history)  # mode setting applies to the legacy path too
+        complexity = await self._decide_complexity(  # the mode setting applies to the legacy path too
+            with_messages_read(question, self.inbox), dialog_history, needs_tools=bool(notices) or self._has_unread_results(),
+        )
         
         response = None
         
