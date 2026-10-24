@@ -4,8 +4,8 @@
 
 ## ⚡ In a nutshell
 
-**Your own AI agent in Telegram.** Write, talk or send a file: it thinks with Claude, uses 50+ tools and
-answers in the same chat.
+**Your own AI agent in Telegram.** Write, talk or send a file: it thinks with a frontier AI model, uses 50+
+tools and answers in the same chat.
 
 - 💬 **Understands what you send**: text, voice, photos, videos, PDFs and documents, replies and forwards
 - 🧠 **Remembers you**: the current chat word for word, every past conversation as a searchable summary,
