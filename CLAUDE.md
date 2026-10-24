@@ -348,7 +348,9 @@ docker-compose.yml          services: telegram-bot-api (local Bot API server) + 
                             the Cloudflare Tunnel to the sign-in callback, started only with COMPOSE_PROFILES=tunnel)
 .env.example                template for .env (WORKSPACE_ROOT comes from docker-compose.yml; BROWSER_SERVICE_URL is unused)
 docs/                       design notes: agent-roadmap.md (transcript / caching / subagents)
-static/                     README images only
+static/                     README images only: schema/memory-*.svg (the memory diagrams, light + dark through
+                            prefers-color-scheme; the defaults they quote: 5 summaries, 3 similar turns, 120k tokens,
+                            40 photos, 3 turns of tool results, 20,000 chars, 8 KB) and the donation QR codes
 data/                       runtime state, git-ignored (see "On-disk data layout"); also the admin's MCP servers file
 ```
 

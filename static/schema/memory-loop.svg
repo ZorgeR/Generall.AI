@@ -1,0 +1,126 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 760" width="1200" height="760" role="img" aria-label="How GALL.AI remembers: every turn reads memory before Claude is called, looks things up while it works and writes the turn back before the answer is sent.">
+<title>How GALL.AI remembers: every turn reads memory before Claude is called, looks things up while it works and writes the turn back before the answer is sent.</title>
+<style>
+.bg{fill:#ffffff}
+text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#1f2328}
+.mono{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace}
+.mut{fill:#59636e}
+.ln{stroke:#818b98;fill:none;stroke-linecap:round;stroke-linejoin:round}
+.ah{fill:#818b98}
+.frame{fill:#f6f8fa;stroke:#d1d9e0}
+.card{fill:#ffffff;stroke:#d1d9e0}
+.ink{fill:#1f2328}
+.onink{fill:#ffffff}
+.dash{stroke-dasharray:5 4}
+.k-blue{fill:#ddf4ff;stroke:#54aeff} .t-blue{fill:#0969da} .s-blue{stroke:#0969da}
+.k-green{fill:#dafbe1;stroke:#4ac26b} .t-green{fill:#1a7f37} .s-green{stroke:#1a7f37}
+.k-purple{fill:#fbefff;stroke:#c297ff} .t-purple{fill:#8250df} .s-purple{stroke:#8250df}
+.k-amber{fill:#fff8c5;stroke:#d4a72c} .t-amber{fill:#9a6700} .s-amber{stroke:#9a6700}
+.k-orange{fill:#fff1e5;stroke:#fb8f44} .t-orange{fill:#bc4c00} .s-orange{stroke:#bc4c00}
+.k-gray{fill:#f6f8fa;stroke:#d1d9e0} .t-gray{fill:#59636e} .s-gray{stroke:#59636e}
+@media (prefers-color-scheme:dark){
+.bg{fill:#0d1117}
+text{fill:#e6edf3}
+.mut{fill:#9198a1}
+.ln{stroke:#656c76}
+.ah{fill:#656c76}
+.frame{fill:#151b23;stroke:#3d444d}
+.card{fill:#0d1117;stroke:#3d444d}
+.ink{fill:#e6edf3}
+.onink{fill:#0d1117}
+.k-blue{fill:#0c2445;stroke:#1f6feb} .t-blue{fill:#58a6ff} .s-blue{stroke:#58a6ff}
+.k-green{fill:#0e2a19;stroke:#238636} .t-green{fill:#3fb950} .s-green{stroke:#3fb950}
+.k-purple{fill:#221838;stroke:#8957e5} .t-purple{fill:#bc8cff} .s-purple{stroke:#bc8cff}
+.k-amber{fill:#2a210b;stroke:#9e6a03} .t-amber{fill:#d29922} .s-amber{stroke:#d29922}
+.k-orange{fill:#2d1a0b;stroke:#bd561d} .t-orange{fill:#f0883e} .s-orange{stroke:#f0883e}
+.k-gray{fill:#161b22;stroke:#3d444d} .t-gray{fill:#9198a1} .s-gray{stroke:#9198a1}
+}
+</style>
+<defs><marker id="ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ah" d="M0,1 L9,5 L0,9 z"/></marker></defs>
+<rect class="bg" x="0" y="0" width="1200" height="760" rx="16"/>
+<text x="40" y="56" font-size="24" font-weight="700">How GALL.AI remembers</text>
+<text x="40" y="84" font-size="14" class="mut">Every turn reads memory before Claude is called, uses it while it works, and writes it back before the answer is sent.</text>
+<rect x="316" y="116" width="568" height="116" rx="14" class="k-orange" stroke-width="1.5" />
+<circle cx="346" cy="148" r="13" class="t-orange"/>
+<text x="346" y="153" font-size="14" class="onink" font-weight="700" text-anchor="middle">2</text>
+<text x="368" y="154" font-size="17"><tspan font-weight="700">Work</tspan><tspan class="mut" font-weight="400">  ·  Claude agent loop</tspan></text>
+<text x="344" y="180" font-size="13" class="mut">thinks, calls tools, reads the messages you send meanwhile</text>
+<rect x="344" y="194" width="119" height="22" rx="11.0" class="k-green" stroke-width="1" />
+<text x="403.5" y="209.32" font-size="12" class="t-green mono" text-anchor="middle">memory_search</text>
+<rect x="471" y="194" width="127" height="22" rx="11.0" class="k-purple" stroke-width="1" />
+<text x="534.5" y="209.32" font-size="12" class="t-purple mono" text-anchor="middle">user_profile_*</text>
+<rect x="606" y="194" width="96" height="22" rx="11.0" class="k-amber" stroke-width="1" />
+<text x="654.0" y="209.32" font-size="12" class="t-amber mono" text-anchor="middle">view_image</text>
+<rect x="710" y="194" width="119" height="22" rx="11.0" class="k-amber" stroke-width="1" />
+<text x="769.5" y="209.32" font-size="12" class="t-amber mono" text-anchor="middle">read_document</text>
+<rect x="410" y="262" width="380" height="340" rx="16" class="frame" stroke-width="1.5" />
+<text x="430" y="291" font-size="15" font-weight="700">Your memory</text>
+<text x="770" y="291" font-size="12" class="mut mono" text-anchor="end">data/&lt;chat id&gt;/</text>
+<rect x="426" y="306" width="348" height="52" rx="9" class="k-blue" stroke-width="1" />
+<text x="442" y="328" font-size="14" class="t-blue" font-weight="700">Transcript</text>
+<text x="760" y="328" font-size="12" class="mut" text-anchor="end">per chat / topic</text>
+<text x="442" y="347" font-size="12.5" class="mut">exact messages, tool calls, thinking, photos</text>
+<rect x="426" y="364" width="348" height="52" rx="9" class="k-green" stroke-width="1" />
+<text x="442" y="386" font-size="14" class="t-green" font-weight="700">Conversation log</text>
+<text x="760" y="386" font-size="12" class="mut" text-anchor="end">all topics</text>
+<text x="442" y="405" font-size="12.5" class="mut">topic + short summary of every turn</text>
+<rect x="426" y="422" width="348" height="52" rx="9" class="k-green" stroke-width="1" />
+<text x="442" y="444" font-size="14" class="t-green" font-weight="700">Semantic index</text>
+<text x="760" y="444" font-size="12" class="mut" text-anchor="end">all topics</text>
+<text x="442" y="463" font-size="12.5" class="mut">an embedding of every turn (FAISS)</text>
+<rect x="426" y="480" width="348" height="52" rx="9" class="k-purple" stroke-width="1" />
+<text x="442" y="502" font-size="14" class="t-purple" font-weight="700">Profile</text>
+<text x="760" y="502" font-size="12" class="mut" text-anchor="end">all topics</text>
+<text x="442" y="521" font-size="12.5" class="mut">durable facts about you, up to 8 KB</text>
+<rect x="426" y="538" width="348" height="52" rx="9" class="k-amber" stroke-width="1" />
+<text x="442" y="560" font-size="14" class="t-amber" font-weight="700">Workspace files</text>
+<text x="760" y="560" font-size="12" class="mut" text-anchor="end">all topics</text>
+<text x="442" y="579" font-size="12.5" class="mut">photos, PDFs, downloads, generated files</text>
+<rect x="40" y="300" width="300" height="264" rx="14" class="card" stroke-width="1.5" />
+<circle cx="72" cy="334" r="13" class="ink"/>
+<text x="72" y="339" font-size="14" class="onink" font-weight="700" text-anchor="middle">1</text>
+<text x="94" y="340" font-size="17" font-weight="700">Recall</text>
+<text x="64" y="366" font-size="12.5" class="mut">before Claude is called</text>
+<circle cx="70" cy="395.5" r="4.5" class="t-blue"/>
+<text x="84" y="400" font-size="13.5">replays the whole transcript</text>
+<circle cx="70" cy="423.5" r="4.5" class="t-green"/>
+<text x="84" y="428" font-size="13.5">adds the 5 newest summaries</text>
+<circle cx="70" cy="451.5" r="4.5" class="t-green"/>
+<text x="84" y="456" font-size="13.5">adds the 3 most similar turns</text>
+<circle cx="70" cy="479.5" r="4.5" class="t-purple"/>
+<text x="84" y="484" font-size="13.5">adds the profile, if it changed</text>
+<circle cx="70" cy="507.5" r="4.5" class="t-gray"/>
+<text x="84" y="512" font-size="13.5">adds time, time zone and topic</text>
+<text x="64" y="542" font-size="12" class="mut" font-style="italic">each memory line is shown once per chat</text>
+<rect x="860" y="300" width="300" height="264" rx="14" class="card" stroke-width="1.5" />
+<circle cx="892" cy="334" r="13" class="ink"/>
+<text x="892" y="339" font-size="14" class="onink" font-weight="700" text-anchor="middle">3</text>
+<text x="914" y="340" font-size="17" font-weight="700">Remember</text>
+<text x="884" y="366" font-size="12.5" class="mut">after the answer is written</text>
+<circle cx="890" cy="395.5" r="4.5" class="t-blue"/>
+<text x="904" y="400" font-size="13.5">appends the turn as it was sent</text>
+<circle cx="890" cy="423.5" r="4.5" class="t-blue"/>
+<text x="904" y="428" font-size="13.5">compacts it past 120k tokens</text>
+<circle cx="890" cy="451.5" r="4.5" class="t-green"/>
+<text x="904" y="456" font-size="13.5">Haiku writes topic + summary</text>
+<circle cx="890" cy="479.5" r="4.5" class="t-green"/>
+<text x="904" y="484" font-size="13.5">embeds it in the semantic index</text>
+<text x="884" y="542" font-size="12" class="mut" font-style="italic">a failed save never blocks the answer</text>
+<path d="M406,432 H344" class="ln" stroke-width="2.5" marker-end="url(#ah)" />
+<text x="375.0" y="422" font-size="12" class="mut" font-weight="600" text-anchor="middle">reads</text>
+<path d="M860,432 H794" class="ln" stroke-width="2.5" marker-end="url(#ah)" />
+<text x="825.0" y="422" font-size="12" class="mut" font-weight="600" text-anchor="middle">writes</text>
+<path d="M600,236 V258" class="ln" stroke-width="2.5" marker-end="url(#ah)" marker-start="url(#ah)" />
+<text x="612" y="252" font-size="12" class="mut" font-weight="600">looks up · edits</text>
+<rect x="480" y="672" width="240" height="56" rx="14" class="card" stroke-width="1.5" />
+<text x="600" y="697" font-size="15" font-weight="700" text-anchor="middle">Telegram chat</text>
+<text x="600" y="716" font-size="12" class="mut" text-anchor="middle">message in · answer out</text>
+<path d="M480,700 H206 Q190,700 190,684 V568" class="ln" stroke-width="2" marker-end="url(#ah)" />
+<text x="335" y="692" font-size="12.5" class="mut" text-anchor="middle">your message</text>
+<path d="M190,300 V188 Q190,172 206,172 H312" class="ln" stroke-width="2" marker-end="url(#ah)" />
+<text x="280" y="162" font-size="12.5" class="mut" text-anchor="middle">request</text>
+<path d="M884,172 H994 Q1010,172 1010,188 V296" class="ln" stroke-width="2" marker-end="url(#ah)" />
+<text x="920" y="162" font-size="12.5" class="mut" text-anchor="middle">answer</text>
+<path d="M1010,564 V684 Q1010,700 994,700 H724" class="ln" stroke-width="2" marker-end="url(#ah)" />
+<text x="865" y="692" font-size="12.5" class="mut" text-anchor="middle">answer sent</text>
+</svg>
