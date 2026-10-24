@@ -2,17 +2,25 @@
 
 > **Note:** GenerALL.AI refers to a "General Purpose AI", not a military general.
 
+## ⚡ In a nutshell
+
+**Your own AI agent in Telegram.** Write, talk or send a file: it thinks with Claude, uses 50+ tools and
+answers in the same chat.
+
+- 💬 **Understands what you send**: text, voice, photos, videos, PDFs and documents, replies and forwards
+- 🧠 **Remembers you**: the current chat word for word, every past conversation as a searchable summary,
+  and a profile of facts you control
+- 🛠️ **Does the work**: web search and research, code in your own sandbox, a real browser that clicks,
+  types and logs in
+- 🎨 **Creates**: images, videos, PDF / Word / Excel documents and voice replies
+- ⏰ **Works on schedule**: reminders and recurring tasks in your time zone, quiet when there is nothing new
+- 🗣️ **Never blocks you**: keep writing while it works; long jobs finish in the background and report back
+- 🔌 **Plugs into your tools**: any MCP server (Notion, Linear, Sentry, …) with a one-tap sign-in
+- 🔒 **Safe by default**: isolated containers without access to private networks, invite-only access
+
 ## 📋 Overview
 
 GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bot communication interface powered by advanced AI models like Claude Sonnet 5.5 and GPT-6.1. It provides a seamless interface for users to interact with AI capabilities through Telegram, supporting text, voice, images, documents, and more.
-
-## 🔎 At a Glance
-
-- **Multimodal Agent System**: Process and respond to text, voice, images, and documents within a single conversation
-- **Tool-Based Architecture**: Powered by specialized modules for tasks like web search, file operations, code execution, and more
-- **Extensible Framework**: Built on a modular system that can be expanded with new capabilities
-- **Natural Interface**: Communicate with advanced AI models through the familiar Telegram messaging platform
-- **Secure Execution**: All operations run in isolated environments with proper permission controls
 
 ## ✨ Features
 
