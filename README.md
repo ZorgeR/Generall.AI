@@ -67,7 +67,8 @@ GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bo
 - **📱 SMS Messaging**: Send SMS text messages to phone numbers via Twilio integration
 - **⚙️ Customizable Settings**: `/settings` with three presets (⚡ Fast, ⚖️ Balanced, 🧠 Deep), a mode setting
   (quick answers vs. deep work) and an Advanced toggle for the power settings
-- **🧠 Persistent Memory**: Maintain conversation context across sessions
+- **🧠 Long memory**: the current chat word for word, plus a summary of every past conversation that is
+  recalled by recency and by meaning ([how memory works](#-how-memory-works))
 - **👤 Profile memory**: the agent keeps a short profile of durable facts about you (name, city, preferences, projects)
   that you can see and clear with `/profile`; say "remember that …" or "forget …"
 - **🔌 MCP servers**: connect your own Model Context Protocol tool servers with `/mcp` (a token, or a one-tap OAuth sign-in for Notion, Linear, Sentry, …) and the agent uses their tools
@@ -75,7 +76,6 @@ GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bo
   show up in Telegram's "/" menu
 - **📊 /usage**: your own usage for the last 30 days (actions, tokens, estimated cost, reminders, workspace size)
 - **🔌 Advanced Agent Architecture**: Powered by a modular agent system with specialized tools for different tasks
-- **💾 Memory Management**: Smart conversation history handling with summarization capabilities
 - **🔍 Web Search**: Search the web for up-to-date information using multiple providers (Perplexity, Tavily)
 - **🧩 Reasoning Systems**: Multiple stages of reasoning with critique and judge mechanisms
 - **☁️ Cloud Storage**: Upload and manage files on S3-compatible storage
@@ -88,17 +88,29 @@ GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bo
   - Track invite usage and user access via admin commands
   - Automatically notify admins when new users join
 
-## ⚙️ How memory work
+## 🧠 How memory works
+
+Every turn reads your memory before Claude is called, uses it while it works and writes the turn back before
+the answer is sent:
+
+![How GALL.AI remembers: Recall replays the transcript and adds recent summaries, similar past conversations and the profile; Claude works with memory tools; Remember appends the turn, compacts it, summarizes and embeds it](static/schema/memory-loop.svg)
+
+What Claude receives on each turn: most of the request has not changed since the last turn and is read from
+the prompt cache; only a small new part is built from your memory.
+
+![What Claude sees on every turn: the system prompt and the chat's transcript form a cached prefix; the new part holds the context line, recent summaries, similar past conversations, the profile when it changed, and your message](static/schema/memory-request.svg)
 
 - **Transcript (short-term)**: every chat (or forum topic) has one real conversation transcript, including the
   tool calls the agent made, what they returned and its reasoning. It is replayed as is on every turn, so the
-  agent remembers what it looked up and did. Large tool results are capped, results older than a few turns
-  are cleared, and when the transcript grows past the configured context size the oldest part is summarized.
-  A new forum topic starts with an empty transcript. Settings: `/settings` → Transcript.
+  agent remembers what it looked up and did. A tool result is cut to 20,000 characters when it arrives. When
+  the transcript grows past the memory window (120k tokens by default), tool results older than the last 3
+  turns are cleared and the oldest half is summarized into one message; past 40 photos the oldest ones become
+  short markers. A new forum topic starts with an empty transcript. Settings: `/settings` → 🧠 Memory.
 - **Long-term memory**: after each turn a short summary and an embedding of the exchange are stored
   (`text-embedding-3-small`, cosine similarity; a model change rebuilds the index by itself). On the next
-  question the most recent summaries and the semantically closest earlier conversations are injected as a
-  memory block, so the agent can recall things from weeks ago even after the transcript was pruned. The agent
+  question the 5 most recent summaries and the 3 semantically closest earlier conversations are added as a
+  memory block (each line only once per chat), so the agent can recall things from weeks ago even after the
+  transcript was compacted. Summaries are shared by all chats and forum topics. The agent
   can also search this memory by keyword (`memory_search`) before saying it does not remember something.
 - **Profile**: durable facts about you (About, Preferences, dated Notes) live in a small profile the agent
   maintains itself and sees whenever it changed. `/profile` shows it and can forget everything; "remember
@@ -114,6 +126,8 @@ GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bo
 - **Prompt caching**: the static prompt and the transcript prefix are cached on the API side, so long
   conversations and tool-heavy turns cost a fraction of the uncached price; the status message shows the
   cached share per turn.
+
+How long each layer lasts and which settings change it: [Memory layers and their settings](#-memory-layers-and-their-settings).
 
 ## 🚀 Example Scenarios
 
@@ -338,6 +352,19 @@ judge rounds, personality prompt, image variants). `/usage` hints at Fast when c
 prompts; the same commands appear in Telegram's "/" menu. `/usage` shows your own last 30 days:
 actions against your quota, requests, answers, tool calls, tokens in/out with the cached share, the
 estimated cost and a 7-day cost sparkline, active reminders and the size of your workspace.
+
+### 🧠 Memory layers and their settings
+
+![Six layers of memory: this turn, the transcript, the earlier summary, long-term memory, the profile and workspace files; the lower the layer, the more condensed it is and the longer it lasts](static/schema/memory-layers.svg)
+
+| Layer | What you can change |
+|---|---|
+| This turn | nothing to set: messages you send while the agent works join the turn |
+| Transcript | `/settings` → 🧠 Memory → **🧵 Remember this chat in full** (off = a plain question/answer window); with **⚙️ Advanced** on, **Memory window** (120k tokens) and **Keep tool results (turns)** (3) |
+| Earlier summary | made by itself when the transcript passes the memory window |
+| Long-term memory | **📚 Recent summaries in memory** and **🔍 Recall similar past chats**; with Advanced on, **Summaries kept** (5) and **Recalled chats per message** (3) |
+| Profile | `/profile` shows it and forgets everything; "remember that …" and "forget …" in the chat |
+| Workspace files | ask the agent to list, send or delete them; `/usage` shows how much space they take |
 
 ### 👤 Profile memory
 

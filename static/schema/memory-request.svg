@@ -1,0 +1,133 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 950" width="1200" height="950" role="img" aria-label="What Claude sees on every turn: a cached prefix (system prompt, tools, the chat's transcript) plus a small new part built from your memory; after the answer the turn is saved.">
+<title>What Claude sees on every turn: a cached prefix (system prompt, tools, the chat's transcript) plus a small new part built from your memory; after the answer the turn is saved.</title>
+<style>
+.bg{fill:#ffffff}
+text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#1f2328}
+.mono{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace}
+.mut{fill:#59636e}
+.ln{stroke:#818b98;fill:none;stroke-linecap:round;stroke-linejoin:round}
+.ah{fill:#818b98}
+.frame{fill:#f6f8fa;stroke:#d1d9e0}
+.card{fill:#ffffff;stroke:#d1d9e0}
+.ink{fill:#1f2328}
+.onink{fill:#ffffff}
+.dash{stroke-dasharray:5 4}
+.k-blue{fill:#ddf4ff;stroke:#54aeff} .t-blue{fill:#0969da} .s-blue{stroke:#0969da}
+.k-green{fill:#dafbe1;stroke:#4ac26b} .t-green{fill:#1a7f37} .s-green{stroke:#1a7f37}
+.k-purple{fill:#fbefff;stroke:#c297ff} .t-purple{fill:#8250df} .s-purple{stroke:#8250df}
+.k-amber{fill:#fff8c5;stroke:#d4a72c} .t-amber{fill:#9a6700} .s-amber{stroke:#9a6700}
+.k-orange{fill:#fff1e5;stroke:#fb8f44} .t-orange{fill:#bc4c00} .s-orange{stroke:#bc4c00}
+.k-gray{fill:#f6f8fa;stroke:#d1d9e0} .t-gray{fill:#59636e} .s-gray{stroke:#59636e}
+@media (prefers-color-scheme:dark){
+.bg{fill:#0d1117}
+text{fill:#e6edf3}
+.mut{fill:#9198a1}
+.ln{stroke:#656c76}
+.ah{fill:#656c76}
+.frame{fill:#151b23;stroke:#3d444d}
+.card{fill:#0d1117;stroke:#3d444d}
+.ink{fill:#e6edf3}
+.onink{fill:#0d1117}
+.k-blue{fill:#0c2445;stroke:#1f6feb} .t-blue{fill:#58a6ff} .s-blue{stroke:#58a6ff}
+.k-green{fill:#0e2a19;stroke:#238636} .t-green{fill:#3fb950} .s-green{stroke:#3fb950}
+.k-purple{fill:#221838;stroke:#8957e5} .t-purple{fill:#bc8cff} .s-purple{stroke:#bc8cff}
+.k-amber{fill:#2a210b;stroke:#9e6a03} .t-amber{fill:#d29922} .s-amber{stroke:#d29922}
+.k-orange{fill:#2d1a0b;stroke:#bd561d} .t-orange{fill:#f0883e} .s-orange{stroke:#f0883e}
+.k-gray{fill:#161b22;stroke:#3d444d} .t-gray{fill:#9198a1} .s-gray{stroke:#9198a1}
+}
+</style>
+<defs><marker id="ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ah" d="M0,1 L9,5 L0,9 z"/></marker></defs>
+<rect class="bg" x="0" y="0" width="1200" height="950" rx="16"/>
+<text x="40" y="56" font-size="24" font-weight="700">What Claude sees on every turn</text>
+<text x="40" y="84" font-size="14" class="mut">One request = a prefix that is cached between turns + a small new part built from your memory.</text>
+<rect x="380" y="118" width="440" height="712" rx="16" class="frame" stroke-width="1.5" />
+<text x="398" y="146" font-size="15" font-weight="700">Context window</text>
+<text x="802" y="146" font-size="12" class="mut" text-anchor="end">one request</text>
+<rect x="396" y="162" width="408" height="58" rx="10" class="k-gray" stroke-width="1.2" />
+<text x="414" y="187" font-size="13.5" font-weight="700">System prompt · tools · capabilities</text>
+<text x="414" y="206" font-size="12" class="mut">the same on every turn</text>
+<rect x="396" y="232" width="408" height="234" rx="10" class="k-blue" stroke-width="1.2" />
+<text x="414" y="257" font-size="13.5" class="t-blue" font-weight="700">Transcript of this chat / forum topic</text>
+<text x="414" y="276" font-size="12" class="mut">replayed exactly as it was stored</text>
+<rect x="414" y="290" width="372" height="26" rx="7" class="card dash" stroke-width="1.2" />
+<text x="426" y="307.5" font-size="12" class="mut" font-style="italic">earlier part of the chat, summarized</text>
+<rect x="576" y="324" width="210" height="26" rx="7" class="card" stroke-width="1" />
+<text x="588" y="341.5" font-size="12">you: a question + a photo</text>
+<rect x="414" y="358" width="250" height="26" rx="7" class="card" stroke-width="1" />
+<text x="426" y="375.5" font-size="12">Claude: thinking → tool call</text>
+<rect x="430" y="392" width="290" height="26" rx="7" class="card" stroke-width="1" />
+<text x="442" y="409.5" font-size="12" class="mono">tool result (cut to 20,000 chars)</text>
+<rect x="414" y="426" width="190" height="26" rx="7" class="card" stroke-width="1" />
+<text x="426" y="443.5" font-size="12">Claude: the answer</text>
+<rect x="396" y="478" width="408" height="336" rx="10" class="k-orange" stroke-width="1.5" />
+<text x="414" y="503" font-size="13.5" class="t-orange" font-weight="700">This turn</text>
+<text x="414" y="522" font-size="12" class="mut">built fresh, then stored with the turn</text>
+<rect x="414" y="536" width="372" height="40" rx="8" class="k-gray" stroke-width="1" />
+<text x="426" y="561" font-size="12" class="t-gray mono" font-weight="600">&lt;context&gt;</text>
+<text x="514" y="561" font-size="13">time · time zone · forum topic</text>
+<rect x="414" y="592" width="372" height="40" rx="8" class="k-green" stroke-width="1" />
+<text x="426" y="617" font-size="12" class="t-green mono" font-weight="600">&lt;memory&gt;</text>
+<text x="514" y="617" font-size="13">5 newest conversation summaries</text>
+<rect x="414" y="648" width="372" height="40" rx="8" class="k-green" stroke-width="1" />
+<text x="426" y="673" font-size="12" class="t-green mono" font-weight="600">&lt;memory&gt;</text>
+<text x="514" y="673" font-size="13">3 most similar past conversations</text>
+<rect x="414" y="704" width="372" height="40" rx="8" class="k-purple" stroke-width="1" />
+<text x="426" y="729" font-size="12" class="t-purple mono" font-weight="600">&lt;profile&gt;</text>
+<text x="514" y="729" font-size="13">only when it changed</text>
+<rect x="414" y="760" width="372" height="40" rx="8" class="card" stroke-width="1" />
+<text x="426" y="785" font-size="13" font-weight="600">your message + photos / PDFs</text>
+<text x="40" y="272" font-size="15" font-weight="700">Stored for you</text>
+<text x="40" y="292" font-size="12" class="mut mono">data/&lt;chat id&gt;/</text>
+<rect x="40" y="306.0" width="260" height="50" rx="10" class="k-blue" stroke-width="1.2" />
+<text x="56" y="327.0" font-size="13.5" class="t-blue" font-weight="700">Transcript file</text>
+<text x="56" y="345.0" font-size="12" class="mut">one per chat / forum topic</text>
+<path d="M300,331 H392" class="ln" stroke-width="2" marker-end="url(#ah)" />
+<text x="348.0" y="324" font-size="12" class="mut" font-weight="600" text-anchor="middle">replayed</text>
+<rect x="40" y="380.0" width="260" height="50" rx="10" class="k-amber" stroke-width="1.2" />
+<text x="56" y="401.0" font-size="13.5" class="t-amber" font-weight="700">Workspace files</text>
+<text x="56" y="419.0" font-size="12" class="mut">photos, PDFs, downloads, outputs</text>
+<path d="M300,405 H426" class="ln dash" stroke-width="2" marker-end="url(#ah)" />
+<text x="348.0" y="398" font-size="12" class="mut" font-weight="600" text-anchor="middle">on demand</text>
+<rect x="40" y="588.0" width="260" height="48" rx="10" class="k-green" stroke-width="1.2" />
+<text x="56" y="609.0" font-size="13.5" class="t-green" font-weight="700">Conversation log</text>
+<text x="56" y="627.0" font-size="12" class="mut">topic + summary of every turn</text>
+<path d="M300,612.0 H392" class="ln" stroke-width="2" marker-end="url(#ah)" />
+<text x="348.0" y="605.0" font-size="12" class="mut" font-weight="600" text-anchor="middle">5 newest</text>
+<rect x="40" y="644.0" width="260" height="48" rx="10" class="k-green" stroke-width="1.2" />
+<text x="56" y="665.0" font-size="13.5" class="t-green" font-weight="700">Semantic index</text>
+<text x="56" y="683.0" font-size="12" class="mut">an embedding of every turn</text>
+<path d="M300,668.0 H392" class="ln" stroke-width="2" marker-end="url(#ah)" />
+<text x="348.0" y="661.0" font-size="12" class="mut" font-weight="600" text-anchor="middle">top 3</text>
+<rect x="40" y="700.0" width="260" height="48" rx="10" class="k-purple" stroke-width="1.2" />
+<text x="56" y="721.0" font-size="13.5" class="t-purple" font-weight="700">Profile</text>
+<text x="56" y="739.0" font-size="12" class="mut">durable facts, up to 8 KB</text>
+<path d="M300,724.0 H392" class="ln" stroke-width="2" marker-end="url(#ah)" />
+<text x="348.0" y="717.0" font-size="12" class="mut" font-weight="600" text-anchor="middle">if changed</text>
+<rect x="40" y="756.0" width="260" height="48" rx="10" class="card" stroke-width="1.2" />
+<text x="56" y="777.0" font-size="13.5" font-weight="700">Telegram</text>
+<text x="56" y="795.0" font-size="12" class="mut">text, voice, photos, files</text>
+<path d="M300,780.0 H392" class="ln" stroke-width="2" marker-end="url(#ah)" />
+<text x="348.0" y="773.0" font-size="12" class="mut" font-weight="600" text-anchor="middle">you send</text>
+<path d="M838,162 h10 V466 h-10" class="ln" stroke-width="1.6" />
+<text x="866" y="291.0" font-size="14.5" font-weight="700">Cached prefix</text>
+<text x="866" y="313.0" font-size="12.5" class="mut">unchanged since the last turn, so</text>
+<text x="866" y="331.0" font-size="12.5" class="mut">most of it is read from the prompt</text>
+<text x="866" y="349.0" font-size="12.5" class="mut">cache at ~10% of the input price</text>
+<path d="M838,478 h10 V814 h-10" class="ln" stroke-width="1.6" />
+<text x="866" y="623.0" font-size="14.5" font-weight="700">New this turn</text>
+<text x="866" y="645.0" font-size="12.5" class="mut">memory lines this chat has already</text>
+<text x="866" y="663.0" font-size="12.5" class="mut">seen are left out; the profile only</text>
+<text x="866" y="681.0" font-size="12.5" class="mut">comes back after it changed</text>
+<text x="40" y="864" font-size="15"><tspan font-weight="700">After the answer</tspan><tspan class="mut">  ·  the turn is saved before it is sent to you</tspan></text>
+<rect x="40" y="880" width="219.22918750000002" height="40" rx="10" class="k-blue" stroke-width="1.2" />
+<text x="149.61459375" y="905" font-size="13" text-anchor="middle">turn appended to the transcript</text>
+<path d="M265.2291875,900 H310.4766875" class="ln" stroke-width="2" marker-end="url(#ah)" />
+<rect x="316.4766875" y="880" width="288.688375" height="40" rx="10" class="k-blue" stroke-width="1.2" />
+<text x="460.820875" y="905" font-size="13" text-anchor="middle">compacted past 120k tokens or 40 photos</text>
+<path d="M611.1650625,900 H656.4125624999999" class="ln" stroke-width="2" marker-end="url(#ah)" />
+<rect x="662.4125625" y="880" width="210.19431250000002" height="40" rx="10" class="k-green" stroke-width="1.2" />
+<text x="767.50971875" y="905" font-size="13" text-anchor="middle">Haiku: topic + short summary</text>
+<path d="M878.6068750000001,900 H923.854375" class="ln" stroke-width="2" marker-end="url(#ah)" />
+<rect x="929.8543750000001" y="880" width="230.14562500000002" height="40" rx="10" class="k-green" stroke-width="1.2" />
+<text x="1044.9271875000002" y="905" font-size="13" text-anchor="middle">embedded in the semantic index</text>
+</svg>

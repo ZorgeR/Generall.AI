@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 736" width="1200" height="736" role="img" aria-label="Six layers of memory, from the exact current turn to facts kept forever: the lower the layer, the more condensed it is and the longer it lasts.">
+<title>Six layers of memory, from the exact current turn to facts kept forever: the lower the layer, the more condensed it is and the longer it lasts.</title>
+<style>
+.bg{fill:#ffffff}
+text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#1f2328}
+.mono{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace}
+.mut{fill:#59636e}
+.ln{stroke:#818b98;fill:none;stroke-linecap:round;stroke-linejoin:round}
+.ah{fill:#818b98}
+.frame{fill:#f6f8fa;stroke:#d1d9e0}
+.card{fill:#ffffff;stroke:#d1d9e0}
+.ink{fill:#1f2328}
+.onink{fill:#ffffff}
+.dash{stroke-dasharray:5 4}
+.k-blue{fill:#ddf4ff;stroke:#54aeff} .t-blue{fill:#0969da} .s-blue{stroke:#0969da}
+.k-green{fill:#dafbe1;stroke:#4ac26b} .t-green{fill:#1a7f37} .s-green{stroke:#1a7f37}
+.k-purple{fill:#fbefff;stroke:#c297ff} .t-purple{fill:#8250df} .s-purple{stroke:#8250df}
+.k-amber{fill:#fff8c5;stroke:#d4a72c} .t-amber{fill:#9a6700} .s-amber{stroke:#9a6700}
+.k-orange{fill:#fff1e5;stroke:#fb8f44} .t-orange{fill:#bc4c00} .s-orange{stroke:#bc4c00}
+.k-gray{fill:#f6f8fa;stroke:#d1d9e0} .t-gray{fill:#59636e} .s-gray{stroke:#59636e}
+@media (prefers-color-scheme:dark){
+.bg{fill:#0d1117}
+text{fill:#e6edf3}
+.mut{fill:#9198a1}
+.ln{stroke:#656c76}
+.ah{fill:#656c76}
+.frame{fill:#151b23;stroke:#3d444d}
+.card{fill:#0d1117;stroke:#3d444d}
+.ink{fill:#e6edf3}
+.onink{fill:#0d1117}
+.k-blue{fill:#0c2445;stroke:#1f6feb} .t-blue{fill:#58a6ff} .s-blue{stroke:#58a6ff}
+.k-green{fill:#0e2a19;stroke:#238636} .t-green{fill:#3fb950} .s-green{stroke:#3fb950}
+.k-purple{fill:#221838;stroke:#8957e5} .t-purple{fill:#bc8cff} .s-purple{stroke:#bc8cff}
+.k-amber{fill:#2a210b;stroke:#9e6a03} .t-amber{fill:#d29922} .s-amber{stroke:#d29922}
+.k-orange{fill:#2d1a0b;stroke:#bd561d} .t-orange{fill:#f0883e} .s-orange{stroke:#f0883e}
+.k-gray{fill:#161b22;stroke:#3d444d} .t-gray{fill:#9198a1} .s-gray{stroke:#9198a1}
+}
+</style>
+<defs><marker id="ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ah" d="M0,1 L9,5 L0,9 z"/></marker></defs>
+<rect class="bg" x="0" y="0" width="1200" height="736" rx="16"/>
+<text x="40" y="56" font-size="24" font-weight="700">Six layers of memory</text>
+<text x="40" y="84" font-size="14" class="mut">From the exact current turn to what is kept forever: the lower the layer, the more condensed it is and the longer it lasts.</text>
+<text x="184" y="134" font-size="12" class="mut" font-weight="700">LAYER</text>
+<text x="470" y="134" font-size="12" class="mut" font-weight="700">WHAT IS KEPT</text>
+<text x="806" y="134" font-size="12" class="mut" font-weight="700">SCOPE</text>
+<text x="944" y="134" font-size="12" class="mut" font-weight="700">HOW CLAUDE GETS IT</text>
+<path d="M40,146 H1160" class="ln" stroke-width="1"/>
+<path d="M215.0,160 H385.0 L394.07749077490774,242 H205.92250922509226 Z" class="k-orange" stroke-width="1.2" stroke-linejoin="round"/>
+<text x="300" y="196" font-size="15" class="t-orange" font-weight="700" text-anchor="middle">This turn</text>
+<text x="300" y="216" font-size="12" class="mut" text-anchor="middle">seconds to minutes</text>
+<text x="470" y="191.5" font-size="13.5">every tool call, result and thinking step,</text>
+<text x="470" y="210.5" font-size="13.5">plus the messages you send meanwhile</text>
+<text x="806" y="205.0" font-size="13.5">this request</text>
+<rect x="944" y="178.0" width="58" height="22" rx="11.0" class="k-orange" stroke-width="1" />
+<text x="973.0" y="193.32" font-size="12" class="t-orange" text-anchor="middle">always</text>
+<text x="944" y="219.0" font-size="13" class="mut">it is the request itself</text>
+<path d="M470,247 H1160" class="ln" stroke-width="0.6" stroke-dasharray="2 4"/>
+<path d="M204.81549815498155,252 H395.1845018450184 L404.2619926199262,334 H195.73800738007378 Z" class="k-blue" stroke-width="1.2" stroke-linejoin="round"/>
+<text x="300" y="288" font-size="15" class="t-blue" font-weight="700" text-anchor="middle">Transcript</text>
+<text x="300" y="308" font-size="12" class="mut" text-anchor="middle">up to 120k tokens</text>
+<text x="470" y="283.5" font-size="13.5">messages, answers, tool calls and results,</text>
+<text x="470" y="302.5" font-size="13.5">photos: all verbatim until compaction</text>
+<text x="806" y="287.5" font-size="13.5">this chat or</text>
+<text x="806" y="306.5" font-size="13.5">forum topic</text>
+<rect x="944" y="270.0" width="76" height="22" rx="11.0" class="k-blue" stroke-width="1" />
+<text x="982.0" y="285.32" font-size="12" class="t-blue" text-anchor="middle">every turn</text>
+<text x="944" y="311.0" font-size="13" class="mut">replayed as is, from the cache</text>
+<path d="M470,339 H1160" class="ln" stroke-width="0.6" stroke-dasharray="2 4"/>
+<path d="M194.6309963099631,344 H405.3690036900369 L414.44649446494464,426 H185.55350553505536 Z" class="k-blue" stroke-width="1.2" stroke-linejoin="round"/>
+<text x="300" y="380" font-size="15" class="t-blue" font-weight="700" text-anchor="middle">Earlier summary</text>
+<text x="300" y="400" font-size="12" class="mut" text-anchor="middle">older part of the chat</text>
+<text x="470" y="375.5" font-size="13.5">past 120k tokens the oldest half is condensed;</text>
+<text x="470" y="394.5" font-size="13.5">old tool results and photos become markers</text>
+<text x="806" y="379.5" font-size="13.5">this chat or</text>
+<text x="806" y="398.5" font-size="13.5">forum topic</text>
+<rect x="944" y="362.0" width="76" height="22" rx="11.0" class="k-blue" stroke-width="1" />
+<text x="982.0" y="377.32" font-size="12" class="t-blue" text-anchor="middle">every turn</text>
+<text x="944" y="403.0" font-size="13" class="mut">first message of the transcript</text>
+<path d="M470,431 H1160" class="ln" stroke-width="0.6" stroke-dasharray="2 4"/>
+<path d="M184.44649446494464,436 H415.55350553505536 L424.6309963099631,518 H175.3690036900369 Z" class="k-green" stroke-width="1.2" stroke-linejoin="round"/>
+<text x="300" y="472" font-size="15" class="t-green" font-weight="700" text-anchor="middle">Long-term memory</text>
+<text x="300" y="492" font-size="12" class="mut" text-anchor="middle">every turn, forever</text>
+<text x="470" y="467.5" font-size="13.5">topic and a short summary of every turn,</text>
+<text x="470" y="486.5" font-size="13.5">plus an embedding to find it by meaning</text>
+<text x="806" y="471.5" font-size="13.5">all chats</text>
+<text x="806" y="490.5" font-size="13.5">and topics</text>
+<rect x="944" y="444.5" width="76" height="22" rx="11.0" class="k-green" stroke-width="1" />
+<text x="982.0" y="459.82" font-size="12" class="t-green" text-anchor="middle">every turn</text>
+<text x="944" y="485.5" font-size="13" class="mut">5 newest + 3 most similar;</text>
+<text x="944" y="503.5" font-size="13" class="mut">memory_search on demand</text>
+<path d="M470,523 H1160" class="ln" stroke-width="0.6" stroke-dasharray="2 4"/>
+<path d="M174.2619926199262,528 H425.7380073800738 L434.8154981549816,610 H165.18450184501845 Z" class="k-purple" stroke-width="1.2" stroke-linejoin="round"/>
+<text x="300" y="564" font-size="15" class="t-purple" font-weight="700" text-anchor="middle">Profile</text>
+<text x="300" y="584" font-size="12" class="mut" text-anchor="middle">until edited</text>
+<text x="470" y="559.5" font-size="13.5">durable facts: About, Preferences, dated</text>
+<text x="470" y="578.5" font-size="13.5">Notes; up to 8 KB, see it with /profile</text>
+<text x="806" y="563.5" font-size="13.5">all chats</text>
+<text x="806" y="582.5" font-size="13.5">and topics</text>
+<rect x="944" y="546.0" width="102" height="22" rx="11.0" class="k-purple" stroke-width="1" />
+<text x="995.0" y="561.32" font-size="12" class="t-purple" text-anchor="middle">when changed</text>
+<text x="944" y="587.0" font-size="13" class="mut">edited with user_profile_*</text>
+<path d="M470,615 H1160" class="ln" stroke-width="0.6" stroke-dasharray="2 4"/>
+<path d="M164.07749077490774,620 H435.92250922509226 L445.0,702 H155.0 Z" class="k-amber" stroke-width="1.2" stroke-linejoin="round"/>
+<text x="300" y="656" font-size="15" class="t-amber" font-weight="700" text-anchor="middle">Workspace files</text>
+<text x="300" y="676" font-size="12" class="mut" text-anchor="middle">until deleted</text>
+<text x="470" y="651.5" font-size="13.5">photos, PDFs, downloads and every file</text>
+<text x="470" y="670.5" font-size="13.5">the agent generated</text>
+<text x="806" y="655.5" font-size="13.5">all chats</text>
+<text x="806" y="674.5" font-size="13.5">and topics</text>
+<rect x="944" y="638.0" width="83" height="22" rx="11.0" class="k-amber" stroke-width="1" />
+<text x="985.5" y="653.32" font-size="12" class="t-amber" text-anchor="middle">on demand</text>
+<text x="944" y="679.0" font-size="13" class="mut">view_image, read_document</text>
+<path d="M205.57564575645756,209.0 H187.16236162361622 Q175.16236162361622,209.0 175.16236162361622,221.0 V273.0 Q175.16236162361622,285.0 187.16236162361622,285.0 H195.16236162361622" class="ln" stroke-width="1.8" marker-end="url(#ah)" />
+<text x="167.16236162361622" y="251.0" font-size="12" class="mut" font-weight="600" text-anchor="end">saved</text>
+<path d="M195.39114391143912,301.0 H176.9778597785978 Q164.9778597785978,301.0 164.9778597785978,313.0 V365.0 Q164.9778597785978,377.0 176.9778597785978,377.0 H184.9778597785978" class="ln" stroke-width="1.8" marker-end="url(#ah)" />
+<text x="156.9778597785978" y="343.0" font-size="12" class="mut" font-weight="600" text-anchor="end">compacted</text>
+<path d="M207.3468634686347,193.0 H64 Q52,193.0 52,205.0 V465.0 Q52,477.0 64,477.0 H173.9077490774908" class="ln" stroke-width="1.8" marker-end="url(#ah)" />
+<text x="62" y="437.0" font-size="12" class="mut" font-weight="600">summarized</text>
+<text x="62" y="452.0" font-size="12" class="mut" font-weight="600">+ embedded</text>
+</svg>
