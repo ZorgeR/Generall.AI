@@ -4,8 +4,8 @@
 
 ## ⚡ In a nutshell
 
-**Your own AI agent in Telegram.** Write, talk or send a file: it thinks with Claude, uses 50+ tools and
-answers in the same chat.
+**Your own AI agent in Telegram.** Write, talk or send a file: it thinks with a frontier AI model, uses 50+
+tools and answers in the same chat.
 
 - 💬 **Understands what you send**: text, voice, photos, videos, PDFs and documents, replies and forwards
 - 🧠 **Remembers you**: the current chat word for word, every past conversation as a searchable summary,
@@ -90,15 +90,15 @@ GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bo
 
 ## 🧠 How memory works
 
-Every turn reads your memory before Claude is called, uses it while it works and writes the turn back before
+Every turn reads your memory before the model is called, uses it while it works and writes the turn back before
 the answer is sent:
 
-![How GALL.AI remembers: Recall replays the transcript and adds recent summaries, similar past conversations and the profile; Claude works with memory tools; Remember appends the turn, compacts it, summarizes and embeds it](static/schema/memory-loop.svg)
+![How GALL.AI remembers: Recall replays the transcript and adds recent summaries, similar past conversations and the profile; the agent loop works with memory tools; Remember appends the turn, compacts it, summarizes and embeds it](static/schema/memory-loop.svg)
 
-What Claude receives on each turn: most of the request has not changed since the last turn and is read from
+What the model receives on each turn: most of the request has not changed since the last turn and is read from
 the prompt cache; only a small new part is built from your memory.
 
-![What Claude sees on every turn: the system prompt and the chat's transcript form a cached prefix; the new part holds the context line, recent summaries, similar past conversations, the profile when it changed, and your message](static/schema/memory-request.svg)
+![What the model sees on every turn: the system prompt and the chat's transcript form a cached prefix; the new part holds the context line, recent summaries, similar past conversations, the profile when it changed, and your message](static/schema/memory-request.svg)
 
 - **Transcript (short-term)**: every chat (or forum topic) has one real conversation transcript, including the
   tool calls the agent made, what they returned and its reasoning. It is replayed as is on every turn, so the

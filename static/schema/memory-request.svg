@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 950" width="1200" height="950" role="img" aria-label="What Claude sees on every turn: a cached prefix (system prompt, tools, the chat's transcript) plus a small new part built from your memory; after the answer the turn is saved.">
-<title>What Claude sees on every turn: a cached prefix (system prompt, tools, the chat's transcript) plus a small new part built from your memory; after the answer the turn is saved.</title>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 950" width="1200" height="950" role="img" aria-label="What the model sees on every turn: a cached prefix (system prompt, tools, the chat's transcript) plus a small new part built from your memory; after the answer the turn is saved.">
+<title>What the model sees on every turn: a cached prefix (system prompt, tools, the chat's transcript) plus a small new part built from your memory; after the answer the turn is saved.</title>
 <style>
 .bg{fill:#ffffff}
 text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#1f2328}
@@ -38,7 +38,7 @@ text{fill:#e6edf3}
 </style>
 <defs><marker id="ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ah" d="M0,1 L9,5 L0,9 z"/></marker></defs>
 <rect class="bg" x="0" y="0" width="1200" height="950" rx="16"/>
-<text x="40" y="56" font-size="24" font-weight="700">What Claude sees on every turn</text>
+<text x="40" y="56" font-size="24" font-weight="700">What the model sees on every turn</text>
 <text x="40" y="84" font-size="14" class="mut">One request = a prefix that is cached between turns + a small new part built from your memory.</text>
 <rect x="380" y="118" width="440" height="712" rx="16" class="frame" stroke-width="1.5" />
 <text x="398" y="146" font-size="15" font-weight="700">Context window</text>
@@ -54,11 +54,11 @@ text{fill:#e6edf3}
 <rect x="576" y="324" width="210" height="26" rx="7" class="card" stroke-width="1" />
 <text x="588" y="341.5" font-size="12">you: a question + a photo</text>
 <rect x="414" y="358" width="250" height="26" rx="7" class="card" stroke-width="1" />
-<text x="426" y="375.5" font-size="12">Claude: thinking → tool call</text>
+<text x="426" y="375.5" font-size="12">agent: thinking → tool call</text>
 <rect x="430" y="392" width="290" height="26" rx="7" class="card" stroke-width="1" />
 <text x="442" y="409.5" font-size="12" class="mono">tool result (cut to 20,000 chars)</text>
 <rect x="414" y="426" width="190" height="26" rx="7" class="card" stroke-width="1" />
-<text x="426" y="443.5" font-size="12">Claude: the answer</text>
+<text x="426" y="443.5" font-size="12">agent: the answer</text>
 <rect x="396" y="478" width="408" height="336" rx="10" class="k-orange" stroke-width="1.5" />
 <text x="414" y="503" font-size="13.5" class="t-orange" font-weight="700">This turn</text>
 <text x="414" y="522" font-size="12" class="mut">built fresh, then stored with the turn</text>
@@ -121,13 +121,13 @@ text{fill:#e6edf3}
 <text x="40" y="864" font-size="15"><tspan font-weight="700">After the answer</tspan><tspan class="mut">  ·  the turn is saved before it is sent to you</tspan></text>
 <rect x="40" y="880" width="219.22918750000002" height="40" rx="10" class="k-blue" stroke-width="1.2" />
 <text x="149.61459375" y="905" font-size="13" text-anchor="middle">turn appended to the transcript</text>
-<path d="M265.2291875,900 H310.4766875" class="ln" stroke-width="2" marker-end="url(#ah)" />
-<rect x="316.4766875" y="880" width="288.688375" height="40" rx="10" class="k-blue" stroke-width="1.2" />
-<text x="460.820875" y="905" font-size="13" text-anchor="middle">compacted past 120k tokens or 40 photos</text>
-<path d="M611.1650625,900 H656.4125624999999" class="ln" stroke-width="2" marker-end="url(#ah)" />
-<rect x="662.4125625" y="880" width="210.19431250000002" height="40" rx="10" class="k-green" stroke-width="1.2" />
-<text x="767.50971875" y="905" font-size="13" text-anchor="middle">Haiku: topic + short summary</text>
-<path d="M878.6068750000001,900 H923.854375" class="ln" stroke-width="2" marker-end="url(#ah)" />
-<rect x="929.8543750000001" y="880" width="230.14562500000002" height="40" rx="10" class="k-green" stroke-width="1.2" />
-<text x="1044.9271875000002" y="905" font-size="13" text-anchor="middle">embedded in the semantic index</text>
+<path d="M265.2291875,900 H300.850625" class="ln" stroke-width="2" marker-end="url(#ah)" />
+<rect x="306.850625" y="880" width="288.688375" height="40" rx="10" class="k-blue" stroke-width="1.2" />
+<text x="451.1948125" y="905" font-size="13" text-anchor="middle">compacted past 120k tokens or 40 photos</text>
+<path d="M601.539,900 H637.1604375" class="ln" stroke-width="2" marker-end="url(#ah)" />
+<rect x="643.1604375" y="880" width="239.07250000000002" height="40" rx="10" class="k-green" stroke-width="1.2" />
+<text x="762.6966874999999" y="905" font-size="13" text-anchor="middle">fast model: topic + short summary</text>
+<path d="M888.2329374999999,900 H923.8543749999999" class="ln" stroke-width="2" marker-end="url(#ah)" />
+<rect x="929.8543749999999" y="880" width="230.14562500000002" height="40" rx="10" class="k-green" stroke-width="1.2" />
+<text x="1044.9271875" y="905" font-size="13" text-anchor="middle">embedded in the semantic index</text>
 </svg>
