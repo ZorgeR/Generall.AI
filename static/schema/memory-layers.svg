@@ -43,7 +43,7 @@ text{fill:#e6edf3}
 <text x="184" y="134" font-size="12" class="mut" font-weight="700">LAYER</text>
 <text x="470" y="134" font-size="12" class="mut" font-weight="700">WHAT IS KEPT</text>
 <text x="806" y="134" font-size="12" class="mut" font-weight="700">SCOPE</text>
-<text x="944" y="134" font-size="12" class="mut" font-weight="700">HOW CLAUDE GETS IT</text>
+<text x="944" y="134" font-size="12" class="mut" font-weight="700">HOW THE MODEL GETS IT</text>
 <path d="M40,146 H1160" class="ln" stroke-width="1"/>
 <path d="M215.0,160 H385.0 L394.07749077490774,242 H205.92250922509226 Z" class="k-orange" stroke-width="1.2" stroke-linejoin="round"/>
 <text x="300" y="196" font-size="15" class="t-orange" font-weight="700" text-anchor="middle">This turn</text>
