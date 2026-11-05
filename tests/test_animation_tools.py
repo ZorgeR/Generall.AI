@@ -1,6 +1,7 @@
 """Animated GIFs (GPT Image 2.6): generate_animation, edit_animation and agents/animation.py."""
 import base64
 import io
+import os
 import shutil
 import subprocess
 from dataclasses import replace
@@ -180,7 +181,8 @@ async def test_a_refused_photo_animation_points_to_the_alternatives(workspace, m
     images = FakeImages(error=lambda kw: ValueError("output_format 'gif' is not supported for image edits"))
     tools, sender = make_tools(monkeypatch, images)
     result = await tools.execute_tool("generate_animation", {"prompt": "x", "images": ["images/photo.png"]})
-    assert result.startswith("Error:") and "image_to_video_generator" in result and "edit_animation" in result
+    assert result.startswith("Error:") and "without images" in result and "edit_animation" in result
+    assert "image_to_video_generator" not in result  # never steer an animation request to the video tools
     assert len(images.edit_calls) == 1 and not sender.animations
 
 
@@ -445,3 +447,18 @@ async def test_sending_a_gif_file_keeps_it_a_gif(tmp_path, monkeypatch):
         result = await ops.execute_tool("send_file_path_to_user_via_telegram", {"file_path": name})
         assert "Successfully" in result, result
     assert sent[0][1] == {"keep_format": True} and sent[1][1] == {}
+
+
+def test_animation_requests_go_to_generate_animation_not_the_video_tools(workspace, monkeypatch):
+    """"Make an animation of this picture" picked image_to_video_generator first: both claimed to animate pictures."""
+    monkeypatch.setenv("GOOGLE_API_KEY", os.environ.get("GOOGLE_API_KEY") or "test-key")  # built at import time
+    from agents.video_tools import VideoTools
+
+    tools = ImageTools("7", FakeSender())
+    animation = next(t for t in tools.tools_schema if t["name"] == "generate_animation")["description"]
+    assert "whenever the user asks for an animation" in animation and "explicitly asks for a video" in animation
+
+    video = {t["name"]: t["description"] for t in VideoTools("7", FakeSender()).tools_schema}
+    for name in ("video_generator", "image_to_video_generator"):
+        assert "generate_animation" in video[name] and "Use only when the user" in video[name], name
+    assert "animates it" not in video["image_to_video_generator"]

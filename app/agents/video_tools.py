@@ -42,7 +42,7 @@ class VideoTools:
         self.tools_schema = [
             {
                 "name": "video_generator",
-                "description": "Generate high-quality videos from text descriptions using Google Veo 3.1 (state-of-the-art text-to-video generation with cinematic quality), save to videos directory, and send to user via Telegram. Supports detailed scene descriptions with camera movements, lighting, and actions.",
+                "description": "Generate high-quality videos from text descriptions using Google Veo 3.1 (state-of-the-art text-to-video generation with cinematic quality), save to videos directory, and send to user via Telegram. Supports detailed scene descriptions with camera movements, lighting, and actions. Use only when the user asks for a video; for an animation, a GIF, a sticker or a loop use generate_animation.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -78,7 +78,7 @@ class VideoTools:
             },
             {
                 "name": "image_to_video_generator",
-                "description": "Generate high-quality videos from an existing image using Google Veo 3.1. Takes a starting image and animates it based on the prompt description. Perfect for bringing static images to life with motion, camera movements, and scene evolution.",
+                "description": "Generate a video (an MP4 clip of several seconds) from an existing image using Google Veo 3.1, following the prompt's motion, camera movements and scene evolution. Use only when the user explicitly asks for a video; for an animation, a GIF or 'animate this picture' use generate_animation.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
