@@ -98,8 +98,12 @@ EMBEDDING_DIMENSION = int(_env("EMBEDDING_DIMENSION", "1536"))
 # below is the only place that knows which model each maps to and which knobs
 # that provider actually takes. Add a backend here, not in the tool.
 # ---------------------------------------------------------------------------
-GPT_IMAGE_MODEL = _env("GPT_IMAGE_MODEL", "gpt-image-2.5-sunburst")  # most capable: generation + editing
-GPT_IMAGE_MODEL_FAST = _env("GPT_IMAGE_MODEL_FAST", "gpt-image-2.5-flare")  # faster, lower quality, same price
+GPT_IMAGE_MODEL = _env("GPT_IMAGE_MODEL", "gpt-image-2.6-sunburst")  # most capable: generation + editing
+GPT_IMAGE_MODEL_FAST = _env("GPT_IMAGE_MODEL_FAST", "gpt-image-2.6-flare")  # faster, lower quality, same price
+# Animated GIFs (generate_animation) have their own pair, so the still-image models can be
+# rolled back to 2.5 without losing GIFs, which only GPT Image 2.6 can make.
+GPT_ANIMATION_MODEL = _env("GPT_ANIMATION_MODEL", "gpt-image-2.6-sunburst")
+GPT_ANIMATION_MODEL_FAST = _env("GPT_ANIMATION_MODEL_FAST", "gpt-image-2.6-flare")
 GEMINI_IMAGE_MODEL_FLASH = _env("GEMINI_IMAGE_MODEL_FLASH", "gemini-3.1-flash-image-preview")
 GEMINI_IMAGE_MODEL_PRO = _env("GEMINI_IMAGE_MODEL_PRO", "gemini-3-pro-image-preview")
 
@@ -111,6 +115,36 @@ IMAGE_QUALITY_FALLBACK = "high"
 IMAGE_ASPECT_RATIOS = ("1:1", "3:2", "2:3", "16:9", "9:16", "4:3", "3:4", "21:9", "5:4", "4:5")
 IMAGE_SIZES = ("1K", "2K", "4K")
 IMAGE_MAX_VARIANTS = 4
+IMAGE_COMPLEXITIES = ("low", "medium", "high")
+
+# Animated GIF output (GPT Image 2.6). The model draws every frame on one sheet within one
+# image budget, so frames are small: 1:1 comes back 512x512 and 16:9 896x512. The frame
+# range is the API reference's (2..16, default 9); the guide's "64" is refused live.
+GIF_FRAMES_MIN, GIF_FRAMES_MAX, GIF_FRAMES_DEFAULT = 2, 16, 9
+GIF_FRAME_MS_MIN, GIF_FRAME_MS_MAX, GIF_FRAME_MS_DEFAULT = 20, 2000, 200
+GIF_SHORT_EDGE = 512
+
+# What an OpenAI image model takes beyond the basics, by model id prefix (dated snapshots
+# inherit their family's entry). From the parameter docs of openai-python 3.46.0:
+# GIF and SVG output and `complexity` are GPT Image 2.6; markup-guided edits exist since
+# 2.5; `input_fidelity` belongs to the models before gpt-image-2 ("for gpt-image-2, omit
+# this parameter"), and is still sent to 2.5 and unknown models only because the tool
+# drops and remembers a refused knob (agents/image_tools.py). Gemini models have none.
+IMAGE_MODEL_FEATURES: tuple[tuple[str, frozenset[str]], ...] = (
+    ("gpt-image-2.6", frozenset({"gif", "svg", "complexity", "markup"})),
+    ("gpt-image-2.5", frozenset({"markup", "input_fidelity"})),
+)
+OPENAI_IMAGE_DEFAULT_FEATURES = frozenset({"input_fidelity"})
+
+
+def image_model_features(provider: str, model: str) -> frozenset[str]:
+    if provider != "openai":
+        return frozenset()
+    name = (model or "").strip().lower()
+    for prefix, features in IMAGE_MODEL_FEATURES:
+        if name.startswith(prefix):
+            return features
+    return OPENAI_IMAGE_DEFAULT_FEATURES
 
 
 @dataclass(frozen=True)
@@ -126,6 +160,10 @@ class ImageBackend:
     batch_variants: bool  # True: one call with n=; False: one call per variant
     interleaved_text: bool = False  # returns prose between images (story mode)
 
+    def supports(self, feature: str) -> bool:
+        """``gif`` | ``svg`` | ``complexity`` | ``markup`` | ``input_fidelity`` (IMAGE_MODEL_FEATURES)."""
+        return feature in image_model_features(self.provider, self.model)
+
 
 IMAGE_BACKENDS: dict[str, ImageBackend] = {
     "auto": ImageBackend("auto", "openai", GPT_IMAGE_MODEL, "sunburst", True, 16, True),
@@ -134,6 +172,13 @@ IMAGE_BACKENDS: dict[str, ImageBackend] = {
     "story": ImageBackend("story", "gemini", GEMINI_IMAGE_MODEL_FLASH, "story", False, 3, False, interleaved_text=True),
 }
 DEFAULT_IMAGE_ENGINE = "auto"
+
+# generate_animation: one GIF per call (n=1), from a prompt or from input pictures (edits).
+ANIMATION_BACKENDS: dict[str, ImageBackend] = {
+    "auto": ImageBackend("auto", "openai", GPT_ANIMATION_MODEL, "sunburst_anim", True, 16, False),
+    "best": ImageBackend("best", "openai", GPT_ANIMATION_MODEL, "sunburst_anim", True, 16, False),
+    "fast": ImageBackend("fast", "openai", GPT_ANIMATION_MODEL_FAST, "flare_anim", True, 16, False),
+}
 
 
 def resolve_image_backend(engine: str | None, quality: str | None = None) -> ImageBackend:
@@ -146,6 +191,11 @@ def resolve_image_backend(engine: str | None, quality: str | None = None) -> Ima
     if backend.provider == "gemini" and (quality or "").lower() in ("xhigh", "max"):
         backend = replace(backend, model=GEMINI_IMAGE_MODEL_PRO, prefix=f"{backend.prefix}_pro")
     return backend
+
+
+def resolve_animation_backend(engine: str | None) -> ImageBackend:
+    """The GIF backend for a purpose word; anything else (``story`` included) is the default."""
+    return ANIMATION_BACKENDS.get((engine or "").strip().lower()) or ANIMATION_BACKENDS[DEFAULT_IMAGE_ENGINE]
 
 # ---------------------------------------------------------------------------
 # Video generation (agents/video_tools.py) - Google Veo, all five tools
@@ -338,12 +388,17 @@ def estimate_cost(model: str, input_tokens: int = 0, output_tokens: int = 0, cac
 
 
 # Image models bill tokens by modality (USD per million tokens): text input, image
-# input, image output. GPT Image 2.5: text output is not billed, and the cached-input
-# rates ($1.25 text / $2 image) are not applied because the images API reports no
-# cached share. Gemini Flash Image: one input rate for text and images and one
+# input, image output. GPT Image 2.5 and 2.6 share the rates: text output is not
+# billed, and the cached-input rates ($1.25 text / $2 image) are not applied because
+# the images API reports no cached share. 2.6 spends more output tokens per image at
+# low (~4x) and medium (~3x) quality; GIFs bill the output tokens of all their frames.
+# SVG output adds the SVG author's tokens (``svg_usage``, priced via MODEL_PRICES when
+# that model is listed). Gemini Flash Image: one input rate for text and images and one
 # output rate, applied to every output token (story prose and thinking included).
 # Models missing here (the Gemini Pro image model) get token counts but no cost.
 IMAGE_TOKEN_PRICES: dict[str, tuple[float, float, float]] = {
+    "gpt-image-2.6-sunburst": (5.0, 8.0, 30.0),
+    "gpt-image-2.6-flare": (5.0, 8.0, 30.0),
     "gpt-image-2.5-sunburst": (5.0, 8.0, 30.0),
     "gpt-image-2.5-flare": (5.0, 8.0, 30.0),
     "gemini-3.1-flash-image-preview": (0.5, 0.5, 60.0),

@@ -2,6 +2,8 @@
 
 Status: **implemented**. Companion to `docs/image-pipeline.md`, which describes the state this
 replaced; quirk numbers below refer to its §9. Decisions in §1 were made by the repo owner.
+The defaults have since moved to GPT Image 2.6, with animated GIFs, SVG and markup edits: see
+`docs/image-2.6-animations.md`.
 
 ## 1. Decisions
 

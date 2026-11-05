@@ -605,7 +605,10 @@ Files included:
 
             if self.sender is None:
                 return "Error: no chat sender available in this context"
-            await self.sender.send_document(full_path, caption=caption or "Here is your file")
+            # A GIF sent as a plain document becomes a Telegram animation (an MP4): when the user
+            # asks for the file, they get the GIF itself.
+            extra = {"keep_format": True} if Path(full_path).suffix.lower() == ".gif" else {}
+            await self.sender.send_document(full_path, caption=caption or "Here is your file", **extra)
 
             return f"Successfully sent file {file_path} to chat ID {self.user_id}.\n"
             

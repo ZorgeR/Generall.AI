@@ -15,10 +15,18 @@ WEBP = b"RIFF" + b"0000" + b"WEBP" + b"0" * 32
 class FakeSender:
     def __init__(self):
         self.documents = []
+        self.animations = []
+        self.videos = []
         self.texts = []
 
-    async def send_document(self, path, caption=None):
+    async def send_document(self, path, caption=None, **kw):
         self.documents.append((path, caption))
+
+    async def send_animation(self, path, caption=None):
+        self.animations.append((path, caption))
+
+    async def send_video(self, path, caption=None):
+        self.videos.append((path, caption))
 
     async def send_markdown(self, text):
         self.texts.append(text)
@@ -46,6 +54,8 @@ class FakeImages:
         kw = dict(kw)
         kw["image_count"] = 1 if not isinstance(kw.get("image"), list) else len(kw["image"])
         kw.pop("image", None)
+        if "markup" in kw:  # the upload is closed after the call: keep what was sent
+            kw["markup"] = kw["markup"].read()
         self.edit_calls.append(kw)
         if self.error:
             raise self.error(kw)
@@ -71,6 +81,13 @@ def workspace(tmp_path, monkeypatch):
     (tmp_path / "data" / "8").mkdir(parents=True)
     (tmp_path / "data" / "8" / "secret.png").write_bytes(PNG)
     return tmp_path
+
+
+def use_model(monkeypatch, engine, model):
+    """Point one engine at another model id (the capabilities follow the id's family)."""
+    from dataclasses import replace
+
+    monkeypatch.setitem(models.IMAGE_BACKENDS, engine, replace(models.IMAGE_BACKENDS[engine], model=model))
 
 
 def make_tools(monkeypatch, fake_images, settings=None):
@@ -250,15 +267,18 @@ async def test_too_many_inputs_for_the_engine_is_refused_before_any_call(workspa
 
 
 # ---- schema and dispatch -----------------------------------------------------
-def test_schema_is_two_tools_and_advertises_the_preference(workspace):
+def test_schema_is_four_tools_and_advertises_the_preference(workspace):
     tools = ImageTools("7", FakeSender(), {"engine": "fast", "quality": "low"})
     names = [t["name"] for t in tools.tools_schema]
-    assert names == ["generate_image", "generate_story_images"]
+    assert names == ["generate_image", "generate_animation", "edit_animation", "generate_story_images"]
     schema = tools.tools_schema[0]
     assert schema["input_schema"]["required"] == ["prompt"]
     assert set(schema["input_schema"]["properties"]) == {
-        "prompt", "images", "engine", "quality", "aspect_ratio", "size", "variants", "format", "caption",
+        "prompt", "images", "engine", "quality", "aspect_ratio", "size", "variants", "format",
+        "complexity", "regions", "markup", "caption",
     }
+    assert "svg" in schema["input_schema"]["properties"]["format"]["enum"]
+    assert "gif" not in schema["input_schema"]["properties"]["format"]["enum"]  # GIFs are generate_animation's
     assert "'fast'" in schema["description"] and "'low'" in schema["description"]
     assert "only embed" in schema["description"].lower()
 
@@ -296,6 +316,7 @@ def test_the_sandbox_patcher_does_not_rebind_image_tool_methods():
 
 # ---- input fidelity ----------------------------------------------------------
 async def test_edits_ask_the_provider_to_stay_faithful_to_the_input(workspace, monkeypatch):
+    use_model(monkeypatch, "auto", "gpt-image-2.5-sunburst")  # the knob belongs to the models before 2.6
     images = FakeImages()
     tools, _ = make_tools(monkeypatch, images)
 
@@ -307,6 +328,15 @@ async def test_edits_ask_the_provider_to_stay_faithful_to_the_input(workspace, m
     assert "input_fidelity" not in images.generate_calls[0]
 
 
+async def test_gpt_image_2_6_edits_omit_input_fidelity(workspace, monkeypatch):
+    """"For gpt-image-2, omit this parameter": a 2.6 edit never sends it, not even once."""
+    images = FakeImages()
+    tools, _ = make_tools(monkeypatch, images)
+    await tools.execute_tool("generate_image", {"prompt": "add a hat", "images": ["images/cat.png"]})
+    assert images.edit_calls[0]["model"] == models.GPT_IMAGE_MODEL
+    assert "input_fidelity" not in images.edit_calls[0]
+
+
 async def test_a_model_that_refuses_input_fidelity_is_retried_and_remembered(workspace, monkeypatch):
     class Picky(FakeImages):
         def edit(self, **kw):
@@ -315,6 +345,7 @@ async def test_a_model_that_refuses_input_fidelity_is_retried_and_remembered(wor
                 raise ValueError("Unknown parameter: 'input_fidelity'")
             return self._result()
 
+    use_model(monkeypatch, "auto", "gpt-image-2.5-sunburst")
     images = Picky()
     tools, sender = make_tools(monkeypatch, images)
 
@@ -421,3 +452,227 @@ async def test_gemini_usage_and_cost_reach_the_turn_trace(workspace, monkeypatch
     assert len(calls) == 2 and bucket["api_calls"] == 2
     assert bucket["input_tokens"] == 2_000_000 and bucket["output_tokens"] == 2_000_000  # thinking counted as output
     assert abs(tools.trace.model_cost(models.GEMINI_IMAGE_MODEL_FLASH) - 2 * (0.5 + 60.0)) < 1e-9
+
+
+# ---- GPT Image 2.6: capabilities, SVG, complexity, knobs, sizes, markup -------
+def test_2_6_is_the_default_and_capabilities_follow_the_model_family():
+    assert models.GPT_IMAGE_MODEL == "gpt-image-2.6-sunburst"
+    assert models.GPT_IMAGE_MODEL_FAST == "gpt-image-2.6-flare"
+    features = models.image_model_features
+    assert features("openai", "gpt-image-2.6-flare") >= {"gif", "svg", "complexity", "markup"}
+    assert "input_fidelity" not in features("openai", "gpt-image-2.6-sunburst")
+    assert features("openai", "gpt-image-2.6-sunburst-2026-11-04") == features("openai", "gpt-image-2.6-sunburst")  # snapshots
+    assert features("openai", "gpt-image-2.5-sunburst") == {"markup", "input_fidelity"}
+    assert features("openai", "gpt-image-1.5") == {"input_fidelity"}  # unknown family: the old behaviour
+    assert features("gemini", models.GEMINI_IMAGE_MODEL_FLASH) == frozenset()
+    assert models.resolve_image_backend("best").supports("gif")
+    assert not models.resolve_image_backend("story").supports("markup")
+
+
+def test_extension_recognises_svg_and_gif():
+    assert extension_for(b'<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg"/>') == "svg"
+    assert extension_for(b"  <svg viewBox='0 0 1 1'></svg>") == "svg"
+    assert extension_for(b"<?xml version='1.0'?><note/>", fallback="png") == "png"
+    assert extension_for(b"GIF89a" + b"0" * 10) == "gif"
+
+
+SVG = b'<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"/>'
+
+
+async def test_svg_is_one_new_vector_drawing_delivered_as_a_file(workspace, monkeypatch):
+    images = FakeImages(payloads=(SVG,))
+    tools, sender = make_tools(monkeypatch, images)
+    result = await tools.execute_tool("generate_image", {"prompt": "a fox logo", "format": "svg", "variants": 3})
+
+    call = images.generate_calls[0]
+    assert call["output_format"] == "svg" and call["n"] == 1
+    assert sender.documents[0][0].endswith(".svg")
+    assert "only one was made" in result and "without a preview" in result
+    assert "![caption]" not in result  # a vector file is never offered for inline embedding
+
+    for args, needle in (
+        ({"prompt": "x", "format": "svg", "images": ["images/cat.png"]}, "only makes new drawings"),
+        ({"prompt": "x", "format": "svg", "engine": "story"}, "cannot make SVG"),
+        ({"prompt": "x", "format": "gif"}, "generate_animation"),
+    ):
+        result = await tools.execute_tool("generate_image", args)
+        assert result.startswith("Error:") and needle in result, args
+    assert len(images.generate_calls) == 1 and not images.edit_calls
+
+
+async def test_svg_author_usage_reaches_the_trace(workspace, monkeypatch):
+    from agents.trace import ToolTrace
+
+    class SvgImages(FakeImages):
+        def _result(self):
+            result = super()._result()
+            result.svg_usage = SimpleNamespace(model="gpt-6.1-sol", input_tokens=1_000_000, output_tokens=1_000_000, reasoning_tokens=0)
+            return result
+
+    tools, _ = make_tools(monkeypatch, SvgImages(payloads=(SVG,)))
+    tools.trace = ToolTrace()
+    await tools.execute_tool("generate_image", {"prompt": "logo", "format": "svg"})
+    assert tools.trace.usage_by_model["gpt-6.1-sol"]["output_tokens"] == 1_000_000
+    assert tools.trace.model_cost("gpt-6.1-sol") == models.estimate_cost("gpt-6.1-sol", 1_000_000, 1_000_000)
+
+
+async def test_complexity_is_sent_only_when_asked_and_supported(workspace, monkeypatch):
+    images = FakeImages()
+    tools, _ = make_tools(monkeypatch, images)
+    await tools.execute_tool("generate_image", {"prompt": "x"})
+    await tools.execute_tool("generate_image", {"prompt": "x", "complexity": "LOW"})
+    assert "complexity" not in images.generate_calls[0]  # the model's own default
+    assert images.generate_calls[1]["complexity"] == "low"
+
+    use_model(monkeypatch, "auto", "gpt-image-2.5-sunburst")
+    result = await tools.execute_tool("generate_image", {"prompt": "x", "complexity": "low"})
+    assert "complexity" not in images.generate_calls[2] and "no complexity setting" in result
+
+
+async def test_safety_identifier_is_a_stable_hash_and_dropped_when_refused(workspace, monkeypatch):
+    images = FakeImages()
+    tools, _ = make_tools(monkeypatch, images)
+    await tools.execute_tool("generate_image", {"prompt": "x"})
+    sent = images.generate_calls[0]["safety_identifier"]
+    assert sent == tools.safety_identifier == ImageTools("7", FakeSender()).safety_identifier
+    assert "7" != sent and len(sent) == 32 and sent != ImageTools("8", FakeSender()).safety_identifier
+
+    class Refuses(FakeImages):
+        def generate(self, **kw):
+            self.generate_calls.append(kw)
+            if "safety_identifier" in kw:
+                raise ValueError("Unknown parameter: 'safety_identifier'.")
+            return self._result()
+
+    images = Refuses()
+    tools, sender = make_tools(monkeypatch, images)
+    result = await tools.execute_tool("generate_image", {"prompt": "x"})
+    assert [("safety_identifier" in c) for c in images.generate_calls] == [True, False]
+    assert not result.startswith("Error") and "refused" not in result  # not worth telling the agent
+    await tools.execute_tool("generate_image", {"prompt": "y"})
+    assert "safety_identifier" not in images.generate_calls[2]  # remembered
+
+
+async def test_a_refused_custom_size_falls_back_to_the_closest_standard_size_once(workspace, monkeypatch):
+    class StandardOnly(FakeImages):
+        def generate(self, **kw):
+            self.generate_calls.append(kw)
+            if kw["size"] not in ("1024x1024", "1536x1024", "1024x1536"):
+                raise ValueError(f"Invalid size '{kw['size']}'. Supported sizes are 1024x1024, 1536x1024, 1024x1536.")
+            return self._result()
+
+    images = StandardOnly()
+    tools, sender = make_tools(monkeypatch, images)
+    result = await tools.execute_tool("generate_image", {"prompt": "x", "aspect_ratio": "16:9"})
+    assert [c["size"] for c in images.generate_calls] == ["2048x1152", "1536x1024"]
+    assert "used 1536x1024 instead" in result and "1536x1024" in sender.documents[0][1]
+
+    images.generate_calls.clear()
+    await tools.execute_tool("generate_image", {"prompt": "x", "aspect_ratio": "16:9"})
+    assert [c["size"] for c in images.generate_calls] == ["1536x1024"]  # no second wasted round trip
+
+    images.generate_calls.clear()
+    result = await tools.execute_tool("generate_image", {"prompt": "x", "size": "1K"})  # 1024x1024 is standard
+    assert [c["size"] for c in images.generate_calls] == ["1024x1024"] and not result.startswith("Error")
+
+
+def _photo(path, size=(400, 300), color=(200, 200, 200)):
+    import PIL.Image
+
+    PIL.Image.new("RGB", size, color).save(path, format="JPEG", quality=95)
+    return path
+
+
+async def test_regions_become_a_transparent_overlay_the_size_of_the_input(workspace, monkeypatch):
+    import io
+
+    import PIL.Image
+
+    _photo(workspace / "data" / "7" / "images" / "room.jpg")
+    images = FakeImages()
+    tools, _ = make_tools(monkeypatch, images)
+    result = await tools.execute_tool("generate_image", {
+        "prompt": "make the lamp red", "images": ["images/room.jpg"],
+        "regions": [{"x": 0.25, "y": 0.5, "width": 0.25, "height": 0.25}],
+    })
+    assert not result.startswith("Error"), result
+    with PIL.Image.open(io.BytesIO(images.edit_calls[0]["markup"])) as overlay:
+        assert overlay.format == "PNG" and overlay.size == (400, 300) and overlay.mode == "RGBA"
+        alpha = overlay.getchannel("A")
+        assert alpha.getpixel((0, 0)) == 0  # transparent outside the marks
+        assert alpha.getpixel((100, 150)) == 255 and overlay.getpixel((100, 150))[:3] == (255, 0, 0)  # the outline
+        assert alpha.getpixel((125, 187)) == 0  # inside the box stays visible
+    assert not list((workspace / "data" / "7" / "images").glob("markup_*"))  # the overlay is temporary
+
+
+async def test_a_photo_the_user_drew_on_becomes_the_markup(workspace, monkeypatch):
+    import io
+
+    import PIL.Image
+    import PIL.ImageDraw
+
+    folder = workspace / "data" / "7" / "images"
+    _photo(folder / "room.jpg")
+    drawn = PIL.Image.open(folder / "room.jpg").convert("RGB")
+    PIL.ImageDraw.Draw(drawn).ellipse((300, 50, 380, 130), outline=(0, 0, 255), width=6)
+    drawn.save(folder / "room_marked.jpg", format="JPEG", quality=90)
+
+    images = FakeImages()
+    tools, _ = make_tools(monkeypatch, images)
+    result = await tools.execute_tool("generate_image", {
+        "prompt": "remove the circled object", "images": ["images/room.jpg"], "markup": "images/room_marked.jpg",
+    })
+    assert not result.startswith("Error"), result
+    with PIL.Image.open(io.BytesIO(images.edit_calls[0]["markup"])) as overlay:
+        alpha = overlay.getchannel("A")
+        box = alpha.getbbox()
+        assert box is not None and 290 <= box[0] <= 302 and 378 <= box[2] <= 392  # only the drawing
+        assert alpha.getpixel((10, 10)) == 0 and alpha.getpixel((200, 250)) == 0
+
+    # the same photo unchanged marks nothing: refused before any call
+    images.edit_calls.clear()
+    result = await tools.execute_tool("generate_image", {
+        "prompt": "x", "images": ["images/room.jpg"], "markup": "images/room.jpg",
+    })
+    assert result.startswith("Error") and "nothing is marked" in result and not images.edit_calls
+
+
+async def test_markup_needs_an_input_image_and_a_model_that_takes_it(workspace, monkeypatch):
+    images = FakeImages()
+    tools, _ = make_tools(monkeypatch, images)
+    region = [{"x": 0.1, "y": 0.1, "width": 0.2, "height": 0.2}]
+    for args, needle in (
+        ({"prompt": "x", "regions": region}, "pass that image"),
+        ({"prompt": "x", "images": ["images/cat.png"], "regions": region, "engine": "story"}, "does not take markup"),
+        ({"prompt": "x", "images": ["images/cat.png"], "regions": [{"x": "a"}]}, "numeric"),
+        ({"prompt": "x", "images": ["images/cat.png"], "markup": "images/nope.png"}, "not an image"),
+    ):
+        result = await tools.execute_tool("generate_image", args)
+        assert result.startswith("Error:") and needle in result, args
+    assert not images.edit_calls and not images.generate_calls
+
+
+async def test_a_refused_markup_is_dropped_and_reported(workspace, monkeypatch):
+    _photo(workspace / "data" / "7" / "images" / "room.jpg")
+
+    class NoMarkup(FakeImages):
+        def edit(self, **kw):
+            super().edit(**kw)
+            if "markup" in kw:
+                raise ValueError("Unsupported parameter: 'markup' is not supported with this model.")
+            return self._result()
+
+    images = NoMarkup()
+    tools, sender = make_tools(monkeypatch, images)
+    result = await tools.execute_tool("generate_image", {
+        "prompt": "x", "images": ["images/room.jpg"], "regions": [{"x": 0.1, "y": 0.1, "width": 0.2, "height": 0.2}],
+    })
+    assert [("markup" in c) for c in images.edit_calls] == [True, False]
+    assert "refused 'markup'" in result and len(sender.documents) == 1
+
+
+def test_the_sandbox_patcher_does_not_touch_the_animation_helpers():
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "app" / "secure_container" / "tool_integrator.py").read_text()
+    assert "animation" not in source.lower()

@@ -11,6 +11,7 @@ OVERRIDE_VARS = [
     "OPENAI_MODEL", "VIDEO_FRAMES_MODEL", "OPENAI_REASONING_EFFORT",
     "WHISPER_MODEL", "EMBEDDING_MODEL", "EMBEDDING_DIMENSION",
     "GEMINI_IMAGE_MODEL_FLASH", "GEMINI_IMAGE_MODEL_PRO", "GPT_IMAGE_MODEL", "GPT_IMAGE_MODEL_FAST",
+    "GPT_ANIMATION_MODEL", "GPT_ANIMATION_MODEL_FAST",
     "VEO_MODEL", "PERPLEXITY_MODEL", "TTS_MODEL",
 ]
 
@@ -43,8 +44,10 @@ def test_defaults(clean_models):
     assert m.EMBEDDING_DIMENSION == 1536
     assert m.GEMINI_IMAGE_MODEL_FLASH == "gemini-3.1-flash-image-preview"
     assert m.GEMINI_IMAGE_MODEL_PRO == "gemini-3-pro-image-preview"
-    assert m.GPT_IMAGE_MODEL == "gpt-image-2.5-sunburst"
-    assert m.GPT_IMAGE_MODEL_FAST == "gpt-image-2.5-flare"
+    assert m.GPT_IMAGE_MODEL == "gpt-image-2.6-sunburst"
+    assert m.GPT_IMAGE_MODEL_FAST == "gpt-image-2.6-flare"
+    assert m.GPT_ANIMATION_MODEL == "gpt-image-2.6-sunburst"
+    assert m.GPT_ANIMATION_MODEL_FAST == "gpt-image-2.6-flare"
     assert m.VEO_MODEL == "veo-3.1-generate-preview"
     assert m.PERPLEXITY_MODEL == "sonar"
     assert m.PERPLEXITY_MODELS == ("sonar-reasoning-pro", "sonar-pro", "sonar")
@@ -133,8 +136,9 @@ def test_estimate_cost(clean_models):
 
 def test_estimate_image_cost(clean_models):
     m = clean_models
-    # per 1M tokens: text input $5, image input $8, image output $30 (both GPT Image 2.5 models)
-    for model in (m.GPT_IMAGE_MODEL, m.GPT_IMAGE_MODEL_FAST):
+    # per 1M tokens: text input $5, image input $8, image output $30 (GPT Image 2.5 and 2.6 alike)
+    for model in (m.GPT_IMAGE_MODEL, m.GPT_IMAGE_MODEL_FAST, m.GPT_ANIMATION_MODEL, m.GPT_ANIMATION_MODEL_FAST,
+                  "gpt-image-2.5-sunburst", "gpt-image-2.5-flare"):
         assert m.estimate_image_cost(model, 1_000_000, 1_000_000, 1_000_000) == 5.0 + 8.0 + 30.0
     # Gemini Flash Image: $0.50 input (text and images), $60 output per 1M
     assert m.estimate_image_cost(m.GEMINI_IMAGE_MODEL_FLASH, 1_000_000, 0, 1_000_000) == 0.5 + 60.0
