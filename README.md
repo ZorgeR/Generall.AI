@@ -39,7 +39,12 @@ GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bo
 - **🎨 Image Generation**: Create new images based on text descriptions or modifications of existing images
   - **🔄 Generate with gpt-image**: Create single images and variants with OpenAI's gpt-image models (`best` / `fast` engines)
   - **✨ Multimodal Generation with Gemini**: Generate stories with matching images using Google's Gemini image models (`story` engine)
-  - **🖌️ Image-to-Image Transformation**: Edit one picture or compose several into one, including photos you sent earlier
+  - **🖌️ Image-to-Image Transformation**: Edit one picture or compose several into one, including photos you sent earlier;
+    mark the exact spot to change, or draw on a copy of the photo and the edit follows your drawing
+  - **🎞️ Animated GIFs**: short looping animations from a description or from your photo (GPT Image 2.6), playing
+    right in the chat; then change their speed, reverse them, make a boomerang, keep some frames, redraw one frame,
+    or get an MP4 copy, without generating them again
+  - **✒️ SVG**: logos, icons and flat illustrations as vector files
 - **📄 Document Processing**: PDFs are read as documents; DOCX, XLSX, JSON, text and code files are extracted and handed to the agent
 - **📝 Documents out**: the agent writes PDF, DOCX, XLSX, Markdown or HTML files from Markdown (`create_document`) and sends them to you
 - **🌐 Web reading and headless browsing**: pages are reduced to their readable content; JavaScript-heavy sites are
@@ -279,6 +284,18 @@ pick a better engine when you ask for the best result.
 Images are delivered once, as files, and the assistant embeds one inside its answer only if you ask
 to see it there.
 
+**Precise edits.** Say what to change ("make the lamp on the left red") or what to keep ("keep the face
+exactly, change the background") and the assistant marks that area on the picture for the model. Or draw on
+your photo with Telegram's brush when you attach it, and send the clean photo too: the model follows your
+drawing, and your message says whether the marked part should change or stay.
+
+**Animated GIFs.** "Make a GIF of a cat waving" gives a short loop (2-16 frames, about 512 px) that plays
+in the chat; "animate this photo" animates a picture you sent. Afterwards "twice as fast", "play it
+backwards", "make it a boomerang", "only the first six frames", "fix the eyes in frame 3" or "as an MP4"
+change the GIF without generating it again; only a redrawn frame calls the model. Longer clips with camera
+moves, realism or sound are the video tools' job. Ask for "the GIF file" to get the .gif itself
+(Telegram otherwise keeps animations as MP4).
+
 ### ✨ Rich Messages
 
 Answers are sent as **rich Telegram messages** (Bot API 10.1): real GitHub-flavored Markdown with
@@ -446,11 +463,20 @@ opinion with `describe_image`.
 GenerALL.AI offers multiple powerful image generation and transformation capabilities:
 
 #### 📸 gpt-image generation
-Generate high-quality images and variants with OpenAI's gpt-image models (`GPT_IMAGE_MODEL` for `best`,
-`GPT_IMAGE_MODEL_FAST` for `fast`), with customizable parameters:
-- Control image size, aspect ratio and quality (`auto` through `max`)
+Generate high-quality images and variants with OpenAI's GPT Image 2.6 models (`GPT_IMAGE_MODEL` =
+`gpt-image-2.6-sunburst` for `best`, `GPT_IMAGE_MODEL_FAST` = `gpt-image-2.6-flare` for `fast`), with
+customizable parameters:
+- Control image size, aspect ratio, quality (`auto` through `max`) and planning complexity
 - Several variants per request (capped in `/settings` → Images)
+- SVG output for logos and icons
 - Supports art styles, photography styles, and concept visualization
+
+#### 🎞️ Animated GIFs
+`generate_animation` makes a GIF with GPT Image 2.6 (`GPT_ANIMATION_MODEL`, `GPT_ANIMATION_MODEL_FAST`):
+2-16 frames that the model draws together, so they stay consistent, at about 512 px (16:9 is 896x512).
+`edit_animation` changes speed, direction, frames and loops locally (Pillow, ffmpeg), redraws a single
+frame through the image model, turns a video into a GIF or a GIF into an MP4. GIF output needs the GIF
+preview to be enabled for your OpenAI API account.
 
 #### ✨ Multimodal Generation with Gemini
 Create rich stories with matching images using Google's advanced Gemini model:

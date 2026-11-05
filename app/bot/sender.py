@@ -288,8 +288,24 @@ class ChatSender:
         *,
         filename: str | None = None,
         caption: str | None = None,
+        keep_format: bool = False,
     ) -> Message:
-        return await self.bot.send_document(document=_input_file(source, filename), caption=_caption(caption), **self._kw())
+        """A file. ``keep_format`` stops Telegram from turning it into something else (a GIF
+        into an MP4 animation), so the user gets the file itself."""
+        extra = {"disable_content_type_detection": True} if keep_format else {}
+        return await self.bot.send_document(
+            document=_input_file(source, filename), caption=_caption(caption), **extra, **self._kw()
+        )
+
+    async def send_animation(
+        self,
+        source: str | Path | bytes,
+        *,
+        filename: str | None = None,
+        caption: str | None = None,
+    ) -> Message:
+        """A GIF (or silent MP4) that plays and loops in the chat; Telegram stores it as MP4."""
+        return await self.bot.send_animation(animation=_input_file(source, filename), caption=_caption(caption), **self._kw())
 
     async def send_photo(
         self,

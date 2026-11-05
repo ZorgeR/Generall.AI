@@ -10,9 +10,9 @@ A single-process Python Telegram bot (aiogram 3, asyncio) that wraps a Claude
 tool-use agent. Users send text / voice / photos / video / audio / documents in
 Telegram; the bot builds a prompt of content blocks (text, plus the photos and PDFs
 themselves as image/document blocks, with the replied-to or forwarded message quoted
-in front), runs a per-message agent loop with 51 built-in tools (files, web search and
+in front), runs a per-message agent loop with 53 built-in tools (files, web search and
 a headless page reader, code execution in a persistent per-user Docker sandbox, image/video
-generation, documents out as pdf/docx/xlsx, reminders and scheduled tasks in the user's time
+generation, animated GIFs, documents out as pdf/docx/xlsx, reminders and scheduled tasks in the user's time
 zone, SMS, S3, TTS, button questions, a user profile, the sandbox status, background tasks) plus Anthropic's
 browser toolset (an interactive Chromium per user, in its own container, with saved logins)
 plus the tools of the user's MCP servers (a bearer token or an OAuth sign-in in one tap), persists multi-layer memory per user on disk
@@ -267,8 +267,12 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
     terminal_tools.py       TerminalTools: run_command (patched; gains run_shell_script/install_package)
     time_tools.py           TimeTools: timezone helpers
     sms_tools.py            SMSTools: Twilio send_sms
-    image_tools.py          ImageTools: one generate_image tool (generate/edit/compose) over the
-                            models.IMAGE_BACKENDS table, plus generate_story_images
+    image_tools.py          ImageTools: one generate_image tool (generate/edit/compose, svg, markup) over the
+                            models.IMAGE_BACKENDS table, generate_story_images, and the GIF pair generate_animation
+                            (models.ANIMATION_BACKENDS, GPT Image 2.6) / edit_animation; _openai_request = every OpenAI
+                            images call with the knob/quality/size discovery
+    animation.py            GIF helpers for the image tools (PIL + ffmpeg, sync, no API): read/write, frame sheet,
+                            frame selection, reverse, boomerang, retime, loop count, replace one frame, video→GIF, GIF→MP4
     video_tools.py          VideoTools: Google Veo 3.1 text→video, image→video, extend, interpolate
     user_interactions.py    UserInteractions: mid-run Telegram messages, TTS voice, reactions, set_user_timezone,
                             schedule_reminder (local time, timezone, weekdays), send file from content,
@@ -926,7 +930,9 @@ A tool provider is duck-typed. It must expose:
 
 Tools that talk to the user receive a `sender` (`bot.sender.ChatSender`) in their constructor, never
 a Telegram update: `sender.send_text(md)`, `send_markdown(md)` (splits, fallback), `send_document(path|bytes,
-filename, caption)`, `send_photo`, `send_video`, `send_voice(bytes)`, `react(emoji)` (only when the turn
+filename, caption, keep_format=False)` (`keep_format`: `disable_content_type_detection`, so a GIF stays a GIF file
+instead of becoming an MP4 animation), `send_photo`, `send_video`, `send_animation` (a GIF that plays and loops in
+the chat), `send_voice(bytes)`, `react(emoji)` (only when the turn
 has a user message), `typing()`. Captions are truncated to 1024. This is what makes tool sends work in
 scheduled agent reminders too. `sender` may be `None` for unit tests; guard before using it. A tool whose point is
 to talk to the user right now or to wait for them (a question, a confirmation, a message, a reaction) must be
@@ -990,9 +996,9 @@ itself is announced by a notice of facts only, a `system` message (see "Queues")
 counted by `track_tool_used` when it started. Toolset members never go to the background. Without a host (tests,
 subagents) every call runs to its end as before.
 
-Effective tool list as the model sees it (after patching; 51 built-in tools, the browser toolset and the user's
+Effective tool list as the model sees it (after patching; 53 built-in tools, the browser toolset and the user's
 `mcp_*` ones; with no session manager there is no `sandbox_status` and no browser, with `browser.enabled` off no
-browser, with no background host no task tools: 44 at the least):
+browser, with no background host no task tools: 46 at the least):
 
 | Provider | Tools | Runs where |
 |---|---|---|
@@ -1003,7 +1009,7 @@ browser, with no background host no task tools: 44 at the least):
 | CodeTools | `execute_python` (+`network_enabled`, ignored in the session: it always has filtered internet) | the user's sandbox session |
 | TerminalTools | `run_command` (bash syntax works), `run_shell_script` (+`network_enabled`, ignored in the session), `install_package` (package_name, manager apt\|pip; persisted and reinstalled at every session start) | the user's sandbox session (a one-off container when none can start) |
 | TimeTools | `get_time_in_timezone`, `list_timezones` | bot process |
-| ImageTools | `generate_image` (no `images` → generate, one → edit, several → compose; engine `auto`/`best`/`fast`/`story`), `generate_story_images` | bot process (SDK calls in worker threads), never sandboxed, delivers each result itself as a document, once |
+| ImageTools | `generate_image` (no `images` → generate, one → edit, several → compose; engine `auto`/`best`/`fast`/`story`; `format` png/jpeg/webp/`svg` (GPT Image 2.6: new drawings only, n=1); `complexity` low/medium/high (2.6, omitted = the model's default); edits: `regions` (boxes or circles (`shape`), fractions 0-1 or pixels; they only point at an area, the prompt says change it or keep it) and/or `markup` (a transparent PNG overlay, or a copy of the photo the user drew on: the drawing is what differs from the input, `MARKUP_DIFF_THRESHOLD`) → one transparent PNG the size of the prepared first input, uploaded as `markup`); `generate_animation` (prompt, `images` to animate (edits endpoint with `output_format=gif`), engine auto/best/fast → `ANIMATION_BACKENDS`, quality, aspect_ratio → `gif_pixel_size` (512 short edge: 1:1 512x512, 16:9 896x512; a photo keeps its shape), `frames` 2-16 (default 9), `frame_duration_ms` 20-2000 (default 200, rounded to 10), complexity; n=1; the GIF is read back (frames, timing) and a numbered frame sheet `<name>_frames.png` saved for `view_image`; delivered with `send_animation`); `edit_animation` (path to a GIF or a video; `edit_frame` + `edit_prompt` (the one model call: that frame as PNG through `images.edit`, fitted back), `frames` ("1-6", "1,3,5"), `reverse`, `boomerang`, `speed` / `frame_duration_ms`, `loop` (plays: 0 forever, 1 once), `output` gif\|mp4; applied in that order; always a new file `<stem>_edit_<hex>.gif`; a video becomes a GIF first: 10 s, 10 fps, ≤ 512 px); `generate_story_images` | bot process (SDK calls, PIL and ffmpeg in worker threads), never sandboxed, delivers each result itself once: a document, a GIF as an animation, an MP4 as a video |
 | VideoTools | `video_generator`, `image_to_video_generator`, `video_from_reference_images`, `video_interpolation_generator`, `video_extension_generator` | bot process (Veo in worker threads, async polling up to 5 min) |
 | SMSTools | `send_sms` | bot process, worker thread |
 | UserInteractions | `send_user_telegram_message`, `send_voice_message`, `set_message_reaction`, `set_user_timezone` (IANA name or city/country alias via `timezones.valid_zone`; saves settings `timezone.name` in to_thread and returns the user's local time, `Error: unknown time zone …` otherwise), `schedule_reminder` (reminder_text; reminder_time `YYYY-MM-DD HH:MM[:SS]` read in the user's zone, or in the optional `timezone` param, unless it carries a `Z`/`±HH:MM` offset, which wins; reminder_type user\|agent; is_periodic + period_type hourly\|daily\|weekly\|monthly + period_interval; `weekdays` [0=Mon..6=Sun] for daily periodic reminders only, the first run moved to an allowed day by `first_allowed_trigger`; stores UTC plus the zone; confirms in local time; user reminders fire with snooze buttons, agent tasks run as scheduled tasks and may answer `<no_update/>`), `send_file_content_to_user_via_telegram`, `ask_user_choice` (question + 2-8 option buttons, waits for the tap up to `timeout_seconds` 30..900, default 300; returns `User chose: "<option>"`, `TYPED_DELIVERED` ("User answered in text instead of tapping a button: their message follows the tool results (a <user_message> block); read it as their reply to this question") when the user typed a plain text in that chat and topic instead and the running turn took it as a message, `User answered in text instead of tapping a button: "<text>"` when no turn took it, a no-answer notice or `Error: …`); its `prompt_notes` (static) tell the model to infer or ask for the zone once and save it, to schedule and confirm in local time, and to answer exactly `<no_update/>` on an uneventful scheduled run | bot process |
@@ -1271,8 +1277,11 @@ data/
                                     reminder this one-off copy was snoozed from]}; written atomically under a per-user lock
     images/                         image_<uuid>.jpg (uploads, full resolution, the path the prompt names) + image_<uuid>_v.jpg (the
                                     downscaled copy the model saw; Retry re-sends it, so it must stay), video_frame_<uuid>.jpg,
-                                    generated_*/transformed_*/composed_*/gpt_generated_*/gpt_edited_*/story_image_*, edit_input_* (transient)
-    videos/                         video_<uuid>.mp4 (uploads), veo3_*.mp4
+                                    generated_*/transformed_*/composed_*/gpt_generated_*/gpt_edited_*/story_image_*,
+                                    sunburst_*/flare_* (stills, .svg too), sunburst_anim_*/flare_anim_*.gif (generate_animation),
+                                    <stem>_edit_<hex>.gif (edit_animation), <gif stem>_frames.png (the frame sheet of each GIF);
+                                    transient: edit_input_*, markup_*.png, frame_input_*.png, .convert_*.gif
+    videos/                         video_<uuid>.mp4 (uploads), veo3_*.mp4, <gif stem>_<hex>.mp4 (edit_animation output mp4)
     audio/, documents/              uploads under their ORIGINAL file names (documents lowercased) → re-uploads overwrite;
                                     documents/ also holds create_document outputs <name>.<md|html|pdf|docx|xlsx> (-2, -3 on a clash)
                                     and the transient render sources .render_<hex>.html|.md
@@ -1490,7 +1499,8 @@ reasoning models and `{}` for anything else. No other file holds a model literal
 | Embeddings | `text-embedding-3-small` (`EMBEDDING_MODEL`), dim 1536 (`EMBEDDING_DIMENSION`, must match the model's vector size); a model change makes every existing index stale and it is rebuilt from `conversations/*.json` in the background (no manual migration; searches return nothing for that user until it finishes) | none; cosine over L2-normalized vectors (`IndexFlatIP`) | `agents/embeddings.py` |
 | MCP tool servers (the user's and the admin's) | `mcp>=2.2` client: streamable HTTP (`streamable_http_client` with an httpx2 client from `create_mcp_http_client` carrying the stored headers, the OAuth provider as `auth` and the request guard as an event hook) or legacy SSE (`sse_client(auth=…, httpx_client_factory=…)`), `ClientSession(read, write, read_timeout_seconds=…)`; the 1.x camelCase/`streamablehttp_client` branches are untested fallbacks | one connection per call, `initialize` → `call_tool`; the `mcp` import (~0.8 s) is lazy inside `open_transport` / `client_session` (tests replace them, or put an `httpx2.MockTransport` in `mcp_tools.HTTP_TRANSPORT`) | `agents/mcp_tools.py`, `bot/mcp_store.py` |
 | MCP OAuth sign-in | `mcp.client.auth.OAuthClientProvider` (RFC 9728 protected resource metadata, RFC 8414 AS metadata, RFC 7591 dynamic registration as a public client "GALL.AI" with `token_endpoint_auth_method: none`, PKCE S256, its own `state`, RFC 8707 `resource`, refresh); our `TokenStorage` (`oauth_flow.OAuthStorage`); the SDK's default `validate_resource_url`; no `client_metadata_url` (no CIMD document is hosted) | redirect URI `PUBLIC_BASE_URL/oauth/callback` (`application_type: web`) or `http://localhost:8765/oauth/callback` (`native`, the copy-paste fallback) | `bot/oauth_flow.py`, `bot/oauth_web.py` |
-| Image gen/edit/compose | engine → model via `models.IMAGE_BACKENDS`: `auto`/`best` → `gpt-image-2.5-sunburst` (`GPT_IMAGE_MODEL`), `fast` → `gpt-image-2.5-flare` (`GPT_IMAGE_MODEL_FAST`, same price, lower quality), `story` → `gemini-3.1-flash-image-preview` (`GEMINI_IMAGE_MODEL_FLASH`), escalating to `gemini-3-pro-image-preview` (`GEMINI_IMAGE_MODEL_PRO`) at quality xhigh/max | OpenAI: `quality` from the `auto…max` ladder, pixel `size` from ratio+tier, `n=variants`, `output_format`, and `input_fidelity=high` on edits so the original survives (any knob the model refuses is dropped and remembered for the process). Gemini: `ImageConfig(aspect_ratio, image_size)`, no quality knob | `agents/image_tools.py` |
+| Image gen/edit/compose | engine → model via `models.IMAGE_BACKENDS`: `auto`/`best` → `gpt-image-2.6-sunburst` (`GPT_IMAGE_MODEL`), `fast` → `gpt-image-2.6-flare` (`GPT_IMAGE_MODEL_FAST`, same price, lower quality), `story` → `gemini-3.1-flash-image-preview` (`GEMINI_IMAGE_MODEL_FLASH`), escalating to `gemini-3-pro-image-preview` (`GEMINI_IMAGE_MODEL_PRO`) at quality xhigh/max. What a model takes beyond the basics comes from its id family: `models.IMAGE_MODEL_FEATURES` (2.6: gif, svg, complexity, markup; 2.5: markup, input_fidelity; other OpenAI: input_fidelity; Gemini: none), `ImageBackend.supports(feature)` | OpenAI (all through `ImageTools._openai_request`): `quality` from the `auto…max` ladder, pixel `size` from ratio+tier (a refused custom size → the closest of 1024x1024/1536x1024/1024x1536 once, remembered per model + size), `n=variants`, `output_format`; optional knobs dropped when refused and remembered when the error says the model does not know them: `safety_identifier` (sha256 of the user id, 32 hex), `input_fidelity=high` on edits (pre-2.6 models only: "for gpt-image-2, omit"), `complexity`, `markup` (the last two reported to the agent when dropped). SVG output adds `svg_usage` (the SVG author model's tokens) to the trace. Gemini: `ImageConfig(aspect_ratio, image_size)`, no quality knob | `agents/image_tools.py` |
+| Animated GIFs | `models.ANIMATION_BACKENDS`: `auto`/`best` → `gpt-image-2.6-sunburst` (`GPT_ANIMATION_MODEL`), `fast` → `gpt-image-2.6-flare` (`GPT_ANIMATION_MODEL_FAST`); their own pair so the still models can be rolled back to 2.5 without losing GIFs. Needs the account's GIF preview access per model | `output_format=gif`, `frame_count` 2-16 (`GIF_FRAMES_*`), `frame_duration_ms` 20-2000 (`GIF_FRAME_MS_*`), n=1, size from `gif_pixel_size` (refused → `auto` once); `images.generate`, or `images.edit` to animate a picture; no streaming, masks or compression. `edit_animation` redraws one frame through the still model (`IMAGE_BACKENDS`, png) | `agents/image_tools.py`, `agents/animation.py` |
 | Video | `veo-3.1-generate-preview` for all five tools (`VEO_MODEL`) | none | `agents/video_tools.py` |
 | Web search / research | Tavily; Perplexity `sonar` default (`PERPLEXITY_MODEL`), enum `PERPLEXITY_MODELS` = sonar-reasoning-pro / sonar-pro / sonar, via raw HTTP | Perplexity payload keeps its own `temperature`/`max_tokens` | `agents/search_tools.py` |
 | TTS | ElevenLabs `eleven_multilingual_v2` (`TTS_MODEL`), voices in `app/voice/voices.json` | none | `bot/media.py`, `agents/user_interactions.py` |
@@ -1535,7 +1545,7 @@ SearchTools and the embeddings `OpenAI` are per instance; ElevenLabs is per call
 | `THREAD_POOL_SIZE` (32, min 8) | bot/app | size of the default executor used by `asyncio.to_thread` |
 | `WORKSPACE_ROOT` | secure_container | host path of the checkout (see Running); set in compose, not `.env.example` |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENAI_API_KEY_WHISPER`, `GOOGLE_API_KEY`, `TAVILY_API_KEY`, `PERPLEXITY_API_KEY`, `ELEVENLABS_API_KEY` | various | see models table; `OPENAI_API_KEY` and `GOOGLE_API_KEY` needed to import `agents.main` |
-| `ANTHROPIC_MODEL`, `ANTHROPIC_EFFORT`, `ANTHROPIC_MODEL_FAST`, `OPENAI_MODEL`, `VIDEO_FRAMES_MODEL`, `OPENAI_REASONING_EFFORT`, `WHISPER_MODEL`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSION`, `GEMINI_IMAGE_MODEL_FLASH`, `GEMINI_IMAGE_MODEL_PRO`, `GPT_IMAGE_MODEL`, `GPT_IMAGE_MODEL_FAST`, `VEO_MODEL`, `PERPLEXITY_MODEL`, `TTS_MODEL` | `models` | optional overrides of the model defaults (blank = default), read once at import; see "Models and external services" and `.env.example` |
+| `ANTHROPIC_MODEL`, `ANTHROPIC_EFFORT`, `ANTHROPIC_MODEL_FAST`, `OPENAI_MODEL`, `VIDEO_FRAMES_MODEL`, `OPENAI_REASONING_EFFORT`, `WHISPER_MODEL`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSION`, `GEMINI_IMAGE_MODEL_FLASH`, `GEMINI_IMAGE_MODEL_PRO`, `GPT_IMAGE_MODEL`, `GPT_IMAGE_MODEL_FAST`, `GPT_ANIMATION_MODEL`, `GPT_ANIMATION_MODEL_FAST`, `VEO_MODEL`, `PERPLEXITY_MODEL`, `TTS_MODEL` | `models` | optional overrides of the model defaults (blank = default), read once at import; see "Models and external services" and `.env.example` |
 | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` | sms_tools | optional; tool returns an error string if unset |
 | `S3_HOST`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET_NAME`, `S3_PATH_TO_STORE` | file_ops | optional |
 | `MAX_IMAGE_RESOLUTION_VISION` (1024), `MAX_IMAGE_RESOLUTION_EDIT` (4096) | bot/media, image_tools | downscale before vision / edit |
@@ -1707,7 +1717,7 @@ name; a new temp dir needs its own `.gitignore` line).
 
 ## README vs code
 
-- README model names (Claude Sonnet 5.5 / GPT-6.1 / GPT-6, gpt-image-2.5 / Gemini image models,
+- README model names (Claude Sonnet 5.5 / GPT-6.1 / GPT-6, gpt-image-2.6 / Gemini image models,
   text-embedding-3-small) now match the defaults in `app/models.py`; if they drift again, `app/models.py` wins.
 - The README's feature list was realigned with the code in the v3 wave: there are no SSH or Shodan tools
   (SSH is only possible via `run_shell_script` inside the sandbox, where openssh-client is installed, with
@@ -1906,10 +1916,28 @@ name; a new temp dir needs its own `.gitignore` line).
   class whose name a `patch_*` function targets silently replaces it; that is how image editing broke.
   `tests/test_image_tools.py` guards the image tools by asserting `tool_integrator.py` never names them.
 - Image tools: `generate_image` resolves engine/quality/size as tool call → user's `image` settings → default,
-  so the agent can override a preference from the request. `xhigh`/`max` are in no published SDK type for images
-  and are sent as given, with a single retry at `IMAGE_QUALITY_FALLBACK` when the provider refuses them. File
-  extensions are derived from the returned bytes, never asserted, and the inline-embed hint is only offered for
-  formats `bot/rich.py` can actually inline.
+  so the agent can override a preference from the request (`generate_animation` too; a `story` preference means
+  the default GIF engine). The SDK documents `xhigh`/`max` for GPT Image 2.5 only; they are sent as given, with a
+  single retry at `IMAGE_QUALITY_FALLBACK` when the provider refuses them. File extensions are derived from the
+  returned bytes, never asserted (svg and gif included), and the inline-embed hint is only offered for formats
+  `bot/rich.py` can actually inline (never gif or svg). Every OpenAI images request goes through
+  `_openai_request`: `fixed` knobs (the GIF's frames) are the request's meaning and a refusal is an error;
+  `optional` ones are dropped on refusal and remembered in `_UNSUPPORTED` only when the error says "unknown /
+  unsupported / …" (`says_unsupported`: a bad markup VALUE is dropped for that call only); a refused custom size
+  is retried once at the standard (or GIF: `auto`) size and remembered as `size=<WxH>`. Error matching is by
+  parameter name in the message (`is_parameter_rejection`), so a new optional knob must have a name that does not
+  occur in unrelated errors. A `TypeError` "unexpected keyword" means the installed openai package is older than
+  the knob (`openai>=3.46.0` is required; `_sdk_hint` says so).
+- GPT Image 2.6 facts the code relies on (openai-python 3.46.0 parameter docs): GIF output needs "access to the GIF
+  preview for the selected model" (per account; the error is explained to the agent), 2-16 frames (the guide's 64
+  is refused live), no masks/streaming/compression; SVG is generation only, n=1, and is billed for the SVG author
+  too (`svg_usage`); `markup` must match the first input's size after EXIF orientation, which is why
+  `_build_markup` measures the PREPARED input (`_prepare_input` may have downscaled it) through `exif_transpose`;
+  the arbitrary-resolution note of the size parameter lists models up to 2.5 only, hence the size fallback.
+  2.6 bills about 4x the output tokens of 2.5 at low quality and 3x at medium (same per-token rates); Batch is
+  not offered for 2.6 (unused here). Claude sees only the first frame of a GIF: the frame sheet is how the agent
+  checks an animation. Telegram stores animations as MP4: `send_file_path_to_user_via_telegram` sends a `.gif`
+  with `keep_format` so the user can get the GIF itself.
 - `agents/main.py` appends `RICH_FORMATTING_GUIDE` / `LEGACY_FORMATTING_GUIDE` to every system
   prompt after selection, then `FOLLOW_UPS_GUIDE` when `follow_ups` is on, then the providers'
   `<capabilities>` block (none of it to the subagent prompt); the `generall-ai-*` prompts still say nothing
@@ -2192,9 +2220,13 @@ name; a new temp dir needs its own `.gitignore` line).
 - **Add a background job**: an `async` loop started from `bot/app.py:on_startup` and appended to
   `runtime.background_tasks`; to run the agent from it, submit a `Job` to `runtime.queue`.
 - **Add an image engine**: a row in `models.IMAGE_BACKENDS` (model id, provider, which operations and knobs it
-  supports, variant strategy, file prefix) and, if it is a new provider, one `_<provider>_images` method in
-  `agents/image_tools.py`. Nothing else dispatches on the engine name. For cost tracking add the model's
-  per-modality rates to `models.IMAGE_TOKEN_PRICES`.
+  supports, variant strategy, file prefix; `ANIMATION_BACKENDS` for GIFs) and, if it is a new provider, one
+  `_<provider>_images` method in `agents/image_tools.py`. Nothing else dispatches on the engine name. A new OpenAI
+  model family with other knobs gets a row in `models.IMAGE_MODEL_FEATURES` (prefix → features). For cost tracking
+  add the model's per-modality rates to `models.IMAGE_TOKEN_PRICES` (`tests/test_models.py` checks the defaults).
+- **Change what a GIF can do**: playback changes are pure functions in `agents/animation.py` (tests in
+  `tests/test_animation_tools.py`, ffmpeg ones skipped without ffmpeg), wired as `edit_animation` parameters in
+  `ImageTools._edit_animation` (keep the documented order); model calls go through `_openai_request`.
 - **Change models**: edit the default in `app/models.py` or set the env var of the same name
   (`ANTHROPIC_MODEL`, `OPENAI_MODEL`, `VIDEO_FRAMES_MODEL`, ...; see `.env.example`). No other file
   holds a model name. Keep the option helpers honest when the new model's API differs: a
