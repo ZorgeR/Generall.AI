@@ -201,6 +201,11 @@ def resolve_animation_backend(engine: str | None) -> ImageBackend:
 # Video generation (agents/video_tools.py) - Google Veo, all five tools
 # ---------------------------------------------------------------------------
 VEO_MODEL = _env("VEO_MODEL", "veo-3.1-generate-preview")
+# Google shut every Veo model on the Gemini API down on 2026-10-22 (its replacement,
+# gemini-omni-1.1-flash, uses the Interactions API, not generate_videos). Listed, the video
+# tools were still called and every call ended in a 404 plus two chat messages, so they are
+# hidden from the agent unless VIDEO_TOOLS=on (once VEO_MODEL names a model that answers).
+VIDEO_TOOLS_ENABLED = _env("VIDEO_TOOLS", "off").strip().lower() in ("1", "true", "yes", "on")
 
 # ---------------------------------------------------------------------------
 # Search (agents/search_tools.py) - Perplexity deep_research default; the tool

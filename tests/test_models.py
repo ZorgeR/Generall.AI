@@ -12,7 +12,7 @@ OVERRIDE_VARS = [
     "WHISPER_MODEL", "EMBEDDING_MODEL", "EMBEDDING_DIMENSION",
     "GEMINI_IMAGE_MODEL_FLASH", "GEMINI_IMAGE_MODEL_PRO", "GPT_IMAGE_MODEL", "GPT_IMAGE_MODEL_FAST",
     "GPT_ANIMATION_MODEL", "GPT_ANIMATION_MODEL_FAST",
-    "VEO_MODEL", "PERPLEXITY_MODEL", "TTS_MODEL",
+    "VEO_MODEL", "VIDEO_TOOLS", "PERPLEXITY_MODEL", "TTS_MODEL",
 ]
 
 
@@ -49,6 +49,7 @@ def test_defaults(clean_models):
     assert m.GPT_ANIMATION_MODEL == "gpt-image-2.6-sunburst"
     assert m.GPT_ANIMATION_MODEL_FAST == "gpt-image-2.6-flare"
     assert m.VEO_MODEL == "veo-3.1-generate-preview"
+    assert m.VIDEO_TOOLS_ENABLED is False  # Veo was shut down on the Gemini API; VIDEO_TOOLS=on lists the tools again
     assert m.PERPLEXITY_MODEL == "sonar"
     assert m.PERPLEXITY_MODELS == ("sonar-reasoning-pro", "sonar-pro", "sonar")
     assert m.PERPLEXITY_MODEL in m.PERPLEXITY_MODELS

@@ -9,7 +9,12 @@ import uuid
 from google import genai
 from google.genai import types
 from google.genai.types import Image, VideoGenerationReferenceImage
-from models import VEO_DEFAULT_SECONDS, VEO_EXTENSION_SECONDS, VEO_MODEL, estimate_video_cost
+from models import VEO_DEFAULT_SECONDS, VEO_EXTENSION_SECONDS, VEO_MODEL, VIDEO_TOOLS_ENABLED, estimate_video_cost
+
+VIDEO_UNAVAILABLE = (
+    "Error: video generation is not available (Google shut down the Veo video models on 2026-10-22). "
+    "Tell the user; for an animation use generate_animation."
+)
 
 load_dotenv()
 
@@ -39,7 +44,8 @@ class VideoTools:
         self.videos_path = self.base_path / "videos"
         self.videos_path.mkdir(parents=True, exist_ok=True)
 
-        self.tools_schema = [
+        # Every tool, listed or not; the agent sees them only while VIDEO_TOOLS is on (models.py).
+        self.all_tools_schema = [
             {
                 "name": "video_generator",
                 "description": "Generate high-quality videos from text descriptions using Google Veo 3.1 (state-of-the-art text-to-video generation with cinematic quality), save to videos directory, and send to user via Telegram. Supports detailed scene descriptions with camera movements, lighting, and actions. Use only when the user asks for a video; for an animation, a GIF, a sticker or a loop use generate_animation.",
@@ -219,8 +225,11 @@ class VideoTools:
                 }
             }
         ]
+        self.tools_schema = self.all_tools_schema if VIDEO_TOOLS_ENABLED else []
 
     async def execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
+        if not VIDEO_TOOLS_ENABLED and tool_name in {t["name"] for t in self.all_tools_schema}:
+            return VIDEO_UNAVAILABLE
         if tool_name == "video_generator":
             return await self._video_generator(**tool_args)
         elif tool_name == "image_to_video_generator":

@@ -449,16 +449,42 @@ async def test_sending_a_gif_file_keeps_it_a_gif(tmp_path, monkeypatch):
     assert sent[0][1] == {"keep_format": True} and sent[1][1] == {}
 
 
+def _animation_description(monkeypatch, video_on):
+    monkeypatch.setattr("agents.image_tools.VIDEO_TOOLS_ENABLED", video_on)
+    tools = ImageTools("7", FakeSender())
+    return next(t for t in tools.tools_schema if t["name"] == "generate_animation")["description"]
+
+
 def test_animation_requests_go_to_generate_animation_not_the_video_tools(workspace, monkeypatch):
     """"Make an animation of this picture" picked image_to_video_generator first: both claimed to animate pictures."""
     monkeypatch.setenv("GOOGLE_API_KEY", os.environ.get("GOOGLE_API_KEY") or "test-key")  # built at import time
     from agents.video_tools import VideoTools
 
-    tools = ImageTools("7", FakeSender())
-    animation = next(t for t in tools.tools_schema if t["name"] == "generate_animation")["description"]
+    animation = _animation_description(monkeypatch, True)
     assert "whenever the user asks for an animation" in animation and "explicitly asks for a video" in animation
 
-    video = {t["name"]: t["description"] for t in VideoTools("7", FakeSender()).tools_schema}
+    video = {t["name"]: t["description"] for t in VideoTools("7", FakeSender()).all_tools_schema}
     for name in ("video_generator", "image_to_video_generator"):
         assert "generate_animation" in video[name] and "Use only when the user" in video[name], name
     assert "animates it" not in video["image_to_video_generator"]
+
+
+async def test_dead_video_tools_are_hidden_and_video_requests_get_an_honest_answer(workspace, monkeypatch):
+    """Veo is gone from the Gemini API (404 on every call): listed, the agent still "tried the video route
+    first" even after a 404 in the same chat, and every try sent two chat messages."""
+    monkeypatch.setenv("GOOGLE_API_KEY", os.environ.get("GOOGLE_API_KEY") or "test-key")
+    from agents import video_tools
+
+    assert models.VIDEO_TOOLS_ENABLED is False  # the default while no video model answers
+    tools = video_tools.VideoTools("7", FakeSender())
+    assert tools.tools_schema == [] and len(tools.all_tools_schema) == 5
+    result = await tools.execute_tool("image_to_video_generator", {"prompt": "x", "image_path": "images/a.jpg"})
+    assert result == video_tools.VIDEO_UNAVAILABLE and "generate_animation" in result
+
+    off = _animation_description(monkeypatch, False)
+    assert "video generation is not available" in off and "video tools" not in off
+
+    monkeypatch.setattr(video_tools, "VIDEO_TOOLS_ENABLED", True)
+    assert [t["name"] for t in video_tools.VideoTools("7", FakeSender()).tools_schema][:2] == [
+        "video_generator", "image_to_video_generator",
+    ]

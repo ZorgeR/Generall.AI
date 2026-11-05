@@ -12,7 +12,8 @@ tools and answers in the same chat.
   and a profile of facts you control
 - 🛠️ **Does the work**: web search and research, code in your own sandbox, a real browser that clicks,
   types and logs in
-- 🎨 **Creates**: images, videos, PDF / Word / Excel documents and voice replies
+- 🎨 **Creates**: images, animated GIFs, SVG, PDF / Word / Excel documents and voice replies (video generation
+  is off since Google shut down its Veo models on the Gemini API on 2026-10-22; `VIDEO_TOOLS=on` brings the tools back)
 - ⏰ **Works on schedule**: reminders and recurring tasks in your time zone, quiet when there is nothing new
 - 🗣️ **Never blocks you**: keep writing while it works; long jobs finish in the background and report back
 - 🔌 **Plugs into your tools**: any MCP server (Notion, Linear, Sentry, …) with a one-tap sign-in
@@ -293,7 +294,7 @@ drawing, and your message says whether the marked part should change or stay.
 in the chat; "animate this photo" animates a picture you sent. Afterwards "twice as fast", "play it
 backwards", "make it a boomerang", "only the first six frames", "fix the eyes in frame 3" or "as an MP4"
 change the GIF without generating it again; only a redrawn frame calls the model. Longer clips with camera
-moves, realism or sound are the video tools' job. Ask for "the GIF file" to get the .gif itself
+moves, realism or sound are the video tools' job (off while no video model answers: `VIDEO_TOOLS`). Ask for "the GIF file" to get the .gif itself
 (Telegram otherwise keeps animations as MP4).
 
 ### ✨ Rich Messages

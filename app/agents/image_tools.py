@@ -64,6 +64,7 @@ from models import (
     IMAGE_QUALITIES,
     IMAGE_QUALITY_FALLBACK,
     IMAGE_SIZES,
+    VIDEO_TOOLS_ENABLED,
     ImageBackend,
     estimate_image_cost,
     resolve_animation_backend,
@@ -430,8 +431,15 @@ class ImageTools:
                 "description": (
                     f"Make an animation: a short animated GIF ({GIF_FRAMES_MIN}-{GIF_FRAMES_MAX} frames, about {GIF_SHORT_EDGE} px) "
                     "that plays and loops in the chat. This is the tool whenever the user asks for an animation, a GIF, a "
-                    "sticker or a loop, or to animate / bring to life a picture (pass it in `images`); use the video tools "
-                    "only when the user explicitly asks for a video (an MP4 clip with camera moves, realism or sound).\n"
+                    "sticker or a loop, or to animate / bring to life a picture (pass it in `images`); "
+                    + (
+                        "use the video tools only when the user explicitly asks for a video (an MP4 clip with camera "
+                        "moves, realism or sound).\n"
+                        if VIDEO_TOOLS_ENABLED else
+                        "video generation is not available right now, so when the user asks for a video, say so and offer "
+                        "an animation instead.\n"
+                    )
+                    +
                     "Describe the subject AND the motion, and say whether it should loop seamlessly. Total length = frames x "
                     f"frame_duration_ms (default {GIF_FRAMES_DEFAULT} x {GIF_FRAME_MS_DEFAULT} ms). Speed, direction, frame "
                     "selection and single-frame fixes are cheaper with edit_animation than a new generation."
