@@ -605,6 +605,33 @@ async def test_regions_become_a_transparent_overlay_the_size_of_the_input(worksp
     assert not list((workspace / "data" / "7" / "images").glob("markup_*"))  # the overlay is temporary
 
 
+async def test_circles_and_the_meaning_of_marks(workspace, monkeypatch):
+    import io
+
+    import PIL.Image
+
+    from agents.image_tools import parse_regions
+
+    assert parse_regions([{"x": 0.1, "y": 0.1, "width": 0.2, "height": 0.2}])[0][4] == "box"
+    assert parse_regions([{"x": 0.1, "y": 0.1, "width": 0.2, "height": 0.2, "shape": "Oval"}])[0][4] == "circle"
+
+    _photo(workspace / "data" / "7" / "images" / "room.jpg")
+    images = FakeImages()
+    tools, _ = make_tools(monkeypatch, images)
+    await tools.execute_tool("generate_image", {
+        "prompt": "keep the circled face exactly as it is, make the background a beach", "images": ["images/room.jpg"],
+        "regions": [{"x": 0.25, "y": 0.25, "width": 0.5, "height": 0.5, "shape": "circle"}],
+    })
+    with PIL.Image.open(io.BytesIO(images.edit_calls[0]["markup"])) as overlay:
+        alpha = overlay.getchannel("A")
+        assert alpha.getpixel((100, 75)) == 0  # the box corner: a circle leaves it clear
+        assert alpha.getpixel((200, 75)) == 255  # the top of the circle
+        assert alpha.getpixel((200, 150)) == 0  # the marked area itself is not painted over
+
+    description = tools.tools_schema[0]["description"]
+    assert "keep it exactly while changing the rest" in description  # marks point; the prompt says what they mean
+
+
 async def test_a_photo_the_user_drew_on_becomes_the_markup(workspace, monkeypatch):
     import io
 

@@ -265,13 +265,20 @@ def _has_transparency(img: PIL.Image.Image) -> bool:
     return img.mode == "P" and "transparency" in img.info
 
 
-def parse_regions(regions) -> List[tuple[float, float, float, float]]:
-    """Boxes ``{x, y, width, height}`` for the markup overlay, as given (fractions or pixels)."""
+REGION_SHAPES = ("box", "circle")
+
+
+def parse_regions(regions) -> List[tuple[float, float, float, float, str]]:
+    """Marks ``{x, y, width, height, shape}`` for the markup overlay, as given (fractions or pixels).
+
+    ``shape`` is ``box`` (default) or ``circle`` (an ellipse inside that box). A mark only
+    points at an area; the prompt says whether to change it or to keep it.
+    """
     if regions in (None, "", []):
         return []
     if not isinstance(regions, (list, tuple)):
-        raise ValueError("regions must be a list of {x, y, width, height} boxes")
-    boxes = []
+        raise ValueError("regions must be a list of {x, y, width, height} marks")
+    marks = []
     for item in regions:
         if not isinstance(item, dict):
             raise ValueError("each region must be an object with x, y, width and height")
@@ -281,8 +288,11 @@ def parse_regions(regions) -> List[tuple[float, float, float, float]]:
             raise ValueError("each region needs numeric x, y, width and height") from None
         if box[2] <= 0 or box[3] <= 0 or min(box) < 0:
             raise ValueError("region width and height must be positive and x, y not negative")
-        boxes.append(box)
-    return boxes
+        shape = _one_of(item.get("shape"), REGION_SHAPES, "") or (
+            "circle" if str(item.get("shape") or "").strip().lower() in ("ellipse", "oval", "round") else "box"
+        )
+        marks.append((*box, shape))
+    return marks
 
 
 class ImageTools:
@@ -347,8 +357,10 @@ class ImageTools:
                     "The image is sent to the user automatically as a file. Only embed it in your answer with "
                     "Markdown (![caption](images/<name>)) if the user asked to see it inside the message.\n"
                     "format 'svg' makes a vector drawing (logos, icons, flat illustrations): new images only, one at a time. "
-                    "For a precise edit, mark the area to change with `regions` (look at the image first) or pass a "
-                    "`markup` picture. For animated GIFs use generate_animation."
+                    "For a precise edit, point at the area with `regions` (look at the image first) or pass the user's "
+                    "`markup` picture, and say in the prompt what the marks mean: change the marked area (\"replace the "
+                    "circled cup with a glass\"), or keep it exactly while changing the rest (\"keep the circled face as "
+                    "it is, change the background\"). For animated GIFs use generate_animation."
                 ),
                 "input_schema": {
                     "type": "object",
@@ -388,19 +400,24 @@ class ImageTools:
                             "type": "array",
                             "items": {
                                 "type": "object",
-                                "properties": {k: {"type": "number"} for k in ("x", "y", "width", "height")},
+                                "properties": {
+                                    **{k: {"type": "number"} for k in ("x", "y", "width", "height")},
+                                    "shape": {"type": "string", "enum": list(REGION_SHAPES), "description": "box (default) or circle"},
+                                },
                                 "required": ["x", "y", "width", "height"],
                             },
                             "description": (
-                                "Edits only: boxes on the first image marking exactly what to change, as fractions 0-1 of its "
-                                "width and height (x, y = top-left corner). They are drawn as an outline overlay the model follows."
+                                "Edits only: marks on the first image, as fractions 0-1 of its width and height (x, y = top-left "
+                                "corner of the box; a circle fills that box). Drawn as red outlines on a transparent overlay; "
+                                "be generous rather than tight. The prompt says whether to change or to keep what is marked."
                             ),
                         },
                         "markup": {
                             "type": "string",
                             "description": (
-                                "Edits only: a workspace picture marking what to change in the first image: a transparent PNG "
-                                "overlay, or a copy of the same photo the user drew on (the drawing is extracted by comparison)."
+                                "Edits only: a workspace picture with the user's own marks on the first image: a transparent PNG "
+                                "overlay, or a copy of the same photo the user drew on in Telegram's editor (the drawing is "
+                                "extracted by comparing it with the first image, which must be the clean original)."
                             ),
                         },
                         "caption": {"type": "string", "description": "Caption shown with the delivered file."},
@@ -864,12 +881,13 @@ class ImageTools:
         if boxes:
             draw = PIL.ImageDraw.Draw(overlay)
             stroke = max(3, round(min(width, height) / 150))
-            for x, y, w, h in boxes:
+            for x, y, w, h, shape in boxes:
                 if max(x, y, w, h) <= 1.0:
                     x, y, w, h = x * width, y * height, w * width, h * height
                 left, top = max(0, min(width - 1, x)), max(0, min(height - 1, y))
                 right, bottom = max(left + 1, min(width - 1, x + w)), max(top + 1, min(height - 1, y + h))
-                draw.rectangle((left, top, right, bottom), outline=MARKUP_COLOR, width=stroke)
+                outline = draw.ellipse if shape == "circle" else draw.rectangle
+                outline((left, top, right, bottom), outline=MARKUP_COLOR, width=stroke)
 
         if overlay.getchannel("A").getextrema()[0] == 255:
             raise ValueError("the markup covers the whole image; mark only the area to change")

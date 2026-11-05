@@ -284,8 +284,10 @@ pick a better engine when you ask for the best result.
 Images are delivered once, as files, and the assistant embeds one inside its answer only if you ask
 to see it there.
 
-**Precise edits.** Say what to change and the assistant marks that area on the picture for the model, or
-draw on a copy of your photo in Telegram's editor and send both: the model follows your drawing.
+**Precise edits.** Say what to change ("make the lamp on the left red") or what to keep ("keep the face
+exactly, change the background") and the assistant marks that area on the picture for the model. Or draw on
+your photo with Telegram's brush when you attach it, and send the clean photo too: the model follows your
+drawing, and your message says whether the marked part should change or stay.
 
 **Animated GIFs.** "Make a GIF of a cat waving" gives a short loop (2-16 frames, about 512 px) that plays
 in the chat; "animate this photo" animates a picture you sent. Afterwards "twice as fast", "play it

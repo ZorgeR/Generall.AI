@@ -52,11 +52,22 @@ boomerang, timing, loop. Always a new file; the original stays.
 
 ## 3. Markup-guided edits
 
-`regions` (boxes as fractions of the image; the agent looks at the picture first) are outlined in red on a
-transparent PNG; `markup` takes a transparent overlay as is, or a copy of the photo the user drew on in
-Telegram's editor: the drawing is what differs from the original by more than `MARKUP_DIFF_THRESHOLD` per
-channel, cleaned of JPEG specks. The overlay is the size of the *prepared* first input after EXIF
-orientation (the API requires it). A refused markup is dropped and the agent is told.
+The API wants a transparent PNG the size of the photo with the marks on it. Nobody in Telegram makes one, so
+the bot does, in one of three ways:
+
+1. **The agent marks it** (the usual case). The user writes "make the lamp on the left red"; the agent, which
+   sees the photo, passes `regions` (boxes or circles as fractions of the image), and the bot draws them as red
+   outlines on a transparent PNG.
+2. **The user draws in Telegram.** Telegram's photo editor (the brush when attaching a photo) burns the drawing
+   into the JPEG. With the clean original in the workspace too (sent twice, or earlier), `markup` = the drawn
+   copy: the drawing is what differs from the original by more than `MARKUP_DIFF_THRESHOLD` per channel,
+   cleaned of JPEG specks, and only those strokes go into the overlay.
+3. **A ready transparent PNG** sent as a file is used as is.
+
+A mark only points at an area. The prompt says what it means: change the marked area ("replace the circled
+cup with a glass") or keep it while changing the rest ("keep the circled face, change the background"); the
+tool description tells the agent to say which. The overlay is the size of the *prepared* first input after
+EXIF orientation (the API requires it). A refused markup is dropped and the agent is told.
 
 ## 4. To verify with the real API (the parts the docs leave open)
 
@@ -72,7 +83,8 @@ orientation (the API requires it). A refused markup is dropped and the agent is 
 | 8 | "a fox logo as SVG" | a `.svg` file | "cannot make SVG" / an error naming `svg`: SVG model selection or access missing |
 | 9 | send a photo, "make the lamp red" (one lamp among others) | the agent passes `regions`, only that lamp changes | |
 | 10 | the photo, then the same photo with a circle drawn on it, "remove what I circled" | the circled thing is gone | |
-| 11 | `/usage` after the tests | GIF costs ≈ $0.02-0.06 each | |
+| 11 | a portrait, "keep the face exactly, change the background to a beach" | the agent circles the face, the prompt says keep | |
+| 12 | `/usage` after the tests | GIF costs ≈ $0.02-0.06 each | |
 
 Rollback: `GPT_IMAGE_MODEL=gpt-image-2.5-sunburst`, `GPT_IMAGE_MODEL_FAST=gpt-image-2.5-flare` in the PROD
 variables (GIFs keep working through `GPT_ANIMATION_MODEL*`).
