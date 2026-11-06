@@ -16,7 +16,7 @@ from .sms_tools import SMSTools
 from .user_interactions import UserInteractions
 from .web_tools import WebTools
 from .document_tools import DocumentTools
-from .widget_tools import WidgetTools
+from .widget_tools import WidgetTools, widgets_available
 from .embeddings import ConversationEmbeddings
 from stats import stats_tracker
 from tavily import TavilyClient
@@ -1391,8 +1391,12 @@ class ChainOfThoughtAgent:
             self.agent.register_provider(self.web_tools, blocking=True)
             self.document_tools = DocumentTools(user_id, sender)
             self.agent.register_provider(self.document_tools, blocking=True)
-            self.widget_tools = WidgetTools(user_id, sender)  # Telegram widgets (Bot API 10.4)
-            self.agent.register_provider(self.widget_tools)
+            # Telegram widgets (Bot API 10.4): listed only while the Bot API server supports them
+            # (bot.widgets.probe at startup), like the video tools without their credentials.
+            self.widget_tools = None
+            if widgets_available():
+                self.widget_tools = WidgetTools(user_id, sender)
+                self.agent.register_provider(self.widget_tools)
             # The persistent sandbox (secure_container.sessions): its facts and status whenever the
             # process has a session manager and commands run in sessions (SANDBOX_SESSIONS); the
             # interactive browser whenever there is a manager and the user's browser.enabled

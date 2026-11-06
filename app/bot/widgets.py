@@ -11,9 +11,13 @@ answers it within 15 s (``answerWidgetQuery``); ``bot/handlers/widget_queries.py
 into an agent turn.
 
 aiogram 3.31 speaks Bot API 10.3, so the three methods the bot uses are declared here
-(``SendWidget``, ``EditMessageWidgetData``, ``AnswerWidgetQuery``) and called as ``await bot(m)``.
-A Bot API server without them (an old local ``telegram-bot-api``) answers 404: ``mark_unsupported``
-then makes every later call fail at once with ``UNSUPPORTED_TEXT`` (until a restart).
+(``SendWidget``, ``EditMessageWidgetData``, ``AnswerWidgetQuery``) and called as ``await bot(m)``:
+aiogram only serializes a method, the Bot API server is what must know it. A server without them
+(the local ``telegram-bot-api`` before 10.4) answers 404. ``probe`` asks the server once at startup
+(``sendWidget`` to chat 0: a server that knows the method refuses the chat with a 400, one that does not
+answers 404) and ``mark_unsupported`` records a 404 from the probe or from any later call: from then on
+the widget tools are not offered to the agent (``available``) and a call already under way fails with
+``UNSUPPORTED_TEXT``, until a restart (a deploy that brings a newer server restarts the bot).
 
 The registry of sent widgets (``data/_widgets/<uid>.json``: id, name, message, topic, the state
 as last written) is bot-only state outside the workspace, like ``data/_mcp``: the sandbox can write
@@ -23,6 +27,7 @@ callers use ``asyncio.to_thread``.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -35,7 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from aiogram.exceptions import TelegramNotFound
+from aiogram.exceptions import TelegramBadRequest, TelegramNotFound
 from aiogram.methods.base import TelegramMethod
 from aiogram.types import InlineKeyboardMarkup, Message, ReplyParameters
 
@@ -55,6 +60,8 @@ MAX_WIDGETS = 50  # records kept per user (oldest dropped)
 MAX_NAME_CHARS = 64
 MAX_FILE_BYTES = 1024 * 1024  # a registry file larger than this reads as broken
 
+PROBE_TIMEOUT = 10.0  # seconds the startup probe waits for the Bot API server
+PROBE_CHAT_ID = 0  # no chat has this id: a server that knows sendWidget refuses it (400), nothing is sent
 UNSUPPORTED_TEXT = (
     "Error: this bot's Telegram Bot API server does not support widgets yet (they need Bot API 10.4). "
     "The admin has to update it (docker compose pull telegram-bot-api). Show the content another way."
@@ -115,10 +122,17 @@ def unsupported() -> str | None:
     return _unsupported
 
 
+def available() -> bool:
+    """Whether the widget tools are offered to the agent: the server is not known to lack them
+    (the probe said yes, or it could not tell and the first call will)."""
+    return _unsupported is None
+
+
 def mark_unsupported(reason: str) -> None:
     global _unsupported
     if _unsupported is None:
-        logger.warning("Widgets are not supported by the Bot API server (%s); the widget tools now refuse", reason)
+        logger.warning("Widgets are not supported by the Bot API server (%s): the widget tools are off until a restart "
+                       "(they need Bot API 10.4)", reason)
     _unsupported = reason
 
 
@@ -133,6 +147,27 @@ def is_unsupported_error(e: BaseException) -> bool:
     one "Not Found: method not found"). Chats and messages that are not found are 400s."""
     text = str(e).lower()
     return isinstance(e, TelegramNotFound) or "method not found" in text or "unknown method" in text
+
+
+async def probe(bot: Any, timeout: float = PROBE_TIMEOUT) -> bool | None:
+    """Ask the Bot API server whether it knows ``sendWidget``, without sending anything: True (it
+    refused chat 0 with a 400), False (404: marked unsupported) or None (no answer, another error:
+    the tools stay listed and the first real call decides). Never raises."""
+    try:
+        await asyncio.wait_for(bot(SendWidget(chat_id=PROBE_CHAT_ID, html="<b>probe</b>")), timeout)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001 - the verdict is in the kind of error
+        if is_unsupported_error(e):
+            mark_unsupported(f"startup probe: {str(getattr(e, 'message', '') or e)}")
+            return False
+        if isinstance(e, TelegramBadRequest):
+            logger.info("Widgets: the Bot API server knows sendWidget (Bot API 10.4); the widget tools are on")
+            return True
+        logger.warning("Could not tell whether the Bot API server supports widgets (%s: %s); the widget tools stay "
+                       "listed and the first call decides", type(e).__name__, e)
+        return None
+    return True
 
 
 def is_not_modified(e: BaseException) -> bool:

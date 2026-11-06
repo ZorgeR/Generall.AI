@@ -318,6 +318,39 @@ async def test_telegram_refusals_reach_the_agent_with_a_hint(env):
     assert widgets.load(USER) == [] and widgets.unsupported() is None
 
 
+# ---- the startup probe ---------------------------------------------------------------------------
+async def test_probe_finds_a_server_without_widgets(env):
+    bot = FakeBot()
+    bot.fail["sendWidget"] = TelegramNotFound(method=SendMessage(chat_id=1, text="x"), message="Not Found: method not found")
+    assert await widgets.probe(bot) is False
+    (method,) = bot.calls
+    assert method.chat_id == widgets.PROBE_CHAT_ID == 0  # no chat has that id: nothing can be sent
+    assert not widgets.available() and "startup probe" in widgets.unsupported()
+    assert widget_tools.widgets_available() is False
+
+
+async def test_probe_finds_a_server_with_widgets(env):
+    bot = FakeBot()
+    bot.fail["sendWidget"] = bad_request("Bad Request: chat not found")
+    assert await widgets.probe(bot) is True
+    assert widgets.available() and widget_tools.widgets_available()
+
+
+async def test_probe_without_an_answer_keeps_the_tools(env):
+    bot = FakeBot()
+    bot.fail["sendWidget"] = ConnectionError("server not up yet")
+    assert await widgets.probe(bot) is None
+    assert widgets.available()
+
+    async def hangs(method, request_timeout=None):
+        import asyncio
+
+        await asyncio.sleep(60)
+
+    assert await widgets.probe(hangs, timeout=0.05) is None
+    assert widgets.available()
+
+
 # ---- update_widget / list_widgets / widget_guide -------------------------------------------------
 async def test_update_widget_edits_the_state_silently(env):
     bot = FakeBot()

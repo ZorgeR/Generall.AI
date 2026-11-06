@@ -350,6 +350,20 @@ async def test_the_turn_sends_every_provider_tool_and_the_capabilities_notes(age
     assert MCPTools("42").prompt_notes.strip() in system
 
 
+async def test_widget_tools_are_not_offered_when_the_bot_api_server_lacks_them(agents_main, monkeypatch):
+    """A Bot API server before 10.4 (the startup probe got a 404): no widget tools and no widget notes, so the
+    agent never offers a widget it cannot send."""
+    from agents.widget_tools import PROMPT_NOTES
+    from bot import widgets
+
+    monkeypatch.setattr(widgets, "_unsupported", "startup probe: Not Found")
+    request = await run_turn(agents_main, monkeypatch, settings("speed"))
+    names = {tool["name"] for tool in request["tools"]}
+    assert not names & {"send_widget", "update_widget", "list_widgets", "widget_guide"}
+    system = "".join(block["text"] for block in request["system"]) if isinstance(request["system"], list) else request["system"]
+    assert PROMPT_NOTES not in system
+
+
 # ---- messages sent while the turn starts ------------------------------------------------------------
 def inbox_with(*texts):
     """A real turn inbox already holding ``texts``, as if the user wrote them while the turn was starting."""

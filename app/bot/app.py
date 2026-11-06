@@ -8,7 +8,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 
-from bot import background, oauth_flow, oauth_web, runtime
+from bot import background, oauth_flow, oauth_web, runtime, widgets
 from bot.auth import auth
 from bot.config import config
 from bot.handlers import build_root_router, sandbox_ui
@@ -62,6 +62,8 @@ async def on_startup(bot: Bot) -> None:
     runtime.background_tasks.append(asyncio.create_task(oauth_web.serve(), name="oauth-web"))
     await start_sandbox_sessions(bot)
     await register_commands(bot)
+    # Does the Bot API server know sendWidget (10.4)? Without it the widget tools are not offered.
+    await widgets.probe(bot)
     me = await bot.me()
     oauth_web.set_bot_username(me.username)  # the "Open Telegram" link of the sign-in page
     logger.info("Bot @%s is running (streaming=%s, local_api=%s)", me.username, config.streaming_enabled, config.use_local_api)

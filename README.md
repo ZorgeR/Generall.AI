@@ -333,9 +333,10 @@ chat when the widget change says it all). Messages you send while it works reach
 
 The agent checks every widget against Telegram's limits (32 KB of HTML, 4 KB compressed) and the features the
 apps remove (text inputs, outside files, network access) before sending it, keeps a copy of its HTML in your
-workspace (`widgets/`) and reuses it for the next version. Widgets need a Bot API server that knows them
-(`docker compose pull telegram-bot-api` for the local sidecar) and a Telegram app recent enough to show them;
-older apps show the caption instead.
+workspace (`widgets/`) and reuses it for the next version. Widgets need Bot API 10.4 on the Bot API server and a
+Telegram app recent enough to show them (older apps show the caption instead). The bot checks its server at
+startup and offers widgets only when it supports them; the local `telegram-bot-api` server, which every deploy
+updates, gains them once Telegram publishes the 10.4 server.
 
 ### 💬 Replies, quotes and forwards
 

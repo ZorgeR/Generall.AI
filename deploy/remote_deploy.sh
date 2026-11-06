@@ -134,7 +134,7 @@ main() {
     fi
   fi
 
-  log "Pulling the telegram-bot-api image (best effort; rich messages need Bot API >= 10.1)"
+  log "Pulling the telegram-bot-api image (best effort; rich messages need Bot API >= 10.1, widgets >= 10.4)"
   docker compose pull --quiet telegram-bot-api || echo "WARNING: pull failed, keeping the current image"
 
   # Profile services (cloudflared with COMPOSE_PROFILES=tunnel in .env) are started by the "up" below;

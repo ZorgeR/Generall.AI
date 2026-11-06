@@ -8,6 +8,7 @@ returns the authoring guide (``WIDGET_GUIDE``), read once before writing the fir
 static prompt carries only the short ``PROMPT_NOTES``. Taps that ask the bot
 (``TelegramWidget.request``) come back as agent turns: ``bot/handlers/widget_queries.py``.
 
+Listed only while the Bot API server supports widgets (``widgets_available``: the startup probe, or a 404 since).
 Runs in the bot process (one Bot API call per tool; registry and file I/O in worker threads),
 never sandboxed: ``tool_integrator.py`` must never name this class or its methods
 (``tests/test_widgets.py`` guards it).
@@ -26,6 +27,13 @@ from typing import Any
 from bot import widgets
 
 logger = logging.getLogger(__name__)
+
+def widgets_available() -> bool:
+    """Whether ChainOfThoughtAgent lists the widget tools: not when the Bot API server is known to lack
+    them (``bot.widgets.probe`` at startup, or a 404 since). A tool the agent cannot use would still be
+    offered to the user and called."""
+    return widgets.available()
+
 
 HTML_DIR = "widgets"  # workspace folder of the sent HTML (data/<uid>/widgets/<name>-<hex>.html)
 
