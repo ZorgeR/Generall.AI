@@ -592,6 +592,40 @@ def test_query_of_reads_the_raw_update():
     assert wq.query_of(plain) == (None, False)
 
 
+def test_an_aiogram_that_knows_widgets_still_reaches_us():
+    """A later aiogram (Bot API 10.4) declares widget_query and Message.widget as typed fields, so they leave
+    model_extra: both readers must still find them, with the Bot API's own key names ("from", not "from_user")."""
+    from aiogram.types import Chat, TelegramObject, User
+    from pydantic import Field
+
+    class WidgetQuery(TelegramObject):
+        id: str
+        from_user: User = Field(..., alias="from")
+        chat: Chat | None = None
+        message_id: int | None = None
+        data: str
+
+    class Widget(TelegramObject):
+        id: str | None = None
+        width: int = 0
+
+    class FutureUpdate(Update):
+        widget_query: WidgetQuery | None = None
+
+    class FutureMessage(Message):
+        widget: Widget | None = None
+
+    real = {**query("go"), "from": {"id": 42, "is_bot": False, "first_name": "Alice"}}  # as Telegram sends it
+    update = FutureUpdate.model_validate({"update_id": 1, "widget_query": real})
+    assert not (update.model_extra or {}).get("widget_query")  # typed now, not an extra
+    raw, copy = wq.query_of(update)
+    assert copy is False and raw["data"] == "go" and raw["from"]["first_name"] == "Alice"
+    assert raw["chat"]["id"] == 42 and raw["message_id"] == 901
+    message = FutureMessage.model_validate({"message_id": 1, "date": 1, "chat": CHAT, "widget": {"id": "77"}})
+    assert widgets.sent_widget_info(message)["id"] == "77"
+    assert wq.query_of(Update.model_validate({"update_id": 2})) == (None, False)
+
+
 async def test_the_dispatcher_routes_widget_queries_and_polls_for_them(monkeypatch):
     import warnings
 

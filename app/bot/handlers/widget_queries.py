@@ -1,7 +1,7 @@
 """Taps inside a widget that ask the bot (Bot API 10.4 ``widget_query``) become agent turns.
 
 aiogram 3.31 does not know the update: it keeps the payload in ``Update.model_extra`` and would only
-warn "unknown update type". ``WidgetQueryMiddleware``, an outer middleware on ``dp.update``
+warn "unknown update type" (a later aiogram with Bot API 10.4 declares it as a field: ``query_of`` reads both). ``WidgetQueryMiddleware``, an outer middleware on ``dp.update``
 (``bot/app.py``; ``allowed_updates`` gets ``widget_query`` there too), takes it first and hands it to
 ``handle_query``.
 
@@ -271,13 +271,11 @@ async def _run_widget_turn(bot: Any, batch: _Batch, ctx: JobContext) -> None:
 
 
 def query_of(update: TelegramObject) -> tuple[dict | None, bool]:
-    """(the raw widget query of ``update``, whether it came from a forwarded copy), or (None, False)."""
-    extra = getattr(update, "model_extra", None)
-    if not isinstance(extra, dict):
-        return None, False
+    """(the raw widget query of ``update``, whether it came from a forwarded copy), or (None, False).
+    Read from ``model_extra`` (aiogram 3.31) or a declared field (an aiogram that knows Bot API 10.4)."""
     for name, copy in ((UPDATE_TYPE, False), (COPY_UPDATE_TYPE, True)):
-        raw = extra.get(name)
-        if isinstance(raw, dict):
+        raw = widgets.raw_field(update, name)
+        if raw is not None:
             return raw, copy
     return None, False
 

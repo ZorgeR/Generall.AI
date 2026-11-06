@@ -1800,10 +1800,12 @@ name; a new temp dir needs its own `.gitignore` line).
 - The widget tools and their notes are part of the tool list and the static prompt: adding or changing them, and
   their appearing once the Bot API server gains 10.4 (or disappearing after a 404), strips stored thinking once
   (fingerprint change), as for any tool change.
-- aiogram 3.31 knows nothing of widgets: the three methods are ordinary `TelegramMethod` subclasses (as aiogram's
-  own methods are; it only serializes them, the server must know them) and the `widget_query` update is read from
-  `Update.model_extra`. When aiogram ships Bot API 10.4 types, they can replace both; until then a field Telegram
-  adds is a field on the method class.
+- aiogram knows nothing of widgets (3.31.0 of 2026-08-26 is the latest release, and its dev-3.x branch was still
+  Bot API 10.3 on 2026-11-01): the three methods are ordinary `TelegramMethod` subclasses (as aiogram's own
+  methods are; it only serializes them, the server must know them), and `widgets.raw_field` reads `widget_query`
+  and `Message.widget` from `model_extra` OR from a declared field, so an aiogram with Bot API 10.4 (which
+  `aiogram>=3.31.0` lets a deploy install) keeps working: `tests/test_widgets.py` simulates one. Its native
+  methods can replace ours then; until then a field Telegram adds is a field on the method class.
 
 ## README vs code
 

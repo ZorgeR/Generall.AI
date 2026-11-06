@@ -285,11 +285,22 @@ def lint(html: str, *, allow_queries: bool = False) -> tuple[list[str], list[str
     return problems, notes
 
 
+def raw_field(obj: Any, name: str) -> dict | None:
+    """Field ``name`` of an aiogram object as the Bot API's JSON dict, or None. aiogram 3.31 (Bot API 10.3)
+    keeps fields it does not know in ``model_extra``; a release with Bot API 10.4 will declare the widget
+    fields as typed attributes instead: both are read, so upgrading aiogram does not silently lose them."""
+    extra = getattr(obj, "model_extra", None)
+    value = extra.get(name) if isinstance(extra, dict) else None
+    if value is None and name in (getattr(type(obj), "model_fields", None) or {}):
+        value = getattr(obj, name, None)
+    if value is not None and not isinstance(value, dict) and hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json", by_alias=True, exclude_none=True)  # "from", not "from_user"
+    return value if isinstance(value, dict) else None
+
+
 def sent_widget_info(message: Any) -> dict:
-    """The ``widget`` object of a sent message (aiogram keeps unknown fields in ``model_extra``)."""
-    extra = getattr(message, "model_extra", None) or {}
-    widget = extra.get("widget") if isinstance(extra, dict) else None
-    return widget if isinstance(widget, dict) else {}
+    """The ``widget`` object of a sent message."""
+    return raw_field(message, "widget") or {}
 
 
 # ---- the registry (data/_widgets/<uid>.json) ---------------------------------------------------
