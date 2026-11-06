@@ -29,6 +29,10 @@ are consistent, but small (512 px short edge: 1:1 → 512x512, 16:9 → 896x512)
 each → a 1.8 s loop). Right for loops, stickers, reaction GIFs, logo/icon animations and simple character
 motion; scenes, camera moves, realism and sound stay with the Veo video tools.
 
+Tool choice: "an animation", "a GIF", "a sticker", "a loop" and "animate this picture" go to
+`generate_animation`; the Veo tools say they are for an explicit request for a video only (before that,
+`image_to_video_generator` also claimed to "animate" pictures and was picked first).
+
 **`generate_animation`** — `prompt`, `images` (animate a picture: `images.edit` with `output_format=gif`),
 engine `auto`/`best`/`fast` (`models.ANIMATION_BACKENDS`, its own model pair `GPT_ANIMATION_MODEL[_FAST]` so
 stills can roll back without losing GIFs), `quality`, `aspect_ratio` (a photo keeps its own shape),

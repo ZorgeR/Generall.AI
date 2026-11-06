@@ -9,14 +9,98 @@ import uuid
 from google import genai
 from google.genai import types
 from google.genai.types import Image, VideoGenerationReferenceImage
-from models import VEO_DEFAULT_SECONDS, VEO_EXTENSION_SECONDS, VEO_MODEL, estimate_video_cost
+from models import (
+    VEO_DEFAULT_SECONDS,
+    VEO_EXTENSION_SECONDS,
+    VEO_GENERATE_AUDIO,
+    VEO_MODEL,
+    VIDEO_BACKEND,
+    VIDEO_TOOLS_ENABLED,
+    estimate_video_cost,
+)
+
+VIDEO_UNAVAILABLE = (
+    "Error: video generation is not available: Veo now runs only on Google Cloud's Agent Platform, and the bot "
+    "has no Agent Platform credentials (GOOGLE_VERTEX_API_KEY or GOOGLE_VERTEX_CREDENTIALS). "
+    "Tell the user; for an animation use generate_animation."
+)
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-google_api_key = os.getenv("GOOGLE_API_KEY")
-genai_client = genai.Client(api_key=google_api_key)
+CLOUD_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+DEFAULT_LOCATION = "us-central1"  # where Veo 3.1 GA is served
+
+
+def _service_account_info(raw: str) -> dict:
+    """GOOGLE_VERTEX_CREDENTIALS: the service-account key as JSON on one line, or base64 of it
+    (the PROD .env renderer drops values that contain a newline)."""
+    import base64
+    import json
+
+    text = raw.strip()
+    if not text.startswith("{"):
+        text = base64.b64decode(text).decode("utf-8")
+    info = json.loads(text)
+    if not isinstance(info, dict) or info.get("type") != "service_account":
+        raise ValueError("not a service-account key")
+    return info
+
+
+def build_client():
+    """The genai client and a label of where Veo calls go.
+
+    Agent Platform (formerly Vertex AI) with a service account (every method accepts it), else
+    with an Agent Platform API key (express mode), else the Gemini API (no Veo model answers
+    there since 2026-10-22). A broken service-account value is logged and the next option used.
+    """
+    raw = (os.getenv("GOOGLE_VERTEX_CREDENTIALS") or "").strip()
+    if raw:
+        try:
+            from google.oauth2 import service_account
+
+            info = _service_account_info(raw)
+            credentials = service_account.Credentials.from_service_account_info(info, scopes=[CLOUD_SCOPE])
+            project = (os.getenv("GOOGLE_CLOUD_PROJECT") or "").strip() or info.get("project_id")
+            location = (os.getenv("GOOGLE_CLOUD_LOCATION") or "").strip() or DEFAULT_LOCATION
+            client = genai.Client(vertexai=True, project=project, location=location, credentials=credentials)
+            return client, f"Agent Platform (service account, {project}, {location})"
+        except Exception as e:  # noqa: BLE001 - one bad secret must not stop the bot
+            logger.error("GOOGLE_VERTEX_CREDENTIALS is unusable (%s); trying the next video credential", e)
+    api_key = (os.getenv("GOOGLE_VERTEX_API_KEY") or "").strip()
+    if api_key:
+        return genai.Client(vertexai=True, api_key=api_key), "Agent Platform (API key)"
+    return genai.Client(api_key=os.getenv("GOOGLE_API_KEY")), "Gemini API"
+
+
+genai_client, VIDEO_ENDPOINT = build_client()
+ON_AGENT_PLATFORM = VIDEO_ENDPOINT.startswith("Agent Platform")
+logger.info("Video tools: %s, model %s, listed: %s", VIDEO_ENDPOINT, VEO_MODEL, VIDEO_TOOLS_ENABLED)
+
+
+def error_hint(error: BaseException) -> str:
+    """What to do about a Google Cloud refusal, for the agent and the log."""
+    text = str(error)
+    low = text.lower()
+    if "api keys are not supported" in low or ("401" in text and "Agent Platform (API key)" == VIDEO_ENDPOINT):
+        return (
+            " (The Agent Platform refused the API key for this call. Bind the key to a service account in the "
+            "Google Cloud console, or give the bot a service-account key as GOOGLE_VERTEX_CREDENTIALS.)"
+        )
+    if "403" in text or "permission_denied" in low:
+        return (
+            " (Google Cloud refused access: enable the Agent Platform (Vertex AI) API and billing for the project, "
+            "and allow the key or service account to use it, e.g. the role Vertex AI User.)"
+        )
+    if "404" in text or "not_found" in low:
+        return (
+            f" (The model {VEO_MODEL} is not available here: check VEO_MODEL (veo-3.1-generate-001, "
+            "veo-3.1-fast-generate-001) and GOOGLE_CLOUD_LOCATION, or Veo access for the project.)"
+        )
+    if "only supported in the gemini developer client" in low:
+        return " (This SDK call does not exist on the Agent Platform; the bot needs a code update.)"
+    return ""
 
 MAX_WAIT_SECONDS = 300  # 5 minutes max
 POLL_INTERVAL_SECONDS = 20
@@ -39,10 +123,11 @@ class VideoTools:
         self.videos_path = self.base_path / "videos"
         self.videos_path.mkdir(parents=True, exist_ok=True)
 
-        self.tools_schema = [
+        # Every tool, listed or not; the agent sees them only while VIDEO_TOOLS is on (models.py).
+        self.all_tools_schema = [
             {
                 "name": "video_generator",
-                "description": "Generate high-quality videos from text descriptions using Google Veo 3.1 (state-of-the-art text-to-video generation with cinematic quality), save to videos directory, and send to user via Telegram. Supports detailed scene descriptions with camera movements, lighting, and actions.",
+                "description": "Generate high-quality videos from text descriptions using Google Veo 3.1 (state-of-the-art text-to-video generation with cinematic quality), save to videos directory, and send to user via Telegram. Supports detailed scene descriptions with camera movements, lighting, and actions. Use only when the user asks for a video; for an animation, a GIF, a sticker or a loop use generate_animation.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -78,7 +163,7 @@ class VideoTools:
             },
             {
                 "name": "image_to_video_generator",
-                "description": "Generate high-quality videos from an existing image using Google Veo 3.1. Takes a starting image and animates it based on the prompt description. Perfect for bringing static images to life with motion, camera movements, and scene evolution.",
+                "description": "Generate a video (an MP4 clip of several seconds) from an existing image using Google Veo 3.1, following the prompt's motion, camera movements and scene evolution. Use only when the user explicitly asks for a video; for an animation, a GIF or 'animate this picture' use generate_animation.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -219,8 +304,11 @@ class VideoTools:
                 }
             }
         ]
+        self.tools_schema = self.all_tools_schema if VIDEO_TOOLS_ENABLED else []
 
     async def execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
+        if not VIDEO_TOOLS_ENABLED and tool_name in {t["name"] for t in self.all_tools_schema}:
+            return VIDEO_UNAVAILABLE
         if tool_name == "video_generator":
             return await self._video_generator(**tool_args)
         elif tool_name == "image_to_video_generator":
@@ -251,6 +339,9 @@ class VideoTools:
 
     async def _generate_and_wait(self, **kwargs):
         """Start a generate_videos operation and poll it without blocking the event loop."""
+        config = kwargs.get("config")
+        if ON_AGENT_PLATFORM and config is not None and getattr(config, "generate_audio", None) is None:
+            config.generate_audio = VEO_GENERATE_AUDIO  # an Agent Platform option (the Gemini API refuses it)
         operation = await asyncio.to_thread(genai_client.models.generate_videos, model=VEO_MODEL, **kwargs)
         start = time.monotonic()
         while not operation.done:
@@ -287,14 +378,18 @@ class VideoTools:
         video_path = self.videos_path / filename
 
         def _download() -> None:
-            genai_client.files.download(file=generated_video.video)
+            # The Agent Platform returns the bytes inline (no Cloud Storage bucket is given); the
+            # Gemini API returns a file to download (files.download exists only there).
+            if not getattr(generated_video.video, "video_bytes", None):
+                genai_client.files.download(file=generated_video.video)
             generated_video.video.save(str(video_path))
 
         await asyncio.to_thread(_download)
         await self.sender.send_video(str(video_path), caption=caption)
         return video_path
 
-    async def _fail(self, user_text: str, error_message: str) -> str:
+    async def _fail(self, user_text: str, error_message: str, error: BaseException | None = None) -> str:
+        error_message += error_hint(error) if error is not None else ""
         logger.error(error_message)
         await self._notify(user_text)
         return error_message
@@ -325,7 +420,7 @@ class VideoTools:
                 "Video has been sent to user via Telegram.\n"
             )
         except Exception as e:
-            return await self._fail("❌ Sorry, video generation failed. Please try again.", f"Error generating video: {str(e)}")
+            return await self._fail("❌ Sorry, video generation failed. Please try again.", f"Error generating video: {str(e)}", e)
 
     async def _image_to_video_generator(self, prompt: str, image_path: str, orientation: str = "horizontal", quality: str = "720p", negative_prompt: str = "", caption: str = "Here is your generated video from the image") -> str:
         """Generate a high-quality video from an image using Google's Veo model"""
@@ -354,7 +449,7 @@ class VideoTools:
                 "Video has been sent to user via Telegram.\n"
             )
         except Exception as e:
-            return await self._fail("❌ Sorry, video generation from image failed. Please try again.", f"Error generating video from image: {str(e)}")
+            return await self._fail("❌ Sorry, video generation from image failed. Please try again.", f"Error generating video from image: {str(e)}", e)
 
     async def _video_from_reference_images(self, prompt: str, reference_image_paths: list, quality: str = "720p", negative_prompt: str = "", caption: str = "Here is your generated video with reference images") -> str:
         """Generate a high-quality video using reference images with Google's Veo model"""
@@ -387,7 +482,7 @@ class VideoTools:
                 "Video has been sent to user via Telegram.\n"
             )
         except Exception as e:
-            return await self._fail("❌ Sorry, video generation with reference images failed. Please try again.", f"Error generating video with reference images: {str(e)}")
+            return await self._fail("❌ Sorry, video generation with reference images failed. Please try again.", f"Error generating video with reference images: {str(e)}", e)
 
     async def _video_interpolation_generator(self, prompt: str, first_frame_path: str, last_frame_path: str, orientation: str = "horizontal", quality: str = "720p", negative_prompt: str = "", caption: str = "Here is your interpolated video") -> str:
         """Generate a high-quality video with specified first and last frames using Google's Veo model"""
@@ -420,7 +515,7 @@ class VideoTools:
                 "Video has been sent to user via Telegram.\n"
             )
         except Exception as e:
-            return await self._fail("❌ Sorry, interpolated video generation failed. Please try again.", f"Error generating interpolated video: {str(e)}")
+            return await self._fail("❌ Sorry, interpolated video generation failed. Please try again.", f"Error generating interpolated video: {str(e)}", e)
 
     async def _video_extension_generator(self, prompt: str, source_video_path: str, caption: str = "Here is your extended video") -> str:
         """Extend an existing video using Google's Veo model"""
@@ -429,8 +524,10 @@ class VideoTools:
             video_path_obj = self._resolve_path(source_video_path)
             if not video_path_obj.exists():
                 return f"Error: The source video at path {source_video_path} does not exist."
-            # The genai client requires videos to be uploaded before use
-            source_video = await asyncio.to_thread(genai_client.files.upload, file=str(video_path_obj))
+            if ON_AGENT_PLATFORM:  # the video goes inline; files.upload exists only on the Gemini API
+                source_video = await asyncio.to_thread(types.Video.from_file, location=str(video_path_obj), mime_type="video/mp4")
+            else:
+                source_video = await asyncio.to_thread(genai_client.files.upload, file=str(video_path_obj))
             quality = "720p"  # Currently only supports 720p for extension
             await self._notify(f"🎬 Video extension started ({quality})... This may take 1-2 minutes. Please wait.")
             config = types.GenerateVideosConfig(number_of_videos=1, resolution=quality)
@@ -448,4 +545,4 @@ class VideoTools:
                 "Video has been sent to user via Telegram.\n"
             )
         except Exception as e:
-            return await self._fail("❌ Sorry, video extension failed. Please try again.", f"Error extending video: {str(e)}")
+            return await self._fail("❌ Sorry, video extension failed. Please try again.", f"Error extending video: {str(e)}", e)
