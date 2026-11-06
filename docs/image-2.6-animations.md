@@ -1,6 +1,7 @@
 # GPT Image 2.6: animated GIFs, SVG, markup — design
 
-Status: **implemented, waiting for a live test**. Builds on `docs/image-consolidation-design.md`.
+Status: **implemented; GIFs tested live** (a photo animated with `gpt-image-2.6-flare`: 8 frames, 512x704 from a
+3:4 photo; GIF preview access is enabled on the account). The other checks in section 4 are still open. Builds on `docs/image-consolidation-design.md`.
 
 GPT Image 2.6 (`gpt-image-2.6-sunburst` / `gpt-image-2.6-flare`, released 2026-11-04) keeps 2.5's per-token
 prices and adds four things the bot now uses: animated GIF output, SVG output, a `complexity` knob and
@@ -66,7 +67,10 @@ the bot does, in one of three ways:
    into the JPEG. With the clean original in the workspace too (sent twice, or earlier), `markup` = the drawn
    copy: the drawing is what differs from the original by more than `MARKUP_DIFF_THRESHOLD` per channel,
    cleaned of JPEG specks, and only those strokes go into the overlay.
-3. **A ready transparent PNG** sent as a file is used as is.
+3. **A transparent PNG already in the workspace** (one the agent made or downloaded) is used as the overlay
+   as it is. One the user uploads in Telegram is not: uploads are converted to JPEG for the model
+   (`media.prepare_downloaded_image_for_vision` flattens transparency on white), so it arrives opaque and
+   is treated like a drawn copy (way 2).
 
 A mark only points at an area. The prompt says what it means: change the marked area ("replace the circled
 cup with a glass") or keep it while changing the rest ("keep the circled face, change the background"); the
@@ -79,7 +83,7 @@ EXIF orientation (the API requires it). A refused markup is dropped and the agen
 |---|---|---|---|
 | 1 | "make a GIF of a cat waving" | an animation in the chat, caption `gpt-image-2.6-sunburst · … · 9 frames · 200 ms · 512x512` | error says "GIF preview": ask OpenAI to enable it for the org / both models |
 | 2 | same with "16:9, 12 frames, fast" | `gpt-image-2.6-flare`, 896x512, 12 frames | "used auto instead" in the log/result: the GIF size table differs, adjust `gif_pixel_size` |
-| 3 | send a photo, "animate this photo" | an animation of that photo | "Animating an existing picture was refused": the edits endpoint does not take GIFs on this account; the agent offers the Veo route |
+| 3 | send a photo, "animate this photo" | an animation of that photo (**passed**: flare, 8 frames, 512x704) | "Animating an existing picture was refused": the edits endpoint does not take GIFs on this account; the agent offers the Veo route |
 | 4 | "twice as fast", "boomerang", "only frames 1-5", "as mp4" | new animation / video, no API call (no cost line for it) | |
 | 5 | "redraw frame 3 with …" | one `images.edit` call, the frame replaced | |
 | 6 | a still image at default settings (2K) | delivered as before | "Size 2048x2048 is not accepted … used 1024x1024": 2.6 takes standard sizes only (works, but smaller) |

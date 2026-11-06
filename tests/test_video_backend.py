@@ -44,9 +44,32 @@ def test_the_client_goes_where_veo_answers(no_video_env, monkeypatch):
 
     monkeypatch.setenv("GOOGLE_VERTEX_API_KEY", "AQ.agent-platform-key")
     client, endpoint = vt.build_client()
-    assert endpoint == "Agent Platform (API key)"
+    assert endpoint == "Agent Platform (API key, express mode)"
     assert client._api_client.vertexai and client._api_client.api_key == "AQ.agent-platform-key"
     assert client._api_client._http_options.base_url == "https://aiplatform.googleapis.com/"
+
+
+def test_a_project_sends_the_key_to_the_project_scoped_address(no_video_env, monkeypatch):
+    """Express mode (no project) gets RESOURCE_PROJECT_INVALID from Veo; with a project the key goes regional."""
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json={"name": "projects/p/locations/us-central1/operations/1"})
+
+    monkeypatch.setenv("GOOGLE_VERTEX_API_KEY", "AQ.key")
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "gall-video")
+    client, endpoint = vt.build_client()
+    assert endpoint == "Agent Platform (API key, gall-video, us-central1)"
+    api = client._api_client
+    assert api.api_key == "AQ.key" and api.project == "gall-video" and api.location == "us-central1"
+
+    client = genai.Client(vertexai=True, api_key="AQ.key", project="gall-video", location="us-central1",
+                          http_options=types.HttpOptions(client_args={"transport": httpx.MockTransport(handler)}))
+    client.models.generate_videos(model=vt.VEO_MODEL, prompt="x")
+    assert seen[0].url.host == "us-central1-aiplatform.googleapis.com"
+    assert seen[0].url.path == f"/v1beta1/projects/gall-video/locations/us-central1/publishers/google/models/{vt.VEO_MODEL}:predictLongRunning"
+    assert seen[0].headers["x-goog-api-key"] == "AQ.key"
 
 
 @pytest.mark.parametrize("encode", [lambda s: s, lambda s: base64.b64encode(s.encode()).decode()])
@@ -66,7 +89,7 @@ def test_a_service_account_key_wins_and_may_be_base64(no_video_env, monkeypatch,
 def test_a_broken_service_account_value_falls_back_and_is_logged(no_video_env, monkeypatch, caplog):
     monkeypatch.setenv("GOOGLE_VERTEX_CREDENTIALS", "not json, not base64 of json")
     monkeypatch.setenv("GOOGLE_VERTEX_API_KEY", "AQ.key")
-    assert vt.build_client()[1] == "Agent Platform (API key)"
+    assert vt.build_client()[1] == "Agent Platform (API key, express mode)"
     assert "GOOGLE_VERTEX_CREDENTIALS is unusable" in caplog.text and "AQ.key" not in caplog.text
 
     monkeypatch.setenv("GOOGLE_VERTEX_CREDENTIALS", json.dumps({"type": "authorized_user"}))
@@ -75,7 +98,12 @@ def test_a_broken_service_account_value_falls_back_and_is_logged(no_video_env, m
 
 
 def test_google_cloud_refusals_get_a_hint(monkeypatch):
-    monkeypatch.setattr(vt, "VIDEO_ENDPOINT", "Agent Platform (API key)")
+    monkeypatch.setattr(vt, "VIDEO_ENDPOINT", "Agent Platform (API key, express mode)")
+    project = vt.error_hint(Exception(
+        "400 INVALID_ARGUMENT. {'error': {'message': 'Invalid resource field value in the request.', "
+        "'details': [{'reason': 'RESOURCE_PROJECT_INVALID'}]}}"))
+    assert "GOOGLE_CLOUD_PROJECT" in project and "service account" in project  # what the first live call returned
+    assert "service account" in vt.error_hint(Exception("403 API_KEY_SERVICE_BLOCKED"))
     assert "service account" in vt.error_hint(Exception("401 UNAUTHENTICATED. API keys are not supported by this API."))
     assert "Vertex AI User" in vt.error_hint(Exception("403 PERMISSION_DENIED"))
     assert "VEO_MODEL" in vt.error_hint(Exception("404 NOT_FOUND. models/x is not found"))
@@ -165,7 +193,7 @@ async def test_extension_sends_the_video_inline_on_the_agent_platform(agent_plat
 
 async def test_a_refused_api_key_is_explained_to_the_agent(agent_platform, monkeypatch):
     workspace, _ = agent_platform
-    monkeypatch.setattr(vt, "VIDEO_ENDPOINT", "Agent Platform (API key)")
+    monkeypatch.setattr(vt, "VIDEO_ENDPOINT", "Agent Platform (API key, express mode)")
 
     def refuse(request):
         return httpx.Response(401, json={"error": {"code": 401, "status": "UNAUTHENTICATED",
