@@ -52,8 +52,12 @@ def build_client():
     """The genai client and a label of where Veo calls go.
 
     Agent Platform (formerly Vertex AI) with a service account (every method accepts it), else
-    with an Agent Platform API key (express mode), else the Gemini API (no Veo model answers
-    there since 2026-10-22). A broken service-account value is logged and the next option used.
+    with an Agent Platform API key, else the Gemini API (no Veo model answers there since
+    2026-10-22). A broken service-account value is logged and the next option used.
+
+    Veo refuses express mode (an API key alone: requests without a project fail with
+    RESOURCE_PROJECT_INVALID), so with GOOGLE_CLOUD_PROJECT set the key goes to the regional,
+    project-scoped address instead; Google takes a key there when it is bound to a service account.
     """
     raw = (os.getenv("GOOGLE_VERTEX_CREDENTIALS") or "").strip()
     if raw:
@@ -70,7 +74,12 @@ def build_client():
             logger.error("GOOGLE_VERTEX_CREDENTIALS is unusable (%s); trying the next video credential", e)
     api_key = (os.getenv("GOOGLE_VERTEX_API_KEY") or "").strip()
     if api_key:
-        return genai.Client(vertexai=True, api_key=api_key), "Agent Platform (API key)"
+        project = (os.getenv("GOOGLE_CLOUD_PROJECT") or "").strip()
+        if project:
+            location = (os.getenv("GOOGLE_CLOUD_LOCATION") or "").strip() or DEFAULT_LOCATION
+            client = genai.Client(vertexai=True, api_key=api_key, project=project, location=location)
+            return client, f"Agent Platform (API key, {project}, {location})"
+        return genai.Client(vertexai=True, api_key=api_key), "Agent Platform (API key, express mode)"
     return genai.Client(api_key=os.getenv("GOOGLE_API_KEY")), "Gemini API"
 
 
@@ -83,7 +92,14 @@ def error_hint(error: BaseException) -> str:
     """What to do about a Google Cloud refusal, for the agent and the log."""
     text = str(error)
     low = text.lower()
-    if "api keys are not supported" in low or ("401" in text and "Agent Platform (API key)" == VIDEO_ENDPOINT):
+    keyed = VIDEO_ENDPOINT.startswith("Agent Platform (API key")
+    if "resource_project_invalid" in low:
+        return (
+            " (Veo needs a Google Cloud project, which an API key alone (express mode) does not give: set "
+            "GOOGLE_CLOUD_PROJECT to the project id and bind the key to a service account with the role Vertex AI User, "
+            "or give the bot a service-account key as GOOGLE_VERTEX_CREDENTIALS.)"
+        )
+    if "api keys are not supported" in low or "api_key_service_blocked" in low or ("401" in text and keyed):
         return (
             " (The Agent Platform refused the API key for this call. Bind the key to a service account in the "
             "Google Cloud console, or give the bot a service-account key as GOOGLE_VERTEX_CREDENTIALS.)"
