@@ -12,8 +12,8 @@ tools and answers in the same chat.
   and a profile of facts you control
 - 🛠️ **Does the work**: web search and research, code in your own sandbox, a real browser that clicks,
   types and logs in
-- 🎨 **Creates**: images, animated GIFs, SVG, PDF / Word / Excel documents and voice replies (video generation
-  is off since Google shut down its Veo models on the Gemini API on 2026-10-22; `VIDEO_TOOLS=on` brings the tools back)
+- 🎨 **Creates**: images, animated GIFs, SVG, PDF / Word / Excel documents and voice replies and videos with
+  Veo 3.1 (on Google Cloud's Agent Platform: set `GOOGLE_VERTEX_API_KEY`; Google shut Veo down on the Gemini API)
 - ⏰ **Works on schedule**: reminders and recurring tasks in your time zone, quiet when there is nothing new
 - 🗣️ **Never blocks you**: keep writing while it works; long jobs finish in the background and report back
 - 🔌 **Plugs into your tools**: any MCP server (Notion, Linear, Sentry, …) with a one-tap sign-in
@@ -294,7 +294,7 @@ drawing, and your message says whether the marked part should change or stay.
 in the chat; "animate this photo" animates a picture you sent. Afterwards "twice as fast", "play it
 backwards", "make it a boomerang", "only the first six frames", "fix the eyes in frame 3" or "as an MP4"
 change the GIF without generating it again; only a redrawn frame calls the model. Longer clips with camera
-moves, realism or sound are the video tools' job (off while no video model answers: `VIDEO_TOOLS`). Ask for "the GIF file" to get the .gif itself
+moves, realism or sound are the video tools' job (Veo 3.1 on Google Cloud's Agent Platform, listed when its credentials are set). Ask for "the GIF file" to get the .gif itself
 (Telegram otherwise keeps animations as MP4).
 
 ### ✨ Rich Messages
@@ -561,7 +561,7 @@ you, nothing is sent at all, and `/reminders` shows how many runs stayed quiet.
 - Anthropic API Key (for Claude Sonnet 5.5 and Haiku 5.5)
 - OpenAI API Key (for GPT-6.1 / GPT-6, gpt-image, Whisper and embeddings)
 - ElevenLabs API Key (for voice synthesis)
-- Google API Key (for Gemini image generation and Veo video)
+- Google API Key (for Gemini image generation) and a Google Cloud Agent Platform API key or service account (for Veo video)
 
 ## 📥 Installation
 

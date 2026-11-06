@@ -12,7 +12,8 @@ OVERRIDE_VARS = [
     "WHISPER_MODEL", "EMBEDDING_MODEL", "EMBEDDING_DIMENSION",
     "GEMINI_IMAGE_MODEL_FLASH", "GEMINI_IMAGE_MODEL_PRO", "GPT_IMAGE_MODEL", "GPT_IMAGE_MODEL_FAST",
     "GPT_ANIMATION_MODEL", "GPT_ANIMATION_MODEL_FAST",
-    "VEO_MODEL", "VIDEO_TOOLS", "PERPLEXITY_MODEL", "TTS_MODEL",
+    "VEO_MODEL", "VIDEO_TOOLS", "VEO_GENERATE_AUDIO", "GOOGLE_VERTEX_API_KEY", "GOOGLE_VERTEX_CREDENTIALS",
+    "PERPLEXITY_MODEL", "TTS_MODEL",
 ]
 
 
@@ -48,8 +49,9 @@ def test_defaults(clean_models):
     assert m.GPT_IMAGE_MODEL_FAST == "gpt-image-2.6-flare"
     assert m.GPT_ANIMATION_MODEL == "gpt-image-2.6-sunburst"
     assert m.GPT_ANIMATION_MODEL_FAST == "gpt-image-2.6-flare"
-    assert m.VEO_MODEL == "veo-3.1-generate-preview"
-    assert m.VIDEO_TOOLS_ENABLED is False  # Veo was shut down on the Gemini API; VIDEO_TOOLS=on lists the tools again
+    assert m.VEO_MODEL == "veo-3.1-generate-001"  # GA on Google Cloud's Agent Platform
+    assert m.VIDEO_BACKEND == "gemini" and m.VIDEO_TOOLS_ENABLED is False  # no Agent Platform credentials: no Veo
+    assert m.VEO_GENERATE_AUDIO is True
     assert m.PERPLEXITY_MODEL == "sonar"
     assert m.PERPLEXITY_MODELS == ("sonar-reasoning-pro", "sonar-pro", "sonar")
     assert m.PERPLEXITY_MODEL in m.PERPLEXITY_MODELS
@@ -71,7 +73,7 @@ def test_env_override_is_honoured(clean_models, monkeypatch):
     assert m.openai_reasoning_options("gpt-5.6-nova") == {"reasoning_effort": "low"}
     assert m.openai_reasoning_options("gpt-6.1-sol") == {}  # no longer a configured model
     assert m.EMBEDDING_DIMENSION == 3072
-    assert m.VEO_MODEL == "veo-3.1-generate-preview"
+    assert m.VEO_MODEL == "veo-3.1-generate-001"
     assert m.ANTHROPIC_MODEL_FAST == "claude-haiku-5-5"  # untouched
 
 
@@ -150,3 +152,23 @@ def test_estimate_video_cost(clean_models):
     m = clean_models
     assert m.estimate_video_cost(m.VEO_MODEL, m.VEO_DEFAULT_SECONDS) == 8 * 0.40
     assert m.estimate_video_cost("some-unknown-video-model", 8) is None
+
+
+def test_video_tools_follow_the_agent_platform_credentials(clean_models, monkeypatch):
+    """Veo answers only on Google Cloud's Agent Platform since the Gemini API shut it down (2026-10-22)."""
+    assert clean_models.VIDEO_TOOLS_ENABLED is False
+    monkeypatch.setenv("GOOGLE_VERTEX_API_KEY", "AQ.key")
+    m = importlib.reload(clean_models)
+    assert m.VIDEO_BACKEND == "agent_platform" and m.VIDEO_TOOLS_ENABLED is True  # VIDEO_TOOLS=auto
+
+    monkeypatch.setenv("VIDEO_TOOLS", "off")
+    assert importlib.reload(m).VIDEO_TOOLS_ENABLED is False  # forced off
+
+    monkeypatch.delenv("GOOGLE_VERTEX_API_KEY")
+    monkeypatch.setenv("GOOGLE_VERTEX_CREDENTIALS", "{...}")
+    monkeypatch.setenv("VIDEO_TOOLS", "auto")
+    assert importlib.reload(m).VIDEO_TOOLS_ENABLED is True
+
+    monkeypatch.delenv("GOOGLE_VERTEX_CREDENTIALS")
+    monkeypatch.setenv("VIDEO_TOOLS", "on")
+    assert importlib.reload(m).VIDEO_TOOLS_ENABLED is True  # forced on, whatever answers

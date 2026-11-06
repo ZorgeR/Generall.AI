@@ -200,12 +200,28 @@ def resolve_animation_backend(engine: str | None) -> ImageBackend:
 # ---------------------------------------------------------------------------
 # Video generation (agents/video_tools.py) - Google Veo, all five tools
 # ---------------------------------------------------------------------------
-VEO_MODEL = _env("VEO_MODEL", "veo-3.1-generate-preview")
-# Google shut every Veo model on the Gemini API down on 2026-10-22 (its replacement,
-# gemini-omni-1.1-flash, uses the Interactions API, not generate_videos). Listed, the video
-# tools were still called and every call ended in a 404 plus two chat messages, so they are
-# hidden from the agent unless VIDEO_TOOLS=on (once VEO_MODEL names a model that answers).
-VIDEO_TOOLS_ENABLED = _env("VIDEO_TOOLS", "off").strip().lower() in ("1", "true", "yes", "on")
+#
+# Google shut every Veo model on the Gemini API (generativelanguage.googleapis.com) down on
+# 2026-10-22. Veo 3.1 GA lives on Google Cloud's Gemini Enterprise Agent Platform (formerly
+# Vertex AI: aiplatform.googleapis.com, `vertexai=True` in the SDK): veo-3.1-generate-001,
+# veo-3.1-fast-generate-001. agents/video_tools.py talks to it with GOOGLE_VERTEX_CREDENTIALS
+# (a service-account key, which every Agent Platform method accepts) or GOOGLE_VERTEX_API_KEY
+# (an Agent Platform API key, "express mode"); with neither it falls back to the Gemini API,
+# where no Veo model answers any more.
+VEO_MODEL = _env("VEO_MODEL", "veo-3.1-generate-001")
+VIDEO_BACKEND = (
+    "agent_platform"
+    if (os.getenv("GOOGLE_VERTEX_CREDENTIALS") or "").strip() or (os.getenv("GOOGLE_VERTEX_API_KEY") or "").strip()
+    else "gemini"
+)
+# Listed dead tools were still called (a 404 plus two chat messages each), so the video tools are
+# shown only when they can work: VIDEO_TOOLS=auto (default) = on with Agent Platform credentials,
+# on / off force it.
+_VIDEO_TOOLS = _env("VIDEO_TOOLS", "auto").strip().lower()
+VIDEO_TOOLS_ENABLED = _VIDEO_TOOLS in ("1", "true", "yes", "on") or (_VIDEO_TOOLS == "auto" and VIDEO_BACKEND == "agent_platform")
+# Veo 3 on the Agent Platform makes audio with the video when asked (and bills it: about $0.40/s
+# with audio vs $0.20/s without at standard quality).
+VEO_GENERATE_AUDIO = _env("VEO_GENERATE_AUDIO", "true").strip().lower() in ("1", "true", "yes", "on")
 
 # ---------------------------------------------------------------------------
 # Search (agents/search_tools.py) - Perplexity deep_research default; the tool
@@ -424,6 +440,9 @@ def estimate_image_cost(model: str, text_input_tokens: int = 0, image_input_toke
 # duration_seconds, so Veo's default length is what gets billed: 8 s for a new
 # video, 7 s for an extension.
 VIDEO_PRICES_PER_SECOND: dict[str, float] = {
+    "veo-3.1-generate-001": 0.40,  # with audio; third-party figures, check the Agent Platform pricing page
+    "veo-3.1-fast-generate-001": 0.10,
+    "veo-3.1-lite-generate-001": 0.05,
     "veo-3.1-generate-preview": 0.40,
 }
 VEO_DEFAULT_SECONDS = 8
