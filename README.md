@@ -48,6 +48,9 @@ GALL.AI (General AI) is a sophisticated multimodal agent system with telegram bo
   - **✒️ SVG**: logos, icons and flat illustrations as vector files
 - **📄 Document Processing**: PDFs are read as documents; DOCX, XLSX, JSON, text and code files are extracted and handed to the agent
 - **📝 Documents out**: the agent writes PDF, DOCX, XLSX, Markdown or HTML files from Markdown (`create_document`) and sends them to you
+- **🧩 Widgets**: interactive mini-HTML cards right inside the chat (Telegram widgets, Bot API 10.4): dashboards,
+  charts, calculators, trackers, quizzes, small games; the agent keeps them up to date in place, and a tap on a
+  widget button can ask the agent for fresh data
 - **🌐 Web reading and headless browsing**: pages are reduced to their readable content; JavaScript-heavy sites are
   rendered by a headless Chromium inside the sandbox (`browse_webpage`), with an optional screenshot
 - **🧭 Interactive browser**: the agent opens sites in its own Chromium, clicks, types, fills forms, signs up
@@ -313,6 +316,26 @@ Rich messages are on by default and can be switched per chat in `/settings` → 
 Turn them off if your Telegram app is too old and shows "unsupported message"; the bot then uses
 classic Markdown formatting. If the Bot API server (the `telegram-bot-api` sidecar) is older than
 10.1 the bot detects it once and falls back to MarkdownV2 formatting (tables as monospace blocks).
+
+### 🧩 Widgets
+
+Ask for "a dashboard of my portfolio", "a mortgage calculator", "a packing checklist for the trip" or "a quiz
+about chapter 3" and the agent can answer with a **Telegram widget** (Bot API 10.4): a small self-contained
+HTML card drawn inside the message on every Telegram app, like a tiny mini app that needs no website. It runs
+in the app's sandbox with no network, follows the chat's light or dark theme, and remembers your own choices
+on your device.
+
+A widget's layout is fixed once it is sent, but its data is not: the agent keeps the numbers in the widget's
+state and changes them in place, silently, without a new message, for example from a scheduled task that
+refreshes your dashboard every morning. A widget can also have buttons that ask the agent: tap "Refresh" or
+"Next question" and the agent gets the request, does the work and updates the widget (staying quiet in the
+chat when the widget change says it all). Messages you send while it works reach it as usual.
+
+The agent checks every widget against Telegram's limits (32 KB of HTML, 4 KB compressed) and the features the
+apps remove (text inputs, outside files, network access) before sending it, keeps a copy of its HTML in your
+workspace (`widgets/`) and reuses it for the next version. Widgets need a Bot API server that knows them
+(`docker compose pull telegram-bot-api` for the local sidecar) and a Telegram app recent enough to show them;
+older apps show the caption instead.
 
 ### 💬 Replies, quotes and forwards
 

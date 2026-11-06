@@ -14,6 +14,7 @@ from bot.config import config
 from bot.handlers import build_root_router, sandbox_ui
 from bot.handlers.commands import bot_commands
 from bot.handlers.mcp_ui import refresh_admin_servers
+from bot.handlers.widget_queries import UPDATE_TYPE as WIDGET_QUERY, WidgetQueryMiddleware
 from bot.jobs import reminders_loop
 from bot.media import configure_ffmpeg, ensure_temp_dirs
 from bot.queue import Job
@@ -94,8 +95,18 @@ async def on_shutdown(bot: Bot) -> None:
     await sandbox_ui.shutdown_sessions()  # after the jobs: no turn starts a session behind it
 
 
+def allowed_updates(dp: Dispatcher) -> list[str]:
+    """The update types polling asks for: what the routers handle, plus the widget queries no
+    router knows (a Bot API server without widgets ignores the unknown name)."""
+    used = dp.resolve_used_update_types()
+    return used + [WIDGET_QUERY] if WIDGET_QUERY not in used else used
+
+
 def create_dispatcher() -> Dispatcher:
     dp = Dispatcher()
+    # Taps inside a widget that ask the bot (Bot API 10.4 widget_query): aiogram does not know the
+    # update, so an outer middleware takes it before the "unknown update type" path.
+    dp.update.outer_middleware(WidgetQueryMiddleware())
     dp.include_router(build_root_router())
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
@@ -114,4 +125,4 @@ async def run() -> None:
     dp = create_dispatcher()
     if config.drop_pending_updates:
         await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    await dp.start_polling(bot, allowed_updates=allowed_updates(dp))

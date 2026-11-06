@@ -322,6 +322,7 @@ async def test_the_turn_sends_every_provider_tool_and_the_capabilities_notes(age
     from agents.profile_tools import ProfileTools
     from agents.user_interactions import UserInteractions
     from agents.vision_tools import VisionTools
+    from agents.widget_tools import WidgetTools
     from bot import mcp_store
 
     monkeypatch.setenv(mcp_store.ENV_ADMIN_FILE, str(tmp_path / "no_admin_servers.json"))
@@ -338,12 +339,13 @@ async def test_the_turn_sends_every_provider_tool_and_the_capabilities_notes(age
         "user_profile_read", "user_profile_add", "user_profile_remove", "user_profile_replace",  # ProfileTools
         "mcp_demo_lookup",  # MCPTools
         "browse_webpage", "create_document",  # WebTools, DocumentTools
+        "send_widget", "update_widget", "list_widgets", "widget_guide",  # WidgetTools
         "set_user_timezone", "schedule_reminder", "ask_user_choice",  # UserInteractions
         "memory_search", "run_subagent",
     }, sorted(names)
     system = "".join(block["text"] for block in request["system"]) if isinstance(request["system"], list) else request["system"]
     assert "<capabilities>" in system and "</capabilities>" in system
-    for provider in (VisionTools, ProfileTools, UserInteractions):
+    for provider in (VisionTools, ProfileTools, UserInteractions, WidgetTools):
         assert str(provider.prompt_notes).strip() in system, provider.__name__
     assert MCPTools("42").prompt_notes.strip() in system
 

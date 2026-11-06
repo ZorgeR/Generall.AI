@@ -10,10 +10,11 @@ A single-process Python Telegram bot (aiogram 3, asyncio) that wraps a Claude
 tool-use agent. Users send text / voice / photos / video / audio / documents in
 Telegram; the bot builds a prompt of content blocks (text, plus the photos and PDFs
 themselves as image/document blocks, with the replied-to or forwarded message quoted
-in front), runs a per-message agent loop with 53 built-in tools (48 while the video tools are off: they are listed only with Google Cloud
+in front), runs a per-message agent loop with 57 built-in tools (52 while the video tools are off: they are listed only with Google Cloud
 Agent Platform credentials, `VIDEO_TOOLS`) (files, web search and
 a headless page reader, code execution in a persistent per-user Docker sandbox, image/video
-generation, animated GIFs, documents out as pdf/docx/xlsx, reminders and scheduled tasks in the user's time
+generation, animated GIFs, documents out as pdf/docx/xlsx, Telegram widgets (interactive mini-HTML cards inside a
+message, Bot API 10.4, whose taps can ask the agent), reminders and scheduled tasks in the user's time
 zone, SMS, S3, TTS, button questions, a user profile, the sandbox status, background tasks) plus Anthropic's
 browser toolset (an interactive Chromium per user, in its own container, with saved logins)
 plus the tools of the user's MCP servers (a bearer token or an OAuth sign-in in one tap), persists multi-layer memory per user on disk
@@ -51,7 +52,8 @@ the browser server inside the container (`test_browser_server.py`), the browser 
 message window and `inbox.combine`; `test_mode.py`: what the agent reads before its first model call;
 `test_background_tasks.py`: the background host, notifications and notification turns; `test_live_turn_loop.py`:
 injection at tool boundaries and the background watcher in the agent loop; `test_task_tools.py`;
-`test_transcript_live_turn.py`: tool-result messages with injected blocks, system notices), and how these features meet
+`test_transcript_live_turn.py`: tool-result messages with injected blocks, system notices), Telegram widgets (`test_widgets.py`: the size and profile checks, the registry outside the
+workspace, send / update / list, widget queries becoming agent turns, the dispatcher middleware), and how these features meet
 (`tests/test_cross_features.py`).
 `tests/conftest.py` sets `MESSAGE_WINDOW_SECONDS=0` for the whole run (handlers queue or inject at once); the
 window's tests turn it on with `monkeypatch.setattr(messages, "MESSAGE_WINDOW", …)`.
@@ -168,6 +170,12 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
                             (IANA names in any case, ALIASES of ~60 cities/countries consulted first), zone_of, format_local,
                             to_utc, COMMON_ZONES (the /timezone picker), zone_from_location (optional timezonefinder, lazy)
     ui.py                   answer_md/edit_md helpers: legacy Markdown with plain-text fallback
+    widgets.py              Telegram widgets (Bot API 10.4; aiogram 3.31 has 10.3): the methods SendWidget /
+                            EditMessageWidgetData / AnswerWidgetQuery (called as `await bot(m)`), the server's limits
+                            (measure = zlib level 9; check_html, check_state, state_value: "" → CLEARED_STATE "null"),
+                            lint (PROBLEMS that break a widget, NOTES), the sticky unsupported flag (a 404 from the Bot API
+                            server: UNSUPPORTED_TEXT), the registry data/_widgets/<uid>.json (add / load / find / by_message /
+                            update / count_tap; bot-only, O_NOFOLLOW reads, mkstemp + os.replace, per-user lock; sync)
     jobs.py                 reminders scheduler loop (10 s): sends user reminders with snooze buttons, runs agent
                             reminders as scheduled tasks (task_prompt framing + QUIET_MARKER through run_turn, no
                             announcement; last_result / quiet_runs on the record)
@@ -229,6 +237,13 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
                             secure_container.sessions lazily (None = no manager: /sandbox says unavailable, hooks no-op)
       stats_ui.py           admin /stats: dashboard photo + text view, users page, per-user view, limits, block;
                             display names cached 1 h (successful lookups only)
+      widget_queries.py     taps inside a widget that ask the bot (`widget_query`, unknown to aiogram): WidgetQueryMiddleware
+                            (outer, on dp.update) → handle_query: answered at once (ACK {"ok":true} or {"ok":false,"error"}),
+                            only for a widget of the registry with allow_queries; joins the running turn of the widget's
+                            topic (inject, ready Prepared, no 👀) or queues a turn (WIDGET_LABEL, WIDGET_HEADER, reply to the
+                            widget, quiet marker; _Batch: requests while it waits join it, MAX_EVENTS; DEDUPE_SECONDS for
+                            the same data; RATE_LIMIT per RATE_WINDOW per widget); widget_prompt; counts as a received
+                            message (quota)
   reminders_store.py        RemindersStore (`reminders_store` singleton): per-user locked JSON read/modify/write;
                             calculate_next_trigger steps daily/weekly/monthly in the reminder's zone and skips days
                             outside `weekdays`; clean_weekdays, first_allowed_trigger, WEEKDAY_NAMES
@@ -264,6 +279,9 @@ app/                        Python package root; the bot runs with cwd=app/ (Doc
                             get_container_manager() (process-wide, lazy) and last_json_line() for script output
     document_tools.py       DocumentTools: create_document (md/html rendered on the host with python-markdown; pdf/docx/
                             xlsx rendered in the sandbox by scripts/render_document.py), sends the file itself
+    widget_tools.py         WidgetTools: send_widget (html or html_file; checks, then SendWidget; HTML copy in
+                            widgets/<name>-<hex>.html), update_widget (EditMessageWidgetData), list_widgets, widget_guide
+                            (WIDGET_GUIDE, the authoring guide, read on demand; static PROMPT_NOTES are short)
     code_tools.py           CodeTools: execute_python (patched to run in Docker at startup)
     terminal_tools.py       TerminalTools: run_command (patched; gains run_shell_script/install_package)
     time_tools.py           TimeTools: timezone helpers
@@ -389,6 +407,11 @@ Deployment facts that are easy to get wrong:
   on an old checkout; against an older server the bot logs one warning and falls back to MarkdownV2
   for the rest of the process (`bot/rich.py` flag). Old Telegram clients show rich messages as
   "unsupported message"; users turn them off per chat in `/settings` → Rich Messages.
+- Widgets (`sendWidget`, Bot API 10.4) need a Bot API server that knows them too (`docker compose pull
+  telegram-bot-api`); against an older one the first `send_widget` gets a 404, logs one warning and the widget
+  tools refuse for the rest of the process (`bot/widgets.py` flag), telling the agent to show the content another
+  way. Polling asks for `widget_query` updates (`bot.app.allowed_updates`); a server without them ignores the name.
+  Telegram apps below layer 233 show a widget as unsupported media with its caption.
 - The `bot` service runs `privileged: true` with `network_mode: host`. Host networking is what lets it
   reach the `telegram-bot-api` sidecar at `localhost:8081`; the shared `telegram-bot-api-data` volume
   is mounted in both containers because local-mode `get_file` returns server-side absolute paths
@@ -485,8 +508,9 @@ Deployment facts that are easy to get wrong:
    `ContainerManager` is instantiated twice here (once kept for cleanup, once inside the wrapper).
 3. **Only then** `import agents.main` — so every `ChainOfThoughtAgent` sees patched classes.
    `bot.agent_runner` also imports `agents.main` lazily, inside `run_turn`, for the same reason.
-4. `bot.app.run()`: build `Bot` (local API session when configured), `Dispatcher`, include the root
-   router, `delete_webhook(drop_pending_updates)`, `start_polling`. `on_startup` loads the auth store,
+4. `bot.app.run()`: build `Bot` (local API session when configured), `Dispatcher` (the outer
+   `WidgetQueryMiddleware` on `dp.update` first), include the root router, `delete_webhook(drop_pending_updates)`,
+   `start_polling(allowed_updates=allowed_updates(dp))` (the routers' types + `widget_query`). `on_startup` loads the auth store,
    configures ffmpeg for pydub, starts the reminders loop, the `mcp-admin-refresh` task
    (`mcp_ui.refresh_admin_servers`) and the `oauth-web` task (`oauth_web.serve`: the sign-in callback endpoint
    when `PUBLIC_BASE_URL` is set; a bind or TLS failure is one ERROR line and the copy-paste fallback),
@@ -542,7 +566,21 @@ execution between host and sandbox.
   `inject_target` returns None for it, so a later message of that topic waits in the window too. `/cancel` drops
   every open window of the user (`drop_windows`: preparations cancelled, the count line edited to "🛑 Cancelled.",
   counted as dropped messages). Not windowed: a message that joins a running turn, button presses (Retry,
-  Continue, follow-ups), scheduled tasks and notification turns.
+  Continue, follow-ups), scheduled tasks, notification turns and widget requests.
+- **Widget requests.** A tap inside a widget the agent sent with `allow_queries` that calls
+  `TelegramWidget.request(data)` arrives as a `widget_query` update (`bot/handlers/widget_queries.py`). It is
+  answered at once (`answerWidgetQuery`, the server waits 15 s) with `{"ok":true}`: the answer only says the agent
+  got it; what the agent does reaches the widget as a state change (`update_widget`). The request then joins the
+  running turn of the widget's topic like a follow-up press (`messages.inject_target` / `inject`, a ready
+  `Prepared` with `widget_prompt`, `message_id` None: no reactions on the widget), else it is queued as a turn of its
+  own (`Job(label "widget request", thread_id = the widget's topic, from_user=True, on_drop=_forget)` →
+  `run_turn(header=WIDGET_HEADER, reply_to_message_id=<the widget>, quiet_marker=QUIET_MARKER)`: a request that only
+  changes the widget leaves no message). Requests of the same widget arriving while that turn waits join it
+  (`_Batch.events`, at most `MAX_EVENTS` 10); the same data again within `DEDUPE_SECONDS` (2 s) is acknowledged and
+  dropped, and past `RATE_LIMIT` (6) accepted requests of one widget per `RATE_WINDOW` (60 s) the answer is
+  `{"ok":false,"error":"too many requests, wait a minute"}` (a widget asking in a loop). Unknown widgets, widgets without `allow_queries`, forwarded copies (`shared_widget_query`; the agent
+  sends no shared widgets), via-bot messages, unauthorized chats and an exhausted quota get `{"ok":false,"error":…}`
+  and no turn. Each accepted request counts as a received message (`track_message_received(uid, "widget")`).
 - **Live turns: joining the running turn.** `run_turn` opens an inbox (`bot/inbox.py`) right before it builds
   the agent and closes it the moment `generate_response` returned, failed or was cancelled. Meanwhile a new
   message of the same chat AND forum topic joins that turn instead of queueing: `messages.inject_target(user_id,
@@ -997,9 +1035,9 @@ itself is announced by a notice of facts only, a `system` message (see "Queues")
 counted by `track_tool_used` when it started. Toolset members never go to the background. Without a host (tests,
 subagents) every call runs to its end as before.
 
-Effective tool list as the model sees it (after patching; 53 built-in tools, the browser toolset and the user's
+Effective tool list as the model sees it (after patching; 57 built-in tools, the browser toolset and the user's
 `mcp_*` ones; without Agent Platform credentials (or with `VIDEO_TOOLS=off`) no video tools, with no session manager there is no
-`sandbox_status` and no browser, with `browser.enabled` off no browser, with no background host no task tools: 41 at
+`sandbox_status` and no browser, with `browser.enabled` off no browser, with no background host no task tools: 45 at
 the least):
 
 | Provider | Tools | Runs where |
@@ -1023,6 +1061,7 @@ the least):
 | SandboxTools (registered, awaited; only while sessions are on) | `sandbox_status`: when the sandbox and the browser close if unused (user's local time), memory, open tabs, stored logins size, saved packages, whether the user was warned; its `prompt_notes` carry the sandbox facts (30 min idle, the warning, what persists, fresh bash per command, `nohup` for background jobs, filtered internet, apt/pip persistence) | bot process (`manager.status` in to_thread); inherited by subagents |
 | BrowserTools (registered, awaited; only with `browser.enabled`) | the browser toolset members (`navigate`, `screenshot`, `zoom`, `left_click`, `right_click`, `middle_click`, `double_click`, `triple_click`, `hover`, `left_click_drag`, `left_mouse_down`, `left_mouse_up`, `mouse_move`, `scroll`, `scroll_to`, `type`, `key`, `hold_key`, `wait`, `read_page`, `find`, `get_page_text`, `form_input`, `new_tab`, `list_tabs`, `switch_tab`, `close_tab`; `javascript_exec`, `file_upload`, `read_console`, `read_network` disabled); `browser_confirm(summary)` (sends the current screenshot with ✅ Allow / ❌ Cancel through `bot/questions.ask`, 300 s; Allow = one sensitive action within 5 minutes, this turn only; only a tap grants it: a typed answer, `Answer.tapped` False, returns the text with "That is not a permission" and clears any allowance); `browser_show_screenshot(caption, region?)` (crop scaled up to 3x, e.g. a captcha for the user) | members: the user's browser container (`SessionManager.browser_call` in to_thread, 75 s); the two tools: bot process. Never given to subagents |
 | DocumentTools (registered, blocking) | `create_document` (format md\|html\|pdf\|docx\|xlsx, title, content Markdown, filename?) → `documents/<sanitized name>.<fmt>` (existing names get `-2`, `-3`); the tool sends the file itself and returns "Document saved to documents/… (<size> KB) and sent to the user." | md/html: bot process (python-markdown: tables, fenced_code, sane_lists, toc + embedded CSS); pdf/docx/xlsx: sandbox via `run_script("render_document.py", …)`, network off, 1g for pdf, timeout 90 s (script deadline 75 s) |
+| WidgetTools (registered, awaited) | `send_widget` (html or html_file (a workspace file, read `O_NOFOLLOW`), name, caption?, chat_data?, public_data? (JSON text ≤ 1024 bytes each), allow_queries, width/height (0 = auto, clamped to 600), ignore_checks): `widgets.check_html` (≤ 32768 bytes, ≤ 4096 after zlib level 9) and `lint` first (problems: form controls, iframe/media, `<script src>`, `<link>`, http(s) `src` / `url()`, `@import`, fetch/XHR/WebSocket → `Error: the widget was not sent …` unless ignore_checks; notes such as vh units or request() without allow_queries are returned with the result), then `SendWidget` into the turn's chat and topic; records `w<N>` in the registry and saves the HTML as `widgets/<name>-<hex>.html` (none for html_file); returns "Widget w3 \"<name>\" sent (message N; X bytes of HTML, Y of 4096 bytes compressed)."; `update_widget(widget = id, name or message id, chat_data?, public_data?)` → `EditMessageWidgetData` (silent; "" → `"null"`, "not modified" = done, a gone message marks the record `gone`); `list_widgets`; `widget_guide` (the authoring guide: profile, bubble, input, `TelegramWidget`, limits, how state and requests work with this bot, an example). `prompt_notes`: when to offer a widget, read the guide first, state via update_widget (a periodic agent task can refresh a dashboard), `[Widget request]` turns and `<no_update/>` | bot process (one Bot API call; registry and file I/O in to_thread); a 404 from the Bot API server turns the tools off for the process (`UNSUPPORTED_TEXT`) |
 | TaskTools (registered, awaited; only with a background host, never inherited by subagents) | `wait_for_tasks(timeout_seconds 5..600, default 120)`: the unread results of finished tasks at once (as blocks, marked read), "No background tasks are running." at once when none runs and the inbox holds nothing, else `inbox.wait` until something can be drained: a finished task → its result (or "A background task ended with nothing to read …" for a cancel or a result read already), "A new user message arrived; it follows." or the timeout (names the tasks still running); without an inbox it polls the host every second; `get_task_result(task_id)` (a finished task's result as tool-result content, marked read: `host.read`; a running one: "Task t3 (tool) is still running (…). A system message will say when it ends …"; unknown: `Error: no background task …`; pruned or cancelled: `Error: the result of task t3 is no longer available.`); `list_tasks` (id · tool · status running\|done\|failed\|cancelled · duration · "result not read yet" · start · args); `cancel_task(task_id)` (`t3`, `T3` or `3`; "Task t3 was cancelled." or `Error: no running background task …`). Static `<live_turn>` `prompt_notes`: how injected `<user_message sent_during_turn="true" time="…">` blocks look (also a typed answer to `ask_user_choice`), never ignore a message, answer quick questions with `send_user_telegram_message`, do not restart a backgrounded call, the system message when a task ends carries no output (read it with `get_task_result`), say a result will follow when answering while a task runs | bot process; the tasks themselves are the host's (`bot/background.py`) |
 
 Unreachable: all 11 `SystemTools` tools (`install_package`, `run_shell_script` duplicates plus
@@ -1185,6 +1224,11 @@ pip) and replayed once at every session start; a file the model writes with `cre
   (`mcp_store._locate`), so a provider that loaded a record before it changed gets no token and a sign-in that
   finishes after its record changed stores nothing. `data/_mcp/`, `data/tls/` and `data/.mcp_token_key` are never
   mounted into a container.
+  The widget registry (`data/_widgets/<uid>.json`: which message each widget id names) is bot-only for the same
+  reason: a record the sandbox could rewrite would point `update_widget` at another message. Edits always go to the
+  user's own chat (`chat_id = int(user_id)`); the HTML copies in `data/<uid>/widgets/` are written link-safe
+  (`ensure_real_dir`, then `O_EXCL | O_NOFOLLOW` relative to the folder's descriptor) and `send_widget(html_file=…)`
+  reads through `resolve_under` + `O_NOFOLLOW` (a regular file of at most 32 KB).
 
 ## Memory and on-disk data layout
 
@@ -1222,6 +1266,11 @@ data/
                                     (the admin's, e.g. a Cloudflare Origin Certificate; they win) or the generated <host>.selfsigned.pem /
                                     <host>.selfsigned.key (EC P-256, CN + SAN = the host of PUBLIC_BASE_URL, 10 years, key 0600, O_EXCL,
                                     reused; the admin's files are never touched)
+  _widgets/<chat_id>.json           the widgets the agent sent in this chat (bot-only, directory 0700, file 0600, read O_NOFOLLOW,
+                                    mkstemp + os.replace): {"next": N, "widgets": [{id "w<N>", name, message_id, thread_id,
+                                    allow_queries, chat_data, public_data (as last written), caption, html_file (workspace path),
+                                    html_bytes, packed_bytes, telegram_id, created, updated, taps, last_tap, gone}]}, newest
+                                    MAX_WIDGETS (50) kept; ids never reused
   _sandbox/<chat_id>/browser/       the browser container's mount (/run/browser), outside the user's workspace: ctl/browser.sock
                                     (the control socket), profile/ (Chromium's persistent profile: cookies and logins, plus
                                     gall-session-cookies.json between a shutdown and the next start; deleted by
@@ -1289,6 +1338,8 @@ data/
                                     and the transient render sources .render_<hex>.html|.md
     downloads/                      download_file / download_webpage(save_to_file) / create_zip_archive outputs, screenshot_<hex>.png
                                     (browse_webpage), files the interactive browser downloaded (moved here by the bot)
+    widgets/                        <name>-<hex>.html: a copy of each widget's HTML send_widget sent inline (for the next version;
+                                    send_widget(html_file=…) sends one again)
     installed_packages.txt, installed_python_packages.txt   the persisted apt / pip names (install_package), one per line,
                                     replayed at every session start
     temp_code_<hex>.py, temp_script_<hex>.sh,
@@ -1578,8 +1629,11 @@ name; a new temp dir needs its own `.gitignore` line).
   Retry/Continue/follow-ups: `AuthMiddleware(check_limits=True)` on message AND callback_query). Handlers
   never check auth themselves; they receive `user_id` (str chat id) and, in `chat`, `limit` as kwargs.
   Unknown `/commands` match nothing and are ignored. Middleware is registered as inner middleware, so
-  it only runs for a handler whose filters matched. Polling uses `dp.resolve_used_update_types()`, which
-  must keep `stopped_message_generation` (Telegram's Stop on a draft) next to message and callback_query.
+  it only runs for a handler whose filters matched. Polling uses `bot.app.allowed_updates(dp)`:
+  `dp.resolve_used_update_types()`, which must keep `stopped_message_generation` (Telegram's Stop on a draft) next
+  to message and callback_query, plus `widget_query`, which no router handles: aiogram 3.31 does not know the update
+  and keeps it in `Update.model_extra`; `WidgetQueryMiddleware` (an outer middleware on `dp.update`, so it runs before
+  aiogram's "unknown update type" warning) hands it to `widget_queries.handle_query` and never to the routers.
 - Commands: `/start [invite_<code>]` (authorized users get `START_AUTHORIZED`: welcome + 3 "Try:" examples +
   pointers to /help and /settings via `answer_md`; the unauthorized branch is unchanged HTML), `/help`
   (`HELP_ABOUT` capabilities, the `COMMANDS` with one-line descriptions, tips, 6 example prompts; legacy
@@ -1716,8 +1770,27 @@ name; a new temp dir needs its own `.gitignore` line).
   Snooze (`snooze_time`: N minutes from now, or "tomorrow" = 09:00 local, `SNOOZE_TOMORROW_HOUR`) re-schedules
   a one-shot in place and gives a periodic reminder a one-off `type: user` copy with `snoozed_from`, so the
   series does not drift; the fired message is edited into `snooze_text` (no keyboard).
+- Widgets: the Bot API 10.4 methods are `TelegramMethod` subclasses in `bot/widgets.py`, called as `await bot(m)`
+  (a fake bot in tests needs `__call__`). aiogram's session drops falsy fields (`if not value: continue`), so an
+  empty string cannot clear a widget's state: `state_value` sends `"null"` instead, and False flags or 0 sizes are
+  simply not sent (= the defaults).
 - Logging: `logging.getLogger(__name__)` in the `bot` package; `agents/main.py` is still
   `print`-only and dumps every API response and tool result to stdout. Nothing writes log files.
+
+- **Widgets: the HTML is frozen, the state is not.** A widget's HTML never changes after `sendWidget` (no edit
+  replaces it): a new layout is a new widget, and old messages keep the old one. Only `chat_data` / `public_data`
+  change (`update_widget`), so a widget the agent wants to keep current must draw everything from its state
+  (`widget_guide` says so). The registry keeps the state as last written by the agent; the widget prompt shows it.
+- Widget requests cost a turn each (a model call, tool calls, quota) and the server does not tell a tap from a
+  background request (in the private chat a widget may call `request()` without a tap, once when shown and every 5 s
+  while visible): the guide forbids `request()` outside a tap handler, and the handler only coalesces (one waiting
+  turn per widget), drops the same data within 2 s and refuses past 6 accepted requests of a widget a minute. The answer the widget gets is only `{"ok":true}`; an agent
+  turn can take longer than any client waits, so nothing the agent computes goes into it.
+- `lint` is a regex heuristic over the source, not the widget-sandbox validator: it catches the common breakages
+  (inputs, outside files, network) and can be wrong both ways; `ignore_checks` lets the agent send past a false
+  positive. The real validator runs in each Telegram app and silently drops what is out of profile 1.
+- The widget tools and their notes are part of the tool list and the static prompt: adding or changing them
+  strips stored thinking once (fingerprint change), as for any tool change.
 
 ## README vs code
 
@@ -2156,6 +2229,12 @@ name; a new temp dir needs its own `.gitignore` line).
   script writes go under a directory made writable with `web_tools.writable_dir`.
 - **Add an output document format**: `document_tools.FORMATS` (+ `SANDBOX_FORMATS` when it renders in the
   sandbox) and a branch in `scripts/render_document.py` (`build_<fmt>`), tests in `tests/test_document_tools.py`.
+- **Change widget support**: limits, checks, methods and the registry in `bot/widgets.py`; the tools, their
+  notes and the authoring guide (`WIDGET_GUIDE`, keep its example passing `lint`: `tests/test_widgets.py` checks it)
+  in `agents/widget_tools.py`; requests from widgets in `bot/handlers/widget_queries.py`. The source of truth for
+  what a widget may do is TelegramMessenger/widget-sandbox (`docs/widget-runtime-profile.md`, `docs/tgw-format.md`
+  for the Bot API names); a new Bot API widget field is a field on the method class. Shared widgets (`is_shared`,
+  `sendSharedWidget`, `shared_widget_query`) are not used: copies of the agent's widgets cannot ask.
 - **Add an MCP server**: users: `/mcp add <name> <url> [token] [sse]`; for everyone: a record in the file named
   by `MCP_SERVERS_FILE` (`data/mcp_servers.json`, see the data layout), discovered at the next start or admin
   `/mcp refresh`. Tool names become `mcp_<server>_<tool>`; the tool list change strips stored thinking once.
